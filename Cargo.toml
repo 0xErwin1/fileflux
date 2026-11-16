@@ -1,0 +1,66 @@
+[package]
+name = "fileflux"
+version = "0.1.0-dev.0"
+edition = "2024"
+rust-version = "1.99"
+description = "A file explorer in the Bolt family"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# The GPUI stack follows DBFlux, like ReqFlux: gpui-pre 0.3.9 and
+# gpui-component / gpui-kit-assets 0.7.3, with DBFlux's patched copies taken by
+# git rev (see [patch.crates-io]) so the app, bolt and gpui-component build
+# against one GPUI.
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui-component = { version = "=0.7.3" }
+# The Lucide icon catalog gpui-component 0.7.3 bundles, the one the family
+# links; the window draws its icons through `bolt`'s `IconSource::Svg`.
+gpui-kit-assets = { version = "=0.7.3" }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+# Bolt, the design system shared with DBFlux and ReqFlux, from the same DBFlux
+# rev as the GPUI stack.
+bolt = { git = "https://github.com/0xErwin1/dbflux", rev = "bf3cbd00d09227e6d5dc44893a4d2ded92d7c8ce" }
+
+# Only what startup and logging need.
+anyhow = "1.0.104"
+env_logger = "0.11.11"
+log = "0.4.34"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unwrap_in_result = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+let_underscore_must_use = "warn"
+
+# Fileflux follows DBFlux's GPUI stack by git rev: DBFlux vendors gpui-pre 0.3.9
+# with the frame-observer hooks, gpui-base and gpui-component 0.7.3 with its
+# editor patches, and gpui-pre-linux 0.3.9 with a Wayland keymap fix (see
+# vendor/*/VENDOR.md there). Taking them by git keeps the app, bolt and
+# gpui-component on one GPUI build without copying them here. The rev is
+# DBFlux's main where Bolt was merged (#1233); move it with DBFlux.
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/0xErwin1/dbflux", rev = "bf3cbd00d09227e6d5dc44893a4d2ded92d7c8ce" }
+gpui-base = { git = "https://github.com/0xErwin1/dbflux", rev = "bf3cbd00d09227e6d5dc44893a4d2ded92d7c8ce" }
+gpui-component = { git = "https://github.com/0xErwin1/dbflux", rev = "bf3cbd00d09227e6d5dc44893a4d2ded92d7c8ce" }
+gpui-pre-linux = { git = "https://github.com/0xErwin1/dbflux", rev = "bf3cbd00d09227e6d5dc44893a4d2ded92d7c8ce" }
+
+# Line tables keep backtraces usable at a fraction of the link time and
+# memory that full debug info costs with GPUI in the graph.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -1,0 +1,7 @@
+# Rust build output
+/target
+
+# Nix build results and direnv caches
+/result
+/result-*
+/.direnv
