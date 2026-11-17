@@ -288,16 +288,16 @@ fn strip_surrounding(value: &str, quote: char) -> &str {
     inner.strip_suffix(quote).unwrap_or(inner)
 }
 
-/// Parses the mount table. The root is always shown; every other mounted
-/// real storage volume is shown at its absolute path, while known
-/// pseudo/system filesystem types and virtual or internal runtime mount
-/// paths (`/proc`, `/sys`, `/dev` and `/run` outside the user's media
-/// roots) are excluded. Repeated mount points are deduplicated, fstab octal
-/// escapes are decoded and raw path bytes are preserved.
+/// Lists mounted disk partitions, including removable USB storage. Device
+/// sources, not individual bind/subvolume mountpoints, identify volumes;
+/// the filesystem root wins over internal mounts of the same partition.
+/// Virtual/network sources and loop/RAM images are not disk partitions.
+/// Escaped device and mount paths retain their original bytes.
 pub fn parse_mounts(mounts: &[u8], user: Option<&OsStr>) -> MountTable {
-    let mut volumes = Vec::new();
+    let mut volumes: Vec<Place> = Vec::new();
     let mut warnings = Vec::new();
     let mut seen: Vec<OsString> = Vec::new();
+    let mut devices: Vec<OsString> = Vec::new();
     for (position, line) in mounts.split(|&byte| byte == b'\n').enumerate() {
         let line = line.strip_suffix(&b"\r"[..]).unwrap_or(line);
         if line.is_empty() || line.first() == Some(&b'#') {
@@ -306,7 +306,7 @@ pub fn parse_mounts(mounts: &[u8], user: Option<&OsStr>) -> MountTable {
         let mut fields = line
             .split(|&byte| byte == b' ' || byte == b'\t')
             .filter(|field| !field.is_empty());
-        let _device = fields.next();
+        let device_field = fields.next();
         let Some(mount_field) = fields.next() else {
             warnings.push(format!(
                 "malformed /proc/self/mounts entry on line {} was skipped",
@@ -319,6 +319,13 @@ pub fn parse_mounts(mounts: &[u8], user: Option<&OsStr>) -> MountTable {
                 "malformed /proc/self/mounts entry on line {} was skipped",
                 position + 1
             ));
+            continue;
+        };
+        let Some(device) = device_field
+            .map(decode_fstab_field)
+            .map(OsString::from_vec)
+            .filter(|source| is_partition_source(source))
+        else {
             continue;
         };
         let path = PathBuf::from(OsString::from_vec(decode_fstab_field(mount_field)));
@@ -334,6 +341,15 @@ pub fn parse_mounts(mounts: &[u8], user: Option<&OsStr>) -> MountTable {
             Some(file_name) => file_name.to_string_lossy().into_owned(),
             None => path.to_string_lossy().into_owned(),
         };
+        if let Some(index) = devices.iter().position(|known| known == &device) {
+            if path == Path::new("/")
+                && let Some(volume) = volumes.get_mut(index)
+            {
+                *volume = Place { label, path };
+            }
+            continue;
+        }
+        devices.push(device);
         volumes.push(Place { label, path });
     }
     volumes.sort_by(|a, b| {
@@ -343,6 +359,14 @@ pub fn parse_mounts(mounts: &[u8], user: Option<&OsStr>) -> MountTable {
             .cmp(b.path.as_os_str().as_bytes())
     });
     MountTable { volumes, warnings }
+}
+
+fn is_partition_source(source: &OsStr) -> bool {
+    let bytes = source.as_bytes();
+    bytes.starts_with(b"/dev/")
+        && !["/dev/loop", "/dev/ram", "/dev/zram", "/dev/fuse"]
+            .iter()
+            .any(|prefix| bytes.starts_with(prefix.as_bytes()))
 }
 
 /// Known pseudo and system filesystem types that are never user-visible
@@ -372,12 +396,15 @@ const PSEUDO_FILESYSTEMS: &[&str] = &[
     "autofs",
 ];
 
-/// The root plus every mounted real storage volume: pseudo/system
+/// Eligible device-backed storage mountpoints: pseudo/system
 /// filesystem types are excluded, virtual mounts are excluded by path
 /// (`/proc`, `/sys`, `/dev`), `/run` is treated as internal runtime except
 /// the user's media roots, and any other absolute mount point (for example
 /// `/srv/data`) counts as storage.
 fn is_visible_mount(path: &Path, fs_type: &OsStr, user: Option<&OsStr>) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
     if path == Path::new("/") {
         return true;
     }
@@ -617,7 +644,7 @@ mod tests {
         Ok(())
     }
 
-    /// The root is always shown; mounted real storage is shown at arbitrary
+    /// A device-backed root is shown; mounted partitions remain visible at arbitrary
     /// absolute paths, while pseudo and internal runtime mounts are excluded
     /// by path and filesystem type instead of a storage allowlist.
     #[test]
@@ -682,6 +709,44 @@ tmpmount /run/temp tmpfs rw 0 0\n";
             .collect();
         assert_eq!(paths, vec!["/srv/data"]);
         Ok(())
+    }
+
+    #[test]
+    fn volumes_are_mounted_partitions_and_usb_not_internal_bind_mounts() {
+        let mounts = b"\
+/dev/nvme0n1p2 /nix/store btrfs rw 0 0\n\
+/dev/nvme0n1p2 / btrfs rw 0 0\n\
+/dev/nvme0n1p2 /home btrfs rw 0 0\n\
+/dev/nvme0n1p2 /swap btrfs rw 0 0\n\
+/dev/nvme0n1p1 /boot vfat rw 0 0\n\
+/dev/mapper/data /mnt/data ext4 rw 0 0\n\
+/dev/sdb1 /run/media/fixture/USB\\040Disk exfat rw 0 0\n\
+/dev/sdb1 /mnt/usb-bind exfat rw 0 0\n\
+/dev/loop0 /mnt/image ext4 rw 0 0\n\
+/dev/fuse /mnt/fuse fuseblk rw 0 0\n\
+server:/share /mnt/network nfs rw 0 0\n\
+tmpfs /run tmpfs rw 0 0\n";
+        let table = parse_mounts(mounts, Some(OsStr::new("fixture")));
+        let paths: Vec<_> = table
+            .volumes
+            .iter()
+            .map(|place| place.path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("/"),
+                Path::new("/boot"),
+                Path::new("/mnt/data"),
+                Path::new("/run/media/fixture/USB Disk")
+            ]
+        );
+        assert!(table.warnings.is_empty());
+        assert!(
+            parse_mounts(b"overlay / overlay rw 0 0\n", None)
+                .volumes
+                .is_empty()
+        );
     }
 
     /// A mount point listed twice is deduplicated.
@@ -767,7 +832,13 @@ tmpmount /run/temp tmpfs rw 0 0\n";
         )));
         assert!(contains("XDG_DATA_HOME"), "relative-variable warning kept");
         assert!(!contains("could not read /proc/self/mounts"));
-        assert!(contains("volume=/"), "real mount table root is reported");
+        assert!(
+            report_text
+                .lines()
+                .filter_map(|line| line.strip_prefix("volume="))
+                .all(|path| Path::new(path).is_absolute()),
+            "reported partition mountpoints must be absolute; a container root need not be a disk"
+        );
         Ok(())
     }
 }

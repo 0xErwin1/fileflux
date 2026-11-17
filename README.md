@@ -17,7 +17,7 @@ Review and authorize `.envrc` again after changing it. For shells without direnv
 
 | Area | Behavior |
 |---|---|
-| Navigation | Sidebar places (Home, Desktop, Documents, Downloads, Music, Pictures, Videos per your freedesktop config), scoped **Home Trash**, and mounted volumes from the mount table — exact paths, no invented free-space numbers. |
+| Navigation | Sidebar places (Home, Desktop, Documents, Downloads, Music, Pictures, Videos per your freedesktop config), scoped **Home Trash**, and mounted disk partitions/USB storage from the mount table — one entry per device, without virtual or duplicate bind mounts. Paths are exact, with no invented free-space numbers; mounting, unmounting and ejecting are not performed. |
 | Path field | Always editable (Ctrl+L); Enter navigates absolute, relative, or `~/…` paths — no shell evaluation. Escape restores the committed path. Invalid or missing paths report an error and keep the current listing, history, and selection. |
 | History | Back/forward/up with disabled states (Alt+Left/Right/Up). Failed loads change nothing. |
 | Views | Icon grid of fixed-size tiles (104 px wide, equal-size rows, left-aligned partial rows — the last row never stretches) and a details list drawn by Bolt's shared data grid (`Name/Type/Size/Modified` with the family's row-number gutter, sideways scrolling and drag-to-resize); view toggle keeps folder, query and selection. |
