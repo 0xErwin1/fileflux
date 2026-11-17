@@ -1,4 +1,6 @@
-//! GUI startup.
+//! GUI startup: logging, the Bolt theme and the explorer window inside
+//! `gpui_component`'s [`Root`], reusing the startup lifecycle the setup
+//! screen proved.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -7,15 +9,15 @@ use anyhow::Result;
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use gpui_component::Root;
 
-use crate::setup::SetupScreen;
+use crate::explorer::{Explorer, bind_keys};
 use crate::theme;
 
-/// The size the setup window opens at, until the file explorer settles its
-/// own layout.
-const MAIN_WINDOW_SIZE: (f32, f32) = (1024.0, 680.0);
+/// The explorer's typical viewport (design brief: 1440×900), room for the
+/// 290 px sidebar plus a comfortable content island.
+const MAIN_WINDOW_SIZE: (f32, f32) = (1440.0, 900.0);
 
-/// Initializes logging, installs the Bolt theme and opens the setup window,
-/// running until the last window closes.
+/// Initializes logging, installs the Bolt theme and opens the explorer
+/// window, running until the last window closes.
 pub(crate) fn open() -> std::process::ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -34,7 +36,7 @@ pub(crate) fn open() -> std::process::ExitCode {
             })
             .detach();
 
-            if let Err(error) = open_setup_window(cx) {
+            if let Err(error) = open_explorer_window(cx) {
                 error_slot.replace(Some(error));
                 cx.quit();
             }
@@ -43,7 +45,7 @@ pub(crate) fn open() -> std::process::ExitCode {
     match startup_error.take() {
         None => std::process::ExitCode::SUCCESS,
         Some(error) => {
-            eprintln!("fileflux: failed to open the setup window: {error:#}");
+            eprintln!("fileflux: failed to open the explorer window: {error:#}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -56,10 +58,11 @@ fn assets() -> impl gpui::AssetSource {
     gpui_kit_assets::AllAssets
 }
 
-/// Installs the theme and opens the setup window wrapped in gpui-component's
-/// [`Root`].
-fn open_setup_window(cx: &mut App) -> Result<()> {
+/// Installs the theme, binds the explorer's keys and opens the explorer
+/// window wrapped in gpui-component's [`Root`].
+fn open_explorer_window(cx: &mut App) -> Result<()> {
     theme::install(bolt::palette::PaletteMode::System, cx);
+    bind_keys(cx);
 
     let bounds = Bounds::centered(
         None,
@@ -77,8 +80,11 @@ fn open_setup_window(cx: &mut App) -> Result<()> {
     };
 
     cx.open_window(options, |window, cx| {
-        let screen = cx.new(|_| SetupScreen::new());
-        cx.new(|cx| Root::new(screen, window, cx))
+        let explorer = cx.new(|cx| Explorer::new(window, cx));
+        explorer.update(cx, |explorer, cx| {
+            explorer.initial_focus().focus(window, cx);
+        });
+        cx.new(|cx| Root::new(explorer, window, cx))
     })?;
 
     Ok(())

@@ -1,8 +1,7 @@
-//! The Fileflux binary: for now, the setup window only. File browsing comes
-//! next.
+//! The Fileflux binary: the read-only explorer window.
 
+mod explorer;
 mod gui;
-mod setup;
 mod theme;
 
 use std::process::ExitCode;
