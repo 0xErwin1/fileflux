@@ -10,9 +10,13 @@ Automated assertions:
 1. The window appears, titled "<home folder> — Fileflux".
 2. Ctrl+L, nonexistent path, Enter, Escape, Enter: the title still names the
    failed folder (failed submit + Escape preserve the committed folder).
-3. Ctrl+F, non-matching query, Escape: the app stays alive; a grid-content
+3. Ctrl+L, relative child "first", Enter, Enter again: the title stays
+   "first" (the stale-submit bug would navigate into first/second).
+4. Ctrl+F, non-matching query, Escape: the app stays alive; a grid-content
    comparison is not automatable without an AT-SPI session, so the helper
    prints MANUAL for that visual check and never claims it passed.
+5. Ctrl+F filter, then a path navigation: the field must visibly follow
+   the cleared query — MANUAL, same reason.
 
 Usage: nix develop --command python3 scripts/native-smoke.py
 Requires target/debug/fileflux and an X display. Exits 3 with a MANUAL
@@ -150,6 +154,9 @@ class Fixture:
         self.home = self.root / "home"
         self.home.mkdir()
         (self.home / "alpha.txt").write_bytes(b"a")
+        # first/second: with the stale-submit bug, the second Enter of the
+        # consecutive-submit repro navigates home -> first -> first/second.
+        (self.home / "first" / "second").mkdir(parents=True)
         self.alt = self.root / "alt-folder"
         self.alt.mkdir()
 
@@ -364,15 +371,57 @@ def main() -> None:
                 fail("a failed path submit disturbed the committed folder")
             print("PASS: failed path submit + Escape + Enter retains the prior folder", flush=True)
 
-            # Finding 1, search side: drive the actual repro (Ctrl+F, a
-            # non-matching query, Escape) for the app's liveness, then
-            # report the visible content restore as what it is: manual.
+            # Finding 1: from home, submit the relative child "first", then
+            # press Enter again while the field is still focused. The commit
+            # must reseed the field (second Enter reloads "first"); with the
+            # bug it navigates into first/second.
+            x.chord("Control", "l")
+            time.sleep(0.3)
+            x.type_text(str(fixture.home))
+            time.sleep(0.3)
+            x.tap("Return")
+            time.sleep(1.0)
+            x.chord("Control", "l")
+            time.sleep(0.3)
+            x.type_text("first")
+            time.sleep(0.3)
+            x.tap("Return")
+            time.sleep(1.0)
+            first_title = window_name(x, int(window, 16))
+            if "first" not in first_title:
+                fail(f"the relative submit 'first' did not navigate: title {first_title!r}")
+            x.tap("Return")
+            time.sleep(1.0)
+            second_title = window_name(x, int(window, 16))
+            if "second" in second_title:
+                fail(
+                    "a second Enter resolved the stale text against the new "
+                    f"folder and navigated deeper: title {second_title!r}"
+                )
+            if "first" not in second_title:
+                fail(f"the second Enter lost the committed folder: {second_title!r}")
+            print("PASS: consecutive Enter submissions reload the displayed folder", flush=True)
+
+            # Finding 2, search side: drive the repros for liveness — a
+            # non-matching query + Escape, and a filter followed by a
+            # navigation. The field text and grid are not readable without
+            # an AT-SPI session, so both checks stay MANUAL.
             x.chord("Control", "f")
             time.sleep(0.3)
             x.type_text("zz-nomatch")
             time.sleep(0.5)
             x.tap("Escape")
             time.sleep(0.5)
+            x.chord("Control", "f")
+            time.sleep(0.3)
+            x.type_text("alpha")
+            time.sleep(0.5)
+            x.chord("Control", "l")
+            time.sleep(0.3)
+            x.type_text(str(fixture.home))
+            time.sleep(0.3)
+            x.tap("Return")
+            time.sleep(1.0)
             if app.poll() is not None:
                 fail(f"app died during the search drive: {app.returncode}")
             manual_report = True
@@ -392,9 +441,11 @@ def main() -> None:
         fixture.cleanup()
     if manual_report:
         manual(
-            "Ctrl+F 'no-match' Escape must visibly restore the listing; "
-            "read the grid with an AT-SPI session or by eye — this helper "
-            "cannot verify it and did not pretend to"
+            "two visual checks need eyes or AT-SPI (this helper cannot read "
+            "the field text or grid): after Ctrl+F 'no-match' Escape the "
+            "listing must visibly restore; after a filter plus navigation "
+            "the search field must show the committed (empty) query with "
+            "the full listing and no filter line"
         )
 
 

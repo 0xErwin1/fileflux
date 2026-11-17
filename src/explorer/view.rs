@@ -144,6 +144,12 @@ pub(crate) struct Explorer {
     pub(crate) path_seed: String,
     /// Whether the path field holds an edit that has not been submitted.
     pub(crate) path_edited: bool,
+    /// The path field's edit revision: bumped by every user edit, never by
+    /// programmatic reseeds (they emit no Change event).
+    path_edit_revision: u64,
+    /// The edited-path submit in flight, if any: its scan generation plus
+    /// the edit revision at submit time.
+    submitted_edit: Option<SubmittedEdit>,
     /// The current-folder filename search field.
     pub(crate) search_input: Entity<InputState>,
     /// The whole-window focus, so Escape has somewhere to give the focus
@@ -209,6 +215,8 @@ impl Explorer {
             path_input,
             path_seed: String::new(),
             path_edited: false,
+            path_edit_revision: 0,
+            submitted_edit: None,
             search_input,
             shell_focus: cx.focus_handle(),
             entries_focus: cx.focus_handle(),
@@ -230,13 +238,14 @@ impl Explorer {
                 InputEvent::PressEnter { .. } => this.submit_path(window, cx),
                 InputEvent::Change => {
                     let text = this.path_input.read(cx).value().to_string();
+                    this.path_edit_revision += 1;
                     this.path_edited = text != this.path_seed;
                     this.state.clear_path_error();
                     cx.notify();
                 }
                 InputEvent::Blur => {
                     if this.path_edited {
-                        this.seed_path_input(window, cx);
+                        this.seed_path_input(window, cx, false);
                         cx.notify();
                     }
                 }
@@ -300,15 +309,17 @@ impl Explorer {
     }
 
     /// Navigates: turns the transition into a scan and starts it off the UI
-    /// thread. A transition that changes nothing produces no scan.
+    /// thread. A transition that changes nothing produces no scan. Returns
+    /// the started scan, so a path submit can remember it.
     pub(crate) fn navigate(
         &mut self,
         transition: Transition,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<Scan> {
         let scan = self.state.begin(transition);
-        self.start_scan(scan, window, cx);
+        self.start_scan(scan.clone(), window, cx);
+        scan
     }
 
     /// Starts the scan (risk item 4): the blocking read runs on the
@@ -356,10 +367,20 @@ impl Explorer {
                     self.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 }
                 self.refresh_snapshot();
-                self.seed_path_input(window, cx);
+                // Consume the submitted edit only when this completion is
+                // its own scan with no newer edit after it; stale or failed
+                // completions never reseed either field.
+                let revision = self.path_edit_revision;
+                let settled = self
+                    .submitted_edit
+                    .take()
+                    .is_some_and(|edit| edit.settles(scan.generation, revision));
+                self.seed_path_input(window, cx, settled);
+                self.sync_search_input(window, cx);
                 cx.notify();
             }
             Err(error) => {
+                self.submitted_edit = None;
                 if !self.state.commit_failure(scan, error.to_string()) {
                     return;
                 }
@@ -394,11 +415,13 @@ impl Explorer {
 
     /// Seeds the path field with the committed location unless the user is
     /// mid-edit. Unedited submits therefore retain the actual current path.
-    fn seed_path_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `force` reseeds even while focused, for a just-settled submission,
+    /// so a second Enter reloads the displayed location; post-submission
+    /// edits keep the guard.
+    fn seed_path_input(&mut self, window: &mut Window, cx: &mut Context<Self>, force: bool) {
         let committed = self.committed_path_text();
-        let editing =
-            self.path_input.read(cx).focus_handle(cx).is_focused(window) && self.path_edited;
-        if editing {
+        let focused = self.path_input.read(cx).focus_handle(cx).is_focused(window);
+        if !force && focused && self.path_edited {
             return;
         }
         self.path_seed.clone_from(&committed);
@@ -419,6 +442,19 @@ impl Explorer {
             Location::Directory(path) => path.to_string_lossy().into_owned(),
             Location::Trash => "Trash".to_owned(),
         }
+    }
+
+    /// Synchronizes the search field with the committed query after a
+    /// commit, so the field, the listing and the match count agree again.
+    /// `set_value` emits no Change; no query-subscription feedback.
+    fn sync_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let committed = self.state.query().to_owned();
+        self.search_input.update(cx, |input, cx| {
+            let shown = input.value().to_string();
+            if let Some(value) = search_field_resync(&committed, &shown) {
+                input.set_value(value.to_owned(), window, cx);
+            }
+        });
     }
 
     fn sync_window_title(&self, window: &mut Window) {
@@ -501,8 +537,14 @@ impl Explorer {
             Ok(location) => {
                 self.state.clear_path_error();
                 self.state.clear_notice();
-                self.seed_path_input(window, cx);
-                self.navigate(Transition::Visit(location), window, cx);
+                let revision = self.path_edit_revision;
+                let scan = self.navigate(Transition::Visit(location), window, cx);
+                if let Some(scan) = scan {
+                    self.submitted_edit = Some(SubmittedEdit {
+                        generation: scan.generation,
+                        revision,
+                    });
+                }
             }
             Err(argument) => {
                 self.state.clear_notice();
@@ -605,6 +647,29 @@ impl Explorer {
         };
         (total - 2.0 * IslandMetrics::GAP.as_f32() - sidebar - 2.0 * 16.0).max(0.0)
     }
+}
+
+/// The path-field edit a successful edited-path submit started: the scan
+/// generation it began under, and the field's edit revision at submit time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubmittedEdit {
+    generation: u64,
+    revision: u64,
+}
+
+impl SubmittedEdit {
+    /// Only the submission's own scan, and only with no newer edit, may
+    /// reseed the field — even while it stays focused. The revision, never
+    /// the text, decides: edits away and back are still newer edits.
+    fn settles(self, scan_generation: u64, current_revision: u64) -> bool {
+        self.generation == scan_generation && self.revision == current_revision
+    }
+}
+
+/// The value the search field must be set to after a commit, or `None` when
+/// it already shows the committed query and no programmatic set is needed.
+fn search_field_resync<'a>(committed_query: &'a str, field_value: &str) -> Option<&'a str> {
+    (field_value != committed_query).then_some(committed_query)
 }
 
 impl Render for Explorer {
@@ -931,5 +996,47 @@ pub(crate) fn path_argument_message(argument: &PathArgument) -> String {
     match argument {
         PathArgument::Empty => "Enter a path to navigate.".to_owned(),
         PathArgument::Unresolvable(detail) => format!("Cannot navigate there: {detail}."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The finding: a successful edited-path submission reseeds the path
+    /// field — even while it stays focused — so a second Enter reloads the
+    /// displayed folder instead of resolving the stale text against the new
+    /// directory. Only the submission's own scan settles it, and only while
+    /// no newer edit exists; the revision (never the text) decides, so
+    /// edits away and back are still newer edits.
+    #[test]
+    fn a_submitted_path_edit_settles_only_on_its_own_current_scan() {
+        let submitted = SubmittedEdit {
+            generation: 7,
+            revision: 3,
+        };
+        let same_scan = submitted.settles(7, 3);
+        assert!(same_scan, "the submitted scan's completion reseeds");
+        let newer_scan = submitted.settles(8, 3);
+        assert!(!newer_scan, "a newer scan's completion never reseeds");
+        let newer_edit = submitted.settles(7, 4);
+        assert!(!newer_edit, "an edit after the submission is preserved");
+        let edited_away_and_back = submitted.settles(7, 5);
+        assert!(
+            !edited_away_and_back,
+            "identical text at a newer revision is a newer edit"
+        );
+    }
+
+    /// The finding: a successful navigation clears the state's query, and
+    /// the search field must follow the committed query, so the field and
+    /// the listing agree. An already-synced field is left alone.
+    #[test]
+    fn the_search_field_resyncs_with_the_committed_query() {
+        let cleared = search_field_resync("", "alpha");
+        assert_eq!(cleared, Some(""), "field follows cleared query");
+        let restored = search_field_resync("alpha", "");
+        assert_eq!(restored, Some("alpha"), "lost query is restored");
+        assert_eq!(search_field_resync("", ""), None, "already in sync: no set");
     }
 }
