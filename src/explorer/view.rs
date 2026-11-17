@@ -22,8 +22,8 @@ use fileflux::core::places::{Places, discover};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px,
+    KeyBinding, ParentElement, Render, ScrollHandle, ScrollStrategy, Stateful, Styled,
+    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
 };
 
 use gpui_component::ActiveTheme as _;
@@ -157,8 +157,19 @@ pub(crate) struct Explorer {
     pub(crate) shell_focus: FocusHandle,
     /// The entries area focus, which carries the arrow keys.
     pub(crate) entries_focus: FocusHandle,
-    /// The scroll anchor of the virtualized entry rows.
-    pub(crate) scroll: UniformListScrollHandle,
+    /// The vertical scroll handle of the details list. The two
+    /// presentations count rows in different units — entries versus rows of
+    /// tiles — so each keeps its own handle and its own list element id.
+    pub(crate) list_scroll: UniformListScrollHandle,
+    /// The vertical scroll handle of the tile grid.
+    pub(crate) grid_scroll: UniformListScrollHandle,
+    /// The horizontal scroll handle of the details-list viewport, which
+    /// Bolt's `GridOverflow` drives for header and rows together.
+    pub(crate) list_hscroll: ScrollHandle,
+    /// The entries area's measured inner width, recorded by the draw-nothing
+    /// measuring canvas every frame; `None` until the first layout reached
+    /// it, so the first frame draws with the estimate below.
+    pub(crate) entries_width: Option<f32>,
     /// The retained scan task, replaced by the next scan.
     scan_task: Option<Task<()>>,
     /// The path field's Enter/Change/Blur subscription.
@@ -220,7 +231,10 @@ impl Explorer {
             search_input,
             shell_focus: cx.focus_handle(),
             entries_focus: cx.focus_handle(),
-            scroll: UniformListScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            grid_scroll: UniformListScrollHandle::new(),
+            list_hscroll: ScrollHandle::new(),
+            entries_width: None,
             scan_task: None,
             sidebar_open: true,
             rendered_columns: 1,
@@ -361,10 +375,12 @@ impl Explorer {
                 if !self.state.commit(scan.clone(), listing) {
                     return;
                 }
-                // A genuine folder change returns the list to its top; a
-                // reload keeps the reader at the place they were reading.
+                // A genuine folder change returns the reader to the top of
+                // the presentation that is showing; a reload keeps the
+                // reader at the place they were reading.
                 if !scan.refresh {
-                    self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    self.active_scroll_handle()
+                        .scroll_to_item(0, ScrollStrategy::Top);
                 }
                 self.refresh_snapshot();
                 // Consume the submitted edit only when this completion is
@@ -592,7 +608,30 @@ impl Explorer {
             View::List => position,
             View::Grid => util::grid_row(position, self.rendered_columns.max(1)),
         };
-        self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        self.active_scroll_handle()
+            .scroll_to_item(row, ScrollStrategy::Nearest);
+    }
+
+    /// The vertical scroll handle of the presentation that is showing: the
+    /// two views count rows in different units, so they never share one.
+    fn active_scroll_handle(&self) -> &UniformListScrollHandle {
+        match self.state.view() {
+            View::List => &self.list_scroll,
+            View::Grid => &self.grid_scroll,
+        }
+    }
+
+    /// Switches the presentation. The other view's handle keeps an offset
+    /// counted in the wrong row units, so the fresh view starts at its top;
+    /// the selection lives in the state and survives untouched.
+    pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        if self.state.view() == view {
+            return;
+        }
+        self.state.set_view(view);
+        self.active_scroll_handle()
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
     }
 
     /// Enter (or double click) on the selected entry: directories navigate,
@@ -634,9 +673,10 @@ impl Explorer {
         cx.notify();
     }
 
-    /// The width the content island can use, derived for the grid column
-    /// count. The estimate covers the 8 px outer gutters, the sidebar
-    /// column, the inter-island gap and the island's 16 px content padding.
+    /// The width the content island can use, as the **first-frame estimate**
+    /// of the entries area's inner width, derived before the measuring
+    /// canvas has reported: the 8 px outer gutters, the sidebar column, the
+    /// inter-island gap and the island's 16 px content padding.
     fn content_width(&self, window: &Window) -> f32 {
         let total = f32::from(window.viewport_size().width);
         let narrow = total < NARROW_WIDTH;
@@ -677,9 +717,13 @@ impl Render for Explorer {
         let colors = bolt::colors(cx);
         let narrow = f32::from(window.viewport_size().width) < NARROW_WIDTH;
 
-        // Grid geometry is derived here and reused by the arrow keys, so
-        // both agree on the row of a tile.
-        self.rendered_columns = entries::grid_columns(self.content_width(window));
+        // Grid geometry comes from the entries area's measured inner width
+        // once the first frame has reported it; the estimate only seeds the
+        // very first frame. The arrow keys reuse the same geometry.
+        self.rendered_columns = entries::grid_columns(
+            self.entries_width
+                .unwrap_or_else(|| self.content_width(window)),
+        );
 
         let document = self.render_document_island(cx);
         let side = sidebar::render(self, narrow, cx);

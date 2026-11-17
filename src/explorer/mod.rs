@@ -3,6 +3,7 @@
 pub(crate) mod entries;
 pub(crate) mod sidebar;
 pub(crate) mod state;
+pub(crate) mod table;
 pub(crate) mod toolbar;
 pub(crate) mod util;
 pub(crate) mod view;

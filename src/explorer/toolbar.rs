@@ -147,8 +147,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         .tooltip("Icon view")
                         .selected(this.state.view() == View::Grid)
                         .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.state.set_view(View::Grid);
-                            cx.notify();
+                            this.set_view(View::Grid, cx);
                         })),
                 )
                 .child(
@@ -159,8 +158,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         .tooltip("List view")
                         .selected(this.state.view() == View::List)
                         .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.state.set_view(View::List);
-                            cx.notify();
+                            this.set_view(View::List, cx);
                         })),
                 ),
         )

@@ -20,7 +20,7 @@ Review and authorize `.envrc` again after changing it. For shells without direnv
 | Navigation | Sidebar places (Home, Desktop, Documents, Downloads, Music, Pictures, Videos per your freedesktop config), scoped **Home Trash**, and mounted volumes from the mount table — exact paths, no invented free-space numbers. |
 | Path field | Always editable (Ctrl+L); Enter navigates absolute, relative, or `~/…` paths — no shell evaluation. Escape restores the committed path. Invalid or missing paths report an error and keep the current listing, history, and selection. |
 | History | Back/forward/up with disabled states (Alt+Left/Right/Up). Failed loads change nothing. |
-| Views | Icon grid and details list (Name/Type/Size/Modified), view toggle keeps folder, query and selection. |
+| Views | Icon grid of fixed-size tiles (104 px wide, equal-size rows, left-aligned partial rows — the last row never stretches) and a details list drawn by Bolt's shared data grid (`Name/Type/Size/Modified` with the family's row-number gutter, sideways scrolling and drag-to-resize); view toggle keeps folder, query and selection. |
 | Search | Ctrl+F filters file names in the current folder only — case-insensitive, nonrecursive, with a live "n of m" count; no matches is distinct from an empty folder; Escape clears. |
 | Selection | Click selects, Ctrl+click toggles, Escape clears; arrow keys and Home/End move through visible entries and scroll them into view; a filtered-out selection stays selected. |
 | Open | Double click or Enter navigates into folders. Files, symlinks, and broken links are never opened and answer honestly in the status bar that Fileflux is read-only. |

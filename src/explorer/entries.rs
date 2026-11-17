@@ -1,11 +1,15 @@
-//! The entries area: the virtualized grid of folder tiles and the details
-//! list, over `gpui::uniform_list`.
+//! The entries area: the measured container over the two virtualized
+//! presentations — the folder tile grid and the details list. The list is
+//! Bolt's own data grid (see [`super::table`]); the grid composes Bolt's
+//! `ListRow`/icon/text primitives into fixed-size tiles, because Bolt has
+//! no gallery primitive of its own.
 //!
-//! The list and the grid both render chunked fixed-height rows; the grid
-//! derives its column count from the content width with a minimum of one,
-//! so no row renders the whole directory and no keystroke rescans it.
-//! Clicks and keyboard arrows go through the raw entry paths the state
-//! keeps; display names are lossy and never used for navigation.
+//! The grid derives its column count from the entries area's **measured**
+//! inner width with a minimum of one, so no row renders the whole directory
+//! and no keystroke rescans it. Tiles are fixed-width and never stretch:
+//! a partial last row left-aligns exactly the remaining tiles. Clicks and
+//! keyboard arrows go through the raw entry paths the state keeps; display
+//! names are lossy and never used for navigation.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -17,38 +21,51 @@ use bolt::tokens::Spacing;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, InteractiveElement, IntoElement, Modifiers,
-    ParentElement, Stateful, Styled, WeakEntity, Window, div, prelude::*, px,
+    ParentElement, Stateful, Styled, WeakEntity, Window, canvas, div, prelude::*, px,
 };
 
 use super::icon;
 use super::state::View;
-use super::util;
 use super::view::{ENTRIES_CONTEXT, Explorer};
 
-/// Tile width of the reference grid (normal density).
+/// Tile width of the reference grid (normal density); every tile draws at
+/// exactly this width, so a partial last row matches a full one.
 const TILE_WIDTH: f32 = 104.0;
-/// Tile height, icon plus two filename lines.
-const TILE_HEIGHT: f32 = 104.0;
+/// Tile height: 16 px top padding, the 40 px icon, 12 px gap, two 18 px
+/// filename lines and 8 px bottom padding — long names clip at two lines.
+const TILE_HEIGHT: f32 = 112.0;
 /// Gap between tiles.
 const TILE_GAP: f32 = 8.0;
 /// Horizontal padding of the entries area.
 const ENTRIES_PADDING: f32 = 16.0;
 
-/// Derives the grid column count from the available content width, with a
-/// minimum of one so nothing is ever unreachable.
-pub(crate) fn grid_columns(available_width: f32) -> usize {
-    let usable = (available_width - 2.0 * ENTRIES_PADDING).max(TILE_WIDTH);
+/// Derives the grid column count from the entries area's **inner** width —
+/// the content box the tiles lay out in; the padding is already excluded by
+/// the measurement — with a minimum of one so nothing is ever unreachable.
+pub(crate) fn grid_columns(inner_width: f32) -> usize {
+    let usable = inner_width.max(TILE_WIDTH);
     (((usable + TILE_GAP) / (TILE_WIDTH + TILE_GAP)).floor() as usize).max(1)
 }
 
+/// The tile indices of grid row `row`: a full row holds exactly `columns`
+/// tiles, the last partial row holds exactly the remaining ones (never
+/// stretched to fill the width), and a row past the end is empty.
+pub(crate) fn grid_tile_range(row: usize, count: usize, columns: usize) -> std::ops::Range<usize> {
+    let columns = columns.max(1);
+    let start = (row * columns).min(count);
+    start..(start + columns).min(count)
+}
+
 /// The entries area of the explorer: loading, empty, no-result and result
-/// states.
+/// states. The result states live in one measured content wrapper: a
+/// draw-nothing canvas records the wrapper's inner width, and the column
+/// count follows that measurement instead of a viewport estimate.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let visible: Arc<Vec<usize>> = Arc::new(this.state.visible_indices());
     let count = visible.len();
 
-    let mut container = div()
+    let container = div()
         .id("explorer-entries")
         .key_context(ENTRIES_CONTEXT)
         .track_focus(&this.entries_focus)
@@ -58,8 +75,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .flex()
         .flex_col()
         .px(px(ENTRIES_PADDING))
-        .pb(Spacing::XL)
-        .overflow_y_scroll();
+        .pb(Spacing::XL);
 
     if this.state.is_loading() && count == 0 {
         return container.justify_center().child(
@@ -118,163 +134,93 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         );
     }
 
-    let snapshot = Arc::clone(&this.snapshot);
-    let selected: BTreeSet<PathBuf> = this.state.selection().clone();
-    let columns = this.rendered_columns.max(1);
     let weak = cx.entity().downgrade();
+    let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.state.selection().clone());
     let list_view = this.state.view() == View::List;
+    let columns = this.rendered_columns.max(1);
     let item_count = if list_view {
         count
     } else {
         count.div_ceil(columns)
     };
+    let snapshot = Arc::clone(&this.snapshot);
+    let weak_for_rows = weak.clone();
+    let visible_for_rows = Arc::clone(&visible);
+    let selected_for_rows = Arc::clone(&selected);
 
-    let list = gpui::uniform_list(
-        "explorer-rows",
-        item_count,
-        move |row_range, _window, cx: &mut App| {
-            row_range
-                .map(|row| {
-                    if list_view {
-                        render_list_row(&snapshot, &visible, row, &selected, &weak, cx)
-                    } else {
-                        render_grid_row(&snapshot, &visible, row, columns, &selected, &weak, cx)
-                    }
-                })
-                .collect::<Vec<_>>()
-        },
-    )
-    .flex_1()
-    .min_h_0()
-    .track_scroll(&this.scroll.clone());
-
-    if list_view {
-        container = container
-            .child(list_header(cx))
-            .child(list.font_family(bolt::fonts::grid_family(cx)));
+    // One vertical scroll owner per presentation: the two modes count rows
+    // in different units (entries versus rows of tiles), so they keep
+    // separate handles and separate list element ids.
+    let rows = if list_view {
+        super::table::render_list(this, visible, selected, &weak, cx).into_any_element()
     } else {
-        container = container.child(list);
-    }
-
-    container
-}
-
-/// The list header row: the four columns of the details list.
-fn list_header(cx: &App) -> Stateful<Div> {
-    let colors = bolt::colors(cx);
-    div()
-        .id("explorer-list-header")
-        .flex_none()
-        .h(px(32.0))
-        .flex()
-        .items_center()
-        .gap(Spacing::LG)
-        .px(Spacing::MD)
-        .border_b_1()
-        .border_color(colors.line)
-        .text_size(px(12.0))
-        .text_color(colors.muted)
-        .child(name_column().child("Name"))
-        .child(kind_column().child("Type"))
-        .child(size_column().child("Size"))
-        .child(modified_column().child("Modified"))
-}
-
-/// The column widths of the details list, matching the reference design
-/// (minmax(180px,1fr) 120px 100px 170px with 16px gaps).
-fn name_column() -> Div {
-    div().flex_1().min_w_0().truncate()
-}
-
-fn kind_column() -> Div {
-    div().w(px(120.0)).flex_none().overflow_hidden()
-}
-
-fn size_column() -> Div {
-    div().w(px(100.0)).flex_none().text_right()
-}
-
-fn modified_column() -> Div {
-    div().w(px(170.0)).flex_none().overflow_hidden()
-}
-
-/// One details row at the visible position `row`.
-fn render_list_row(
-    snapshot: &[Entry],
-    visible: &[usize],
-    row: usize,
-    selected: &BTreeSet<PathBuf>,
-    weak: &WeakEntity<Explorer>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    let colors = bolt::colors(cx);
-    let fallback = || div().h(px(32.0));
-    let Some(&index) = visible.get(row) else {
-        return fallback().into_any_element();
+        gpui::uniform_list(
+            "explorer-grid-rows",
+            item_count,
+            move |row_range, _window, cx: &mut App| {
+                row_range
+                    .map(|row| {
+                        render_grid_row(
+                            &snapshot,
+                            &visible_for_rows,
+                            row,
+                            columns,
+                            &selected_for_rows,
+                            &weak_for_rows,
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .flex_1()
+        .min_h_0()
+        .track_scroll(&this.grid_scroll.clone())
+        .into_any_element()
     };
-    let Some(entry) = snapshot.get(index) else {
-        return fallback().into_any_element();
-    };
-    let path = entry.path.clone();
-    let name = entry.display_name().into_owned();
-    let kind = util::format_kind(entry);
-    let size = util::format_size(entry.size);
-    let modified = util::format_modified(entry.modified);
-    let is_folder = entry.kind == EntryKind::Directory && !entry.is_symlink;
-    let row_selected = selected.contains(&path);
 
-    let row_element: Stateful<Div> =
-        ListRow::new(ElementId::Name(format!("explorer-row-{row}").into()))
-            .selected(row_selected)
-            .selection_bar(true)
-            .build(cx)
-            .flex_none()
-            .h(px(32.0))
+    container.child(
+        div()
+            .id("explorer-entries-content")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
             .flex()
-            .items_center()
-            .gap(Spacing::LG)
-            .px(Spacing::MD)
-            .border_b_1()
-            .border_color(colors.row_divider)
-            .on_click(entry_click(weak, path.clone(), name.clone()))
-            .child(
-                name_column()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(Spacing::SM)
-                    .child(
-                        Icon::new(icon(if is_folder {
-                            gpui_kit_assets::IconName::Folder
-                        } else if entry.kind == EntryKind::Symlink {
-                            gpui_kit_assets::IconName::Link2Off
-                        } else {
-                            gpui_kit_assets::IconName::File
-                        }))
-                        .color(if is_folder {
-                            colors.info
-                        } else {
-                            colors.muted
-                        }),
-                    )
-                    .child(
-                        div()
-                            .text_color(if row_selected {
-                                colors.strong
-                            } else {
-                                colors.foreground
-                            })
-                            .child(name),
-                    ),
-            )
-            .child(kind_column().text_color(colors.muted).child(kind))
-            .child(size_column().text_color(colors.muted).child(size))
-            .child(modified_column().text_color(colors.muted).child(modified));
-
-    row_element.into_any_element()
+            .flex_col()
+            .child(measure_width(&weak))
+            .child(rows),
+    )
 }
 
-/// One grid row: up to `columns` tiles with fixed height and gap.
+/// A draw-nothing canvas that records the entries content's measured inner
+/// width in the explorer, so the grid columns and the keyboard row step use
+/// the width the area actually has instead of a viewport-minus-sidebar
+/// estimate. The width (and the columns derived from it) is stored only
+/// when it changed, so the measurement never becomes a paint loop.
+fn measure_width(weak: &WeakEntity<Explorer>) -> impl IntoElement {
+    let weak = weak.clone();
+    canvas(
+        move |bounds, window, cx| {
+            let width = f32::from(bounds.size.width);
+            if let Err(error) = weak.update(cx, |this, cx| {
+                if this.entries_width != Some(width) {
+                    this.entries_width = Some(width);
+                    cx.notify();
+                    window.request_animation_frame();
+                }
+            }) {
+                log::debug!("the entries area outlived its explorer: {error}");
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
+/// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a
+/// fixed-height left-aligned row.
 fn render_grid_row(
     snapshot: &[Entry],
     visible: &[usize],
@@ -285,23 +231,16 @@ fn render_grid_row(
     cx: &mut App,
 ) -> gpui::AnyElement {
     let colors = bolt::colors(cx);
-    let start = row * columns;
-    let end = (start + columns).min(visible.len());
-    let tiles: Vec<Entry> = visible
-        .get(start..end)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|&index| snapshot.get(index))
-        .cloned()
-        .collect();
-
     let mut row_element = div()
         .id(ElementId::Name(format!("explorer-grid-row-{row}").into()))
         .flex()
         .gap(px(TILE_GAP))
         .h(px(TILE_HEIGHT))
         .min_w_0();
-    for (tile_index, tile) in tiles.into_iter().enumerate() {
+    for index in grid_tile_range(row, visible.len(), columns) {
+        let Some(tile) = visible.get(index).and_then(|&i| snapshot.get(i)) else {
+            continue;
+        };
         let path = tile.path.clone();
         let name = tile.display_name().into_owned();
         let is_folder = tile.kind == EntryKind::Directory && !tile.is_symlink;
@@ -310,21 +249,21 @@ fn render_grid_row(
 
         row_element = row_element.child(
             ListRow::new(ElementId::Name(
-                format!("explorer-tile-{row}-{tile_index}").into(),
+                format!("explorer-tile-{row}-{index}").into(),
             ))
             .selected(tile_selected)
             .selection_bar(true)
             .build(cx)
-            .w_full()
+            .w(px(TILE_WIDTH))
+            .flex_none()
             .h_full()
-            .min_w_0()
             .flex()
             .flex_col()
             .items_center()
             .pt(Spacing::LG)
             .pb(Spacing::SM)
             .px(Spacing::XS)
-            .on_click(entry_click(weak, path.clone(), name.clone()))
+            .on_click(entry_click(weak, path))
             .child(
                 Icon::new(icon(if is_folder {
                     gpui_kit_assets::IconName::Folder
@@ -361,34 +300,100 @@ fn render_grid_row(
 
 /// The click handler of one entry: single click selects (Ctrl toggles),
 /// double click opens. The selection uses raw paths; a click also focuses
-/// the entries area, so the keyboard follows the pointer.
+/// the entries area, so the keyboard follows the pointer. Both the tiles
+/// and the details grid's cells route through here.
+pub(crate) fn handle_entry_click(
+    weak: &WeakEntity<Explorer>,
+    path: PathBuf,
+    click_count: usize,
+    control: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Err(error) = weak.update(cx, |this, cx| {
+        this.entries_focus.focus(window, cx);
+        if click_count >= 2 {
+            this.open_path(&path, window, cx);
+        } else if control {
+            this.state.clear_notice();
+            this.state.toggle(&path);
+            cx.notify();
+        } else {
+            this.state.clear_notice();
+            this.state.select_only(&path);
+            cx.notify();
+        }
+    }) {
+        log::debug!("the row outlived its explorer: {error}");
+    }
+}
+
+/// The tile click handler: reads the click count and modifiers off the
+/// event and applies [`handle_entry_click`].
 fn entry_click(
     weak: &WeakEntity<Explorer>,
     path: PathBuf,
-    _name: String,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let weak = weak.clone();
-    move |event: &ClickEvent, _window, cx| {
+    move |event: &ClickEvent, window, cx| {
         let click_count = event.click_count();
         let modifiers = match event {
             ClickEvent::Mouse(mouse) => mouse.down.modifiers,
             _ => Modifiers::default(),
         };
-        if let Err(error) = weak.update_in(cx, |this, window, cx| {
-            this.entries_focus.focus(window, cx);
-            if click_count >= 2 {
-                this.open_path(&path, window, cx);
-            } else if modifiers.control {
-                this.state.clear_notice();
-                this.state.toggle(&path);
-                cx.notify();
-            } else {
-                this.state.clear_notice();
-                this.state.select_only(&path);
-                cx.notify();
-            }
-        }) {
-            log::debug!("the row outlived its explorer: {error}");
-        }
+        handle_entry_click(
+            &weak,
+            path.clone(),
+            click_count,
+            modifiers.control,
+            window,
+            cx,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `grid_columns` answers with the column count of the entries area's
+    /// **inner** (already padded) width: exact-width boundaries fit exactly
+    /// that many tiles, one pixel less drops a column, and nothing ever
+    /// collapses to zero columns, so the last row is always reachable.
+    #[test]
+    fn grid_columns_fits_exact_tile_boundaries_and_narrow_panes() {
+        assert_eq!(grid_columns(TILE_WIDTH), 1);
+        assert_eq!(grid_columns(0.0), 1, "never zero columns");
+        assert_eq!(
+            grid_columns(2.0 * TILE_WIDTH + TILE_GAP),
+            2,
+            "exactly two tiles fit"
+        );
+        assert_eq!(grid_columns(2.0 * TILE_WIDTH + TILE_GAP - 1.0), 1);
+        assert_eq!(grid_columns(3.0 * TILE_WIDTH + 2.0 * TILE_GAP), 3);
+        assert_eq!(grid_columns(3.0 * TILE_WIDTH + 2.0 * TILE_GAP - 1.0), 2);
+        assert_eq!(grid_columns(4.0 * TILE_WIDTH + 3.0 * TILE_GAP), 4);
+    }
+
+    /// Every grid row, the last partial one included, addresses the same
+    /// fixed tile geometry: a full row holds exactly `columns` tiles, the
+    /// last partial row holds exactly the remaining tiles (never stretched
+    /// to fill), and a row past the end is empty.
+    #[test]
+    fn grid_tile_rows_keep_full_and_partial_rows_identical() {
+        assert_eq!(grid_tile_range(0, 10, 4), 0..4);
+        assert_eq!(grid_tile_range(1, 10, 4), 4..8);
+        assert_eq!(
+            grid_tile_range(2, 10, 4),
+            8..10,
+            "the partial last row holds exactly the remaining tiles"
+        );
+        assert_eq!(grid_tile_range(3, 10, 4), 10..10, "past the end is empty");
+        assert_eq!(
+            grid_tile_range(1, 8, 4),
+            4..8,
+            "a divisible count has no partial row"
+        );
+        assert_eq!(grid_tile_range(0, 5, 0), 0..1, "no columns means one tile");
     }
 }
