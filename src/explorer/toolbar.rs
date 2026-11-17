@@ -4,8 +4,8 @@
 //! and the session-favorites star.
 //!
 //! The controls keep their sizes from `bolt`'s tokens; on narrow windows
-//! they shrink with flex instead of disappearing, and a toggle parks the
-//! sidebar.
+//! they shrink with flex instead of disappearing, and the sidebar toggle
+//! hides or shows the sidebar at any width.
 
 use bolt::controls::{Button, InputEscape, SearchCount, SearchField};
 use bolt::primitives::Icon;
@@ -32,8 +32,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .py(Spacing::MD)
         .border_b_1()
         .border_color(colors.line)
-        // On narrow windows this toggle parks the sidebar; on wide ones the
-        // sidebar keeps its column and the toggle does nothing visually.
+        // The sidebar toggle works at every width: it hides or shows the
+        // sidebar, and the content island takes the freed space.
         .child(
             Button::new("explorer-sidebar-toggle", "Sidebar")
                 .ghost()

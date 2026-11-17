@@ -4,7 +4,8 @@
 //! Layout follows the reference design (design/file-explorer/01, translated
 //! from design/system.md): the desk with a native title bar, 8 px gutters, a
 //! 290 px sidebar island and a document island, and a 38 px status bar. The
-//! window title shows the current folder plus Fileflux.
+//! in-window header strip is empty; the window title shows the current
+//! folder plus Fileflux.
 //!
 //! Directory scans run off the UI thread (see [`load_location`]); every scan
 //! carries a generation from [`ExplorerState::begin`], and only a completion
@@ -17,7 +18,7 @@ use std::sync::Arc;
 
 use bolt::composites::Island;
 use bolt::controls::{InputEvent, InputState};
-use bolt::tokens::{ChromeColors, IslandMetrics, Spacing};
+use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover};
 use fileflux::core::{Listing, Location};
 use gpui::{
@@ -25,8 +26,6 @@ use gpui::{
     KeyBinding, ParentElement, Render, ScrollHandle, ScrollStrategy, Stateful, Styled,
     Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
 };
-
-use gpui_component::ActiveTheme as _;
 
 use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
 use crate::explorer::{entries, sidebar, toolbar, util};
@@ -762,7 +761,7 @@ impl Render for Explorer {
             .flex_col()
             .bg(colors.desk)
             .text_color(colors.foreground)
-            .child(self.render_header(cx))
+            .child(self.render_header())
             .on_action(cx.listener(|this, _: &FocusPath, window, cx| {
                 this.focus_path(window, cx);
             }))
@@ -821,50 +820,12 @@ impl Render for Explorer {
 }
 
 impl Explorer {
-    /// The 44 px header row on the desk: the Fileflux brandmark, and the
-    /// current folder as the window title shows it. No buttons — the family
-    /// shell has one primary job.
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
-        let colors = bolt::colors(cx);
-        let tint = ChromeColors::tint(cx.theme());
-        div()
-            .id("explorer-header")
-            .flex_none()
-            .h(px(44.0))
-            .flex()
-            .items_center()
-            .px(Spacing::LG)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(Spacing::SM)
-                    .text_color(tint)
-                    .child(
-                        div()
-                            .h(px(22.0))
-                            .w(px(22.0))
-                            .bg(tint)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(colors.desk)
-                            .child("F"),
-                    )
-                    .child("fileflux"),
-            )
-            .child(
-                div()
-                    .id("explorer-header-title")
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .text_color(colors.muted)
-                    .child(format!("{} — Fileflux", self.current_label())),
-            )
+    /// The 44 px empty top strip of the desk. It shows nothing: the user
+    /// asked for no brand text or icon (S10). The OS window title keeps the
+    /// `current folder — Fileflux` identity; the strip only preserves the
+    /// reference design's header geometry.
+    fn render_header(&self) -> impl IntoElement {
+        div().id("explorer-header").flex_none().h(px(44.0))
     }
 
     /// In the grid, up and down move one row of tiles; in the list they

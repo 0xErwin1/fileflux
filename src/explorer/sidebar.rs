@@ -18,13 +18,14 @@ use super::icon;
 use super::state::Transition;
 use super::view::{Explorer, SIDEBAR_WIDTH};
 
-/// The sidebar island, or nothing while a narrow window keeps it parked.
+/// The sidebar island, or nothing while it is toggled closed — at either
+/// window width, since a collapsed sidebar must not resurrect on a resize.
 pub(crate) fn render(
     this: &Explorer,
     narrow: bool,
     cx: &mut Context<Explorer>,
 ) -> Option<Stateful<Div>> {
-    if narrow && !this.sidebar_open {
+    if !this.sidebar_open {
         return None;
     }
     let colors = bolt::colors(cx);

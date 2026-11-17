@@ -47,7 +47,7 @@ Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R relo
 
 ## Current scope
 
-Read-only by design (S3): no destructive operations, no copy/move, no tabs, no previews. The window title shows the current folder plus Fileflux. Modification dates are displayed in UTC without a timezone database. Narrow windows park the sidebar behind the sidebar toggle; path, search and view controls always stay reachable.
+Read-only by design (S3): no destructive operations, no copy/move, no tabs, no previews. The window title shows the current folder plus Fileflux; the in-window header strip stays empty (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable.
 
 ## Design
 
