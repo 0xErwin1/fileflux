@@ -226,12 +226,16 @@ impl Affected {
     /// What `job` changes. A job that removes or adds items also changes the
     /// Trash view.
     pub(crate) fn of_job(job: &Job) -> Self {
+        // Each parent folder once, in first-seen order.
         let parents = |paths: &[PathBuf]| -> Vec<Location> {
-            paths
-                .iter()
-                .filter_map(|path| path.parent())
-                .map(|parent| Location::Directory(parent.to_path_buf()))
-                .collect()
+            let mut folders: Vec<Location> = Vec::new();
+            for parent in paths.iter().filter_map(|path| path.parent()) {
+                let folder = Location::Directory(parent.to_path_buf());
+                if !folders.contains(&folder) {
+                    folders.push(folder);
+                }
+            }
+            folders
         };
         match job {
             Job::Create { dir, .. } => Self::Folders(vec![Location::Directory(dir.clone())]),
@@ -568,5 +572,32 @@ mod tests {
             [1],
             "the origin tab waits for its result even when it moved elsewhere"
         );
+    }
+}
+
+#[cfg(test)]
+mod affected_tests {
+    use super::*;
+    use crate::explorer::ops::Job;
+
+    fn dir(path: &str) -> Location {
+        Location::Directory(PathBuf::from(path))
+    }
+
+    #[test]
+    fn trashing_many_items_of_one_folder_lists_that_folder_once() {
+        let job = Job::Trash(vec![PathBuf::from("/d/a"), PathBuf::from("/d/b")]);
+        assert_eq!(
+            Affected::of_job(&job),
+            Affected::Folders(vec![dir("/d"), Location::Trash])
+        );
+    }
+
+    #[test]
+    fn a_closed_origin_tab_still_refreshes_affected_tabs() {
+        let c = dir("/c");
+        let t = Location::Trash;
+        let trashed = Affected::of_job(&Job::Trash(vec![PathBuf::from("/c/x")]));
+        assert_eq!(tabs_to_refresh(&[&c, &t], &trashed, None), [0, 1]);
     }
 }

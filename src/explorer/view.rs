@@ -884,9 +884,13 @@ impl Explorer {
                 // background tab has none, so a missing folder falls back
                 // here like the watcher would.
                 let location = scan.location.clone();
-                tab.state
+                // A stale refresh (the tab has navigated since) must not
+                // override that navigation with a fallback.
+                let current = tab
+                    .state
                     .commit_failure(scan, "the folder could not be refreshed".to_owned());
-                if error.kind() == io::ErrorKind::NotFound
+                if current
+                    && error.kind() == io::ErrorKind::NotFound
                     && let Location::Directory(gone) = location
                 {
                     self.watched_folder_gone(id, &gone, window, cx);
