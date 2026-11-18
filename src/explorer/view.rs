@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use bolt::composites::Island;
@@ -24,7 +25,9 @@ use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
-use fileflux::core::watch::{Debounce, WatchEvent, Watcher, nearest_existing_ancestor};
+use fileflux::core::watch::{
+    Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor,
+};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -279,7 +282,8 @@ fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<L
     }
 }
 
-/// How long one blocking watcher wait lasts on the background executor.
+/// How often the UI collects what the watcher thread reported. The thread
+/// itself sleeps in the kernel; this only drains its channel.
 const WATCH_STEP: Duration = Duration::from_millis(100);
 
 /// Where the toast stack starts, below the toolbar and the subbar.
@@ -348,11 +352,8 @@ pub(crate) struct Tab {
     pub(crate) child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
-    /// The folder the live-refresh watcher observes, if any. Only the
-    /// active tab is watched: see [`Explorer::after_tab_switch`].
-    watched: Option<PathBuf>,
-    /// The retained watch loop; replacing or dropping it ends the watcher.
-    watch_task: Option<Task<()>>,
+    /// The holds on the folders this tab live-refreshes from.
+    watch: TabWatch,
     /// What to select (and whether to rename) once the next listing shows it.
     pub(crate) pending: Option<PendingSelect>,
     /// The path field's Enter/Change/Blur subscription.
@@ -460,13 +461,38 @@ impl Tab {
             permission_task: None,
             child_counts: Arc::new(HashMap::new()),
             counts_task: None,
-            watched: None,
-            watch_task: None,
+            watch: TabWatch::default(),
             pending: None,
             _path_events: path_events,
             _search_events: search_events,
             _table_events: table_events,
         }
+    }
+}
+
+/// The watch holds of one tab, active or not: its committed folder, and the
+/// folder a navigation in flight is reading, from the moment the scan
+/// starts. Dropping a hold releases its share of the inotify watch.
+#[derive(Debug, Default)]
+struct TabWatch {
+    committed: Option<WatchHandle>,
+    target: Option<WatchHandle>,
+}
+
+impl TabWatch {
+    /// Moves `slot` to watch `wanted`. The new hold is taken before the old
+    /// one is released, so a folder both name never loses its watch.
+    fn retarget(slot: &mut Option<WatchHandle>, wanted: Option<PathBuf>, hub: &WatchHub) {
+        if slot.as_ref().map(WatchHandle::path) == wanted.as_deref() {
+            return;
+        }
+        *slot = wanted.and_then(|path| match hub.watch(&path) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                log::warn!("cannot watch {}: {error}", path.display());
+                None
+            }
+        });
     }
 }
 
@@ -563,6 +589,15 @@ pub(crate) struct Explorer {
     pub(crate) toast_host: Entity<ToastHost>,
     /// The terminal "Open terminal here" runs, when one exists.
     pub(crate) terminal: Option<PathBuf>,
+    /// The one watcher thread every tab's folders are watched through;
+    /// `None` when inotify is unavailable (tabs then refresh on activation).
+    hub: Option<WatchHub>,
+    /// What the watcher thread reported, drained by [`Self::pump_watch_events`].
+    watch_events: Option<Receiver<(PathBuf, FolderEvent)>>,
+    /// Per-folder debounce of the change events, shared by every tab on it.
+    folder_debounce: HashMap<PathBuf, Debounce>,
+    /// The retained loop that drains the watcher channel.
+    _watch_pump: Option<Task<()>>,
 }
 
 impl Focusable for Explorer {
@@ -607,6 +642,14 @@ impl Explorer {
             .unwrap_or_else(|| Location::Directory(PathBuf::from("/")));
         let state = ExplorerState::new(initial.clone(), home.clone());
         let first = Tab::new(0, state, window, cx);
+
+        let (hub, watch_events) = match WatchHub::new() {
+            Ok((hub, events)) => (Some(hub), Some(events)),
+            Err(error) => {
+                log::warn!("live refresh is unavailable: {error}");
+                (None, None)
+            }
+        };
 
         let toast_host = cx.new(|_cx| ToastHost::new());
         cx.set_global(ToastGlobal {
@@ -655,7 +698,22 @@ impl Explorer {
             pastes: HashMap::new(),
             toast_host,
             terminal,
+            hub,
+            watch_events,
+            folder_debounce: HashMap::new(),
+            _watch_pump: None,
         };
+        this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCH_STEP).await;
+                if this
+                    .update_in(cx, |this, window, cx| this.pump_watch_events(window, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
 
         // The sidebar discovery reads the user-dirs configuration and the
         // mount table: blocking work that belongs off the UI thread.
@@ -795,6 +853,8 @@ impl Explorer {
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.scan_task = Some(task);
         }
+        // From now on a change in the folder being read is not missed.
+        self.sync_watches(id);
         cx.notify();
     }
 
@@ -811,6 +871,19 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.settle_scan(id, scan, result, window, cx);
+        // The committed folder may have changed and the navigation is over.
+        self.sync_watches(id);
+    }
+
+    fn settle_scan(
+        &mut self,
+        id: TabId,
+        scan: Scan,
+        result: io::Result<Listing>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let active = id == self.active_id();
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
@@ -820,20 +893,27 @@ impl Explorer {
                 if !tab.state.commit(scan.clone(), listing) {
                     return;
                 }
-                // Only the active tab is watched: a background tab is
-                // re-read when it becomes active again.
-                if active {
-                    self.sync_watcher(id, window, cx);
-                }
                 if scan.live {
                     // A background refresh only swaps the listing: focus,
                     // path editing, scroll position and the filter stay.
                     self.refresh_snapshot(id);
+                    log::debug!(
+                        "tab {id} ({}) now lists {} entries of {:?}",
+                        if active { "active" } else { "background" },
+                        self.tabs.by_id_mut(id).map_or(0, |tab| tab.snapshot.len()),
+                        scan.location
+                    );
                     self.start_child_counts(id, cx);
                     if let Some(tab) = self.tabs.by_id_mut(id) {
                         tab.permissions = None;
                     }
                     self.after_listing_changed(id, window, cx);
+                    // A change that landed while this refresh was reading.
+                    let postponed = self
+                        .tabs
+                        .by_id_mut(id)
+                        .and_then(|tab| tab.state.begin_deferred_op_refresh());
+                    self.start_scan_in(id, postponed, window, cx);
                     cx.notify();
                     return;
                 }
@@ -881,8 +961,8 @@ impl Explorer {
             Err(error) if scan.live => {
                 // The folder became unreadable or vanished mid-scan. A
                 // watched folder's vanishing is reported by the watcher; a
-                // background tab has none, so a missing folder falls back
-                // here like the watcher would.
+                // folder that vanished before its watch existed (or while
+                // the refresh was reading) falls back here the same way.
                 let location = scan.location.clone();
                 // A stale refresh (the tab has navigated since) must not
                 // override that navigation with a fallback.
@@ -914,74 +994,82 @@ impl Explorer {
         }
     }
 
-    /// Makes the watcher observe tab `id`'s committed folder (the active
-    /// tab's): a new folder replaces (and thereby stops) the previous watch,
-    /// the Trash is not watched. The loop blocks only on the background
-    /// executor, debounces bursts, and ends when the folder vanishes or the
-    /// task is replaced.
-    fn sync_watcher(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Points tab `id`'s watch holds at the folder it shows and the folder
+    /// a navigation in flight is reading (the Trash is not watched). Tabs on
+    /// the same folder share one inotify watch inside the hub.
+    fn sync_watches(&mut self, id: TabId) {
+        let Some(hub) = self.hub.as_ref() else {
+            return;
+        };
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
-        let Location::Directory(path) = tab.state.current().clone() else {
-            tab.watched = None;
-            tab.watch_task = None;
-            return;
+        let committed = match tab.state.current() {
+            Location::Directory(path) => Some(path.clone()),
+            Location::Trash => None,
         };
-        if tab.watched.as_ref() == Some(&path) && tab.watch_task.is_some() {
-            return;
-        }
-        tab.watched = Some(path.clone());
-        tab.watch_task = None;
-        let watcher = match Watcher::new(&path) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                log::warn!("cannot watch {}: {error}", path.display());
-                return;
-            }
-        };
-        let executor = cx.background_executor().clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let mut watcher = watcher;
-            let mut debounce = Debounce::default();
-            loop {
-                let step = executor.spawn(async move {
-                    let event = watcher.wait(WATCH_STEP);
-                    (watcher, event)
-                });
-                let (back, event) = step.await;
-                watcher = back;
-                let now = Instant::now();
+        let target = tab
+            .state
+            .pending_directory()
+            .map(Path::to_path_buf)
+            .filter(|path| committed.as_ref() != Some(path));
+        TabWatch::retarget(&mut tab.watch.committed, committed, hub);
+        TabWatch::retarget(&mut tab.watch.target, target, hub);
+    }
+
+    /// Collects what the watcher thread reported since the last call and
+    /// acts on it for every tab, active or not: a vanished folder sends the
+    /// tabs showing it to the nearest existing ancestor; a change restarts
+    /// the folder's debounce, and once it settles every tab on that folder
+    /// (or navigating into it) re-reads it, keeping selection, filter and
+    /// scroll.
+    fn pump_watch_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut gone = Vec::new();
+        if let Some(events) = &self.watch_events {
+            while let Ok((path, event)) = events.try_recv() {
                 match event {
-                    WatchEvent::Changed => debounce.note(now),
-                    WatchEvent::Idle => {}
-                    WatchEvent::Gone => {
-                        let gone = path.clone();
-                        if let Err(error) = this.update_in(cx, |this, window, cx| {
-                            this.watched_folder_gone(id, &gone, window, cx);
-                        }) {
-                            log::debug!("the explorer closed before the folder fallback: {error}");
-                        }
-                        return;
-                    }
-                }
-                if debounce.ready(now) {
-                    debounce.reset();
-                    let alive = this.update_in(cx, |this, window, cx| {
-                        let scan = this
-                            .tabs
-                            .by_id_mut(id)
-                            .and_then(|tab| tab.state.begin_live_refresh());
-                        this.start_scan_in(id, scan, window, cx);
-                    });
-                    if alive.is_err() {
-                        return;
-                    }
+                    FolderEvent::Changed => self.folder_debounce.entry(path).or_default().note(now),
+                    FolderEvent::Gone => gone.push(path),
                 }
             }
-        });
-        if let Some(tab) = self.tabs.by_id_mut(id) {
-            tab.watch_task = Some(task);
+        }
+        for path in gone {
+            self.folder_debounce.remove(&path);
+            let ids: Vec<TabId> = self
+                .tabs
+                .iter()
+                .filter(|tab| tab.state.current() == &Location::Directory(path.clone()))
+                .map(|tab| tab.id)
+                .collect();
+            for id in ids {
+                self.watched_folder_gone(id, &path, window, cx);
+            }
+        }
+        let due: Vec<PathBuf> = self
+            .folder_debounce
+            .iter()
+            .filter(|(_, debounce)| debounce.ready(now))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in due {
+            self.folder_debounce.remove(&path);
+            let active = self.active_id();
+            let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
+            for id in ids {
+                let scan = self
+                    .tabs
+                    .by_id_mut(id)
+                    .and_then(|tab| tab.state.folder_changed(&path));
+                if scan.is_some() {
+                    log::debug!(
+                        "live refresh of {} in tab {id} ({})",
+                        path.display(),
+                        if id == active { "active" } else { "background" }
+                    );
+                }
+                self.start_scan_in(id, scan, window, cx);
+            }
         }
     }
 
@@ -1001,13 +1089,16 @@ impl Explorer {
         if tab.state.current() != &Location::Directory(gone.to_path_buf()) {
             return;
         }
-        // The loop that reported this returns on its own; only forget the path.
-        tab.watched = None;
         let Some(ancestor) = nearest_existing_ancestor(gone) else {
             return;
         };
         let notice = format!(
             "{} no longer exists; showing {}",
+            gone.display(),
+            ancestor.display()
+        );
+        log::debug!(
+            "{} is gone: tab {id} falls back to {}",
             gone.display(),
             ancestor.display()
         );
@@ -1449,11 +1540,10 @@ impl Explorer {
         let state = self.tab().state.for_new_tab(location.clone());
         let mut tab = Tab::new(id, state, window, cx);
         let scan = tab.state.begin(Transition::Visit(location));
-        let previous = self.active_id();
         self.tabs.open(tab, placement);
         self.start_scan_in(id, scan, window, cx);
         if placement == Placement::Foreground {
-            self.after_tab_switch(Some(previous), false, window, cx);
+            self.after_tab_switch(false, window, cx);
         }
         cx.notify();
     }
@@ -1496,11 +1586,12 @@ impl Explorer {
         let Some(closed) = self.tabs.close(index) else {
             return;
         };
-        // Dropping the tab ends its scan, watcher and probe tasks.
+        // Dropping the tab ends its scan and probe tasks and releases its
+        // watch holds (the folder's inotify watch goes with the last one).
         let closed_active = closed.id == previous;
         drop(closed);
         if closed_active {
-            self.after_tab_switch(None, true, window, cx);
+            self.after_tab_switch(true, window, cx);
         }
         cx.notify();
     }
@@ -1520,7 +1611,7 @@ impl Explorer {
     ) {
         let previous = self.active_id();
         if self.tabs.activate(index) && self.active_id() != previous {
-            self.after_tab_switch(Some(previous), true, window, cx);
+            self.after_tab_switch(true, window, cx);
         }
     }
 
@@ -1529,7 +1620,7 @@ impl Explorer {
         let previous = self.active_id();
         self.tabs.cycle(step);
         if self.active_id() != previous {
-            self.after_tab_switch(Some(previous), true, window, cx);
+            self.after_tab_switch(true, window, cx);
         }
     }
 
@@ -1542,40 +1633,27 @@ impl Explorer {
     ) {
         let previous = self.active_id();
         if self.tabs.jump(number) && self.active_id() != previous {
-            self.after_tab_switch(Some(previous), true, window, cx);
+            self.after_tab_switch(true, window, cx);
         }
     }
 
     /// What a change of the active tab does around the tabs themselves:
     ///
-    /// - the tab left behind drops its watcher (a watcher parks one thread
-    ///   of the shared background executor, so only the active tab owns
-    ///   one) — it is re-read when it becomes active again, so a tab never
-    ///   shows stale data once it is back;
+    /// - every tab keeps its own watch holds, so nothing changes hands here;
+    ///   the tab being shown is re-read only when events cannot have kept it
+    ///   current: the Trash (not watched) or a folder whose watch failed.
+    ///   `refresh` is off for a tab that is being loaded for the first time
+    ///   anyway;
     /// - the inline rename and the context menu belong to the tab they
     ///   started in and are dropped; dialogs are modal over the window and
     ///   stay;
-    /// - the new tab starts watching *before* its re-read, so a change
-    ///   between the two is never missed (`refresh` is off for a tab that
-    ///   is being loaded for the first time anyway);
     /// - the window title follows the tab and the keyboard goes to its
     ///   entries — or to its path field when it was mid path edit.
-    fn after_tab_switch(
-        &mut self,
-        previous: Option<TabId>,
-        refresh: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(old) = previous.and_then(|id| self.tabs.by_id_mut(id)) {
-            old.watched = None;
-            old.watch_task = None;
-        }
+    fn after_tab_switch(&mut self, refresh: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.renaming = None;
         self.menu = None;
         let id = self.active_id();
-        self.sync_watcher(id, window, cx);
-        if refresh {
+        if refresh && self.tab().watch.committed.is_none() {
             let scan = self.tab_mut().state.begin_op_refresh();
             self.start_scan_in(id, scan, window, cx);
         }

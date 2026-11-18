@@ -403,6 +403,34 @@ impl ExplorerState {
         self.begin_scan(Transition::Visit(current), true, None)
     }
 
+    /// The folder `folder` changed on disk. Returns the background re-read
+    /// of the shown folder when this tab shows it and no scan is pending.
+    ///
+    /// A scan in flight is never cancelled. When it reads `folder` (the
+    /// navigation target, or the shown folder being refreshed) the change
+    /// may have landed after the listing was taken, so a re-read is
+    /// postponed until the scan commits ([`Self::begin_deferred_op_refresh`]).
+    pub(crate) fn folder_changed(&mut self, folder: &Path) -> Option<Scan> {
+        if let Some(pending) = &self.pending {
+            if matches!(&pending.location, Location::Directory(path) if path == folder) {
+                self.op_refresh_deferred = true;
+            }
+            return None;
+        }
+        match self.nav.current() {
+            Location::Directory(path) if path == folder => self.begin_live_refresh(),
+            _ => None,
+        }
+    }
+
+    /// The directory the pending scan reads, if one is in flight.
+    pub(crate) fn pending_directory(&self) -> Option<&Path> {
+        match &self.pending.as_ref()?.location {
+            Location::Directory(path) => Some(path),
+            Location::Trash => None,
+        }
+    }
+
     /// A re-read of the shown location after one of our own operations
     /// finished, Trash included (it is not watched). Unlike the watcher's
     /// refresh it supersedes a scan in flight: that scan may have read the
@@ -1657,6 +1685,90 @@ mod tests {
             state.begin_live_refresh().is_none(),
             "the Trash is not live"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_in_the_shown_folder_refreshes_it_and_other_folders_do_not() -> TestResult {
+        let mut state = state();
+        assert!(state.folder_changed(Path::new("/elsewhere")).is_none());
+        let scan = state
+            .folder_changed(Path::new("/fixture"))
+            .ok_or("a refresh of the shown folder")?;
+        assert!(scan.live);
+        assert_eq!(scan.location, dir("/fixture"));
+        Ok(())
+    }
+
+    /// A tab navigating into X also watches X: a change that lands before
+    /// the scan commits would otherwise be read by neither the scan (which
+    /// may already have listed X) nor a refresh.
+    #[test]
+    fn a_change_in_the_folder_a_tab_is_navigating_into_refreshes_it_after_the_commit() -> TestResult
+    {
+        let mut state = state();
+        let navigating = state
+            .begin(Transition::Visit(dir("/fixture/x")))
+            .ok_or("scan")?;
+        assert_eq!(state.pending_directory(), Some(Path::new("/fixture/x")));
+        assert!(
+            state.folder_changed(Path::new("/fixture/x")).is_none(),
+            "the navigation in flight is not cancelled"
+        );
+        assert!(state.is_loading(), "still navigating");
+        assert!(state.commit(navigating, listing(&[("old", EntryKind::File)])));
+
+        let refresh = state
+            .begin_deferred_op_refresh()
+            .ok_or("a re-read of X after it committed")?;
+        assert_eq!(refresh.location, dir("/fixture/x"));
+        assert!(refresh.live, "the refresh keeps selection and filter");
+        assert!(state.commit(
+            refresh,
+            listing(&[("old", EntryKind::File), ("new", EntryKind::File)])
+        ));
+        assert_eq!(state.listing().entries.len(), 2, "the change shows");
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_elsewhere_while_navigating_refreshes_nothing() -> TestResult {
+        let mut state = state();
+        let navigating = state
+            .begin(Transition::Visit(dir("/fixture/x")))
+            .ok_or("scan")?;
+        // The folder being left changes: it is about to be replaced anyway.
+        assert!(state.folder_changed(Path::new("/fixture")).is_none());
+        assert!(state.folder_changed(Path::new("/other")).is_none());
+        assert!(state.commit(navigating, listing(&[])));
+        assert!(state.begin_deferred_op_refresh().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_during_a_live_refresh_is_read_again_after_it_commits() -> TestResult {
+        let mut state = state();
+        let first = state
+            .folder_changed(Path::new("/fixture"))
+            .ok_or("a refresh")?;
+        assert!(state.folder_changed(Path::new("/fixture")).is_none());
+        assert!(state.commit(first, listing(&[])));
+        let again = state
+            .begin_deferred_op_refresh()
+            .ok_or("the change that landed mid-scan")?;
+        assert_eq!(again.location, dir("/fixture"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_trash_is_never_refreshed_by_a_folder_change() -> TestResult {
+        let mut state = state();
+        let trash = state
+            .begin(Transition::Visit(Location::Trash))
+            .ok_or("scan")?;
+        assert_eq!(state.pending_directory(), None, "the Trash is no directory");
+        assert!(state.commit(trash, listing(&[])));
+        assert!(state.folder_changed(Path::new("/fixture")).is_none());
         Ok(())
     }
 

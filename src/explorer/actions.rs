@@ -272,8 +272,8 @@ impl Explorer {
             });
         }
         // The watcher would catch up within a moment; this makes our own
-        // result show right away, and covers the unwatched Trash and the
-        // tabs in the background, which have no watcher.
+        // result show right away, and covers the Trash, which is not
+        // watched.
         self.refresh_after_operation(context, window, cx);
         cx.notify();
     }
