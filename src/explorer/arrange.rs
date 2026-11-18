@@ -1267,13 +1267,6 @@ pub(crate) struct ArrangeJob {
 /// A finished [`ArrangeJob`].
 #[derive(Debug, Clone)]
 pub(crate) struct ArrangeOutput {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     generation: u64,
     inputs: ArrangeInputs,
     /// The entry indices that pass, in displayed order.
@@ -1413,13 +1406,6 @@ impl ArrangeCache {
 
     /// A job is running; [`Self::resolve`] keeps showing the last result
     /// meanwhile.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn is_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -1447,13 +1433,6 @@ impl ArrangeCache {
     /// already is, or a job for exactly these inputs is running. Builds the
     /// index here when the scan did not (that is the one linear step left
     /// on the calling thread).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn begin(&mut self, inputs: ArrangeInputs, entries: &[Entry]) -> Option<ArrangeJob> {
         if self
             .shown
@@ -1485,13 +1464,6 @@ impl ArrangeCache {
     /// the listing, query or arrangement moved on while it ran. The partial
     /// results it computed for the current listing are kept for the next
     /// job either way.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn commit(&mut self, output: ArrangeOutput, current: &ArrangeInputs) -> bool {
         if output.inputs.epoch == current.epoch {
             self.warm = output.warm.clone();

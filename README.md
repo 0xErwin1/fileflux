@@ -85,6 +85,7 @@ Both live in the tab (a new tab inherits them; the active tab's are saved as the
 | Size | < 1 MB, 1–100 MB, 100 MB–1 GB, > 1 GB (SI units, like the displayed sizes). One choice, or none. Files with an unknown size never match. |
 | Folders and ranges | A size range never applies to folders (they have no byte size). A date range applies to folders only when **Folders is the only type chip selected**; otherwise folders pass it. |
 | Combining | Every filter and the name search (Ctrl+F) combine with AND. |
+| Large folders | Folders of more than a few thousand entries are indexed once, next to the read, and every change of the search, sort, filters or folder counts is arranged on the background executor, so typing and clicking never wait for it (a 1,000,000-entry folder stays responsive). While a result is being computed the previous order stays on screen and keeps driving selection and the keyboard; the latest change always wins, and a status-bar **Sorting…** shows only when a result takes longer than about 150 ms. Smaller folders are arranged in place. |
 | Chips and counts | Each active filter is a removable chip in the subbar next to the folder title, with **Clear all** when there are several. While anything filters, the subbar reads "12 of 40 items", and the status bar and details panel show the same "N of M". New folder / New file clear the search and filters so the new item is visible. |
 
 ## Tabs

@@ -21,7 +21,6 @@ use gpui::{
     Styled, div, prelude::*, px,
 };
 
-use super::state::ExplorerState;
 use super::view::{Explorer, TabId};
 use super::{entries, icon, util};
 
@@ -329,17 +328,6 @@ impl Explorer {
     }
 }
 
-/// The selected entries of the committed listing, in listing order.
-fn selected_entries(state: &ExplorerState) -> Vec<&Entry> {
-    let selection = state.selection();
-    state
-        .listing()
-        .entries
-        .iter()
-        .filter(|entry| selection.contains(&entry.path))
-        .collect()
-}
-
 /// The full text of the current location, as the path field seeds it.
 fn location_text(location: &Location) -> String {
     match location {
@@ -356,7 +344,7 @@ fn wrappable(text: &str) -> String {
 /// The panel: `.inspector` — resizable, left line border, scrollable.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
-    let selected = selected_entries(&this.tab().state);
+    let selected = this.tab().state.selected_entries();
     let body = match selected.as_slice() {
         [] => none_selected(this, cx),
         [entry] => one_selected(this, entry, cx),
@@ -473,7 +461,7 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         .tab()
         .state
         .is_filtering()
-        .then(|| this.tab().state.visible_indices().len());
+        .then(|| this.tab().state.visible_shared().len());
     let items = util::items_label(total, shown);
     vec![
         preview_box(folder_glyph(cx), cx).into_any_element(),

@@ -43,7 +43,7 @@ use gpui_component::table::{TableEvent, TableState};
 use gpui_component::tooltip::Tooltip;
 
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
-use crate::explorer::arrange::ArrangeCommand;
+use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
@@ -284,6 +284,31 @@ fn install_modal_seams(cx: &mut App) {
 
 /// Reads one location off the UI thread: a plain directory scan, or the
 /// home Trash listing. Recorded original Trash paths are never opened.
+/// A listing read on the background executor with everything the UI thread
+/// would otherwise build per commit: the arrangement index and the shared
+/// entry snapshot. Both cost a walk of the whole folder, so both are made
+/// next to the read.
+struct Loaded {
+    listing: Listing,
+    index: Arc<ArrangeIndex>,
+    snapshot: Arc<Vec<fileflux::core::Entry>>,
+    folder_label: String,
+}
+
+/// [`load_location`] plus the derived data of [`Loaded`].
+fn load_indexed(location: &Location, trash_root: Option<&Path>) -> io::Result<Loaded> {
+    let listing = load_location(location, trash_root)?;
+    let index = Arc::new(ArrangeIndex::build(&listing.entries));
+    let snapshot = Arc::new(listing.entries.clone());
+    let folder_label = util::folder_counts_label(&listing.entries);
+    Ok(Loaded {
+        listing,
+        index,
+        snapshot,
+        folder_label,
+    })
+}
+
 fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<Listing> {
     match location {
         Location::Directory(path) => fileflux::core::fs::read_directory(path),
@@ -296,6 +321,9 @@ fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<L
         },
     }
 }
+
+/// How long an arrangement job may run before the status bar says so.
+const ARRANGE_HINT_DELAY: Duration = Duration::from_millis(150);
 
 /// How often the UI collects what the watcher thread reported. The thread
 /// itself sleeps in the kernel; this only drains its channel.
@@ -375,6 +403,9 @@ pub(crate) struct Tab {
     /// on every commit; the render closures read this instead of scanning
     /// the directory again.
     pub(crate) snapshot: Arc<Vec<fileflux::core::Entry>>,
+    /// "4 folders · 7 files" of the committed listing, counted on the scan
+    /// thread so no frame walks the folder for it.
+    pub(crate) folder_label: String,
     /// The editable path field.
     pub(crate) path_input: Entity<InputState>,
     /// The text the path field was last seeded with; an unedited submit
@@ -408,6 +439,12 @@ pub(crate) struct Tab {
     pub(crate) permission_task: Option<Task<()>>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
+    /// The retained arrangement job loop (see [`Explorer::arrange_tab`]).
+    arrange_task: Option<Task<()>>,
+    /// When the current stretch of arrangement jobs began.
+    arranging_since: Option<Instant>,
+    /// The timer that repaints once a job has run [`ARRANGE_HINT_DELAY`].
+    arrange_hint_task: Option<Task<()>>,
     /// The holds on the folders this tab live-refreshes from.
     watch: TabWatch,
     /// What to select (and whether to rename) once the next listing shows it.
@@ -421,6 +458,14 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
+    /// An arrangement job has been running long enough to say so.
+    pub(crate) fn arrange_is_slow(&self) -> bool {
+        self.state.is_arranging()
+            && self
+                .arranging_since
+                .is_some_and(|since| since.elapsed() >= ARRANGE_HINT_DELAY)
+    }
+
     /// A tab with its own fields and tables, committed to `state` but not
     /// scanned yet.
     fn new(
@@ -475,6 +520,7 @@ impl Tab {
                     };
                     let text = tab.search_input.read(cx).value().to_string();
                     tab.state.set_query(text);
+                    this.arrange_tab(id, cx);
                     cx.notify();
                 }
             },
@@ -502,6 +548,7 @@ impl Tab {
             id,
             state,
             snapshot: Arc::new(Vec::new()),
+            folder_label: String::new(),
             path_input,
             path_seed: String::new(),
             path_edited: false,
@@ -516,6 +563,9 @@ impl Tab {
             permission_in_flight: None,
             permission_task: None,
             counts_task: None,
+            arrange_task: None,
+            arranging_since: None,
+            arrange_hint_task: None,
             watch: TabWatch::default(),
             pending: None,
             _path_events: path_events,
@@ -1065,7 +1115,7 @@ impl Explorer {
         let trash_root = self.trash_root.clone();
         let load = cx
             .background_executor()
-            .spawn(async move { load_location(&location, trash_root.as_deref()) });
+            .spawn(async move { load_indexed(&location, trash_root.as_deref()) });
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = load.await;
             if let Err(error) = this.update_in(cx, |this, window, cx| {
@@ -1091,7 +1141,7 @@ impl Explorer {
         &mut self,
         id: TabId,
         scan: Scan,
-        result: io::Result<Listing>,
+        result: io::Result<Loaded>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1104,7 +1154,7 @@ impl Explorer {
         &mut self,
         id: TabId,
         scan: Scan,
-        result: io::Result<Listing>,
+        result: io::Result<Loaded>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1137,14 +1187,20 @@ impl Explorer {
             return;
         };
         match result {
-            Ok(listing) => {
-                if !tab.state.commit(scan.clone(), listing) {
+            Ok(Loaded {
+                listing,
+                index,
+                snapshot,
+                folder_label,
+            }) => {
+                if !tab.state.commit_indexed(scan.clone(), listing, index) {
                     return;
                 }
+                tab.snapshot = snapshot;
+                tab.folder_label = folder_label;
                 if scan.live {
                     // A background refresh only swaps the listing: focus,
                     // path editing, scroll position and the filter stay.
-                    self.refresh_snapshot(id);
                     log::debug!(
                         "tab {id} ({}) now lists {} entries of {:?}",
                         if active { "active" } else { "background" },
@@ -1171,7 +1227,6 @@ impl Explorer {
                 if !scan.refresh {
                     self.scroll_to_top(id, cx);
                 }
-                self.refresh_snapshot(id);
                 self.start_child_counts(id, cx);
                 let Some(tab) = self.tabs.by_id_mut(id) else {
                     return;
@@ -1430,8 +1485,13 @@ impl Explorer {
         };
         tab.state.set_child_counts(Arc::new(HashMap::new()));
         let entries = Arc::clone(&tab.snapshot);
-        if !entries.iter().any(fileflux::core::Entry::is_directory) {
+        let has_folders = entries.iter().any(fileflux::core::Entry::is_directory);
+        if !has_folders {
             tab.counts_task = None;
+        }
+        // The fresh listing's order, once, with its (empty) counts.
+        self.arrange_tab(id, cx);
+        if !has_folders {
             return;
         }
         let counting = cx
@@ -1443,6 +1503,7 @@ impl Explorer {
                 if let Some(tab) = this.tabs.by_id_mut(id) {
                     tab.state.set_child_counts(Arc::new(counts));
                 }
+                this.arrange_tab(id, cx);
                 cx.notify();
             }) {
                 log::debug!("the explorer closed before its folder counts settled: {error}");
@@ -1470,11 +1531,66 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Rebuilds tab `id`'s entry snapshot the virtualized rows read.
-    fn refresh_snapshot(&mut self, id: TabId) {
-        if let Some(tab) = self.tabs.by_id_mut(id) {
-            tab.snapshot = Arc::new(tab.state.listing().entries.clone());
+    /// Makes tab `id`'s displayed order current after a commit or a change
+    /// of its query, sort, filters or folder counts. A small folder is
+    /// arranged right here; a large one gets a job on the background
+    /// executor while the previous order stays on screen. The job loop
+    /// ends with the order of the latest inputs: a stale result is dropped
+    /// and the next job starts from what the inputs became meanwhile.
+    pub(crate) fn arrange_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let was_arranging = tab.state.is_arranging();
+        let Some(first) = tab.state.refresh_arrangement() else {
+            if !tab.state.is_arranging() {
+                // Arranged here, or already current: no job is wanted.
+                tab.arrange_task = None;
+                tab.arranging_since = None;
+                tab.arrange_hint_task = None;
+            }
+            cx.notify();
+            return;
+        };
+        if !was_arranging {
+            tab.arranging_since = Some(Instant::now());
+            // The indicator only shows once the wait is noticeable.
+            tab.arrange_hint_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(ARRANGE_HINT_DELAY).await;
+                if let Err(error) = this.update(cx, |_, cx| cx.notify()) {
+                    log::debug!("the explorer closed before its sorting hint: {error}");
+                }
+            }));
         }
+        let task = cx.spawn(async move |this, cx| {
+            let mut job = first;
+            loop {
+                let output = cx
+                    .background_executor()
+                    .spawn(async move { job.run() })
+                    .await;
+                let next = this.update(cx, |this, cx| {
+                    cx.notify();
+                    let tab = this.tabs.by_id_mut(id)?;
+                    let next = tab.state.settle_arrange(output);
+                    if next.is_none() {
+                        tab.arranging_since = None;
+                        tab.arrange_hint_task = None;
+                    }
+                    next
+                });
+                match next {
+                    Ok(Some(next)) => job = next,
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::debug!("the explorer closed before its arrangement settled: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+        tab.arrange_task = Some(task);
+        cx.notify();
     }
 
     /// Seeds tab `id`'s path field with its committed location unless the
@@ -1603,6 +1719,8 @@ impl Explorer {
     /// goes away — and gives the keyboard back to the entries area.
     pub(crate) fn clear_search_on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tab_mut().state.clear_query();
+        let id = self.active_id();
+        self.arrange_tab(id, cx);
         self.tab().search_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
@@ -1664,7 +1782,7 @@ impl Explorer {
     /// Moves the keyboard selection by `delta` visible positions and
     /// scrolls the row it lands on into view.
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.tab().state.visible_indices().len();
+        let count = self.tab().state.visible_shared().len();
         if count == 0 {
             return;
         }
@@ -1698,7 +1816,7 @@ impl Explorer {
     }
 
     fn select_extreme(&mut self, position: usize, cx: &mut Context<Self>) {
-        let count = self.tab().state.visible_indices().len();
+        let count = self.tab().state.visible_shared().len();
         if count == 0 {
             return;
         }
@@ -2152,7 +2270,7 @@ impl Render for Explorer {
                 this.select_extreme(0, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLastEntry, _window, cx| {
-                let count = this.tab().state.visible_indices().len();
+                let count = this.tab().state.visible_shared().len();
                 this.select_extreme(count.saturating_sub(1), cx);
             }))
             .on_action(cx.listener(|this, _: &ExtendUp, _window, cx| {
@@ -2177,7 +2295,7 @@ impl Render for Explorer {
                 this.extend_selection_to_extreme(0, cx);
             }))
             .on_action(cx.listener(|this, _: &ExtendToLast, _window, cx| {
-                let count = this.tab().state.visible_indices().len();
+                let count = this.tab().state.visible_shared().len();
                 this.extend_selection_to_extreme(count.saturating_sub(1), cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
@@ -2380,7 +2498,7 @@ impl Explorer {
             (!query.is_empty()).then(|| {
                 format!(
                     "Filtering \u{201c}{query}\u{201d} — {} of {} items. Current folder only, no subfolders.",
-                    self.tab().state.visible_indices().len(),
+                    self.tab().state.visible_shared().len(),
                     self.tab().state.listing().entries.len()
                 )
             })
@@ -2405,11 +2523,11 @@ impl Explorer {
             String::new()
         } else if self.tab().state.is_filtering() {
             util::filtered_counts_label(
-                self.tab().state.visible_indices().len(),
+                self.tab().state.visible_shared().len(),
                 self.tab().state.listing().entries.len(),
             )
         } else {
-            util::folder_counts_label(&self.tab().state.listing().entries)
+            self.tab().folder_label.clone()
         };
         let toasts = self.render_toasts(window, &meta);
         div()
@@ -2603,7 +2721,7 @@ impl Explorer {
             .tab()
             .state
             .is_filtering()
-            .then(|| self.tab().state.visible_indices().len());
+            .then(|| self.tab().state.visible_shared().len());
         let selection = self.tab().state.selection();
         let mut count_text = util::status_label(
             entries_count,
@@ -2612,7 +2730,8 @@ impl Explorer {
             self.tab().state.selected_size(),
         );
         // A single selected Trash entry keeps its recorded origin.
-        if let Some(path) = selection.iter().next().filter(|_| selection.len() == 1)
+        if self.in_trash()
+            && let Some(path) = selection.iter().next().filter(|_| selection.len() == 1)
             && let Some(origin) = self
                 .tab()
                 .state
@@ -2744,6 +2863,17 @@ impl Explorer {
                     .text_color(colors.foreground)
                     .child(div().size(px(6.0)).bg(colors.info))
                     .child(text)
+            }))
+            .children(self.tab().arrange_is_slow().then(|| {
+                div()
+                    .id("explorer-status-sorting")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_color(colors.foreground)
+                    .child(div().size(px(6.0)).bg(colors.info))
+                    .child("Sorting\u{2026}")
             }))
             .child(
                 div()

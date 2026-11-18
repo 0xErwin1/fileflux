@@ -381,7 +381,7 @@ fn search_count(this: &Explorer, _cx: &mut Context<Explorer>) -> Option<SearchCo
         return None;
     }
     let total = this.tab().state.listing().entries.len();
-    let shown = this.tab().state.visible_indices().len();
+    let shown = this.tab().state.visible_shared().len();
     if shown == 0 {
         return Some(SearchCount::new("no matches"));
     }

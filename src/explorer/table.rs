@@ -466,6 +466,8 @@ impl TableDelegate for EntryTableDelegate {
                 };
                 if let Err(error) = weak.update(cx, |explorer, cx| {
                     explorer.tab_mut().state.click_sort(key);
+                    let id = explorer.active_id();
+                    explorer.arrange_tab(id, cx);
                     cx.notify();
                 }) {
                     log::debug!("the list header outlived its explorer: {error}");

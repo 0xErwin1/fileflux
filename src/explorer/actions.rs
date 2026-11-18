@@ -140,12 +140,10 @@ impl Explorer {
     /// Operations act on these only: a selection the filter hides is never
     /// trashed or deleted behind the user's back.
     pub(crate) fn selected_visible_paths(&self) -> Vec<PathBuf> {
-        let selection = self.tab().state.selection();
         self.tab()
             .state
-            .visible_entries()
+            .visible_selected()
             .into_iter()
-            .filter(|entry| selection.contains(&entry.path))
             .map(|entry| entry.path.clone())
             .collect()
     }
@@ -476,6 +474,8 @@ impl Explorer {
         if self.tab().state.is_filtering() {
             self.tab_mut().state.clear_query();
             self.tab_mut().state.arrange(ArrangeCommand::ClearFilters);
+            let id = self.active_id();
+            self.arrange_tab(id, cx);
             self.tab()
                 .search_input
                 .update(cx, |input, cx| input.set_value(String::new(), window, cx));
@@ -1092,6 +1092,8 @@ impl Explorer {
     /// order on the next frame.
     pub(crate) fn arrange(&mut self, command: ArrangeCommand, cx: &mut Context<Self>) {
         self.tab_mut().state.arrange(command);
+        let id = self.active_id();
+        self.arrange_tab(id, cx);
         // The open Sort/Filter menu redraws its check marks.
         let arrangement = self.tab().state.arrangement().clone();
         if let Some(menu) = self.menu.as_mut()

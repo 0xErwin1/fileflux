@@ -254,7 +254,7 @@ pub(crate) fn grid_tile_range(row: usize, count: usize, columns: usize) -> std::
 /// count follows that measurement instead of a viewport estimate.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
-    let visible: Arc<Vec<usize>> = Arc::new(this.tab().state.visible_indices());
+    let visible: Arc<Vec<usize>> = this.tab().state.visible_shared();
     let count = visible.len();
     // The empty space's menu is open: the area shows it acts on the folder.
     let empty_space_menu = this
@@ -394,9 +394,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         Arc::new(
             this.tab()
                 .state
-                .visible_entries()
+                .visible_selected()
                 .into_iter()
-                .filter(|entry| selected.contains(&entry.path))
                 .map(|entry| entry.path.clone())
                 .collect(),
         )

@@ -468,6 +468,7 @@ impl ExplorerState {
     /// including a newer scan that itself failed. On success the candidate
     /// navigation becomes committed, the listing is replaced, and the query,
     /// selection and notice are cleared: the folder (or its content) moved.
+    #[cfg(test)]
     pub(crate) fn commit(&mut self, scan: Scan, listing: Listing) -> bool {
         self.commit_with_index(scan, listing, None)
     }
@@ -475,13 +476,6 @@ impl ExplorerState {
     /// [`Self::commit`] with the listing's [`ArrangeIndex`], built on the
     /// scan's thread so the UI thread never walks the entries. An index of
     /// another length is ignored.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn commit_indexed(
         &mut self,
         scan: Scan,
@@ -563,11 +557,13 @@ impl ExplorerState {
     /// in the **displayed** order: grid and list both follow the sort.
     /// Keyboard navigation, range selection and the table all read this one
     /// order.
+    #[cfg(test)]
     pub(crate) fn visible_indices(&self) -> Vec<usize> {
         self.visible_indices_at(&Local::now())
     }
 
     /// [`Self::visible_indices`] at an explicit `now`, for the date filters.
+    #[cfg(test)]
     pub(crate) fn visible_indices_at<Tz>(&self, now: &DateTime<Tz>) -> Vec<usize>
     where
         Tz: TimeZone + Send + Sync + 'static,
@@ -617,13 +613,6 @@ impl ExplorerState {
     /// running. Call it after every change of those, and after a commit of a
     /// listing. Until the job lands, [`Self::visible_shared`] keeps the
     /// previous order instead of computing on the calling thread.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn begin_arrange(&mut self) -> Option<ArrangeJob> {
         let inputs = self.arrange_inputs(&Local::now());
         self.arrange
@@ -636,13 +625,6 @@ impl ExplorerState {
     /// returned; a larger one returns the job from [`Self::begin_arrange`]
     /// for the caller to run off the UI thread. Call it after a listing
     /// commit and after every change of the query, sort, filters or counts.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn refresh_arrangement(&mut self) -> Option<ArrangeJob> {
         if self.listing.entries.len() > INLINE_ARRANGE_ENTRIES {
             return self.begin_arrange();
@@ -656,39 +638,28 @@ impl ExplorerState {
     /// is stale: a newer job began since, the listing was replaced, or the
     /// query, sort, filters or counts changed while it ran. After a `false`
     /// call [`Self::begin_arrange`] again.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn commit_arrange(&mut self, output: ArrangeOutput) -> bool {
         let current = self.arrange_inputs(&Local::now());
         self.arrange.with(|cache| cache.commit(output, &current))
     }
 
+    /// Settles an arrangement job and says what to run next: commits
+    /// `output` (a stale result changes nothing) and returns the job for
+    /// whatever the query, sort, filters, counts or listing became while it
+    /// ran, so the last change always ends up shown. `None` when the order
+    /// is current.
+    pub(crate) fn settle_arrange(&mut self, output: ArrangeOutput) -> Option<ArrangeJob> {
+        let _landed = self.commit_arrange(output);
+        self.begin_arrange()
+    }
+
     /// An arrangement job is in flight.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn is_arranging(&self) -> bool {
         self.arrange.with(|cache| cache.is_pending())
     }
 
     /// Forgets the arrangement job in flight (its task was dropped), so
     /// [`Self::begin_arrange`] starts a new one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the explorer view starts arrangement jobs off the UI thread"
-        )
-    )]
     pub(crate) fn cancel_arrange(&mut self) {
         self.arrange.with(ArrangeCache::cancel);
     }
@@ -715,7 +686,7 @@ impl ExplorerState {
     /// The search or the filters hide every entry of a folder that has
     /// some; the UI shows a "no matches" state instead of "empty folder".
     pub(crate) fn is_no_result(&self) -> bool {
-        self.is_filtering() && self.visible_shared().is_empty()
+        self.is_filtering() && !self.is_arranging() && self.visible_shared().is_empty()
     }
 
     // --- selection ----------------------------------------------------------
@@ -824,12 +795,53 @@ impl ExplorerState {
 
     /// The combined size of the selected files; folders carry no size.
     pub(crate) fn selected_size(&self) -> u64 {
-        self.listing
-            .entries
-            .iter()
-            .filter(|entry| self.selected.contains(&entry.path))
+        self.selected_entries()
+            .into_iter()
             .filter_map(|entry| entry.size)
             .sum()
+    }
+
+    /// The selected entries of the committed listing, in listing order. The
+    /// walk stops at the last one found, so an empty or small selection
+    /// never reads a whole huge folder on every frame.
+    pub(crate) fn selected_entries(&self) -> Vec<&Entry> {
+        let wanted = self.selected.len();
+        let mut found = Vec::with_capacity(wanted);
+        if wanted == 0 {
+            return found;
+        }
+        for entry in &self.listing.entries {
+            if self.selected.contains(&entry.path) {
+                found.push(entry);
+                if found.len() == wanted {
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    /// The selected entries that are on screen under the query and the
+    /// filters, in the displayed order. Stops at the last one found, like
+    /// [`Self::selected_entries`].
+    pub(crate) fn visible_selected(&self) -> Vec<&Entry> {
+        let wanted = self.selected.len();
+        let mut found = Vec::with_capacity(wanted);
+        if wanted == 0 {
+            return found;
+        }
+        for &index in self.visible_shared().iter() {
+            let Some(entry) = self.listing.entries.get(index) else {
+                continue;
+            };
+            if self.selected.contains(&entry.path) {
+                found.push(entry);
+                if found.len() == wanted {
+                    break;
+                }
+            }
+        }
+        found
     }
 
     /// Selects the visible entry at `position` (keyboard navigation); the
@@ -2365,6 +2377,114 @@ mod tests {
         assert!(large.commit_arrange(job.run()));
         assert_eq!(large.visible_shared().len(), names.len());
         assert!(large.refresh_arrangement().is_none(), "already current");
+        Ok(())
+    }
+
+    #[test]
+    fn settling_a_stale_job_starts_the_job_for_the_latest_inputs() -> TestResult {
+        let mut state = arranging()?;
+        state.set_query("a".into());
+        let first = state.begin_arrange().ok_or("a job")?;
+        state.set_query("alphab".into());
+        let next = state
+            .settle_arrange(first.run())
+            .ok_or("the stale result starts the next job")?;
+        assert_eq!(
+            shown_names(&state).len(),
+            4,
+            "the stale result is not shown"
+        );
+        assert!(state.is_arranging());
+        assert!(state.settle_arrange(next.run()).is_none(), "now current");
+        assert_eq!(shown_names(&state), ["alphabet.rs"]);
+        assert!(!state.is_arranging());
+        Ok(())
+    }
+
+    #[test]
+    fn typing_during_a_running_job_ends_with_the_latest_query() -> TestResult {
+        let mut state = arranging()?;
+        let mut running = None;
+        for query in ["b", "be", "bet", "beta"] {
+            state.set_query(query.into());
+            // The view asks for a job after each keystroke; only a changed
+            // input yields one, and the newest replaces the running one.
+            if let Some(job) = state.begin_arrange() {
+                running = Some(job);
+            }
+        }
+        let mut job = running.ok_or("a job")?;
+        while let Some(next) = state.settle_arrange(job.run()) {
+            job = next;
+        }
+        assert_eq!(shown_names(&state), ["beta.md"]);
+        assert!(!state.is_arranging());
+        Ok(())
+    }
+
+    #[test]
+    fn selection_and_keyboard_follow_the_last_shown_order_while_a_job_runs() -> TestResult {
+        let mut state = arranging()?;
+        state.select_visible(1);
+        assert_eq!(state.cursor_position(), Some(1));
+        state.set_query("beta".into());
+        let job = state.begin_arrange().ok_or("a job")?;
+        assert_eq!(
+            shown_names(&state),
+            ["Notes", "alpha.txt", "alphabet.rs", "beta.md"],
+            "the previous order is still the displayed one"
+        );
+        state.extend_selection_by(1);
+        assert_eq!(state.cursor_position(), Some(2), "moves in the shown order");
+        assert!(state.settle_arrange(job.run()).is_none());
+        assert_eq!(shown_names(&state), ["beta.md"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pending_job_is_not_a_no_result_state() -> TestResult {
+        let mut state = state();
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        let names: Vec<String> = (0..=INLINE_ARRANGE_ENTRIES)
+            .map(|serial| format!("file{serial}.txt"))
+            .collect();
+        let entries: Vec<(&str, EntryKind)> = names
+            .iter()
+            .map(|name| (name.as_str(), EntryKind::File))
+            .collect();
+        assert!(state.commit(scan, listing(&entries)));
+        state.arrange(ArrangeCommand::ToggleHidden);
+        let job = state.refresh_arrangement().ok_or("a job")?;
+        assert!(state.is_filtering());
+        assert!(!state.is_no_result(), "still sorting, not empty-handed");
+        assert!(state.settle_arrange(job.run()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_entries_follow_listing_order_and_visible_ones_the_displayed_order() -> TestResult {
+        let mut state = sized_state()?;
+        state.click_sort(SortKey::Size);
+        state.click_sort(SortKey::Size);
+        assert!(state.selected_entries().is_empty(), "nothing is selected");
+        assert!(state.visible_selected().is_empty());
+        state.select_only(Path::new("/fixture/b"));
+        state.toggle(Path::new("/fixture/c"));
+        let names = |entries: Vec<&Entry>| -> Vec<String> {
+            entries
+                .into_iter()
+                .map(|entry| entry.name.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names(state.selected_entries()), ["b", "c"], "listing order");
+        assert_eq!(
+            names(state.visible_selected()),
+            ["c", "b"],
+            "displayed order"
+        );
+        state.set_query("b".into());
+        assert_eq!(names(state.selected_entries()), ["b", "c"], "hidden stays");
+        assert_eq!(names(state.visible_selected()), ["b"], "only what is shown");
         Ok(())
     }
 }
