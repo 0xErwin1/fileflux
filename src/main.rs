@@ -46,12 +46,11 @@ fn launch() -> Result<Launch, CliError> {
         }
         Command::Open(None) => Ok(Launch::Window(None)),
         Command::Open(Some(path)) => {
-            let cwd = std::env::current_dir()
-                .map_err(|error| CliError::Unreadable(PathBuf::from("."), error.to_string()))?;
             let home = std::env::var_os("HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from);
-            cli::resolve_start(&path, &cwd, home.as_deref()).map(|dir| Launch::Window(Some(dir)))
+            cli::resolve_start(&path, std::env::current_dir, home.as_deref())
+                .map(|dir| Launch::Window(Some(dir)))
         }
     }
 }

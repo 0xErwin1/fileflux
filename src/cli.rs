@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The text `--help` prints.
 pub const USAGE: &str = "\
@@ -39,6 +39,8 @@ pub enum CliError {
     NoHome,
     /// The start path exists but could not be inspected.
     Unreadable(PathBuf, String),
+    /// A relative start path was given but the current directory is gone.
+    NoCurrentDir(String),
 }
 
 impl CliError {
@@ -57,6 +59,9 @@ impl fmt::Display for CliError {
             Self::NoHome => f.write_str("'~' needs $HOME to be set"),
             Self::Unreadable(path, reason) => {
                 write!(f, "cannot open '{}': {reason}", path.display())
+            }
+            Self::NoCurrentDir(reason) => {
+                write!(f, "cannot resolve a relative path: {reason}")
             }
         }
     }
@@ -96,16 +101,24 @@ where
 
 /// Turns the start path into the absolute directory to open: a leading `~`
 /// expands against `home` (for quoted arguments the shell left alone),
-/// relative paths resolve against `cwd`, and a file opens its parent.
-/// Symlinks are kept as written, so the path bar shows what was typed.
-pub fn resolve_start(path: &Path, cwd: &Path, home: Option<&Path>) -> Result<PathBuf, CliError> {
+/// relative paths resolve against `cwd` (asked for only then), and a file
+/// opens its parent. `.` and `..` are resolved lexically, like the shell's
+/// `cd`, so the path bar and "up" follow what was typed.
+pub fn resolve_start(
+    path: &Path,
+    cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+    home: Option<&Path>,
+) -> Result<PathBuf, CliError> {
     let expanded = match path.strip_prefix("~") {
         Ok(rest) => home.ok_or(CliError::NoHome)?.join(rest),
         Err(_) => path.to_path_buf(),
     };
-    // Collecting the components drops trailing slashes and `.` segments, so
-    // `~/Pictures/` shows as `/home/me/Pictures`.
-    let absolute: PathBuf = cwd.join(expanded).components().collect();
+    let absolute = if expanded.is_absolute() {
+        normalize(&expanded)
+    } else {
+        let cwd = cwd().map_err(|error| CliError::NoCurrentDir(error.to_string()))?;
+        normalize(&cwd.join(expanded))
+    };
     match std::fs::metadata(&absolute) {
         Ok(meta) if meta.is_dir() => Ok(absolute),
         Ok(_) => Ok(absolute
@@ -116,6 +129,22 @@ pub fn resolve_start(path: &Path, cwd: &Path, home: Option<&Path>) -> Result<Pat
         }
         Err(error) => Err(CliError::Unreadable(absolute, error.to_string())),
     }
+}
+
+/// Drops `.` segments and trailing slashes and folds `..` into its parent,
+/// without touching the filesystem. `..` above the root stays at the root.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -136,6 +165,17 @@ mod tests {
         }
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    /// A current directory that resolves to `dir`.
+    fn at(dir: &Path) -> impl FnOnce() -> std::io::Result<PathBuf> {
+        let dir = dir.to_path_buf();
+        move || Ok(dir)
+    }
+
+    /// A deleted current directory: absolute and `~` paths must not need it.
+    fn no_cwd() -> std::io::Result<PathBuf> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
     }
 
     #[test]
@@ -185,25 +225,50 @@ mod tests {
         std::fs::write(root.join("Pictures/photo.png"), b"")?;
 
         assert_eq!(
-            resolve_start(Path::new("Pictures"), &root, None)?,
+            resolve_start(Path::new("Pictures"), at(&root), None)?,
             root.join("Pictures")
         );
         assert_eq!(
-            resolve_start(Path::new("~/Pictures/"), Path::new("/"), Some(&root))?,
+            resolve_start(Path::new("~/Pictures/"), no_cwd, Some(&root))?,
             root.join("Pictures")
         );
         assert_eq!(
-            resolve_start(Path::new("~"), Path::new("/"), Some(&root))?.as_os_str(),
+            resolve_start(Path::new("~"), no_cwd, Some(&root))?.as_os_str(),
             root.as_os_str()
         );
         assert_eq!(
-            resolve_start(Path::new("Pictures/photo.png"), &root, None)?,
+            resolve_start(Path::new("Pictures/photo.png"), at(&root), None)?,
             root.join("Pictures")
         );
         assert_eq!(
-            resolve_start(&root.join("Pictures"), Path::new("/elsewhere"), None)?,
+            resolve_start(&root.join("Pictures"), no_cwd, None)?,
             root.join("Pictures")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn folds_dot_dot_and_needs_cwd_only_for_relative_paths() -> TestResult {
+        let root = scratch("dotdot")?;
+        std::fs::create_dir_all(root.join("a/b"))?;
+        std::fs::create_dir_all(root.join("sibling"))?;
+
+        assert_eq!(
+            resolve_start(Path::new(".."), at(&root.join("a/b")), None)?,
+            root.join("a")
+        );
+        assert_eq!(
+            resolve_start(Path::new("../../sibling/."), at(&root.join("a/b")), None)?,
+            root.join("sibling")
+        );
+        assert_eq!(
+            resolve_start(Path::new("/.."), no_cwd, None)?,
+            PathBuf::from("/")
+        );
+        assert!(matches!(
+            resolve_start(Path::new("a"), no_cwd, None),
+            Err(CliError::NoCurrentDir(_))
+        ));
         Ok(())
     }
 
@@ -211,11 +276,11 @@ mod tests {
     fn reports_missing_paths_and_missing_home() -> TestResult {
         let root = scratch("missing")?;
         assert_eq!(
-            resolve_start(Path::new("nope"), &root, None),
+            resolve_start(Path::new("nope"), at(&root), None),
             Err(CliError::Missing(root.join("nope")))
         );
         assert_eq!(
-            resolve_start(Path::new("~/x"), &root, None),
+            resolve_start(Path::new("~/x"), at(&root), None),
             Err(CliError::NoHome)
         );
         Ok(())
