@@ -12,6 +12,8 @@
 //! names are lossy and never used for navigation.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,7 +22,7 @@ use bolt::primitives::Icon;
 use bolt::tokens::Spacing;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
-    App, ClickEvent, Context, Div, ElementId, InteractiveElement, IntoElement, Modifiers,
+    App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
     ParentElement, Stateful, Styled, WeakEntity, Window, canvas, div, prelude::*, px,
 };
 
@@ -31,13 +33,101 @@ use super::view::{ENTRIES_CONTEXT, Explorer};
 /// Tile width of the reference grid (normal density); every tile draws at
 /// exactly this width, so a partial last row matches a full one.
 const TILE_WIDTH: f32 = 104.0;
-/// Tile height: 16 px top padding, the 40 px icon, 12 px gap, two 18 px
-/// filename lines and 8 px bottom padding — long names clip at two lines.
-const TILE_HEIGHT: f32 = 112.0;
+/// Tile top padding above the icon slot.
+const TILE_TOP_PADDING: f32 = 12.0;
+/// Height of the one icon slot every glyph draws in, so the folder
+/// silhouette and the file glyphs share a baseline row.
+const ICON_SLOT: f32 = 32.0;
+/// Gap between the icon slot and the filename.
+const NAME_GAP: f32 = 8.0;
+/// One filename line's height; long names clip at two lines.
+const NAME_LINE: f32 = 18.0;
+/// Tile bottom padding under the filename.
+const TILE_BOTTOM_PADDING: f32 = 8.0;
+/// Tile height: top padding, the icon slot, the name gap, two clamped
+/// filename lines and bottom padding — half of the earlier grid's vertical
+/// dead space, with the filename at the primary 13 px text size.
+const TILE_HEIGHT: f32 =
+    TILE_TOP_PADDING + ICON_SLOT + NAME_GAP + 2.0 * NAME_LINE + TILE_BOTTOM_PADDING;
 /// Gap between tiles.
 const TILE_GAP: f32 = 8.0;
 /// Horizontal padding of the entries area.
 const ENTRIES_PADDING: f32 = 16.0;
+
+/// The compact filled folder silhouette drawn in a tile's icon slot: the
+/// bundled Lucide folder glyph is stroke-only, so the fill is composed
+/// natively from a tab and a body of existing info blue — a silhouette, not
+/// a square colored app-icon chip.
+const FOLDER_WIDTH: f32 = 40.0;
+/// Silhouette height; fits [`ICON_SLOT`].
+const FOLDER_HEIGHT: f32 = 32.0;
+/// Width of the raised folder tab.
+const FOLDER_TAB_WIDTH: f32 = 16.0;
+/// How far the tab rises above the body.
+const FOLDER_TAB_HEIGHT: f32 = 14.0;
+/// Where the body starts under the tab.
+const FOLDER_BODY_TOP: f32 = 8.0;
+
+/// Chooses the bundled Lucide glyph for a non-directory entry from the
+/// file name's extension alone: no file contents are read and no MIME
+/// probe runs. Extensions compare case-insensitively; anything the table
+/// does not name — including extensionless names and dotfiles — stays the
+/// plain file glyph.
+pub(crate) fn file_glyph(name: &OsStr) -> gpui_kit_assets::IconName {
+    use gpui_kit_assets::IconName;
+
+    let extension = Path::new(name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "tif" | "tiff" => {
+            IconName::FileImage
+        }
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" | "mpg" | "mpeg" => {
+            IconName::FileVideoCamera
+        }
+        "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" => IconName::FileMusic,
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "iso" => {
+            IconName::FileArchive
+        }
+        "csv" | "tsv" | "xls" | "xlsx" | "ods" => IconName::FileSpreadsheet,
+        "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "html" | "css" | "json" | "toml" | "yaml"
+        | "yml" | "xml" | "sh" | "c" | "h" | "cpp" | "hpp" | "go" | "java" | "kt" | "rb"
+        | "php" | "lua" | "sql" => IconName::FileCode,
+        "txt" | "md" | "log" | "conf" | "cfg" | "ini" | "rst" | "pdf" | "doc" | "docx" | "odt"
+        | "rtf" => IconName::FileText,
+        _ => IconName::File,
+    }
+}
+
+/// The folder silhouette: one relative frame holding the filled tab and
+/// the filled body, both in the given info blue. Two rectangles compose the
+/// classic tab-and-body folder shape without any stroke or outline.
+fn folder_silhouette(color: Hsla) -> impl IntoElement {
+    div()
+        .relative()
+        .w(px(FOLDER_WIDTH))
+        .h(px(FOLDER_HEIGHT))
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(FOLDER_TAB_WIDTH))
+                .h(px(FOLDER_TAB_HEIGHT))
+                .bg(color),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .right(px(0.0))
+                .top(px(FOLDER_BODY_TOP))
+                .bottom(px(0.0))
+                .bg(color),
+        )
+}
 
 /// Derives the grid column count from the entries area's **inner** width —
 /// the content box the tiles lay out in; the padding is already excluded by
@@ -74,8 +164,9 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .min_w_0()
         .flex()
         .flex_col()
-        .px(px(ENTRIES_PADDING))
-        .pb(Spacing::XL);
+        .when(this.state.view() != View::List, |container| {
+            container.px(px(ENTRIES_PADDING)).pb(Spacing::XL)
+        });
 
     if this.state.is_loading() && count == 0 {
         return container.justify_center().child(
@@ -247,6 +338,29 @@ fn render_grid_row(
         let broken = tile.is_symlink && tile.kind == EntryKind::Symlink;
         let tile_selected = selected.contains(&path);
 
+        // Folders draw the filled blue silhouette; a resolvable symlink
+        // draws the symlink glyph; a broken one the warning glyph; every
+        // other entry the extension-derived file glyph. Selection, hover
+        // and clicks keep the raw path — the glyphs are display-only.
+        let glyph = if broken {
+            Icon::new(icon(gpui_kit_assets::IconName::Link2Off))
+                .size(px(ICON_SLOT))
+                .color(colors.warning)
+                .into_any_element()
+        } else if tile.is_symlink {
+            Icon::new(icon(gpui_kit_assets::IconName::FileSymlink))
+                .size(px(ICON_SLOT))
+                .color(colors.muted)
+                .into_any_element()
+        } else if is_folder {
+            folder_silhouette(colors.info).into_any_element()
+        } else {
+            Icon::new(icon(file_glyph(&tile.name)))
+                .size(px(ICON_SLOT))
+                .color(colors.muted)
+                .into_any_element()
+        };
+
         row_element = row_element.child(
             ListRow::new(ElementId::Name(
                 format!("explorer-tile-{row}-{index}").into(),
@@ -260,32 +374,18 @@ fn render_grid_row(
             .flex()
             .flex_col()
             .items_center()
-            .pt(Spacing::LG)
-            .pb(Spacing::SM)
+            .pt(px(TILE_TOP_PADDING))
+            .pb(px(TILE_BOTTOM_PADDING))
             .px(Spacing::XS)
             .on_click(entry_click(weak, path))
-            .child(
-                Icon::new(icon(if is_folder {
-                    gpui_kit_assets::IconName::Folder
-                } else if broken {
-                    gpui_kit_assets::IconName::Link2Off
-                } else {
-                    gpui_kit_assets::IconName::File
-                }))
-                .size(px(40.0))
-                .color(if is_folder {
-                    colors.info
-                } else if broken {
-                    colors.warning
-                } else {
-                    colors.muted
-                }),
-            )
+            .child(glyph)
             .child(
                 div()
-                    .mt(Spacing::MD)
-                    .text_size(px(12.0))
+                    .mt(px(NAME_GAP))
+                    .text_size(px(13.0))
+                    .line_height(px(NAME_LINE))
                     .line_clamp(2)
+                    .text_center()
                     .text_color(if tile_selected {
                         colors.strong
                     } else {
@@ -395,5 +495,54 @@ mod tests {
             "a divisible count has no partial row"
         );
         assert_eq!(grid_tile_range(0, 5, 0), 0..1, "no columns means one tile");
+    }
+
+    /// The extension-only glyph classifier maps common file types to
+    /// distinct bundled Lucide glyphs from the file name alone: no file
+    /// contents, no MIME probes, case-insensitive extensions, and the plain
+    /// file glyph for everything it does not name.
+    #[test]
+    fn file_glyphs_distinguish_common_types_by_extension_alone() {
+        use gpui_kit_assets::IconName;
+        let glyph = |name: &str| file_glyph(std::ffi::OsStr::new(name));
+
+        assert_eq!(glyph("notes.txt"), IconName::FileText);
+        assert_eq!(glyph("README.md"), IconName::FileText);
+        assert_eq!(glyph("report-draft.pdf"), IconName::FileText);
+        assert_eq!(glyph("screenshot-session.PNG"), IconName::FileImage);
+        assert_eq!(glyph("wallpaper-mountains.jpg"), IconName::FileImage);
+        assert_eq!(glyph("demo-recording.mp4"), IconName::FileVideoCamera);
+        assert_eq!(glyph("podcast-episode.mp3"), IconName::FileMusic);
+        assert_eq!(glyph("backup-home.tar.gz"), IconName::FileArchive);
+        assert_eq!(glyph("wallpaper-pack.zip"), IconName::FileArchive);
+        assert_eq!(glyph("dataset-sample.csv"), IconName::FileSpreadsheet);
+        assert_eq!(glyph("explorer.rs"), IconName::FileCode);
+        assert_eq!(glyph("theme.css"), IconName::FileCode);
+        assert_eq!(glyph("Cargo.toml"), IconName::FileCode);
+        assert_eq!(glyph("budget-2026.ods"), IconName::FileSpreadsheet);
+        // Nothing the classifier names stays a bare file glyph; everything
+        // else does — including files without an extension and dotfiles.
+        assert_eq!(glyph("Makefile"), IconName::File);
+        assert_eq!(glyph("archive"), IconName::File);
+        assert_eq!(glyph(".gitignore"), IconName::File, "dotfiles stay plain");
+        assert_eq!(glyph("readme.txt.bak"), IconName::File);
+    }
+
+    /// The tile height is exactly its composition — top padding, one icon
+    /// slot, the name gap and two clamped filename lines plus bottom
+    /// padding — so the fixed row height can never silently grow away from
+    /// the geometry the tiles draw, and the folder silhouette fits the same
+    /// icon slot the file glyphs use.
+    #[test]
+    fn tile_height_matches_its_composition_and_slot() {
+        let composed =
+            TILE_TOP_PADDING + ICON_SLOT + NAME_GAP + 2.0 * NAME_LINE + TILE_BOTTOM_PADDING;
+        assert_eq!(
+            TILE_HEIGHT, composed,
+            "the row height is the tile's own sum"
+        );
+        let (slot, folder_height, folder_width) = (ICON_SLOT, FOLDER_HEIGHT, FOLDER_WIDTH);
+        assert!(folder_height <= slot, "silhouette fits the icon slot");
+        assert!(folder_width <= TILE_WIDTH, "silhouette fits the tile width");
     }
 }
