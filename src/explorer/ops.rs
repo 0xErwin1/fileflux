@@ -184,8 +184,9 @@ pub(crate) enum Job {
     Restore(Vec<OsString>),
     /// Trash view, confirmed.
     DeleteFromTrash(Vec<OsString>),
-    /// Trash view, confirmed.
-    EmptyTrash,
+    /// Trash view, confirmed: exactly the names the confirmation counted.
+    /// Items trashed after the dialog opened are never part of it.
+    EmptyTrash(Vec<OsString>),
     Undo(UndoAction),
 }
 
@@ -268,7 +269,7 @@ pub(crate) fn run_job(job: Job, ctx: &JobCtx, sink: &Sink) -> Report {
         Job::DeletePermanently(paths) => delete_items(&paths, sink),
         Job::Restore(names) => restore_items(&names, ctx, sink),
         Job::DeleteFromTrash(names) => delete_from_trash(&names, ctx, sink),
-        Job::EmptyTrash => empty_trash(ctx, sink),
+        Job::EmptyTrash(names) => empty_trash(ctx, names, sink),
         Job::Undo(action) => match undo(&action, ctx, sink) {
             Ok(report) => report,
             Err(reason) => Report::error(format!("Can't undo: {reason}")),
@@ -581,17 +582,11 @@ fn delete_from_trash(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
     summarize(deleted.len(), done, "delete", cancelled, details)
 }
 
-fn empty_trash(ctx: &JobCtx, sink: &Sink) -> Report {
-    let names: Vec<OsString> = match fs::read_dir(ctx.trash_root.join("files")) {
-        Ok(found) => found.flatten().map(|entry| entry.file_name()).collect(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Report::error(format!("Could not read the Trash: {error}")),
-    };
+/// Deletes exactly the confirmed `names`. There is deliberately no
+/// root-wide sweep: other Trash jobs may be running, and an info file
+/// without content can be a `put` that has not moved its file yet.
+fn empty_trash(ctx: &JobCtx, names: Vec<OsString>, sink: &Sink) -> Report {
     if names.is_empty() {
-        // Nothing to remove; still drop info files whose content is gone.
-        if let Err(error) = trash::empty(&ctx.trash_root) {
-            return Report::error(format!("Could not empty the Trash: {error}"));
-        }
         return Report::say(Severity::Info, "The Trash is already empty");
     }
     sink.set_total(names.len() as u64);
@@ -615,12 +610,6 @@ fn empty_trash(ctx: &JobCtx, sink: &Sink) -> Report {
         }
     }
     sink.advance(names.len() as u64, "");
-    if !cancelled {
-        // Orphan info files (content already gone) go too.
-        if let Err(error) = trash::empty(&ctx.trash_root) {
-            details.push(format!("Trash metadata: {error}"));
-        }
-    }
     if cancelled {
         let text = if removed == 0 {
             "Cancelled: the Trash was not emptied".to_owned()

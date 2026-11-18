@@ -78,7 +78,8 @@ pub(crate) struct MenuState {
 pub(crate) enum DialogAction {
     DeletePermanently(Vec<PathBuf>),
     DeleteFromTrash(Vec<OsString>),
-    EmptyTrash,
+    /// The Trash names the dialog counted; nothing else is deleted.
+    EmptyTrash(Vec<OsString>),
 }
 
 /// The open confirmation dialog.
@@ -574,14 +575,20 @@ impl Explorer {
         if !self.in_trash() {
             return;
         }
-        let count = self.state.listing().entries.len();
-        if count == 0 {
+        let names: Vec<OsString> = self
+            .state
+            .listing()
+            .entries
+            .iter()
+            .filter_map(|entry| entry.path.file_name().map(OsString::from))
+            .collect();
+        if names.is_empty() {
             return;
         }
         self.open_dialog(
-            DialogKind::EmptyTrash { count },
+            DialogKind::EmptyTrash { count: names.len() },
             &[],
-            DialogAction::EmptyTrash,
+            DialogAction::EmptyTrash(names),
             window,
             cx,
         );
@@ -627,7 +634,9 @@ impl Explorer {
                 format!("Deleting {} from the Trash", count_label(names.len())),
                 Job::DeleteFromTrash(names),
             ),
-            DialogAction::EmptyTrash => ("Emptying the Trash".to_owned(), Job::EmptyTrash),
+            DialogAction::EmptyTrash(names) => {
+                ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
+            }
         };
         self.start_job(title, job, true, window, cx);
         cx.notify();

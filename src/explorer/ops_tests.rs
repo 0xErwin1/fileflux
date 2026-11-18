@@ -845,21 +845,57 @@ fn deleting_from_the_trash_and_emptying_remove_items_for_good() -> TestResult {
 
     let cancel = sink();
     cancel.request_cancel();
-    let stopped = run_job(Job::EmptyTrash, &ctx, &cancel);
+    let stopped = run_job(
+        Job::EmptyTrash(vec![os("b.txt"), os("c.txt")]),
+        &ctx,
+        &cancel,
+    );
     assert!(stopped.cancelled);
     assert!(
         scratch.trash().join("files/b.txt").exists(),
         "cancel keeps the rest"
     );
 
-    let emptied = run_job(Job::EmptyTrash, &ctx, &sink());
+    let emptied = run_job(
+        Job::EmptyTrash(vec![os("b.txt"), os("c.txt")]),
+        &ctx,
+        &sink(),
+    );
     assert_eq!(text(&emptied), "Emptied the Trash");
     assert!(!scratch.trash().join("files/b.txt").exists());
     assert!(!scratch.trash().join("files/c.txt").exists());
     assert!(!scratch.trash().join("info/c.txt.trashinfo").exists());
 
-    let again = run_job(Job::EmptyTrash, &ctx, &sink());
+    let again = run_job(Job::EmptyTrash(Vec::new()), &ctx, &sink());
     assert_eq!(severity(&again), Some(Severity::Info));
     assert_eq!(text(&again), "The Trash is already empty");
+    Ok(())
+}
+
+#[test]
+fn empty_trash_touches_only_the_confirmed_items() -> TestResult {
+    let scratch = Scratch::new("empty-confirmed")?;
+    let a = scratch.file("a.txt", "a")?;
+    let late = scratch.file("late.txt", "late")?;
+    let ctx = scratch.ctx();
+    trash_paths(&ctx, &[&a]);
+    // Trashed after the confirmation counted the Trash.
+    trash_paths(&ctx, &[&late]);
+    // A concurrent put that has written its info but not moved its file yet.
+    let pending_info = scratch.trash().join("info/pending.txt.trashinfo");
+    std::fs::write(
+        &pending_info,
+        "[Trash Info]\nPath=/somewhere/pending.txt\nDeletionDate=2026-11-18T10:00:00\n",
+    )?;
+
+    let emptied = run_job(Job::EmptyTrash(vec![os("a.txt")]), &ctx, &sink());
+    assert_eq!(text(&emptied), "Emptied the Trash");
+    assert!(!scratch.trash().join("files/a.txt").exists());
+    assert!(
+        scratch.trash().join("files/late.txt").exists(),
+        "unconfirmed item kept"
+    );
+    assert!(scratch.trash().join("info/late.txt.trashinfo").exists());
+    assert!(pending_info.exists(), "in-flight put metadata kept");
     Ok(())
 }
