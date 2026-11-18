@@ -2,8 +2,12 @@
 //! the same shared virtualized table the DBFlux/ReqFlux family uses — with a
 //! small [`EntryTableDelegate`] over the explorer's snapshot. No handmade
 //! header, cells or scrolling of its own, and **no row-number gutter**: the
-//! table answers four plain columns (`Name/Type/Size/Modified`), so nothing
+//! table answers three plain columns (`Name/Size/Modified`), so nothing
 //! numbers the visible rows.
+//!
+//! The delegate owns the list's sort ([`SortSpec`]): a header click sets or
+//! flips it, the sorted header draws strong with an arrow, and folders stay
+//! grouped before files whatever the key or direction.
 //!
 //! Widths are the explorer's business: [`distribute_widths`] spreads the
 //! columns over the entries area's measured width so the table fills the
@@ -20,6 +24,7 @@
 //! carries no modifiers and the table's internal row selection is off, so
 //! it can never swallow or clobber the explorer's multi-selection.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,21 +48,144 @@ use super::util;
 use super::view::Explorer;
 
 /// The details list's columns, in order. No ordinal column: the table has
-/// exactly these four, nothing numbering the rows.
-pub(crate) const COLUMN_COUNT: usize = 4;
-/// The columns' designed widths, from the reference design
-/// (`minmax(180px,1fr) 120px 100px 170px`).
-pub(crate) const LIST_DEFAULT_WIDTHS: [f32; 4] = [220.0, 120.0, 100.0, 170.0];
+/// exactly these three, nothing numbering the rows.
+pub(crate) const COLUMN_COUNT: usize = 3;
+/// The columns' designed widths, from the reference design (a flexible Name
+/// then Size and Modified).
+pub(crate) const LIST_DEFAULT_WIDTHS: [f32; COLUMN_COUNT] = [220.0, 110.0, 170.0];
 /// Each column's explicit minimum: below their sum the table overflows
 /// sideways instead of squeezing a column unreadable.
-pub(crate) const LIST_MIN_WIDTHS: [f32; 4] = [180.0, 90.0, 90.0, 160.0];
+pub(crate) const LIST_MIN_WIDTHS: [f32; COLUMN_COUNT] = [180.0, 80.0, 140.0];
 /// The Name column's explicit minimum width.
 pub(crate) const LIST_NAME_MIN_WIDTH: f32 = LIST_MIN_WIDTHS[0];
 /// How far a recorded drag width may drift from the delegate's applied
 /// widths before it counts as a deliberate user change.
 pub(crate) const DRAG_EPSILON: f32 = 0.5;
 
-const COLUMN_NAMES: [&str; COLUMN_COUNT] = ["Name", "Type", "Size", "Modified"];
+const COLUMN_NAMES: [&str; COLUMN_COUNT] = ["Name", "Size", "Modified"];
+const SIZE_COLUMN: usize = 1;
+
+/// What the list is sorted by.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SortKey {
+    Name,
+    Size,
+    Modified,
+}
+
+impl SortKey {
+    /// The sort key of column `column`, or `None` past the columns.
+    pub(crate) fn of_column(column: usize) -> Option<Self> {
+        match column {
+            0 => Some(Self::Name),
+            SIZE_COLUMN => Some(Self::Size),
+            2 => Some(Self::Modified),
+            _ => None,
+        }
+    }
+}
+
+/// The direction of the sort.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SortDir {
+    Ascending,
+    Descending,
+}
+
+impl SortDir {
+    /// The arrow drawn beside the sorted header.
+    pub(crate) fn arrow(self) -> &'static str {
+        match self {
+            Self::Ascending => "\u{2191}",
+            Self::Descending => "\u{2193}",
+        }
+    }
+
+    fn flipped(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
+/// The list's sort: a key and a direction. Starts at name ascending, the
+/// order the scan already delivers.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct SortSpec {
+    pub(crate) key: SortKey,
+    pub(crate) dir: SortDir,
+}
+
+impl Default for SortSpec {
+    fn default() -> Self {
+        Self {
+            key: SortKey::Name,
+            dir: SortDir::Ascending,
+        }
+    }
+}
+
+impl SortSpec {
+    /// The sort after a click on `key`'s header: the active key flips its
+    /// direction, any other key starts ascending.
+    pub(crate) fn clicked(self, key: SortKey) -> Self {
+        if self.key == key {
+            Self {
+                key,
+                dir: self.dir.flipped(),
+            }
+        } else {
+            Self {
+                key,
+                dir: SortDir::Ascending,
+            }
+        }
+    }
+}
+
+/// Orders two entries under `spec`. Folders always come first, whatever the
+/// key or direction; within a group the key decides (a missing size or time
+/// sorts lowest) and the direction reverses only that; ties fall back to
+/// the case-insensitive name and then the raw path, ascending, so the order
+/// is total and stable.
+pub(crate) fn compare_entries(a: &Entry, b: &Entry, spec: SortSpec) -> Ordering {
+    let by_key = match spec.key {
+        SortKey::Name => Ordering::Equal,
+        SortKey::Size => a.size.cmp(&b.size),
+        SortKey::Modified => a.modified.cmp(&b.modified),
+    };
+    let by_key = match spec.dir {
+        SortDir::Ascending => by_key,
+        SortDir::Descending => by_key.reverse(),
+    };
+    let by_name = a
+        .name
+        .to_string_lossy()
+        .to_lowercase()
+        .cmp(&b.name.to_string_lossy().to_lowercase());
+    // Name is its own key, so the direction applies to the name comparison.
+    let by_name = if spec.key == SortKey::Name && spec.dir == SortDir::Descending {
+        by_name.reverse()
+    } else {
+        by_name
+    };
+    b.is_directory()
+        .cmp(&a.is_directory())
+        .then(by_key)
+        .then(by_name)
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+/// The `visible` snapshot indices reordered under `spec`.
+pub(crate) fn sorted_indices(entries: &[Entry], visible: &[usize], spec: SortSpec) -> Vec<usize> {
+    let mut order = visible.to_vec();
+    order.sort_by(|&a, &b| match (entries.get(a), entries.get(b)) {
+        (Some(a), Some(b)) => compare_entries(a, b, spec),
+        (a, b) => a.is_some().cmp(&b.is_some()).reverse(),
+    });
+    order
+}
 
 /// A cell's presentation, decided by pure functions so the mapping tests
 /// read the same truth the cells render.
@@ -104,7 +232,7 @@ pub(crate) fn entry_glyph(entry: &Entry) -> Glyph {
 /// The alignment of one column: sizes right-align, everything else reads
 /// from the left.
 pub(crate) fn column_align(column: usize) -> CellAlign {
-    if column == 2 {
+    if column == SIZE_COLUMN {
         CellAlign::Right
     } else {
         CellAlign::Left
@@ -114,7 +242,7 @@ pub(crate) fn column_align(column: usize) -> CellAlign {
 /// One column's [`Column`] definition: its width, its explicit minimum, no
 /// reordering and no column-selection semantics — the drag-to-resize
 /// handles stay.
-pub(crate) fn column_definition(column: usize, widths: &[f32; 4]) -> Column {
+pub(crate) fn column_definition(column: usize, widths: &[f32; COLUMN_COUNT]) -> Column {
     let width = widths
         .get(column)
         .copied()
@@ -136,10 +264,10 @@ pub(crate) fn column_definition(column: usize, widths: &[f32; 4]) -> Column {
     .min_width(px(min))
     .movable(false)
     .selectable(false)
-    .when(column == 2, |col| col.text_right())
+    .when(column == SIZE_COLUMN, |col| col.text_right())
 }
 
-const COLUMN_KEYS: [&str; COLUMN_COUNT] = ["name", "kind", "size", "modified"];
+const COLUMN_KEYS: [&str; COLUMN_COUNT] = ["name", "size", "modified"];
 
 /// The widths the table draws at, given the entries area's measured width
 /// (when the first frame has not measured yet, `None`) and the widths the
@@ -153,7 +281,10 @@ const COLUMN_KEYS: [&str; COLUMN_COUNT] = ["name", "kind", "size", "modified"];
 /// body scroll together on the table's own shared handle). A dragged width
 /// is the user's choice: it is floored at its minimum and never recomputed,
 /// even when that leaves a gap or overflows.
-pub(crate) fn distribute_widths(available: Option<f32>, dragged: &HashMap<usize, f32>) -> [f32; 4] {
+pub(crate) fn distribute_widths(
+    available: Option<f32>,
+    dragged: &HashMap<usize, f32>,
+) -> [f32; COLUMN_COUNT] {
     let mut widths = LIST_DEFAULT_WIDTHS;
     for (column, width) in widths.iter_mut().enumerate() {
         if let Some(dragged) = dragged.get(&column) {
@@ -232,8 +363,11 @@ impl ListWidths {
 pub(crate) struct EntryTableDelegate {
     snapshot: Arc<Vec<Entry>>,
     visible: Arc<Vec<usize>>,
+    /// `visible` reordered under `sort`: the rows the table draws.
+    order: Vec<usize>,
+    sort: SortSpec,
     selected: Arc<BTreeSet<PathBuf>>,
-    widths: [f32; 4],
+    widths: [f32; COLUMN_COUNT],
     weak: WeakEntity<Explorer>,
 }
 
@@ -243,20 +377,43 @@ impl EntryTableDelegate {
         snapshot: Arc<Vec<Entry>>,
         visible: Arc<Vec<usize>>,
     ) -> Self {
+        let sort = SortSpec::default();
+        let order = sorted_indices(&snapshot, &visible, sort);
         Self {
             snapshot,
             visible,
+            order,
+            sort,
             selected: Arc::new(BTreeSet::new()),
             widths: LIST_DEFAULT_WIDTHS,
             weak,
         }
     }
 
-    /// Re-points the delegate at a new snapshot and visible set. Cheap: it
-    /// swaps two `Arc`s; the table reads rows through it on every render.
+    /// Re-points the delegate at a new snapshot and visible set, re-sorting
+    /// only when either actually changed (it runs on every render).
     pub(crate) fn set_data(&mut self, snapshot: Arc<Vec<Entry>>, visible: Arc<Vec<usize>>) {
+        if Arc::ptr_eq(&self.snapshot, &snapshot) && self.visible == visible {
+            return;
+        }
         self.snapshot = snapshot;
         self.visible = visible;
+        self.resort();
+    }
+
+    /// Applies a header click on `column`: sets or flips the sort and
+    /// reorders the rows. Returns `false` past the columns.
+    pub(crate) fn sort_by_column(&mut self, column: usize) -> bool {
+        let Some(key) = SortKey::of_column(column) else {
+            return false;
+        };
+        self.sort = self.sort.clicked(key);
+        self.resort();
+        true
+    }
+
+    fn resort(&mut self) {
+        self.order = sorted_indices(&self.snapshot, &self.visible, self.sort);
     }
 
     /// Re-points the delegate at the current selection.
@@ -266,18 +423,18 @@ impl EntryTableDelegate {
 
     /// Applies recomputed column widths (the caller then calls
     /// [`TableState::refresh`] so the table re-reads them).
-    pub(crate) fn set_widths(&mut self, widths: [f32; 4]) {
+    pub(crate) fn set_widths(&mut self, widths: [f32; COLUMN_COUNT]) {
         self.widths = widths;
     }
 
     /// The widths currently applied to the table.
-    pub(crate) fn widths(&self) -> &[f32; 4] {
+    pub(crate) fn widths(&self) -> &[f32; COLUMN_COUNT] {
         &self.widths
     }
 
     /// The entry at visible row `row`, or `None` past the count.
     pub(crate) fn entry_at(&self, row: usize) -> Option<&Entry> {
-        let &index = self.visible.get(row)?;
+        let &index = self.order.get(row)?;
         self.snapshot.get(index)
     }
 
@@ -298,18 +455,15 @@ impl EntryTableDelegate {
                 muted: false,
                 align: CellAlign::Left,
             },
-            1 => CellSpec {
-                text: util::format_kind(entry),
-                muted: true,
-                align: CellAlign::Left,
-            },
-            2 => CellSpec {
-                text: util::format_size(entry.size),
+            SIZE_COLUMN => CellSpec {
+                // The scan carries no child counts and the UI thread never
+                // walks directories, so folders show no count yet.
+                text: util::format_entry_size(entry, None),
                 muted: true,
                 align: CellAlign::Right,
             },
-            3 => CellSpec {
-                text: util::format_modified(entry.modified),
+            2 => CellSpec {
+                text: util::format_modified(entry.modified, &chrono::Local::now()),
                 muted: true,
                 align: CellAlign::Left,
             },
@@ -321,7 +475,7 @@ impl EntryTableDelegate {
     /// Test-only views of the counts the trait methods answer.
     #[cfg(test)]
     fn rows_count_for_tests(&self) -> usize {
-        self.visible.len()
+        self.order.len()
     }
 
     #[cfg(test)]
@@ -343,26 +497,49 @@ impl TableDelegate for EntryTableDelegate {
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.visible.len()
+        self.order.len()
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
         column_definition(col_ix, &self.widths)
     }
 
+    /// The header: the column name, strong with a ↑/↓ arrow when it is the
+    /// sorted column, quiet otherwise. A click sets or flips the sort — the
+    /// delegate owns it, so the table's built-in sort icon stays off.
     fn render_th(
         &mut self,
         col_ix: usize,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let align = column_align(col_ix);
-        let mut head = h_flex().size_full().min_w_0().text_size(px(12.0));
-        if align == CellAlign::Right {
+        let colors = bolt::colors(cx);
+        let sorted = SortKey::of_column(col_ix).filter(|key| *key == self.sort.key);
+        let mut head = h_flex()
+            .id(("sort-header", col_ix))
+            .size_full()
+            .min_w_0()
+            .gap(px(6.0))
+            .text_size(px(12.0))
+            .text_color(if sorted.is_some() {
+                colors.strong
+            } else {
+                colors.muted
+            })
+            .hover(|this| this.text_color(colors.foreground))
+            .on_click(cx.listener(move |table, _: &ClickEvent, _window, cx| {
+                if table.delegate_mut().sort_by_column(col_ix) {
+                    table.refresh(cx);
+                }
+            }));
+        if column_align(col_ix) == CellAlign::Right {
             head = head.justify_end();
         }
         if let Some(name) = COLUMN_NAMES.get(col_ix) {
             head = head.child(*name);
+        }
+        if sorted.is_some() {
+            head = head.child(self.sort.dir.arrow());
         }
         head
     }
@@ -435,7 +612,11 @@ impl TableDelegate for EntryTableDelegate {
             .entry_at(row_ix)
             .is_some_and(|entry| self.selected.contains(&entry.path));
         let weak = self.weak.clone();
-        let mut row = div().id(("row", row_ix));
+        // The lighter divider token between rows, set explicitly so a theme
+        // change in the table's own default can never make them heavy again.
+        let mut row = div()
+            .id(("row", row_ix))
+            .border_color(bolt::colors(cx).row_divider);
         if selected {
             row = row.bg(cx.theme().tokens.table_active);
         }
@@ -560,22 +741,18 @@ mod tests {
         assert_eq!(
             source.columns_count_for_tests(),
             COLUMN_COUNT,
-            "Name, Type, Size, Modified — no ordinal column"
+            "Name, Size, Modified — no ordinal column"
         );
 
         let name = source.cell(0, 0).ok_or("the name cell exists")?;
         assert_eq!(name.text, "Notes", "the name cell shows the display name");
         assert!(!name.muted, "the name draws primary");
         assert_eq!(name.align, CellAlign::Left);
-        let kind = source.cell(0, 1).ok_or("the kind cell exists")?;
-        assert_eq!(kind.text, "Folder");
-        assert!(kind.muted, "metadata draws quiet");
-        assert_eq!(kind.align, CellAlign::Left);
-        let size = source.cell(0, 2).ok_or("the size cell exists")?;
-        assert_eq!(size.text, "\u{2014}", "directories show no size");
-        assert!(size.muted);
+        let size = source.cell(0, 1).ok_or("the size cell exists")?;
+        assert_eq!(size.text, "", "folders without a known count stay empty");
+        assert!(size.muted, "metadata draws quiet");
         assert_eq!(size.align, CellAlign::Right, "sizes right-align");
-        let modified = source.cell(0, 3).ok_or("the modified cell exists")?;
+        let modified = source.cell(0, 2).ok_or("the modified cell exists")?;
         assert_eq!(modified.text, "\u{2014}", "missing metadata is honest");
         assert!(modified.muted);
 
@@ -594,14 +771,16 @@ mod tests {
         assert_eq!(source.path_of(1), None, "no path past the count");
 
         // The delegate answers from the *visible* entries, so a filtered-out
-        // entry never becomes a row: alpha.txt is row 0 only without a query.
+        // entry never becomes a row: alpha.txt is a row only without a query,
+        // and the folder groups before it whatever the snapshot order.
         let unfiltered = EntryTableDelegate::new(
             WeakEntity::<Explorer>::new_invalid(),
             Arc::new(entries),
             Arc::new(vec![0, 1]),
         );
         assert_eq!(unfiltered.rows_count_for_tests(), 2);
-        assert_eq!(unfiltered.path_of(0), Some(Path::new("/fixture/alpha.txt")));
+        assert_eq!(unfiltered.path_of(0), Some(Path::new("/fixture/Notes")));
+        assert_eq!(unfiltered.path_of(1), Some(Path::new("/fixture/alpha.txt")));
         Ok(())
     }
 
@@ -641,7 +820,7 @@ mod tests {
     /// right alignment.
     #[test]
     fn column_definitions_carry_names_minima_and_no_ordinal() {
-        for (column, name) in ["Name", "Type", "Size", "Modified"].iter().enumerate() {
+        for (column, name) in ["Name", "Size", "Modified"].iter().enumerate() {
             let col = column_definition(column, &LIST_DEFAULT_WIDTHS);
             assert_eq!(col.name.as_ref(), *name);
             assert_eq!(
@@ -661,7 +840,7 @@ mod tests {
                 "only Size right-aligns"
             );
         }
-        assert_eq!(COLUMN_COUNT, 4);
+        assert_eq!(COLUMN_COUNT, 3);
     }
 
     /// One width source for the whole contract: the columns spread over the
@@ -674,20 +853,13 @@ mod tests {
         let wide = distribute_widths(Some(1_200.0), &no_drags);
         let total: f32 = wide.iter().sum();
         assert_eq!(total, 1_200.0, "the columns fill the pane exactly");
-        assert!(
-            wide[0] > wide[1] + wide[2] + wide[3],
-            "Name holds the largest share"
-        );
+        assert!(wide[0] > wide[1] + wide[2], "Name holds the largest share");
         assert_eq!(
             wide[1], LIST_DEFAULT_WIDTHS[1],
-            "Type keeps its designed width"
-        );
-        assert_eq!(
-            wide[2], LIST_DEFAULT_WIDTHS[2],
             "Size keeps its designed width"
         );
         assert_eq!(
-            wide[3], LIST_DEFAULT_WIDTHS[3],
+            wide[2], LIST_DEFAULT_WIDTHS[2],
             "Modified keeps its designed width"
         );
 
@@ -726,12 +898,135 @@ mod tests {
         name_drag.insert(0, 260.0);
         let named = distribute_widths(Some(1_200.0), &name_drag);
         assert_eq!(named[0], 260.0, "a dragged Name width is respected");
-        assert_eq!(named[1..].iter().sum::<f32>(), 390.0, "metadata stay put");
+        assert_eq!(named[1..].iter().sum::<f32>(), 280.0, "metadata stay put");
 
         let mut squeezed = HashMap::new();
         squeezed.insert(0, 10.0);
         let floored = distribute_widths(Some(1_200.0), &squeezed);
         assert_eq!(floored[0], LIST_NAME_MIN_WIDTH, "Name keeps its minimum");
+    }
+
+    fn sized(name: &str, kind: EntryKind, size: Option<u64>, secs: Option<u64>) -> Entry {
+        let mut e = entry(name, kind);
+        e.size = size;
+        e.modified = secs.map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        e
+    }
+
+    fn names(entries: &[Entry], order: &[usize]) -> Vec<String> {
+        order
+            .iter()
+            .filter_map(|&i| entries.get(i))
+            .map(|e| e.display_name().into_owned())
+            .collect()
+    }
+
+    fn fixture() -> Vec<Entry> {
+        vec![
+            sized("beta.txt", EntryKind::File, Some(300), Some(200)),
+            sized("Zeta", EntryKind::Directory, None, Some(50)),
+            sized("alpha.txt", EntryKind::File, Some(900), None),
+            sized("Docs", EntryKind::Directory, None, Some(500)),
+            sized("gamma.txt", EntryKind::File, None, Some(100)),
+        ]
+    }
+
+    fn spec(key: SortKey, dir: SortDir) -> SortSpec {
+        SortSpec { key, dir }
+    }
+
+    /// Folders stay grouped before files under every key and direction;
+    /// the key orders within each group, the direction reverses only that,
+    /// and a missing size or time sorts lowest.
+    #[test]
+    fn sorting_groups_folders_first_under_every_key_and_direction() {
+        let entries = fixture();
+        let all: Vec<usize> = (0..entries.len()).collect();
+        let order = |key, dir| names(&entries, &sorted_indices(&entries, &all, spec(key, dir)));
+
+        assert_eq!(
+            order(SortKey::Name, SortDir::Ascending),
+            ["Docs", "Zeta", "alpha.txt", "beta.txt", "gamma.txt"],
+            "name ascending is case-insensitive"
+        );
+        assert_eq!(
+            order(SortKey::Name, SortDir::Descending),
+            ["Zeta", "Docs", "gamma.txt", "beta.txt", "alpha.txt"],
+            "descending still keeps folders first"
+        );
+        assert_eq!(
+            order(SortKey::Size, SortDir::Ascending),
+            ["Docs", "Zeta", "gamma.txt", "beta.txt", "alpha.txt"],
+            "unknown size sorts lowest; equal folders tie by name"
+        );
+        assert_eq!(
+            order(SortKey::Size, SortDir::Descending),
+            ["Docs", "Zeta", "alpha.txt", "beta.txt", "gamma.txt"],
+            "size descending: folders (no size) tie by name ascending"
+        );
+        assert_eq!(
+            order(SortKey::Modified, SortDir::Ascending),
+            ["Zeta", "Docs", "alpha.txt", "gamma.txt", "beta.txt"],
+            "unknown time sorts lowest"
+        );
+        assert_eq!(
+            order(SortKey::Modified, SortDir::Descending),
+            ["Docs", "Zeta", "beta.txt", "gamma.txt", "alpha.txt"]
+        );
+    }
+
+    /// Only the visible indices are reordered, and an out-of-range index
+    /// never panics.
+    #[test]
+    fn sorting_reorders_only_the_visible_indices() {
+        let entries = fixture();
+        let order = sorted_indices(&entries, &[4, 0, 99], SortSpec::default());
+        assert_eq!(order.get(..2), Some(&[0, 4][..]), "beta before gamma");
+        assert_eq!(order.len(), 3, "nothing is dropped or invented");
+    }
+
+    /// A click on the active key flips its direction; another key starts
+    /// ascending. The delegate applies it to its rows and rejects unknown
+    /// columns without changing anything.
+    #[test]
+    fn header_clicks_set_or_flip_the_sort() {
+        let name_asc = SortSpec::default();
+        assert_eq!(name_asc, spec(SortKey::Name, SortDir::Ascending));
+        assert_eq!(
+            name_asc.clicked(SortKey::Name),
+            spec(SortKey::Name, SortDir::Descending)
+        );
+        assert_eq!(
+            name_asc.clicked(SortKey::Size),
+            spec(SortKey::Size, SortDir::Ascending)
+        );
+        assert_eq!(
+            name_asc.clicked(SortKey::Size).clicked(SortKey::Size).dir,
+            SortDir::Descending
+        );
+        assert_eq!(SortDir::Ascending.arrow(), "\u{2191}");
+        assert_eq!(SortDir::Descending.arrow(), "\u{2193}");
+        assert_eq!(SortKey::of_column(0), Some(SortKey::Name));
+        assert_eq!(SortKey::of_column(1), Some(SortKey::Size));
+        assert_eq!(SortKey::of_column(2), Some(SortKey::Modified));
+        assert_eq!(SortKey::of_column(COLUMN_COUNT), None);
+
+        let entries = fixture();
+        let mut source = EntryTableDelegate::new(
+            WeakEntity::<Explorer>::new_invalid(),
+            Arc::new(entries),
+            Arc::new((0..5).collect()),
+        );
+        assert_eq!(source.path_of(0), Some(Path::new("/fixture/Docs")));
+        assert!(source.sort_by_column(0), "name flips to descending");
+        assert_eq!(source.path_of(0), Some(Path::new("/fixture/Zeta")));
+        assert_eq!(source.path_of(2), Some(Path::new("/fixture/gamma.txt")));
+        assert!(!source.sort_by_column(COLUMN_COUNT));
+        assert_eq!(
+            source.sort,
+            spec(SortKey::Name, SortDir::Descending),
+            "an unknown column leaves the sort alone"
+        );
     }
 
     /// Recorded drag widths stay per-window session state.

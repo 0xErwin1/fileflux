@@ -2,9 +2,9 @@
 //! times come straight from the scan; nothing is invented for missing
 //! metadata.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
-use fileflux::core::EntryKind;
+use chrono::{DateTime, Datelike as _, TimeZone, Utc};
 
 /// Human-readable byte size; `None` renders as an em dash (directories and
 /// entries whose metadata could not be read).
@@ -32,59 +32,56 @@ pub(crate) fn format_size(size: Option<u64>) -> String {
     }
 }
 
-/// The UTC timestamp as `YYYY-MM-DD HH:MM`. Fileflux shows UTC explicitly
-/// instead of reinventing a timezone database; `None` means the scan could
-/// not read the modification time.
-pub(crate) fn format_modified(time: Option<SystemTime>) -> String {
+/// The Size cell of the details list: folders show their item count when
+/// the caller knows it (`child_count`) and stay empty otherwise — the scan
+/// carries no child counts and the UI thread never walks directories to
+/// find them. Everything else keeps its human size.
+pub(crate) fn format_entry_size(
+    entry: &fileflux::core::Entry,
+    child_count: Option<usize>,
+) -> String {
+    if entry.is_directory() {
+        child_count.map(format_item_count).unwrap_or_default()
+    } else {
+        format_size(entry.size)
+    }
+}
+
+/// `"1 item"` / `"12 items"`.
+pub(crate) fn format_item_count(count: usize) -> String {
+    if count == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{count} items")
+    }
+}
+
+/// The modification time relative to `now`, in `now`'s time zone: `Today,
+/// 09:41` for the same calendar day, `Yesterday`, `N days ago` up to six
+/// days back, then `18 Nov` within `now`'s year and `18 Nov 2025` before it.
+/// A time later than the end of today is not "relative" and reads as a plain
+/// date. `None` means the scan could not read the time and renders as an em
+/// dash. Pure over `now`, so every branch is testable deterministically.
+pub(crate) fn format_modified<Tz: TimeZone>(
+    time: Option<SystemTime>,
+    now: &DateTime<Tz>,
+) -> String {
     let Some(time) = time else {
         return "\u{2014}".to_owned();
     };
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
-    format!("{} UTC", format_civil(seconds))
-}
-
-/// Seconds since the Unix epoch as `YYYY-MM-DD HH:MM` in UTC (Howard
-/// Hinnant's civil-from-days algorithm).
-fn format_civil(seconds: u64) -> String {
-    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
-    let time_of_day = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = time_of_day / 3_600;
-    let minute = (time_of_day % 3_600) / 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
-}
-
-/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 into
-/// (year, month, day) in the proleptic Gregorian calendar.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = (mp + if mp < 10 { 3 } else { -9 }) as u32;
-    // January and February belong to the following Gregorian year.
-    (year + i64::from(month <= 2), month, day)
-}
-
-/// The type column label: honest about what the scan could resolve.
-/// A symlink that could not be resolved is a broken link; a resolved symlink
-/// shows the target's kind.
-pub(crate) fn format_kind(entry: &fileflux::core::Entry) -> String {
-    if entry.is_symlink && entry.kind == EntryKind::Symlink {
-        return "Broken link".to_owned();
-    }
-    match entry.kind {
-        EntryKind::Directory => "Folder".to_owned(),
-        EntryKind::File => "File".to_owned(),
-        EntryKind::Symlink => "Broken link".to_owned(),
-        EntryKind::Other => "Special".to_owned(),
+    let local = DateTime::<Utc>::from(time)
+        .with_timezone(&now.timezone())
+        .naive_local();
+    let days_ago = now
+        .date_naive()
+        .signed_duration_since(local.date())
+        .num_days();
+    match days_ago {
+        0 => format!("Today, {}", local.format("%H:%M")),
+        1 => "Yesterday".to_owned(),
+        2..=6 => format!("{days_ago} days ago"),
+        _ if local.year() == now.year() => local.format("%-d %b").to_string(),
+        _ => local.format("%-d %b %Y").to_string(),
     }
 }
 
@@ -98,7 +95,8 @@ pub(crate) fn grid_row(position: usize, columns: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use chrono::FixedOffset;
+    use fileflux::core::EntryKind;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -115,53 +113,142 @@ mod tests {
         assert_eq!(format_size(Some(2_251_799_813_685_248)), "2048 TB");
     }
 
+    /// 2026-11-18 (Wednesday) 12:00 in a UTC+2 zone.
+    fn now() -> Result<DateTime<FixedOffset>, Box<dyn std::error::Error>> {
+        Ok(zone()?
+            .with_ymd_and_hms(2026, 11, 18, 12, 0, 0)
+            .single()
+            .ok_or("ambiguous test instant")?)
+    }
+
+    fn zone() -> Result<FixedOffset, Box<dyn std::error::Error>> {
+        FixedOffset::east_opt(2 * 3_600).ok_or_else(|| "offset out of range".into())
+    }
+
+    /// A local (UTC+2) wall-clock instant as a `SystemTime`.
+    fn at(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+    ) -> Result<Option<SystemTime>, Box<dyn std::error::Error>> {
+        let local = zone()?
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .ok_or("ambiguous test instant")?;
+        Ok(Some(local.into()))
+    }
+
     #[test]
-    fn timestamps_render_as_utc_civil_dates() -> TestResult {
-        let epoch = UNIX_EPOCH;
-        assert_eq!(format_modified(Some(epoch)), "1970-01-01 00:00 UTC");
-        // 2026-01-30 14:22:00 UTC.
-        let time = epoch
-            .checked_add(Duration::from_secs(1_769_782_920))
-            .ok_or("test timestamp overflows")?;
-        assert_eq!(format_modified(Some(time)), "2026-01-30 14:22 UTC");
+    fn modified_reads_relative_for_the_last_week() -> TestResult {
+        let now = now()?;
         assert_eq!(
-            format_modified(None),
-            "\u{2014}",
-            "missing metadata is honest"
+            format_modified(at(2026, 11, 18, 9, 41)?, &now),
+            "Today, 09:41"
+        );
+        assert_eq!(
+            format_modified(at(2026, 11, 18, 0, 0)?, &now),
+            "Today, 00:00",
+            "the start of the local day is still today"
+        );
+        assert_eq!(
+            format_modified(at(2026, 11, 17, 23, 59)?, &now),
+            "Yesterday",
+            "one minute before local midnight is yesterday"
+        );
+        assert_eq!(format_modified(at(2026, 11, 17, 0, 0)?, &now), "Yesterday");
+        assert_eq!(
+            format_modified(at(2026, 11, 16, 23, 59)?, &now),
+            "2 days ago"
+        );
+        assert_eq!(
+            format_modified(at(2026, 11, 12, 8, 0)?, &now),
+            "6 days ago",
+            "six days is the last relative day"
         );
         Ok(())
     }
 
     #[test]
-    fn kind_labels_distinguish_broken_links_from_resolved_targets() {
+    fn modified_reads_as_a_date_from_seven_days_back() -> TestResult {
+        let now = now()?;
+        assert_eq!(
+            format_modified(at(2026, 11, 11, 23, 0)?, &now),
+            "11 Nov",
+            "seven days ago is the first absolute date"
+        );
+        assert_eq!(format_modified(at(2026, 1, 5, 10, 0)?, &now), "5 Jan");
+        assert_eq!(
+            format_modified(at(2025, 11, 18, 10, 0)?, &now),
+            "18 Nov 2025",
+            "an older year names the year"
+        );
+        assert_eq!(
+            format_modified(at(2025, 12, 31, 23, 30)?, &now),
+            "31 Dec 2025"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn modified_uses_the_local_calendar_day_not_utc() -> TestResult {
+        // 23:30 UTC on the 17th is 01:30 on the 18th at UTC+2: still today.
+        let now = now()?;
+        let utc_evening = Utc
+            .with_ymd_and_hms(2026, 11, 17, 23, 30, 0)
+            .single()
+            .ok_or("ambiguous test instant")?;
+        assert_eq!(
+            format_modified(Some(utc_evening.into()), &now),
+            "Today, 01:30"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn modified_handles_unknown_and_future_times() -> TestResult {
+        let now = now()?;
+        assert_eq!(format_modified(None, &now), "\u{2014}");
+        assert_eq!(
+            format_modified(at(2026, 11, 18, 23, 0)?, &now),
+            "Today, 23:00",
+            "later today is still today"
+        );
+        assert_eq!(
+            format_modified(at(2026, 11, 20, 9, 0)?, &now),
+            "20 Nov",
+            "a future day falls back to a plain date"
+        );
+        assert_eq!(
+            format_modified(Some(std::time::UNIX_EPOCH), &now),
+            "1 Jan 1970"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn folders_show_item_counts_and_files_keep_sizes() {
         use fileflux::core::Entry;
         use std::ffi::OsString;
-        let mut file = Entry {
-            name: OsString::from("a.txt"),
-            path: "/a.txt".into(),
-            kind: EntryKind::File,
+        let mut entry = Entry {
+            name: OsString::from("docs"),
+            path: "/docs".into(),
+            kind: EntryKind::Directory,
             is_symlink: false,
             size: None,
             modified: None,
             origin: None,
         };
-        assert_eq!(format_kind(&file), "File");
-        file.is_symlink = true;
-        assert_eq!(
-            format_kind(&file),
-            "File",
-            "a resolved symlink shows its target kind"
-        );
-        file.kind = EntryKind::Symlink;
-        assert_eq!(format_kind(&file), "Broken link");
-        file.kind = EntryKind::Directory;
-        assert_eq!(
-            format_kind(&file),
-            "Folder",
-            "a symlinked folder shows Folder"
-        );
-        file.is_symlink = false;
-        assert_eq!(format_kind(&file), "Folder");
+        assert_eq!(format_entry_size(&entry, Some(12)), "12 items");
+        assert_eq!(format_entry_size(&entry, Some(1)), "1 item");
+        assert_eq!(format_entry_size(&entry, Some(0)), "0 items");
+        assert_eq!(format_entry_size(&entry, None), "", "unknown stays empty");
+        entry.kind = EntryKind::File;
+        entry.size = Some(2_048);
+        assert_eq!(format_entry_size(&entry, Some(3)), "2.0 KB");
+        entry.size = None;
+        assert_eq!(format_entry_size(&entry, None), "\u{2014}");
     }
 
     #[test]
