@@ -25,6 +25,7 @@ use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
+use fileflux::core::settings::{Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings};
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
@@ -45,6 +46,10 @@ use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{DialogQueue, MenuPage};
 use crate::explorer::ops::{UndoStack, pick_terminal};
+use crate::explorer::persist::{
+    Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, session_tab,
+    view_from_pref, view_to_pref,
+};
 use crate::explorer::progress::Registry;
 use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
@@ -297,8 +302,6 @@ const TOAST_TOP: f32 = 150.0;
 /// The width the toast stack lays out in, in CSS pixels.
 const TOAST_STACK_WIDTH: f32 = 480.0;
 
-/// Sidebar width of the reference design, in CSS pixels.
-pub(crate) const SIDEBAR_WIDTH: f32 = 290.0;
 /// Below this viewport width the sidebar parks behind the sidebar toggle,
 /// so path, search and view stay reachable.
 pub(crate) const NARROW_WIDTH: f32 = 760.0;
@@ -528,7 +531,7 @@ pub(crate) struct Explorer {
     next_tab_id: TabId,
     /// The home directory, when known: `~` in typed paths, new tabs.
     pub(crate) home: Option<PathBuf>,
-    /// The session favorites, shared by every tab.
+    /// The favorites, shared by every tab and saved with the settings.
     pub(crate) favorites: Favorites,
     /// Sidebar discovery, arriving off the UI thread at startup.
     pub(crate) places: Option<Places>,
@@ -551,6 +554,14 @@ pub(crate) struct Explorer {
     /// Whether the sidebar is shown; narrow windows park it behind the
     /// sidebar toggle.
     pub(crate) sidebar_open: bool,
+    /// The docked sidebar's width in CSS pixels: the saved preference (the
+    /// reference design's 290 by default).
+    pub(crate) sidebar_width: f32,
+    /// When and whether settings and session are written.
+    persistence: Persistence,
+    /// A settings problem for the status bar (an invalid file at startup, a
+    /// failed save); the next navigation dismisses it.
+    settings_notice: Option<String>,
     /// The grid column count of the last render, so keyboard row steps use
     /// the same geometry the list draws with.
     pub(crate) rendered_columns: usize,
@@ -638,16 +649,60 @@ impl Explorer {
     /// path), else the home (or the honest root fallback when `$HOME` is
     /// missing), and the places discovery both start off the UI thread
     /// right away.
-    pub(crate) fn new(start: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    ///
+    /// `startup` is what the settings and session files held: the
+    /// preferences shape the shell and new tabs, the favorites replace the
+    /// empty list, and a restored session replaces the single first tab.
+    pub(crate) fn new(
+        start: Option<PathBuf>,
+        startup: Startup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let Startup {
+            preferences,
+            favorites,
+            restored,
+            persistence,
+            notices,
+        } = startup;
         let home = std::env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        let initial = start
-            .or_else(|| home.clone())
-            .map(Location::Directory)
-            .unwrap_or_else(|| Location::Directory(PathBuf::from("/")));
-        let state = ExplorerState::new(initial.clone(), home.clone());
-        let first = Tab::new(0, state, window, cx);
+        let view = view_from_pref(preferences.view);
+        let arrangement = arrangement_from_prefs(&preferences.arrangement);
+        let mut tab_states: Vec<ExplorerState> = restored
+            .as_ref()
+            .map(|restored| {
+                restored
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        ExplorerState::new(tab.location.clone(), home.clone()).with_presentation(
+                            view_from_pref(tab.view),
+                            arrangement_from_prefs(&tab.arrangement),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if tab_states.is_empty() {
+            let initial = start
+                .or_else(|| home.clone())
+                .map(Location::Directory)
+                .unwrap_or_else(|| Location::Directory(PathBuf::from("/")));
+            tab_states.push(
+                ExplorerState::new(initial, home.clone()).with_presentation(view, arrangement),
+            );
+        }
+        let active_tab = restored.as_ref().map_or(0, |restored| restored.active);
+        let mut rest = tab_states.into_iter();
+        let first_state = rest.next().unwrap_or_else(|| {
+            ExplorerState::new(Location::Directory(PathBuf::from("/")), home.clone())
+        });
+        let initial = first_state.current().clone();
+        let first = Tab::new(0, first_state, window, cx);
+        let remaining: Vec<ExplorerState> = rest.collect();
 
         let (hub, watch_events) = match WatchHub::new() {
             Ok((hub, events)) => (Some(hub), Some(events)),
@@ -670,7 +725,7 @@ impl Explorer {
             tabs: TabList::new(first),
             next_tab_id: 1,
             home,
-            favorites: Favorites::default(),
+            favorites: Favorites::from_paths(favorites),
             places: None,
             sidebar_error: None,
             // Known from the environment at once, so Del has a Trash even
@@ -683,9 +738,12 @@ impl Explorer {
             entries_focus: cx.focus_handle(),
             list_widths: ListWidths::default(),
             entries_width: None,
-            sidebar_open: true,
+            sidebar_open: !preferences.sidebar_collapsed,
+            sidebar_width: preferences.sidebar_width as f32,
+            persistence,
+            settings_notice: None,
             rendered_columns: 1,
-            inspector_open: true,
+            inspector_open: preferences.details_open,
             inspector_shown: false,
             progress: Registry::default(),
             op_contexts: HashMap::new(),
@@ -713,7 +771,10 @@ impl Explorer {
             loop {
                 cx.background_executor().timer(WATCH_STEP).await;
                 if this
-                    .update_in(cx, |this, window, cx| this.pump_watch_events(window, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.pump_watch_events(window, cx);
+                        this.persist_tick(window, cx);
+                    })
                     .is_err()
                 {
                     return;
@@ -736,7 +797,89 @@ impl Explorer {
 
         this.sync_window_title(window);
         this.navigate(Transition::Visit(initial), window, cx);
+        // The rest of a restored session opens behind the first tab, in
+        // order, and the saved active tab takes over.
+        if !remaining.is_empty() {
+            for state in remaining {
+                let location = state.current().clone();
+                this.open_tab_with(state, location, Placement::Background, window, cx);
+            }
+            this.activate_tab(active_tab, window, cx);
+        }
+        this.settings_notice = (!notices.is_empty()).then(|| notices.join(" \u{b7} "));
         this
+    }
+
+    /// The state that is saved between runs, as of now: the settings (the
+    /// favorites, the shell, and the active tab's presentation as the
+    /// default for new tabs) and the session (every tab).
+    fn persist_snapshot(&self, window: &Window) -> (Settings, Session) {
+        let active = self.tab();
+        let size = window.bounds().size;
+        let settings = Settings {
+            version: SETTINGS_VERSION,
+            favorites: self.favorites.list().to_vec(),
+            preferences: Preferences {
+                view: view_to_pref(active.state.view()),
+                arrangement: arrangement_to_prefs(active.state.arrangement()),
+                sidebar_width: self.sidebar_width.round() as u32,
+                sidebar_collapsed: !self.sidebar_open,
+                details_open: self.inspector_open,
+                window_width: f32::from(size.width).round() as u32,
+                window_height: f32::from(size.height).round() as u32,
+            }
+            .sanitized(),
+        };
+        let session = Session {
+            version: SESSION_VERSION,
+            active: self.tabs.active_index(),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    session_tab(
+                        tab.state.current(),
+                        tab.state.view(),
+                        tab.state.arrangement(),
+                    )
+                })
+                .collect(),
+        };
+        (settings, session)
+    }
+
+    /// Runs on every pump tick: saves the persisted state once it has stood
+    /// still for the debounce. The write runs on the background executor; a
+    /// failure shows one status notice and never blocks.
+    fn persist_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let (settings, session) = self.persist_snapshot(window);
+        let Some(job) = self.persistence.observe(settings, session, Instant::now()) else {
+            return;
+        };
+        let write = cx.background_executor().spawn(async move { job.run() });
+        cx.spawn(async move |this, cx| {
+            let errors = write.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if let Some(notice) = this.persistence.finished(&errors) {
+                    this.settings_notice = Some(notice);
+                    cx.notify();
+                }
+            }) {
+                log::debug!("the explorer closed before its save settled: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Saves what is still pending, on the spot: the window is closing and
+    /// the process ends right after, so there is no later to wait for.
+    pub(crate) fn flush_persistence(&mut self, window: &Window) {
+        let (settings, session) = self.persist_snapshot(window);
+        if let Some(job) = self.persistence.flush(settings, session) {
+            for error in job.run() {
+                log::warn!("settings were not saved on close: {error}");
+            }
+        }
     }
 
     /// Handles the path field of tab `id`: Enter, typing and blur.
@@ -813,6 +956,7 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Scan> {
+        self.settings_notice = None;
         let scan = self.tab_mut().state.begin(transition);
         self.start_scan(scan.clone(), window, cx);
         scan
@@ -1534,7 +1678,7 @@ impl Explorer {
     fn shell_width(&self, window: &Window) -> f32 {
         let narrow = f32::from(window.viewport_size().width) < NARROW_WIDTH;
         let sidebar = if self.sidebar_open && !narrow {
-            SIDEBAR_WIDTH + IslandMetrics::GAP.as_f32()
+            self.sidebar_width + IslandMetrics::GAP.as_f32()
         } else {
             0.0
         };
@@ -1565,9 +1709,22 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let state = self.tab().state.for_new_tab(location.clone());
+        self.open_tab_with(state, location, placement, window, cx);
+    }
+
+    /// [`Self::open_tab`] with the state the tab starts from: a new tab
+    /// inherits the active tab's, a restored one brings its own.
+    fn open_tab_with(
+        &mut self,
+        state: ExplorerState,
+        location: Location,
+        placement: Placement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let state = self.tab().state.for_new_tab(location.clone());
         let mut tab = Tab::new(id, state, window, cx);
         let scan = tab.state.begin(Transition::Visit(location));
         self.tabs.open(tab, placement);
@@ -2306,6 +2463,17 @@ impl Explorer {
                     .text_ellipsis()
                     .text_color(colors.muted)
                     .child(notice.to_owned()),
+            );
+        } else if let Some(notice) = &self.settings_notice {
+            status = status.child(
+                div()
+                    .id("explorer-status-settings")
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(colors.warning)
+                    .child(notice.clone()),
             );
         }
 

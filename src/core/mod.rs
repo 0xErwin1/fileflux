@@ -11,6 +11,7 @@ pub mod kinds;
 pub mod navigation;
 pub mod ops;
 pub mod places;
+pub mod settings;
 pub mod trash;
 pub mod watch;
 

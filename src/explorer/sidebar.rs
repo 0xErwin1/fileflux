@@ -1,9 +1,9 @@
-//! The sidebar island: standard places, the session favorites and the
+//! The sidebar island: standard places, the favorites and the
 //! mounted devices, discovered off the UI thread.
 //!
 //! Rows show the name only and navigate on click; the full path is the
 //! row's tooltip and the active row shows the 2 px tint bar of the
-//! reference design. Favorites are session-only (nothing is written) and
+//! reference design. Favorites are saved in the settings file and
 //! are added and removed for the current directory with the toolbar's star
 //! button; the virtual Trash is never favorited. Devices add a 3 px usage
 //! meter and a "free of" line only when `statvfs` answered; nothing is
@@ -26,7 +26,7 @@ use super::dnd::{self, DropTarget};
 use super::icon;
 use super::state::Transition;
 use super::tabs::Placement;
-use super::view::{Explorer, SIDEBAR_WIDTH};
+use super::view::Explorer;
 
 /// The sidebar island, or nothing while it is toggled closed — at either
 /// window width, since a collapsed sidebar must not resurrect on a resize.
@@ -41,7 +41,7 @@ pub(crate) fn render(
     let colors = bolt::colors(cx);
 
     let mut island = Island::new()
-        .w(px(SIDEBAR_WIDTH))
+        .w(px(this.sidebar_width))
         .h_full()
         .child(places_section(this, cx))
         .child(favorites_section(this, cx))
@@ -70,7 +70,7 @@ pub(crate) fn render(
                 .left(IslandMetrics::GAP)
                 .top(IslandMetrics::GAP)
                 .bottom(px(46.0))
-                .w(px(SIDEBAR_WIDTH))
+                .w(px(this.sidebar_width))
                 .overflow_y_scroll()
                 .child(island),
         );
@@ -80,7 +80,7 @@ pub(crate) fn render(
         div()
             .id("explorer-sidebar-slot")
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(this.sidebar_width))
             .h_full()
             .overflow_y_scroll()
             .child(island),
@@ -154,7 +154,7 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     ))
 }
 
-/// The Favorites section: session-only rows, with an empty hint.
+/// The Favorites section: saved rows, with an empty hint.
 fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let mut section = div().flex_none().flex().flex_col();
     section = section.child(section_label("favorites-label", "Favorites", cx));

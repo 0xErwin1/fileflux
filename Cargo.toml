@@ -37,6 +37,11 @@ rustix = { version = "1.1.6", features = ["event", "fs"] }
 # a frame; no codec is needed, so no feature is enabled. The version is the
 # one GPUI already links, so both share one `image::Frame` type.
 image = { version = "=0.25.10", default-features = false }
+# Settings persistence: the TOML files under the XDG config and state
+# directories. Both versions are already in the lock through the GPUI stack;
+# only the features the files need are enabled.
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+toml = { version = "=1.2.1", default-features = false, features = ["std", "serde", "parse", "display"] }
 
 [lints.rust]
 unsafe_code = "deny"

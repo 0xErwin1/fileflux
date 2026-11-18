@@ -165,7 +165,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     cx.notify();
                 })),
         )
-        // The session favorites toggle for the current directory.
+        // The favorites toggle for the current directory.
         .child(
             Button::new("explorer-favorite", "Favorite")
                 .ghost()
@@ -177,7 +177,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         gpui_kit_assets::IconName::Star
                     },
                 ))
-                .tooltip("Add or remove the current folder as a session-only favorite")
+                .tooltip("Add or remove the current folder as a favorite")
                 .disabled(this.tab().state.current() == &Location::Trash)
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_favorite(cx);

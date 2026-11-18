@@ -67,14 +67,14 @@ The script only writes to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mi
 | Details panel | A 300 px read-only panel on the right of the document island, toggled by the toolbar panel button or Ctrl+I (open by default; hidden automatically when the window is too narrow to leave the entries 520 px after the island's own padding). Nothing selected: the folder glyph, name, item total ("N of M" while a filter is active) and full location. One entry: a preview (image files draw the image, contain-fit; others the folder/file glyph), name, kind ("Image · JPG"), size, local modified time, permissions (`rw-r--r--`, read off the UI thread with one `stat`, at most one probe at a time and debounced; `unavailable` in muted text when it fails), the item count for folders and path (Trash entries show their original location). Several: the count and the total size of the selected files. The panel is read-only; the actions live in the context menu and the keyboard. |
 | Status bar | Left: "N items" or "N selected · <total size of the selected files>", plus loading, error and status notices (long names and paths end in an ellipsis instead of running under the right-hand side), the rename editor's refusal reason, and a compact indicator ("Moving 20000 items to Trash · 9655 of 20000 items") while an operation that takes more than ~400 ms runs. Right: the free space of the volume that holds the current folder (longest mount-path prefix) with a small success-colored square. Shortcuts live in the toolbar tooltips. |
 | Live refresh | The folder of every tab, active or in the background, is watched (inotify, one shared watcher thread, one watch per distinct folder however many tabs show it); creates, deletes, moves and edits made elsewhere show up within about a second, keeping the selection of entries that still exist, the filter and the scroll position. A tab that is still opening a folder already watches it, so a change during the scan is read right after it commits. If a tab's folder is deleted, that tab falls back to the nearest existing parent with a notice, even in the background. The Trash is not watched; it is re-read when its tab is shown. |
-| Favorites | Session-only: the toolbar star adds/removes the current directory. Nothing is written to configuration; the Trash cannot be favorited. |
+| Favorites | The toolbar star adds/removes the current directory; favorites are saved in the settings file (see [Settings](#settings)). The Trash cannot be favorited. |
 | Loading | Directory scans, Trash reads and places discovery run off the UI thread with a generation guard: stale completions (including a newer failed request's) never overwrite newer results. |
 
 Non-UTF8 file names keep their exact raw bytes for navigation; lossy text appears only in display strings.
 
 ## Sort and filter
 
-Both live in the tab (a new tab inherits them; nothing is written to disk) and apply to the grid and the list alike. Selection, arrow keys, Shift ranges, Ctrl+A, Enter, the image viewer's list, paste targets and the details panel all follow the filtered and sorted result. They are controlled from the subbar's **Sort** and **Filter** buttons, from the same two pages in the empty-space context menu, and from the list header (a click sets or flips the sort).
+Both live in the tab (a new tab inherits them; the active tab's are saved as the default for the next launch, see [Settings](#settings)) and apply to the grid and the list alike. Selection, arrow keys, Shift ranges, Ctrl+A, Enter, the image viewer's list, paste targets and the details panel all follow the filtered and sorted result. They are controlled from the subbar's **Sort** and **Filter** buttons, from the same two pages in the empty-space context menu, and from the list header (a click sets or flips the sort).
 
 | Control | Behaviour |
 | --- | --- |
@@ -89,7 +89,7 @@ Both live in the tab (a new tab inherits them; nothing is written to disk) and a
 
 ## Tabs
 
-Several folders open at once in one window. The tab strip sits at the top of the document island, above the toolbar, and appears only while two or more tabs are open: square Bolt tabs 30 px tall, the active one on the raised fill with strong text and a 2 px tint bar along its bottom edge. A tab shows the folder name (`Home` for the home directory, `Trash` for the Trash view) and carries the full path as its tooltip; the close button shows on the active tab and on hover. Tabs are session-only (nothing is written), and the command-line path opens as the first tab. The window title follows the active tab.
+Several folders open at once in one window. The tab strip sits at the top of the document island, above the toolbar, and appears only while two or more tabs are open: square Bolt tabs 30 px tall, the active one on the raised fill with strong text and a 2 px tint bar along its bottom edge. A tab shows the folder name (`Home` for the home directory, `Trash` for the Trash view) and carries the full path as its tooltip; the close button shows on the active tab and on hover. The open tabs are restored at the next launch (see [Settings](#settings)); a command-line path opens just that folder instead. The window title follows the active tab.
 
 | Action | How |
 |---|---|
@@ -125,6 +125,23 @@ Everything that changes the disk runs off the UI thread, reports its result (toa
 | Progress | An operation running longer than ~400 ms shows a non-modal card bottom-right (title, bar, "N of M items", current item, **Cancel**; several stack) and a status-bar indicator, and ends in a summary toast ("Cancelled: moved 12441 items to Trash" keeps its Undo). Cancelling stops before the next item; what was done stays done. The card (`explorer/progress.rs`) shows bytes, speed and ETA for copy and move. |
 
 Safety defaults: Del never deletes — it moves to the Trash; permanent deletion only comes from Shift+Del, the Trash view or an unavailable Trash, always behind a confirmation that a background result cannot replace and Enter alone cannot accept; renames, creations and pastes never replace an existing entry without an explicit Replace; undo never touches an item that is not the one the operation acted on; a navigation always wins over the refresh of a finished operation; operations act only on the entries visible under the current filter; Trash write support covers the home Trash and `$topdir/.Trash-$uid` (not the shared `$topdir/.Trash`).
+
+## Settings
+
+Fileflux remembers its preferences, favorites and open tabs in two small TOML files. Changes are saved on their own (about half a second after the last change, off the UI thread, and once more when the window closes); there is no settings screen.
+
+| File | Location | Holds |
+|---|---|---|
+| `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | The favorites, and the preferences: default view (grid or list), default sort and filters (hide hidden files, folders first, natural order, categories, date and size), sidebar width and whether it starts collapsed, whether the details panel is open, and the window size. |
+| `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder or Trash, view, sort and filters of each) and which one is active. |
+
+- **The default view, sort and filters are the active tab's.** A new tab already starts from the tab it was opened from, so whatever the active tab shows is saved as the default for the next launch. (Per-folder memory is not implemented.)
+- **Restoring.** Starting `fileflux` without a path reopens the saved tabs. A tab whose folder no longer exists opens its nearest existing parent (home if none), with a status-bar notice.
+- **A path on the command line wins.** `fileflux ~/x` opens only that folder and neither reads nor overwrites the saved session, so a quick launch never replaces the tabs of your last regular run. Preferences and favorites are still loaded and saved.
+- **Safe to break.** Every file carries a `version`. Unknown keys are ignored and missing keys take their defaults. A file that cannot be parsed loads the defaults, shows a status-bar notice and is first copied beside it as `settings.toml.bad-<UTC timestamp>` (the same for `session.toml`). A file written by a *newer* Fileflux loads the defaults with a notice and is never overwritten. A failed save shows one notice and never blocks the app; the next change retries. Keys you add by hand that Fileflux does not know are dropped the next time it writes the file.
+- **Atomic writes.** Each file is written to `<name>.tmp` in the same directory, synced and renamed over the old one, so a crash never leaves half a file. Files are created with mode `0600` because they list your folders.
+- **Paths are lossless.** A UTF-8 path is a plain string; any other path is stored as `{ bytes = [...] }`, so folders with non-UTF-8 names round-trip.
+- **Resetting.** Delete the file (or both): the next launch starts from the defaults.
 
 ## Checks
 

@@ -11,13 +11,10 @@ use fileflux::cli::Target;
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use gpui_component::Root;
 
+use crate::explorer::persist::Startup;
 use crate::explorer::{Explorer, bind_keys};
 use crate::theme;
 use crate::viewer;
-
-/// The explorer's typical viewport (design brief: 1440×900), room for the
-/// 290 px sidebar plus a comfortable content island.
-const MAIN_WINDOW_SIZE: (f32, f32) = (1440.0, 900.0);
 
 /// Initializes logging, installs the Bolt theme and opens the explorer
 /// window at the resolved directory (home when none) or the image viewer,
@@ -77,11 +74,15 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
     theme::install(theme::STARTUP_PALETTE, cx);
     bind_keys(cx);
 
-    let bounds = Bounds::centered(
-        None,
-        size(px(MAIN_WINDOW_SIZE.0), px(MAIN_WINDOW_SIZE.1)),
-        cx,
+    // The settings and session files are small: read them here, before the
+    // window opens, so its size and the first tabs are the saved ones. A
+    // path on the command line wins over the saved session.
+    let startup = Startup::load(start.as_deref());
+    let window_size = (
+        startup.preferences.window_width as f32,
+        startup.preferences.window_height as f32,
     );
+    let bounds = Bounds::centered(None, size(px(window_size.0), px(window_size.1)), cx);
     let options = WindowOptions {
         app_id: Some("fileflux".into()),
         titlebar: Some(TitlebarOptions {
@@ -93,9 +94,15 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
     };
 
     cx.open_window(options, |window, cx| {
-        let explorer = cx.new(|cx| Explorer::new(start, window, cx));
+        let explorer = cx.new(|cx| Explorer::new(start, startup, window, cx));
         explorer.update(cx, |explorer, cx| {
             explorer.initial_focus().focus(window, cx);
+        });
+        // Closing the window saves what the debounce has not yet written.
+        let closing = explorer.clone();
+        window.on_window_should_close(cx, move |window, cx| {
+            closing.update(cx, |explorer, _cx| explorer.flush_persistence(window));
+            true
         });
         cx.new(|cx| Root::new(explorer, window, cx))
     })?;

@@ -1,4 +1,4 @@
-//! Pure explorer state: navigation, filtering, selection, session favorites
+//! Pure explorer state: navigation, filtering, selection, the favorites list
 //! and the asynchronous scan guard, testable without GPUI or the filesystem.
 //!
 //! The UI drives it in three steps: [`ExplorerState::begin`] turns a
@@ -93,12 +93,24 @@ pub(crate) fn retain_existing(
         .collect()
 }
 
-/// The session favorites, shared by every tab of the window: in the order
-/// they were added, never persisted, unique, never the virtual Trash.
+/// The favorites, shared by every tab of the window: in the order they were
+/// added, unique, never the virtual Trash. They are saved in the settings
+/// file by [`super::persist`]; this type only holds them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Favorites(Vec<PathBuf>);
 
 impl Favorites {
+    /// The saved favorites, in their order, without repeats.
+    pub(crate) fn from_paths(paths: Vec<PathBuf>) -> Self {
+        let mut unique: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+        Self(unique)
+    }
+
     /// The favorites, in the order they were added.
     pub(crate) fn list(&self) -> &[PathBuf] {
         &self.0
@@ -113,8 +125,7 @@ impl Favorites {
     }
 
     /// Adds the directory `location` or removes it again. The virtual Trash
-    /// is never favorited. Favorites live in memory only: nothing is
-    /// written anywhere.
+    /// is never favorited.
     pub(crate) fn toggle(&mut self, location: &Location) {
         let Location::Directory(path) = location else {
             return;
@@ -194,6 +205,14 @@ impl ExplorerState {
             path_error: None,
             notice: None,
         }
+    }
+
+    /// The state with this presentation (view, sort and filters), as saved
+    /// preferences or a restored tab ask for.
+    pub(crate) fn with_presentation(mut self, view: View, arrangement: Arrangement) -> Self {
+        self.view = view;
+        self.arrangement = arrangement;
+        self
     }
 
     /// The committed current location.
@@ -1445,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn favorites_are_session_only_unique_and_never_the_trash() {
+    fn favorites_are_unique_and_never_the_trash() {
         let mut favorites = Favorites::default();
         assert!(favorites.list().is_empty());
         assert!(!favorites.contains(&dir("/fixture/a")));
