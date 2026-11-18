@@ -40,7 +40,7 @@ pub(crate) const ENTRIES_CONTEXT: &str = "FilefluxEntries";
 actions!(
     fileflux_explorer,
     [
-        /// Focuses the path field and selects its content.
+        /// Switches the breadcrumbs to the editable path field.
         FocusPath,
         /// Focuses the filename search field and selects its content.
         FocusSearch,
@@ -145,6 +145,8 @@ pub(crate) struct Explorer {
     pub(crate) path_seed: String,
     /// Whether the path field holds an edit that has not been submitted.
     pub(crate) path_edited: bool,
+    /// Whether the editable path field replaces the breadcrumbs.
+    pub(crate) path_editing: bool,
     /// The path field's edit revision: bumped by every user edit, never by
     /// programmatic reseeds (they emit no Change event).
     path_edit_revision: u64,
@@ -247,6 +249,7 @@ impl Explorer {
             path_input,
             path_seed: String::new(),
             path_edited: false,
+            path_editing: false,
             path_edit_revision: 0,
             submitted_edit: None,
             search_input,
@@ -282,8 +285,10 @@ impl Explorer {
                 InputEvent::Blur => {
                     if this.path_edited {
                         this.seed_path_input(window, cx, false);
-                        cx.notify();
                     }
+                    // Leaving the field returns to the breadcrumbs.
+                    this.path_editing = false;
+                    cx.notify();
                 }
                 InputEvent::Focus => {}
             },
@@ -434,6 +439,10 @@ impl Explorer {
                     .take()
                     .is_some_and(|edit| edit.settles(scan.generation, revision));
                 self.seed_path_input(window, cx, settled);
+                if settled {
+                    self.path_editing = false;
+                    self.entries_focus.focus(window, cx);
+                }
                 self.sync_search_input(window, cx);
                 cx.notify();
             }
@@ -520,13 +529,18 @@ impl Explorer {
     }
 
     /// Focuses the path field and selects its content.
-    fn focus_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Switches the breadcrumbs to the editable path field (Ctrl+L, or a
+    /// click on the bar's empty space) and focuses it once it is drawn.
+    pub(crate) fn focus_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.path_edited = false;
-        self.path_input.update(cx, |input, cx| {
-            input.focus(window, cx);
-            input.select_all(window, cx);
-        });
+        self.path_editing = true;
         cx.notify();
+        cx.defer_in(window, |this, window, cx| {
+            this.path_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.select_all(window, cx);
+            });
+        });
     }
 
     /// Focuses the search field and selects its content.
@@ -545,6 +559,7 @@ impl Explorer {
     /// committed location, listing or navigation history.
     pub(crate) fn restore_path_on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.path_edited = false;
+        self.path_editing = false;
         self.path_seed = self.committed_path_text();
         let seed = self.path_seed.clone();
         self.path_input.update(cx, |input, cx| {
@@ -588,6 +603,8 @@ impl Explorer {
             // Unedited: the submit retains the actual current path.
             let current = self.state.current().clone();
             self.state.clear_path_error();
+            self.path_editing = false;
+            self.entries_focus.focus(window, cx);
             self.navigate(Transition::Visit(current), window, cx);
             return;
         }
@@ -897,7 +914,7 @@ impl Explorer {
         }
     }
 
-    /// The document island: toolbar, scope line, entries, all cut 14 px at
+    /// The document island: toolbar, scope line, folder subbar, entries, all cut 14 px at
     /// the opposing corners by [`Island`].
     fn render_document_island(&mut self, cx: &mut Context<Self>) -> Island {
         Island::new()
@@ -905,6 +922,7 @@ impl Explorer {
             .min_w_0()
             .h_full()
             .child(toolbar::render(self, cx))
+            .child(self.render_subbar(cx))
             .children(self.render_scope_line(cx))
             .child(entries::render(self, cx))
     }
@@ -937,23 +955,83 @@ impl Explorer {
         )
     }
 
-    /// The 38 px status bar: counts, the live status (loading, errors,
-    /// notice, selection), warnings and the key hints.
+    /// The folder subbar under the toolbar: the current folder's title and
+    /// its mono "4 folders · 7 files" meta.
+    fn render_subbar(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let colors = bolt::colors(cx);
+        let meta = if self.state.is_loading() {
+            String::new()
+        } else {
+            util::folder_counts_label(&self.state.listing().entries)
+        };
+        div()
+            .id("explorer-subbar")
+            .flex_none()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(20.0))
+            .child(
+                div()
+                    .id("explorer-subbar-title")
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(16.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(colors.strong)
+                    .child(self.current_label()),
+            )
+            .child(
+                div()
+                    .id("explorer-subbar-meta")
+                    .flex_none()
+                    .font_family(bolt::fonts::editor_family(cx))
+                    .text_size(px(12.0))
+                    .text_color(colors.muted)
+                    .child(meta),
+            )
+    }
+
+    /// The volume usage line of the volume holding the current folder
+    /// (longest mount-path prefix); nothing when it is unknown.
+    fn free_space_label(&self) -> Option<String> {
+        let places = self.places.as_ref()?;
+        let path = match self.state.current() {
+            Location::Directory(path) => path.as_path(),
+            Location::Trash => places.trash_root.as_path(),
+        };
+        let usage = places.volume_containing(path)?.usage?;
+        Some(usage.label())
+    }
+
+    /// The 38 px status bar: the live status (loading, errors, notice) or
+    /// "N items" / "N selected · size" on the left, warnings and the free
+    /// space of the current volume on the right. Shortcuts live in the
+    /// toolbar tooltips.
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = bolt::colors(cx);
         let entries_count = self.state.listing().entries.len();
-        let visible = if self.state.query().is_empty() {
-            None
-        } else {
-            Some(self.state.visible_indices().len())
-        };
-
-        let count_text = match (entries_count, visible) {
-            (_, Some(shown)) => format!("{shown} of {entries_count} shown"),
-            (0, None) => "0 items".to_owned(),
-            (1, None) => "1 item".to_owned(),
-            (count, None) => format!("{count} items"),
-        };
+        let shown = (!self.state.query().is_empty()).then(|| self.state.visible_indices().len());
+        let selection = self.state.selection();
+        let mut count_text = util::status_label(
+            entries_count,
+            shown,
+            selection.len(),
+            self.state.selected_size(),
+        );
+        // A single selected Trash entry keeps its recorded origin.
+        if let Some(path) = selection.iter().next().filter(|_| selection.len() == 1)
+            && let Some(origin) = self
+                .state
+                .listing()
+                .entries
+                .iter()
+                .find(|entry| entry.path == *path)
+                .and_then(|entry| entry.origin.as_ref())
+        {
+            count_text.push_str(&format!(" \u{b7} from {}", origin.to_string_lossy()));
+        }
 
         let mut status = div().flex().items_center().gap(Spacing::SM).min_w_0();
         if self.state.is_loading() {
@@ -992,23 +1070,10 @@ impl Explorer {
                     .text_color(colors.muted)
                     .child(notice.to_owned()),
             );
-        } else if let Some(path) = self.state.selection().iter().next() {
-            let mut text = selection_text(self, path);
-            let more = self.state.selection().len().saturating_sub(1);
-            if more > 0 {
-                text.push_str(&format!(" (+{more} more)"));
-            }
-            status = status.child(
-                div()
-                    .id("explorer-status-selected")
-                    .min_w_0()
-                    .truncate()
-                    .text_color(colors.foreground)
-                    .child(text),
-            );
         }
 
         let warnings = self.state.warnings().len();
+        let selection_active = !selection.is_empty();
         div()
             .id("explorer-status")
             .flex_none()
@@ -1019,7 +1084,17 @@ impl Explorer {
             .px(Spacing::LG)
             .text_size(px(12.0))
             .text_color(colors.muted)
-            .child(count_text)
+            .child(
+                div()
+                    .id("explorer-status-count")
+                    .flex_none()
+                    .text_color(if selection_active {
+                        colors.foreground
+                    } else {
+                        colors.muted
+                    })
+                    .child(count_text),
+            )
             .child(status)
             .child(
                 div()
@@ -1033,27 +1108,17 @@ impl Explorer {
                             .text_color(colors.warning)
                             .child(format!("! {warnings} warning(s) reading this folder"))
                     }))
-                    .child("Ctrl+L path · Ctrl+F find · Alt+←/→/↑ history · Ctrl+R reload"),
+                    .children(self.free_space_label().map(|label| {
+                        div()
+                            .id("explorer-status-free")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().size(px(6.0)).bg(colors.success))
+                            .child(label)
+                    })),
             )
     }
-}
-
-/// The status text of the single selected entry: its (lossy) path plus, for
-/// trash entries, the recorded original location. Display-only; navigation
-/// always uses the raw paths the state keeps.
-fn selection_text(explorer: &Explorer, path: &Path) -> String {
-    let mut text = format!("Selected: {}", path.to_string_lossy());
-    if let Some(origin) = explorer
-        .state
-        .listing()
-        .entries
-        .iter()
-        .find(|entry| entry.path == path)
-        .and_then(|entry| entry.origin.as_ref())
-    {
-        text.push_str(&format!(" (from {})", origin.to_string_lossy()));
-    }
-    text
 }
 
 /// The user-facing message for a rejected path argument.

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use bolt::composites::ListRow;
 use bolt::primitives::{Icon, WhenFocusVisible};
 use bolt::tokens::{Borders, ChromeColors, Spacing};
+use fileflux::core::places::format_bytes;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
@@ -70,10 +71,8 @@ const TILE_GAP: f32 = 6.0;
 const SELECTION_BORDER_ALPHA: f32 = 0.35;
 /// Horizontal padding of the entries area.
 const ENTRIES_PADDING: f32 = 16.0;
-/// Grid top padding so the first row never touches the toolbar border. The
-/// artboard uses 4 px under a folder subbar; until that subbar exists the
-/// grid carries 12 px itself.
-const GRID_TOP_PADDING: f32 = 12.0;
+/// Grid top padding under the folder subbar (artboard 4 px).
+const GRID_TOP_PADDING: f32 = 4.0;
 
 /// The photo thumbnail box (artboard `.photo`): 62×46 with a 1 px border.
 const PHOTO_WIDTH: f32 = 62.0;
@@ -101,23 +100,6 @@ pub(crate) fn has_thumbnail(name: &OsStr) -> bool {
         extension.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
     )
-}
-
-/// The tile subline for a file: B/KB/MB/GB as in the artboard's `fmtSize`
-/// (decimal units; KB whole, MB one decimal, GB two). `None` yields no
-/// subline.
-pub(crate) fn tile_size_label(size: Option<u64>) -> Option<String> {
-    let bytes = size?;
-    let value = bytes as f64;
-    Some(if bytes < 1_000 {
-        format!("{bytes} B")
-    } else if bytes < 1_000_000 {
-        format!("{:.0} KB", value / 1e3)
-    } else if bytes < 1_000_000_000 {
-        format!("{:.1} MB", value / 1e6)
-    } else {
-        format!("{:.2} GB", value / 1e9)
-    })
 }
 
 /// Chooses the bundled Lucide glyph for a non-directory entry from the
@@ -455,7 +437,7 @@ fn render_grid_row(
         let subline = if is_folder {
             None
         } else {
-            tile_size_label(tile.size)
+            tile.size.map(format_bytes)
         };
 
         let mut tile_element = ListRow::new(ElementId::Name(
@@ -533,15 +515,15 @@ fn render_grid_row(
     row_element.into_any_element()
 }
 
-/// The click handler of one entry: single click selects (Ctrl toggles),
-/// double click opens. The selection uses raw paths; a click also focuses
+/// The click handler of one entry: single click selects (Ctrl toggles,
+/// Shift extends a range in displayed order), double click opens. The selection uses raw paths; a click also focuses
 /// the entries area, so the keyboard follows the pointer. Both the tiles
 /// and the details grid's cells route through here.
 pub(crate) fn handle_entry_click(
     weak: &WeakEntity<Explorer>,
     path: PathBuf,
     click_count: usize,
-    control: bool,
+    modifiers: Modifiers,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -549,7 +531,11 @@ pub(crate) fn handle_entry_click(
         this.entries_focus.focus(window, cx);
         if click_count >= 2 {
             this.open_path(&path, window, cx);
-        } else if control {
+        } else if modifiers.shift {
+            this.state.clear_notice();
+            this.state.select_range_to(&path);
+            cx.notify();
+        } else if modifiers.control {
             this.state.clear_notice();
             this.state.toggle(&path);
             cx.notify();
@@ -576,14 +562,7 @@ fn entry_click(
             ClickEvent::Mouse(mouse) => mouse.down.modifiers,
             _ => Modifiers::default(),
         };
-        handle_entry_click(
-            &weak,
-            path.clone(),
-            click_count,
-            modifiers.control,
-            window,
-            cx,
-        );
+        handle_entry_click(&weak, path.clone(), click_count, modifiers, window, cx);
     }
 }
 
@@ -703,20 +682,5 @@ mod tests {
         for name in ["a.heic", "a.svg", "a.txt", "png", ".png", "a.png.bak", "a"] {
             assert!(!eligible(name), "{name}");
         }
-    }
-
-    /// The subline follows the artboard's `fmtSize`; no size, no subline.
-    #[test]
-    fn tile_size_label_follows_the_artboard_format() {
-        assert_eq!(tile_size_label(None), None);
-        assert_eq!(tile_size_label(Some(0)).as_deref(), Some("0 B"));
-        assert_eq!(tile_size_label(Some(999)).as_deref(), Some("999 B"));
-        assert_eq!(tile_size_label(Some(1_000)).as_deref(), Some("1 KB"));
-        assert_eq!(tile_size_label(Some(48_200)).as_deref(), Some("48 KB"));
-        assert_eq!(tile_size_label(Some(2_400_000)).as_deref(), Some("2.4 MB"));
-        assert_eq!(
-            tile_size_label(Some(1_234_000_000)).as_deref(),
-            Some("1.23 GB")
-        );
     }
 }

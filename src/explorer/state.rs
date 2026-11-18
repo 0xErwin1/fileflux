@@ -10,6 +10,7 @@
 //! query: every scan carries the generation it was started under, and only a
 //! completion matching the newest generation is accepted.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,128 @@ pub(crate) enum View {
     Grid,
     /// Details list: Name, Type, Size, Modified.
     List,
+}
+
+/// What the list is sorted by.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SortKey {
+    Name,
+    Size,
+    Modified,
+}
+
+impl SortKey {
+    /// The sort key of column `column`, or `None` past the columns.
+    pub(crate) fn of_column(column: usize) -> Option<Self> {
+        match column {
+            0 => Some(Self::Name),
+            1 => Some(Self::Size),
+            2 => Some(Self::Modified),
+            _ => None,
+        }
+    }
+}
+
+/// The direction of the sort.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SortDir {
+    Ascending,
+    Descending,
+}
+
+impl SortDir {
+    /// The arrow drawn beside the sorted header.
+    pub(crate) fn arrow(self) -> &'static str {
+        match self {
+            Self::Ascending => "\u{2191}",
+            Self::Descending => "\u{2193}",
+        }
+    }
+
+    fn flipped(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
+/// The list's sort: a key and a direction. Starts at name ascending, the
+/// order the scan already delivers.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct SortSpec {
+    pub(crate) key: SortKey,
+    pub(crate) dir: SortDir,
+}
+
+impl Default for SortSpec {
+    fn default() -> Self {
+        Self {
+            key: SortKey::Name,
+            dir: SortDir::Ascending,
+        }
+    }
+}
+
+impl SortSpec {
+    /// The sort after a click on `key`'s header: the active key flips its
+    /// direction, any other key starts ascending.
+    pub(crate) fn clicked(self, key: SortKey) -> Self {
+        if self.key == key {
+            Self {
+                key,
+                dir: self.dir.flipped(),
+            }
+        } else {
+            Self {
+                key,
+                dir: SortDir::Ascending,
+            }
+        }
+    }
+}
+
+/// Orders two entries under `spec`. Folders always come first, whatever the
+/// key or direction; within a group the key decides (a missing size or time
+/// sorts lowest) and the direction reverses only that; ties fall back to
+/// the case-insensitive name and then the raw path, ascending, so the order
+/// is total and stable.
+pub(crate) fn compare_entries(a: &Entry, b: &Entry, spec: SortSpec) -> Ordering {
+    let by_key = match spec.key {
+        SortKey::Name => Ordering::Equal,
+        SortKey::Size => a.size.cmp(&b.size),
+        SortKey::Modified => a.modified.cmp(&b.modified),
+    };
+    let by_key = match spec.dir {
+        SortDir::Ascending => by_key,
+        SortDir::Descending => by_key.reverse(),
+    };
+    let by_name = a
+        .name
+        .to_string_lossy()
+        .to_lowercase()
+        .cmp(&b.name.to_string_lossy().to_lowercase());
+    // Name is its own key, so the direction applies to the name comparison.
+    let by_name = if spec.key == SortKey::Name && spec.dir == SortDir::Descending {
+        by_name.reverse()
+    } else {
+        by_name
+    };
+    b.is_directory()
+        .cmp(&a.is_directory())
+        .then(by_key)
+        .then(by_name)
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+/// The `visible` snapshot indices reordered under `spec`.
+pub(crate) fn sorted_indices(entries: &[Entry], visible: &[usize], spec: SortSpec) -> Vec<usize> {
+    let mut order = visible.to_vec();
+    order.sort_by(|&a, &b| match (entries.get(a), entries.get(b)) {
+        (Some(a), Some(b)) => compare_entries(a, b, spec),
+        (a, b) => a.is_some().cmp(&b.is_some()).reverse(),
+    });
+    order
 }
 
 /// A navigation transition the user asked for, resolved against the
@@ -83,6 +206,11 @@ pub(crate) struct ExplorerState {
     listing: Listing,
     /// Grid or list presentation.
     view: View,
+    /// The list's sort: the single source of truth for the displayed order
+    /// the keyboard, range selection and the table all follow.
+    sort: SortSpec,
+    /// The entry a Shift-range selection extends from.
+    anchor: Option<PathBuf>,
     /// The current-folder filename filter, as typed (case-insensitive
     /// matching happens at query time).
     query: String,
@@ -113,6 +241,8 @@ impl ExplorerState {
             nav: Navigation::new(initial),
             listing: Listing::default(),
             view: View::Grid,
+            sort: SortSpec::default(),
+            anchor: None,
             query: String::new(),
             selected: BTreeSet::new(),
             favorites: Vec::new(),
@@ -295,14 +425,20 @@ impl ExplorerState {
         self.query.clear();
     }
 
-    /// Indices into [`Self::listing`] that pass the current query, in
-    /// listing order.
+    /// Indices into [`Self::listing`] that pass the current query, in the
+    /// **displayed** order: the list follows its sort, the grid keeps the
+    /// scan's name order, folders first. Keyboard navigation, range
+    /// selection and the table all read this one order.
     pub(crate) fn visible_indices(&self) -> Vec<usize> {
-        filtered_indices(&self.listing.entries, &self.query)
+        let visible = filtered_indices(&self.listing.entries, &self.query);
+        match self.view {
+            View::List => sorted_indices(&self.listing.entries, &visible, self.sort),
+            View::Grid => visible,
+        }
     }
 
-    /// The visible entries in listing order; used by the UI per frame and by
-    /// tests through the public API.
+    /// The visible entries in displayed order; used by the UI per frame and
+    /// by tests through the public API.
     pub(crate) fn visible_entries(&self) -> Vec<&Entry> {
         self.visible_indices()
             .into_iter()
@@ -332,6 +468,7 @@ impl ExplorerState {
     pub(crate) fn select_only(&mut self, path: &Path) {
         self.selected.clear();
         self.selected.insert(path.to_path_buf());
+        self.anchor = Some(path.to_path_buf());
     }
 
     /// Adds or removes the entry at this path (Ctrl+click).
@@ -339,6 +476,43 @@ impl ExplorerState {
         if !self.selected.remove(path) {
             self.selected.insert(path.to_path_buf());
         }
+        self.anchor = Some(path.to_path_buf());
+    }
+
+    /// Shift+click: selects the visible entries between the anchor and
+    /// `path`, in displayed order, replacing the selection. Without a
+    /// visible anchor it selects `path` alone.
+    pub(crate) fn select_range_to(&mut self, path: &Path) {
+        let Some(to) = self.visible_position_of(path) else {
+            return;
+        };
+        let from = self
+            .anchor
+            .as_deref()
+            .and_then(|anchor| self.visible_position_of(anchor));
+        let Some(from) = from else {
+            self.select_only(path);
+            return;
+        };
+        let (start, end) = (from.min(to), from.max(to));
+        let range: BTreeSet<PathBuf> = self
+            .visible_entries()
+            .iter()
+            .skip(start)
+            .take(end - start + 1)
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.selected = range;
+    }
+
+    /// The combined size of the selected files; folders carry no size.
+    pub(crate) fn selected_size(&self) -> u64 {
+        self.listing
+            .entries
+            .iter()
+            .filter(|entry| self.selected.contains(&entry.path))
+            .filter_map(|entry| entry.size)
+            .sum()
     }
 
     /// Selects the visible entry at `position` (keyboard navigation); the
@@ -387,6 +561,17 @@ impl ExplorerState {
     /// Switches the presentation; selection, folder and query are kept.
     pub(crate) fn set_view(&mut self, view: View) {
         self.view = view;
+    }
+
+    /// The list's sort.
+    pub(crate) fn sort(&self) -> SortSpec {
+        self.sort
+    }
+
+    /// Applies a header click: sets or flips the sort. The selection and
+    /// anchor are paths, so they survive the reorder.
+    pub(crate) fn click_sort(&mut self, key: SortKey) {
+        self.sort = self.sort.clicked(key);
     }
 
     // --- favorites (session only) -------------------------------------------
@@ -513,6 +698,109 @@ mod tests {
         state
             .begin(Transition::Visit(dir(to)))
             .ok_or_else(|| "visit must produce a scan".into())
+    }
+
+    /// Entries with distinct sizes: displayed under size-descending the
+    /// order is the reverse of the scan's name order, so any navigation that
+    /// still follows listing order is observably wrong.
+    fn sized_state() -> Result<ExplorerState, Box<dyn std::error::Error>> {
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("begin must return a scan")?;
+        let mut files = Vec::new();
+        for (name, size) in [("a", 10), ("b", 20), ("c", 30), ("d", 40)] {
+            let mut file = entry(name, EntryKind::File);
+            file.size = Some(size);
+            files.push(file);
+        }
+        assert!(state.commit(
+            scan,
+            Listing {
+                entries: files,
+                warnings: Vec::new()
+            }
+        ));
+        state.set_view(View::List);
+        Ok(state)
+    }
+
+    fn displayed(state: &ExplorerState) -> Vec<String> {
+        state
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.display_name().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn sort_order_drives_keyboard_navigation_and_range_selection() -> TestResult {
+        let mut state = sized_state()?;
+        state.click_sort(SortKey::Size);
+        state.click_sort(SortKey::Size);
+        assert_eq!(state.sort().dir, SortDir::Descending);
+        assert_eq!(displayed(&state), ["d", "c", "b", "a"]);
+
+        // Home/Down/End select by displayed position.
+        state.select_visible(0);
+        assert_eq!(
+            state.selection().iter().next(),
+            Some(&PathBuf::from("/fixture/d")),
+            "the first displayed row is the largest file"
+        );
+        let next = state
+            .visible_position_of(Path::new("/fixture/d"))
+            .map(|position| position + 1)
+            .ok_or("d is visible")?;
+        state.select_visible(next);
+        assert_eq!(
+            state.selection().iter().next(),
+            Some(&PathBuf::from("/fixture/c")),
+            "Down from the first displayed row lands on the second"
+        );
+        state.select_visible(state.visible_indices().len() - 1);
+        assert_eq!(
+            state.selection().iter().next(),
+            Some(&PathBuf::from("/fixture/a")),
+            "End is the last displayed row"
+        );
+
+        // Shift-range from the second displayed row to the fourth.
+        state.select_only(Path::new("/fixture/c"));
+        state.select_range_to(Path::new("/fixture/a"));
+        let range: Vec<_> = state.selection().iter().cloned().collect();
+        assert_eq!(
+            range,
+            [
+                PathBuf::from("/fixture/a"),
+                PathBuf::from("/fixture/b"),
+                PathBuf::from("/fixture/c"),
+            ],
+            "c..a in displayed order covers c, b, a"
+        );
+        state.select_only(Path::new("/fixture/d"));
+        state.select_range_to(Path::new("/fixture/b"));
+        assert_eq!(
+            state.selection().len(),
+            3,
+            "d..b in displayed order is d, c, b"
+        );
+        assert!(!state.selection().contains(Path::new("/fixture/a")));
+        Ok(())
+    }
+
+    #[test]
+    fn the_grid_keeps_the_scan_order_whatever_the_list_sort() -> TestResult {
+        let mut state = sized_state()?;
+        state.click_sort(SortKey::Size);
+        state.click_sort(SortKey::Size);
+        state.set_view(View::Grid);
+        assert_eq!(displayed(&state), ["a", "b", "c", "d"]);
+        assert_eq!(state.selected_size(), 0);
+        state.select_only(Path::new("/fixture/b"));
+        state.toggle(Path::new("/fixture/c"));
+        assert_eq!(state.selected_size(), 50, "sizes of the selected files");
+        Ok(())
     }
 
     #[test]

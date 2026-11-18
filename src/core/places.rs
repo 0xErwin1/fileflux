@@ -126,6 +126,18 @@ pub struct Places {
     pub warnings: Vec<String>,
 }
 
+impl Places {
+    /// The volume that holds `path`: the longest mount path that is a
+    /// component-wise prefix of it. `None` when no discovered volume
+    /// contains the path.
+    pub fn volume_containing(&self, path: &Path) -> Option<&Volume> {
+        self.volumes
+            .iter()
+            .filter(|volume| path.starts_with(&volume.path))
+            .max_by_key(|volume| volume.path.components().count())
+    }
+}
+
 /// Enabled entries from `user-dirs.dirs`. Missing entries fall back to the
 /// default subdirectory of the home.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -442,6 +454,7 @@ pub fn parse_mounts(mounts: &[u8], user: Option<&OsStr>) -> MountTable {
         seen.push(mount_point);
         let label = match path.file_name() {
             Some(file_name) => file_name.to_string_lossy().into_owned(),
+            None if path == Path::new("/") => "System".to_owned(),
             None => path.to_string_lossy().into_owned(),
         };
         if let Some(index) = devices.iter().position(|known| known == &device) {
@@ -791,6 +804,50 @@ snapfuse /snap/core22/1 squashfs ro 0 0\n\
             ]
         );
         Ok(())
+    }
+
+    /// Free space belongs to the volume with the longest mount-path prefix.
+    #[test]
+    fn the_containing_volume_is_the_longest_mount_prefix() {
+        let volume = |label: &str, path: &str| Volume {
+            label: label.to_owned(),
+            path: PathBuf::from(path),
+            removable: false,
+            usage: None,
+        };
+        let places = Places {
+            home: PathBuf::from("/home/me"),
+            desktop: PathBuf::from("/home/me/Desktop"),
+            places: Vec::new(),
+            volumes: vec![
+                volume("System", "/"),
+                volume("home", "/home"),
+                volume("data", "/mnt/data"),
+            ],
+            trash_root: PathBuf::from("/home/me/.local/share/Trash"),
+            warnings: Vec::new(),
+        };
+        let label = |path: &str| {
+            places
+                .volume_containing(Path::new(path))
+                .map(|v| v.label.as_str())
+        };
+        assert_eq!(label("/home/me/Pictures"), Some("home"));
+        assert_eq!(label("/mnt/data/x/y"), Some("data"));
+        assert_eq!(label("/mnt/database"), Some("System"), "not a prefix");
+        assert_eq!(label("/etc"), Some("System"));
+        assert_eq!(label("relative"), None);
+    }
+
+    /// The filesystem root reads "System" in the sidebar, not a bare "/".
+    #[test]
+    fn the_root_mount_is_labeled_system() {
+        let table = parse_mounts(
+            b"/dev/sda2 / ext4 rw 0 0\n/dev/sdb1 /mnt/data ext4 rw 0 0\n",
+            None,
+        );
+        let labels: Vec<_> = table.volumes.iter().map(|v| v.label.as_str()).collect();
+        assert_eq!(labels, ["System", "data"]);
     }
 
     /// Real storage mounted outside `/media`, `/mnt` and `/run/media` is a
