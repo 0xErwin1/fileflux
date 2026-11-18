@@ -204,6 +204,9 @@ fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
             this.restore_path_on_escape(window, cx);
             cx.stop_propagation();
         }))
+        .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+            this.leave_path_edit(window, cx);
+        }))
         .child(
             bolt::controls::Input::new(&this.path_input)
                 .id("explorer-path-input")

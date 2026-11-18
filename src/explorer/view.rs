@@ -12,6 +12,7 @@
 //! matching the newest generation settles the state, so stale or failed
 //! scans never corrupt the committed location, history, selection or query.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,6 +77,18 @@ actions!(
         SelectFirstEntry,
         /// Selects the last visible entry.
         SelectLastEntry,
+        /// Extends the selection to the previous visible entry.
+        ExtendUp,
+        /// Extends the selection to the next visible entry.
+        ExtendDown,
+        /// Extends the selection one tile to the left in the grid.
+        ExtendLeft,
+        /// Extends the selection one tile to the right in the grid.
+        ExtendRight,
+        /// Extends the selection to the first visible entry.
+        ExtendToFirst,
+        /// Extends the selection to the last visible entry.
+        ExtendToLast,
         /// Opens the selected directory; other entries answer honestly
         /// read-only.
         OpenSelected,
@@ -101,6 +114,12 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", SelectRight, entries),
         KeyBinding::new("home", SelectFirstEntry, entries),
         KeyBinding::new("end", SelectLastEntry, entries),
+        KeyBinding::new("shift-up", ExtendUp, entries),
+        KeyBinding::new("shift-down", ExtendDown, entries),
+        KeyBinding::new("shift-left", ExtendLeft, entries),
+        KeyBinding::new("shift-right", ExtendRight, entries),
+        KeyBinding::new("shift-home", ExtendToFirst, entries),
+        KeyBinding::new("shift-end", ExtendToLast, entries),
         KeyBinding::new("enter", OpenSelected, entries),
     ]);
 }
@@ -196,8 +215,17 @@ pub(crate) struct Explorer {
     pub(crate) inspector_shown: bool,
     /// The mode of the single inspected entry, probed off the UI thread.
     pub(crate) permissions: Option<PermissionProbe>,
-    /// The permission probe in flight, replaced by the next one.
+    /// The path whose permission probe is waiting out its debounce or
+    /// running: at most one at a time (see [`inspector::probe_decision`]).
+    pub(crate) permission_in_flight: Option<PathBuf>,
+    /// The retained permission probe task.
     pub(crate) permission_task: Option<Task<()>>,
+    /// The item count of each folder of the committed listing, filled off
+    /// the UI thread after the listing is shown; a folder missing from the
+    /// map has not been counted yet, `None` could not be read.
+    pub(crate) child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
+    /// The retained folder-counting task, replaced by the next commit.
+    counts_task: Option<Task<()>>,
 }
 
 impl Focusable for Explorer {
@@ -277,7 +305,10 @@ impl Explorer {
             inspector_open: true,
             inspector_shown: false,
             permissions: None,
+            permission_in_flight: None,
             permission_task: None,
+            child_counts: Arc::new(HashMap::new()),
+            counts_task: None,
             _path_events: None,
             _search_events: None,
             _table_events: None,
@@ -446,6 +477,7 @@ impl Explorer {
                     self.scroll_active_to_top(cx);
                 }
                 self.refresh_snapshot();
+                self.start_child_counts(cx);
                 // A reload may have changed the modes: probe again.
                 self.permissions = None;
                 // Consume the submitted edit only when this completion is
@@ -474,6 +506,31 @@ impl Explorer {
             }
         }
         self.sync_window_title(window);
+    }
+
+    /// Counts the entries of every folder of the committed listing on the
+    /// background executor, then publishes them in one step. A newer commit
+    /// replaces the task (dropping it), so counts never leak across
+    /// listings.
+    fn start_child_counts(&mut self, cx: &mut Context<Self>) {
+        self.child_counts = Arc::new(HashMap::new());
+        let entries = Arc::clone(&self.snapshot);
+        if !entries.iter().any(fileflux::core::Entry::is_directory) {
+            self.counts_task = None;
+            return;
+        }
+        let counting = cx
+            .background_executor()
+            .spawn(async move { fileflux::core::fs::child_counts(&entries) });
+        self.counts_task = Some(cx.spawn(async move |this, cx| {
+            let counts = counting.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.child_counts = Arc::new(counts);
+                cx.notify();
+            }) {
+                log::debug!("the explorer closed before its folder counts settled: {error}");
+            }
+        }));
     }
 
     /// Applies the sidebar discovery. A discovery failure is honest and
@@ -588,6 +645,29 @@ impl Explorer {
         cx.notify();
     }
 
+    /// A press outside the path field (a click on bare chrome never moves
+    /// the focus, so no blur would tell): returns to the breadcrumbs,
+    /// restoring the committed path, like Escape but without stealing a
+    /// focus the press itself is about to give elsewhere.
+    pub(crate) fn leave_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.path_editing {
+            return;
+        }
+        let was_focused = self.path_input.read(cx).focus_handle(cx).is_focused(window);
+        self.path_edited = false;
+        self.path_editing = false;
+        self.path_seed = self.committed_path_text();
+        let seed = self.path_seed.clone();
+        self.path_input.update(cx, |input, cx| {
+            input.set_value(seed, window, cx);
+        });
+        self.state.cancel_path_edit();
+        if was_focused {
+            self.entries_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
     /// Escape in the search field (captured by the field's frame):
     /// clears the query — the full listing returns, the no-result state
     /// goes away — and gives the keyboard back to the entries area.
@@ -655,18 +735,31 @@ impl Explorer {
             return;
         }
         let last = count - 1;
-        let current = self
-            .state
-            .selection()
-            .iter()
-            .next()
-            .and_then(|path| self.state.visible_position_of(path));
+        let current = self.state.cursor_position();
         let target = match current {
             Some(position) => (position as isize + delta).clamp(0, last as isize) as usize,
             None => 0,
         };
         self.state.select_visible(target);
         self.scroll_selected_row(target, cx);
+        cx.notify();
+    }
+
+    /// Shift+Arrow: extends the selection by `delta` visible positions.
+    fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.state.extend_selection_by(delta);
+        if let Some(position) = self.state.cursor_position() {
+            self.scroll_selected_row(position, cx);
+        }
+        cx.notify();
+    }
+
+    /// Shift+Home / Shift+End: extends the selection to `position`.
+    fn extend_selection_to_extreme(&mut self, position: usize, cx: &mut Context<Self>) {
+        self.state.extend_selection_to(position);
+        if let Some(position) = self.state.cursor_position() {
+            self.scroll_selected_row(position, cx);
+        }
         cx.notify();
     }
 
@@ -928,6 +1021,31 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &SelectLastEntry, _window, cx| {
                 let count = this.state.visible_indices().len();
                 this.select_extreme(count.saturating_sub(1), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExtendUp, _window, cx| {
+                let columns = this.grid_step();
+                this.extend_selection(-columns, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExtendDown, _window, cx| {
+                let columns = this.grid_step();
+                this.extend_selection(columns, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExtendLeft, _window, cx| {
+                if this.state.view() != View::List {
+                    this.extend_selection(-1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExtendRight, _window, cx| {
+                if this.state.view() != View::List {
+                    this.extend_selection(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExtendToFirst, _window, cx| {
+                this.extend_selection_to_extreme(0, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExtendToLast, _window, cx| {
+                let count = this.state.visible_indices().len();
+                this.extend_selection_to_extreme(count.saturating_sub(1), cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
                 this.open_selected(window, cx);

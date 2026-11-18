@@ -4,6 +4,7 @@
 //! resolves entry kinds through metadata only, and reports partial failures as
 //! explicit [`Listing::warnings`] instead of hiding entries.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, FileType, Metadata};
 use std::io;
@@ -96,6 +97,30 @@ pub fn read_mode(path: &Path) -> io::Result<Option<u32>> {
     }
 }
 
+/// How many entries `path` holds, or `None` when it cannot be read as a
+/// directory. One `read_dir` pass that only counts: nothing is opened, and
+/// callers run it off the UI thread. Hidden entries count.
+pub fn count_children(path: &Path) -> Option<usize> {
+    let reader = fs::read_dir(path).ok()?;
+    let mut count = 0usize;
+    for item in reader {
+        item.ok()?;
+        count += 1;
+    }
+    Some(count)
+}
+
+/// The item count of every directory in `entries`, keyed by its path; an
+/// unreadable directory maps to `None`. Files are not listed. Blocking:
+/// run it on the background executor, after the listing has been shown.
+pub fn child_counts(entries: &[Entry]) -> HashMap<PathBuf, Option<usize>> {
+    entries
+        .iter()
+        .filter(|entry| entry.is_directory())
+        .map(|entry| (entry.path.clone(), count_children(&entry.path)))
+        .collect()
+}
+
 /// Builds one listing entry; `Err` carries a ready-to-push warning string.
 fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
     let name: OsString = dir_entry.file_name();
@@ -171,7 +196,7 @@ mod tests {
     use std::time::SystemTime;
 
     use super::super::{Entry, EntryKind, Listing};
-    use super::{filtered_indices, read_directory, read_mode};
+    use super::{child_counts, count_children, filtered_indices, read_directory, read_mode};
 
     /// RAII scratch directory under the system temp dir; removed on drop.
     struct Scratch {
@@ -413,6 +438,38 @@ mod tests {
         let hits = filtered_indices(&listing.entries, "bad");
         assert_eq!(hits, vec![0], "ASCII query still finds the raw entry");
         assert_eq!(entry.kind, EntryKind::File);
+        Ok(())
+    }
+    #[test]
+    fn child_counts_counts_each_directory_and_reports_unreadable_as_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = scratch("counts")?;
+        let full = scratch.path().join("full");
+        fs::create_dir(&full)?;
+        fs::write(full.join("a.txt"), "a")?;
+        fs::write(full.join(".hidden"), "h")?;
+        fs::create_dir(full.join("nested"))?;
+        let empty = scratch.path().join("empty");
+        fs::create_dir(&empty)?;
+        fs::write(scratch.path().join("plain.txt"), "p")?;
+
+        assert_eq!(count_children(&full), Some(3), "hidden entries count too");
+        assert_eq!(count_children(&empty), Some(0));
+        assert_eq!(
+            count_children(&scratch.path().join("plain.txt")),
+            None,
+            "a path that cannot be read as a directory has no count"
+        );
+        assert_eq!(count_children(&scratch.path().join("missing")), None);
+
+        let listing = read_directory(scratch.path())?;
+        let counts = child_counts(&listing.entries);
+        assert_eq!(counts.get(&full), Some(&Some(3)));
+        assert_eq!(counts.get(&empty), Some(&Some(0)));
+        assert!(
+            !counts.contains_key(&scratch.path().join("plain.txt")),
+            "files are never counted"
+        );
         Ok(())
     }
 }

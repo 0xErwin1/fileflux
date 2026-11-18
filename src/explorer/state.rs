@@ -211,6 +211,9 @@ pub(crate) struct ExplorerState {
     sort: SortSpec,
     /// The entry a Shift-range selection extends from.
     anchor: Option<PathBuf>,
+    /// The moving end of the selection: the entry the last click, arrow or
+    /// Shift step landed on. Keyboard steps start here.
+    cursor: Option<PathBuf>,
     /// The current-folder filename filter, as typed (case-insensitive
     /// matching happens at query time).
     query: String,
@@ -243,6 +246,7 @@ impl ExplorerState {
             view: View::Grid,
             sort: SortSpec::default(),
             anchor: None,
+            cursor: None,
             query: String::new(),
             selected: BTreeSet::new(),
             favorites: Vec::new(),
@@ -389,6 +393,7 @@ impl ExplorerState {
         self.listing = listing;
         self.query.clear();
         self.selected.clear();
+        self.cursor = None;
         self.notice = None;
         self.pending = None;
         self.load_error = None;
@@ -469,6 +474,7 @@ impl ExplorerState {
         self.selected.clear();
         self.selected.insert(path.to_path_buf());
         self.anchor = Some(path.to_path_buf());
+        self.cursor = Some(path.to_path_buf());
     }
 
     /// Adds or removes the entry at this path (Ctrl+click).
@@ -477,6 +483,7 @@ impl ExplorerState {
             self.selected.insert(path.to_path_buf());
         }
         self.anchor = Some(path.to_path_buf());
+        self.cursor = Some(path.to_path_buf());
     }
 
     /// Shift+click: selects the visible entries between the anchor and
@@ -503,6 +510,60 @@ impl ExplorerState {
             .map(|entry| entry.path.clone())
             .collect();
         self.selected = range;
+        self.cursor = Some(path.to_path_buf());
+    }
+
+    /// The visible position of the selection's moving end: the cursor, else
+    /// the first selected visible entry.
+    pub(crate) fn cursor_position(&self) -> Option<usize> {
+        self.cursor
+            .as_deref()
+            .and_then(|cursor| self.visible_position_of(cursor))
+            .or_else(|| {
+                self.selected
+                    .iter()
+                    .find_map(|path| self.visible_position_of(path))
+            })
+    }
+
+    /// Shift+Arrow: moves the selection's moving end by `delta` visible
+    /// positions (clamped) and selects everything between the anchor and
+    /// it, in displayed order. Without a selection it selects the first
+    /// entry, like a plain arrow.
+    pub(crate) fn extend_selection_by(&mut self, delta: isize) {
+        let count = self.visible_indices().len();
+        if count == 0 {
+            return;
+        }
+        let Some(current) = self.cursor_position() else {
+            self.select_visible(0);
+            return;
+        };
+        let target = current.saturating_add_signed(delta).min(count - 1);
+        self.extend_selection_to(target);
+    }
+
+    /// Shift+Home / Shift+End: extends the selection from the anchor to the
+    /// visible `position` (clamped to the last entry).
+    pub(crate) fn extend_selection_to(&mut self, position: usize) {
+        let visible = self.visible_entries();
+        let Some(last) = visible.len().checked_sub(1) else {
+            return;
+        };
+        let Some(path) = visible.get(position.min(last)).map(|e| e.path.clone()) else {
+            return;
+        };
+        if self.anchor_visible() {
+            self.select_range_to(&path);
+        } else {
+            self.select_only(&path);
+        }
+    }
+
+    fn anchor_visible(&self) -> bool {
+        self.anchor
+            .as_deref()
+            .is_some_and(|anchor| self.visible_position_of(anchor).is_some())
     }
 
     /// The combined size of the selected files; folders carry no size.
@@ -549,6 +610,7 @@ impl ExplorerState {
     /// Empties the selection (Escape over the entries, folder change).
     pub(crate) fn clear_selection(&mut self) {
         self.selected.clear();
+        self.cursor = None;
     }
 
     // --- presentation -------------------------------------------------------
@@ -1270,6 +1332,100 @@ mod tests {
             "BTreeSet order puts alpha first"
         );
         assert_eq!(state.selection().len(), 2, "selection survived the cycle");
+        Ok(())
+    }
+    /// Five files a..e in listing order, list view, name ascending.
+    fn five() -> Result<ExplorerState, Box<dyn std::error::Error>> {
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("begin must return a scan")?;
+        let names = ["a", "b", "c", "d", "e"];
+        assert!(state.commit(
+            scan,
+            Listing {
+                entries: names.iter().map(|n| entry(n, EntryKind::File)).collect(),
+                warnings: Vec::new()
+            }
+        ));
+        Ok(state)
+    }
+
+    fn selected_names(state: &ExplorerState) -> Vec<String> {
+        state
+            .visible_entries()
+            .iter()
+            .filter(|entry| state.selection().contains(&entry.path))
+            .map(|entry| entry.display_name().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn shift_arrows_extend_from_the_anchor_and_shrink_back() -> TestResult {
+        let mut state = five()?;
+        state.select_visible(1); // b is anchor and cursor
+        state.extend_selection_by(1);
+        assert_eq!(selected_names(&state), ["b", "c"]);
+        state.extend_selection_by(1);
+        assert_eq!(selected_names(&state), ["b", "c", "d"]);
+        state.extend_selection_by(-1);
+        assert_eq!(selected_names(&state), ["b", "c"], "moving back shrinks");
+        state.extend_selection_by(-2);
+        assert_eq!(
+            selected_names(&state),
+            ["a", "b"],
+            "crossing the anchor flips the side"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shift_extension_clamps_at_the_ends_and_supports_home_end() -> TestResult {
+        let mut state = five()?;
+        state.select_visible(3);
+        state.extend_selection_by(10);
+        assert_eq!(selected_names(&state), ["d", "e"]);
+        state.extend_selection_to(0);
+        assert_eq!(selected_names(&state), ["a", "b", "c", "d"], "Shift+Home");
+        state.extend_selection_to(4);
+        assert_eq!(selected_names(&state), ["d", "e"], "Shift+End");
+        Ok(())
+    }
+
+    #[test]
+    fn shift_extension_without_a_selection_selects_the_first_entry() -> TestResult {
+        let mut state = five()?;
+        state.extend_selection_by(1);
+        assert_eq!(selected_names(&state), ["a"]);
+        let mut empty = ExplorerState::new(dir("/fixture"), None);
+        empty.extend_selection_by(1);
+        empty.extend_selection_to(0);
+        assert!(empty.selection().is_empty(), "nothing to select");
+        Ok(())
+    }
+
+    #[test]
+    fn shift_extension_follows_the_displayed_sort_order() -> TestResult {
+        let mut state = sized_state()?;
+        state.click_sort(SortKey::Size);
+        state.click_sort(SortKey::Size);
+        assert_eq!(displayed(&state), ["d", "c", "b", "a"]);
+        state.select_visible(0);
+        state.extend_selection_by(1);
+        assert_eq!(selected_names(&state), ["d", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_arrow_after_a_range_moves_from_the_cursor() -> TestResult {
+        let mut state = five()?;
+        state.select_visible(1);
+        state.extend_selection_by(2); // b..d, cursor d
+        assert_eq!(
+            state.cursor_position(),
+            Some(3),
+            "the cursor is the moving end"
+        );
         Ok(())
     }
 }

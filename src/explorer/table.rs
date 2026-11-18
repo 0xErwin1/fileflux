@@ -249,6 +249,8 @@ pub(crate) struct EntryTableDelegate {
     /// The sort the header shows; the state owns it.
     sort: SortSpec,
     selected: Arc<BTreeSet<PathBuf>>,
+    /// Folder item counts, counted off the UI thread after the scan.
+    child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     widths: [f32; COLUMN_COUNT],
     weak: WeakEntity<Explorer>,
 }
@@ -264,6 +266,7 @@ impl EntryTableDelegate {
             visible,
             sort: SortSpec::default(),
             selected: Arc::new(BTreeSet::new()),
+            child_counts: Arc::new(HashMap::new()),
             widths: LIST_DEFAULT_WIDTHS,
             weak,
         }
@@ -285,6 +288,17 @@ impl EntryTableDelegate {
     pub(crate) fn set_sort(&mut self, sort: SortSpec) -> bool {
         let changed = self.sort != sort;
         self.sort = sort;
+        changed
+    }
+
+    /// Re-points the delegate at the folder counts; `true` when they
+    /// changed, so the caller refreshes the table.
+    pub(crate) fn set_child_counts(
+        &mut self,
+        counts: Arc<HashMap<PathBuf, Option<usize>>>,
+    ) -> bool {
+        let changed = !Arc::ptr_eq(&self.child_counts, &counts);
+        self.child_counts = counts;
         changed
     }
 
@@ -328,9 +342,11 @@ impl EntryTableDelegate {
                 align: CellAlign::Left,
             },
             SIZE_COLUMN => CellSpec {
-                // The scan carries no child counts and the UI thread never
-                // walks directories, so folders show no count yet.
-                text: util::format_entry_size(entry, None),
+                // Folder counts arrive from a background pass after the scan.
+                text: util::format_entry_size(
+                    entry,
+                    self.child_counts.get(&entry.path).copied().flatten(),
+                ),
                 muted: true,
                 align: CellAlign::Right,
             },
@@ -556,12 +572,13 @@ pub(crate) fn render_list(
         let delegate = table.delegate_mut();
         let data_changed = delegate.set_data(Arc::clone(&explorer.snapshot), Arc::clone(&visible));
         let sort_changed = delegate.set_sort(explorer.state.sort());
+        let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.child_counts));
         delegate.set_selection(Arc::clone(&selected));
         let widths_changed = delegate.widths() != &desired;
         if widths_changed {
             delegate.set_widths(desired);
         }
-        if data_changed || sort_changed || widths_changed {
+        if data_changed || sort_changed || counts_changed || widths_changed {
             table.refresh(cx);
         }
     });

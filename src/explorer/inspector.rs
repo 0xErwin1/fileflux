@@ -6,7 +6,9 @@
 //! from the scan.
 
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bolt::primitives::Icon;
 use fileflux::core::places::format_bytes;
@@ -22,6 +24,12 @@ use super::{entries, icon, util};
 
 /// Width of the details panel.
 pub(crate) const INSPECTOR_WIDTH: f32 = 300.0;
+/// The document island's horizontal padding (16 px each side) that the
+/// entries area loses on top of the shell and the panel.
+pub(crate) const ISLAND_PADDING: f32 = 2.0 * 16.0;
+/// How long a selection must rest before its permissions are probed, so
+/// arrowing through a folder does not stat every entry on the way.
+const PROBE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// The entries area keeps at least this much room; below it the panel hides.
 pub(crate) const MIN_ENTRIES_WIDTH: f32 = 520.0;
 /// Height of the preview box.
@@ -32,11 +40,11 @@ const PREVIEW_GLYPH: f32 = 72.0;
 const PREVIEW_FOLDER: f32 = 80.0;
 
 /// Whether the panel draws: the user wants it and the entries area keeps at
-/// least [`MIN_ENTRIES_WIDTH`] once the panel and the shell around it take
-/// their room. `shell_width` is everything in the window that is not the
-/// document island (gutters plus the docked sidebar).
+/// least [`MIN_ENTRIES_WIDTH`] once the panel, the island's own padding and
+/// the shell around it take their room. `shell_width` is everything in the
+/// window that is not the document island (gutters plus the docked sidebar).
 pub(crate) fn panel_visible(open: bool, window_width: f32, shell_width: f32) -> bool {
-    open && window_width - shell_width - INSPECTOR_WIDTH >= MIN_ENTRIES_WIDTH
+    open && window_width - shell_width - ISLAND_PADDING - INSPECTOR_WIDTH >= MIN_ENTRIES_WIDTH
 }
 
 /// The kind line: `Folder`, `Image · JPG`, `Document · PDF`. The category
@@ -123,50 +131,157 @@ pub(crate) fn permission_string(mode: u32) -> String {
         .collect()
 }
 
-/// The mode of one path, as last probed off the UI thread. `mode` stays
-/// `None` while the probe is in flight or when it failed.
+/// What the probe of one path found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// The probe has not settled yet.
+    Pending,
+    /// The unix mode bits.
+    Mode(u32),
+    /// The probe failed (or the platform has no mode bits).
+    Unavailable,
+}
+
+/// The mode of one path, as last probed off the UI thread.
 #[derive(Clone, Debug)]
 pub(crate) struct PermissionProbe {
     pub(crate) path: PathBuf,
-    pub(crate) mode: Option<u32>,
+    pub(crate) outcome: ProbeOutcome,
+}
+
+/// What the probe machinery does next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeDecision {
+    /// Nothing to do: the wanted path is already probed or running, or
+    /// nothing is wanted and nothing is cached.
+    Idle,
+    /// Nothing is inspected: drop the cached probe.
+    Clear,
+    /// A probe is in flight for another path: let it finish, then decide
+    /// again, so only the latest selection is probed and never two at once.
+    Wait,
+    /// Probe this path (after the debounce).
+    Start(PathBuf),
+}
+
+/// The pure probe policy. `wanted` is the single inspected path, `cached`
+/// the path of the cached probe, `in_flight` the path being probed now.
+pub(crate) fn probe_decision(
+    wanted: Option<&Path>,
+    cached: Option<&Path>,
+    in_flight: Option<&Path>,
+) -> ProbeDecision {
+    if in_flight.is_some() && in_flight != wanted {
+        return ProbeDecision::Wait;
+    }
+    match wanted {
+        None if cached.is_some() => ProbeDecision::Clear,
+        None => ProbeDecision::Idle,
+        Some(path) if cached == Some(path) || in_flight == Some(path) => ProbeDecision::Idle,
+        Some(path) => ProbeDecision::Start(path.to_path_buf()),
+    }
+}
+
+/// Whether a finished probe of `result_for` may be shown: only while that
+/// path is still the one inspected; a stale result is dropped.
+pub(crate) fn accepts_probe_result(result_for: &Path, wanted: Option<&Path>) -> bool {
+    wanted == Some(result_for)
+}
+
+/// The outcome of one finished `read_mode`.
+pub(crate) fn probe_outcome(result: io::Result<Option<u32>>) -> ProbeOutcome {
+    match result {
+        Ok(Some(mode)) => ProbeOutcome::Mode(mode),
+        Ok(None) | Err(_) => ProbeOutcome::Unavailable,
+    }
+}
+
+/// The Permissions row of an outcome: its text and whether it is muted.
+/// `None` while the probe is pending (no row yet).
+pub(crate) fn probe_row(outcome: &ProbeOutcome) -> Option<(String, bool)> {
+    match outcome {
+        ProbeOutcome::Pending => None,
+        ProbeOutcome::Mode(mode) => Some((permission_string(*mode), false)),
+        ProbeOutcome::Unavailable => Some(("unavailable".to_owned(), true)),
+    }
 }
 
 impl Explorer {
-    /// Starts the permission probe for the single selected entry when the
-    /// panel shows and the cached probe is for another path. The one
-    /// `metadata` call runs on the background executor; the UI thread never
-    /// touches the filesystem for it.
+    /// Drives the permission probe for the single selected entry while the
+    /// panel shows. At most one probe is in flight; a selection change
+    /// while one runs waits for it and then probes only the latest
+    /// selection, after a short debounce. The one `metadata` call runs on
+    /// the background executor; the UI thread never touches the filesystem
+    /// for it. Called from every render, so each settled probe re-decides.
     pub(crate) fn sync_permissions(&mut self, cx: &mut Context<Self>) {
         let wanted = self.inspected_path();
-        let current = self.permissions.as_ref().map(|probe| &probe.path);
-        if wanted.as_ref() == current {
-            return;
+        let decision = probe_decision(
+            wanted.as_deref(),
+            self.permissions.as_ref().map(|probe| probe.path.as_path()),
+            self.permission_in_flight.as_deref(),
+        );
+        match decision {
+            ProbeDecision::Idle | ProbeDecision::Wait => {}
+            ProbeDecision::Clear => self.permissions = None,
+            ProbeDecision::Start(path) => self.start_probe(path, cx),
         }
-        let Some(path) = wanted else {
-            self.permissions = None;
-            self.permission_task = None;
-            return;
-        };
+    }
+
+    fn start_probe(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.permissions = Some(PermissionProbe {
             path: path.clone(),
-            mode: None,
+            outcome: ProbeOutcome::Pending,
         });
-        let probed = path.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { fileflux::core::fs::read_mode(&probed) });
+        self.permission_in_flight = Some(path.clone());
         self.permission_task = Some(cx.spawn(async move |this, cx| {
-            let result = read.await;
-            if let Err(error) = this.update(cx, |this, cx| match result {
-                Ok(mode) => {
-                    if let Some(probe) = this.permissions.as_mut().filter(|p| p.path == path) {
-                        probe.mode = mode;
-                        cx.notify();
+            cx.background_executor().timer(PROBE_DEBOUNCE).await;
+            // Selections made during the debounce have settled: probe the
+            // latest one, or none when the wish moved away from this path.
+            let still_wanted = this.update(cx, |this, _| {
+                accepts_probe_result(&path, this.inspected_path().as_deref())
+            });
+            let outcome = match still_wanted {
+                Ok(true) => {
+                    let probed = path.clone();
+                    let read = cx
+                        .background_executor()
+                        .spawn(async move { fileflux::core::fs::read_mode(&probed) });
+                    let result = read.await;
+                    if let Err(error) = &result {
+                        log::debug!("could not read permissions of {}: {error}", path.display());
+                    }
+                    Some(probe_outcome(result))
+                }
+                Ok(false) => None,
+                Err(error) => {
+                    log::debug!("the explorer closed before the permission probe ran: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.permission_in_flight = None;
+                let wanted = this.inspected_path();
+                match outcome {
+                    Some(outcome) if accepts_probe_result(&path, wanted.as_deref()) => {
+                        if let Some(probe) =
+                            this.permissions.as_mut().filter(|probe| probe.path == path)
+                        {
+                            probe.outcome = outcome;
+                        }
+                    }
+                    _ => {
+                        // Superseded: drop the cache so the next render
+                        // probes the latest selection.
+                        if this
+                            .permissions
+                            .as_ref()
+                            .is_some_and(|probe| probe.path == path)
+                        {
+                            this.permissions = None;
+                        }
                     }
                 }
-                Err(error) => {
-                    log::debug!("could not read permissions of {}: {error}", path.display());
-                }
+                cx.notify();
             }) {
                 log::debug!("the explorer closed before the permission probe settled: {error}");
             }
@@ -270,8 +385,26 @@ fn subtitle(text: String, cx: &Context<Explorer>) -> Div {
         .child(text)
 }
 
+/// One row of the definition list.
+struct Fact {
+    term: &'static str,
+    value: String,
+    /// Drawn in the muted color (an unavailable value).
+    muted: bool,
+}
+
+impl Fact {
+    fn new(term: &'static str, value: String) -> Self {
+        Self {
+            term,
+            value,
+            muted: false,
+        }
+    }
+}
+
 /// The definition list: muted terms, mono right-aligned wrapping values.
-fn facts(rows: Vec<(&'static str, String)>, cx: &Context<Explorer>) -> Div {
+fn facts(rows: Vec<Fact>, cx: &Context<Explorer>) -> Div {
     let colors = bolt::colors(cx);
     let mono = bolt::fonts::editor_family(cx);
     div()
@@ -280,25 +413,33 @@ fn facts(rows: Vec<(&'static str, String)>, cx: &Context<Explorer>) -> Div {
         .flex_col()
         .gap(px(8.0))
         .text_size(px(12.0))
-        .children(rows.into_iter().map(|(term, value)| {
+        .children(rows.into_iter().map(|fact| {
             div()
                 .flex()
                 .gap(px(16.0))
-                .child(div().flex_none().text_color(colors.muted).child(term))
+                .child(div().flex_none().text_color(colors.muted).child(fact.term))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .text_right()
                         .font_family(mono.clone())
-                        .text_color(colors.foreground)
-                        .child(value),
+                        .text_color(if fact.muted {
+                            colors.muted
+                        } else {
+                            colors.foreground
+                        })
+                        .child(fact.value),
                 )
         }))
 }
 
 fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
     let colors = bolt::colors(cx);
+    // The folder's total; "N of M" while a filter hides some of it.
+    let total = this.state.listing().entries.len();
+    let shown = (!this.state.query().is_empty()).then(|| this.state.visible_indices().len());
+    let items = util::items_label(total, shown);
     vec![
         preview_box(folder_glyph(cx), cx).into_any_element(),
         title(this.current_label(), cx)
@@ -307,8 +448,8 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         subtitle("Folder".to_owned(), cx).into_any_element(),
         facts(
             vec![
-                ("Items", this.state.visible_indices().len().to_string()),
-                ("Location", wrappable(&location_text(this.state.current()))),
+                Fact::new("Items", items),
+                Fact::new("Location", wrappable(&location_text(this.state.current()))),
             ],
             cx,
         )
@@ -342,29 +483,40 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
     };
 
     let mut rows = Vec::new();
-    if !entry.is_directory() {
-        rows.push((
+    if entry.is_directory() {
+        if let Some(count) = this.child_counts.get(&entry.path).copied().flatten() {
+            rows.push(Fact::new("Contains", util::format_item_count(count)));
+        }
+    } else {
+        rows.push(Fact::new(
             "Size",
             entry
                 .size
                 .map_or_else(|| "\u{2014}".to_owned(), format_bytes),
         ));
     }
-    rows.push((
+    rows.push(Fact::new(
         "Modified",
         util::format_modified(entry.modified, &chrono::Local::now()),
     ));
-    if let Some(mode) = this
+    if let Some((text, muted)) = this
         .permissions
         .as_ref()
         .filter(|probe| probe.path == entry.path)
-        .and_then(|probe| probe.mode)
+        .and_then(|probe| probe_row(&probe.outcome))
     {
-        rows.push(("Permissions", permission_string(mode)));
+        rows.push(Fact {
+            term: "Permissions",
+            value: text,
+            muted,
+        });
     }
     match &entry.origin {
-        Some(origin) => rows.push(("Original location", wrappable(&origin.to_string_lossy()))),
-        None => rows.push(("Path", wrappable(&entry.path.to_string_lossy()))),
+        Some(origin) => rows.push(Fact::new(
+            "Original location",
+            wrappable(&origin.to_string_lossy()),
+        )),
+        None => rows.push(Fact::new("Path", wrappable(&entry.path.to_string_lossy()))),
     }
 
     vec![
@@ -429,24 +581,115 @@ mod tests {
 
     #[test]
     fn panel_hides_when_the_entries_area_would_drop_below_its_minimum() {
-        // Window 1440, 16 px gutters + 290 sidebar + 8 gap: 1440-314-300=826.
+        // Window 1440, 16 px gutters + 290 sidebar + 8 gap: 1440-314-32-300.
         assert!(panel_visible(true, 1440.0, 314.0));
-        // Exactly the minimum still fits.
-        assert!(panel_visible(
+        // The island's 2x16 px padding is part of the budget: exactly the
+        // minimum still fits, one pixel less does not.
+        let exact = 314.0 + ISLAND_PADDING + INSPECTOR_WIDTH + MIN_ENTRIES_WIDTH;
+        assert!(panel_visible(true, exact, 314.0));
+        assert!(!panel_visible(true, exact - 1.0, 314.0));
+        assert_eq!(ISLAND_PADDING, 32.0);
+        // Without the padding term this window would have fit 520 px of
+        // entries minus 32: it must hide.
+        assert!(!panel_visible(
             true,
             314.0 + INSPECTOR_WIDTH + MIN_ENTRIES_WIDTH,
             314.0
         ));
-        assert!(!panel_visible(
-            true,
-            314.0 + INSPECTOR_WIDTH + MIN_ENTRIES_WIDTH - 1.0,
-            314.0
-        ));
         // The user's toggle always wins.
         assert!(!panel_visible(false, 4000.0, 314.0));
-        // A narrow window without a docked sidebar: 900-16-300=584.
+        // A narrow window without a docked sidebar: 900-16-32-300=552.
         assert!(panel_visible(true, 900.0, 16.0));
         assert!(!panel_visible(true, 800.0, 16.0));
+    }
+
+    fn p(path: &str) -> PathBuf {
+        PathBuf::from(path)
+    }
+
+    #[test]
+    fn probe_decision_starts_the_wanted_path_when_nothing_is_cached_or_running() {
+        let a = p("/a");
+        assert_eq!(
+            probe_decision(Some(&a), None, None),
+            ProbeDecision::Start(p("/a"))
+        );
+        assert_eq!(probe_decision(None, None, None), ProbeDecision::Idle);
+    }
+
+    #[test]
+    fn probe_decision_is_idle_for_an_already_probed_path_and_clears_without_a_wish() {
+        let a = p("/a");
+        assert_eq!(
+            probe_decision(Some(&a), Some(&a), None),
+            ProbeDecision::Idle
+        );
+        assert_eq!(
+            probe_decision(Some(&a), Some(&a), Some(&a)),
+            ProbeDecision::Idle,
+            "the running probe is the wanted one"
+        );
+        assert_eq!(
+            probe_decision(Some(&a), None, Some(&a)),
+            ProbeDecision::Idle,
+            "a reload that dropped the cache never starts a second probe"
+        );
+        assert_eq!(
+            probe_decision(None, Some(&a), None),
+            ProbeDecision::Clear,
+            "a stale cache goes away when nothing is inspected"
+        );
+    }
+
+    #[test]
+    fn probe_decision_waits_while_one_probe_is_in_flight_then_probes_only_the_latest() {
+        let (a, b, c) = (p("/a"), p("/b"), p("/c"));
+        // /a is running; the selection moved to /b, then /c: wait, never start.
+        assert_eq!(
+            probe_decision(Some(&b), Some(&a), Some(&a)),
+            ProbeDecision::Wait
+        );
+        assert_eq!(
+            probe_decision(Some(&c), Some(&a), Some(&a)),
+            ProbeDecision::Wait
+        );
+        // /a settled: the next probe is for the latest wish, /c, never /b.
+        assert_eq!(
+            probe_decision(Some(&c), Some(&a), None),
+            ProbeDecision::Start(p("/c"))
+        );
+        // Nothing wanted while one runs: wait for it, then clear.
+        assert_eq!(
+            probe_decision(None, Some(&a), Some(&a)),
+            ProbeDecision::Wait
+        );
+    }
+
+    #[test]
+    fn a_probe_result_is_applied_only_for_the_path_still_wanted() {
+        let (a, b) = (p("/a"), p("/b"));
+        assert!(accepts_probe_result(&a, Some(&a)));
+        assert!(!accepts_probe_result(&a, Some(&b)), "stale result ignored");
+        assert!(!accepts_probe_result(&a, None), "nothing inspected");
+    }
+
+    #[test]
+    fn a_failed_probe_reads_unavailable_not_absent() {
+        assert_eq!(
+            probe_row(&ProbeOutcome::Mode(0o644)),
+            Some(("rw-r--r--".to_owned(), false))
+        );
+        assert_eq!(
+            probe_row(&ProbeOutcome::Unavailable),
+            Some(("unavailable".to_owned(), true)),
+            "muted text instead of a vanished row"
+        );
+        assert_eq!(probe_row(&ProbeOutcome::Pending), None);
+        // A platform without mode bits: the probe ran but has nothing to show.
+        assert_eq!(probe_outcome(Ok(None)), ProbeOutcome::Unavailable);
+        assert_eq!(probe_outcome(Ok(Some(0o600))), ProbeOutcome::Mode(0o600));
+        let failure = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(probe_outcome(Err(failure)), ProbeOutcome::Unavailable);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! keyboard arrows go through the raw entry paths the state keeps; display
 //! names are lossy and never used for navigation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,9 +28,9 @@ use gpui::{
 };
 use gpui_component::ActiveTheme;
 
-use super::icon;
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
+use super::{icon, util};
 
 /// Tile width of the reference grid (the artboard's 112 px minimum); every
 /// tile draws at exactly this width, so a partial last row matches a full
@@ -318,6 +318,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         count.div_ceil(columns)
     };
     let snapshot = Arc::clone(&this.snapshot);
+    let counts_for_rows = Arc::clone(&this.child_counts);
     let weak_for_rows = weak.clone();
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);
@@ -334,15 +335,13 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             move |row_range, _window, cx: &mut App| {
                 row_range
                     .map(|row| {
-                        render_grid_row(
-                            &snapshot,
-                            &visible_for_rows,
-                            row,
-                            columns,
-                            &selected_for_rows,
-                            &weak_for_rows,
-                            cx,
-                        )
+                        let data = GridData {
+                            snapshot: &snapshot,
+                            visible: &visible_for_rows,
+                            selected: &selected_for_rows,
+                            child_counts: &counts_for_rows,
+                        };
+                        render_grid_row(&data, row, columns, &weak_for_rows, cx)
                     })
                     .collect::<Vec<_>>()
             },
@@ -393,17 +392,31 @@ fn measure_width(weak: &WeakEntity<Explorer>) -> impl IntoElement {
     .size_full()
 }
 
+/// What the grid rows read: the listing snapshot, the visible rows in
+/// displayed order, the selection and the folder counts.
+#[derive(Clone, Copy)]
+struct GridData<'a> {
+    snapshot: &'a [Entry],
+    visible: &'a [usize],
+    selected: &'a BTreeSet<PathBuf>,
+    child_counts: &'a HashMap<PathBuf, Option<usize>>,
+}
+
 /// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a
 /// fixed-height left-aligned row.
 fn render_grid_row(
-    snapshot: &[Entry],
-    visible: &[usize],
+    data: &GridData<'_>,
     row: usize,
     columns: usize,
-    selected: &BTreeSet<PathBuf>,
     weak: &WeakEntity<Explorer>,
     cx: &mut App,
 ) -> gpui::AnyElement {
+    let GridData {
+        snapshot,
+        visible,
+        selected,
+        child_counts,
+    } = *data;
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
     let mut row_element = div()
@@ -438,10 +451,14 @@ fn render_grid_row(
         } else {
             file_glyph_element(file_glyph(&tile.name), colors.muted)
         };
-        // Folders carry no subline: the model knows no child count and the
-        // grid never scans.
+        // Folders show their item count once the background count arrived;
+        // files their size.
         let subline = if is_folder {
-            None
+            child_counts
+                .get(&tile.path)
+                .copied()
+                .flatten()
+                .map(util::format_item_count)
         } else {
             tile.size.map(format_bytes)
         };

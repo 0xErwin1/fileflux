@@ -10,9 +10,8 @@ use chrono::{DateTime, Datelike as _, TimeZone, Utc};
 use fileflux::core::places::format_bytes;
 
 /// The Size cell of the details list: folders show their item count when
-/// the caller knows it (`child_count`) and stay empty otherwise — the scan
-/// carries no child counts and the UI thread never walks directories to
-/// find them. Everything else keeps its human size.
+/// the caller knows it (`child_count`, counted off the UI thread after the
+/// scan) and stay empty until then. Everything else keeps its human size.
 pub(crate) fn format_entry_size(
     entry: &fileflux::core::Entry,
     child_count: Option<usize>,
@@ -23,6 +22,15 @@ pub(crate) fn format_entry_size(
         entry
             .size
             .map_or_else(|| "\u{2014}".to_owned(), format_bytes)
+    }
+}
+
+/// The details panel's folder "Items" fact: the folder's total, or
+/// `"N of M"` while a filter shows only some of them.
+pub(crate) fn items_label(total: usize, shown: Option<usize>) -> String {
+    match shown {
+        Some(shown) => format!("{shown} of {total}"),
+        None => total.to_string(),
     }
 }
 
@@ -473,5 +481,31 @@ mod tests {
         assert_eq!(grid_row(4, 4), 1);
         assert_eq!(grid_row(9, 4), 2);
         assert_eq!(grid_row(0, 0), 0, "no columns means one safe row");
+    }
+
+    #[test]
+    fn folder_sizes_show_item_counts_when_known() {
+        use fileflux::core::Entry;
+        let folder = Entry {
+            name: "d".into(),
+            path: "/d".into(),
+            kind: EntryKind::Directory,
+            is_symlink: false,
+            size: None,
+            modified: None,
+            origin: None,
+        };
+        assert_eq!(format_entry_size(&folder, Some(1)), "1 item");
+        assert_eq!(format_entry_size(&folder, Some(0)), "0 items");
+        assert_eq!(format_entry_size(&folder, Some(12)), "12 items");
+        assert_eq!(format_entry_size(&folder, None), "");
+    }
+
+    #[test]
+    fn the_folder_items_fact_shows_a_filtered_fraction() {
+        assert_eq!(items_label(12, None), "12");
+        assert_eq!(items_label(12, Some(3)), "3 of 12");
+        assert_eq!(items_label(0, None), "0");
+        assert_eq!(items_label(5, Some(0)), "0 of 5");
     }
 }
