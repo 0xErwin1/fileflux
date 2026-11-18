@@ -51,14 +51,132 @@ pub fn read_directory(path: &Path) -> io::Result<Listing> {
 
 /// Sorts entries folders-first, then by natural name order
 /// ([`natural_cmp`]), raw path tie. The order is independent of locale and
-/// deterministic for non-UTF8 names.
+/// deterministic for non-UTF8 names. Equal entries keep their order.
+///
+/// A million names sort in a fraction of a second: each entry gets a
+/// [`natural_sort_prefix`] that decides almost every comparison without
+/// reading the names, and the sort works on those and moves the entries
+/// once, at the end.
 pub fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        b.is_directory()
-            .cmp(&a.is_directory())
-            .then_with(|| natural_cmp(&a.name, &b.name))
-            .then_with(|| a.path.cmp(&b.path))
+    let mut order: Vec<(bool, u128, usize)> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                !entry.is_directory(),
+                natural_sort_prefix(&entry.name.to_string_lossy()),
+                index,
+            )
+        })
+        .collect();
+    let exact = |a: usize, b: usize| match (entries.get(a), entries.get(b)) {
+        (Some(a), Some(b)) => natural_cmp(&a.name, &b.name).then_with(|| a.path.cmp(&b.path)),
+        _ => Ordering::Equal,
+    };
+    order.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| compare_sort_prefixes(a.1, b.1).unwrap_or_else(|| exact(a.2, b.2)))
     });
+    // Put each entry at its place, one cycle of the permutation at a time.
+    let mut placed = vec![false; entries.len()];
+    for start in 0..entries.len() {
+        let mut at = start;
+        while !placed.get(at).copied().unwrap_or(true) {
+            if let Some(slot) = placed.get_mut(at) {
+                *slot = true;
+            }
+            let Some(&(_, _, source)) = order.get(at) else {
+                break;
+            };
+            if source == start {
+                break;
+            }
+            entries.swap(at, source);
+            at = source;
+        }
+    }
+}
+
+/// The byte of a [`natural_sort_prefix`] past a character the prefix does not
+/// spell out (a non-ASCII character, or a number too long to be sized).
+const STOPPED: u8 = 0xFF;
+/// The byte that opens a number in a [`natural_sort_prefix`]: the count of
+/// its significant digits follows, then the digits.
+const NUMBER: u8 = 0xFE;
+/// The first count a number cannot have in a prefix.
+const LONGEST_NUMBER: u8 = 0xFD;
+const PREFIX_BYTES: usize = 16;
+
+/// A fixed-size summary of `text` for the natural order ([`natural_str_cmp`]),
+/// as a big-endian integer of its first sixteen bytes: ASCII characters
+/// lowercased, a run of digits as [`NUMBER`], the count of its digits without
+/// leading zeros and those digits (so numbers order by value), and a name
+/// that ends padded with zeros, which order before any character. The first
+/// non-ASCII character, or a number of 253 digits or more, stops it: every
+/// byte after is `0xFF`. Compare two summaries with
+/// [`compare_sort_prefixes`], which says when they decide the order.
+pub fn natural_sort_prefix(text: &str) -> u128 {
+    let mut bytes = [0u8; PREFIX_BYTES];
+    let mut written = 0;
+    let mut put = |byte: u8| {
+        if let Some(slot) = bytes.get_mut(written) {
+            *slot = byte;
+            written += 1;
+        }
+    };
+    let mut rest = text.as_bytes();
+    while let Some(&first) = rest.first() {
+        if first.is_ascii_digit() {
+            let end = rest
+                .iter()
+                .position(|byte| !byte.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let (run, tail) = rest.split_at(end);
+            let zeros = run.iter().take_while(|&&byte| byte == b'0').count();
+            let digits = run.get(zeros..).unwrap_or_default();
+            match u8::try_from(digits.len()) {
+                Ok(count) if count < LONGEST_NUMBER => {
+                    put(NUMBER);
+                    put(count);
+                    digits.iter().for_each(|&digit| put(digit));
+                }
+                _ => {
+                    (0..PREFIX_BYTES).for_each(|_| put(STOPPED));
+                    break;
+                }
+            }
+            rest = tail;
+        } else if first.is_ascii() {
+            put(first.to_ascii_lowercase());
+            rest = rest.get(1..).unwrap_or_default();
+        } else {
+            (0..PREFIX_BYTES).for_each(|_| put(STOPPED));
+            break;
+        }
+    }
+    u128::from_be_bytes(bytes)
+}
+
+/// The order of two names from their prefixes, when they decide it: at the
+/// first byte where the prefixes differ, one name ended there (an ended name
+/// is the lesser), or both spell out a character or a number's digits.
+/// `None` when the prefixes are equal, or differ at a stop or at a number
+/// against a character: then only the full comparison knows. Whenever this
+/// returns `Some`, it is the order [`natural_str_cmp`] gives (the raw-bytes
+/// tie of [`natural_cmp`] only matters between equal prefixes).
+///
+/// Summaries made as the lowercase text's first bytes (for a plain,
+/// non-natural order) work as well: UTF-8 never contains the stop bytes.
+pub fn compare_sort_prefixes(a: u128, b: u128) -> Option<Ordering> {
+    let differing = a ^ b;
+    if differing == 0 {
+        return None;
+    }
+    let shift = 120 - (differing.leading_zeros() / 8) * 8;
+    let byte = |prefix: u128| ((prefix >> shift) & 0xFF) as u8;
+    let (mine, theirs) = (byte(a), byte(b));
+    let spelled = |byte: u8| byte < NUMBER;
+    (mine == 0 || theirs == 0 || (spelled(mine) && spelled(theirs))).then(|| mine.cmp(&theirs))
 }
 
 /// Compares two names for display: case-insensitively, with runs of ASCII
@@ -68,21 +186,24 @@ pub fn sort_entries(entries: &mut [Entry]) {
 /// them, and names that are still equal fall back to their raw bytes, so the
 /// order is total and deterministic.
 pub fn natural_cmp(a: &OsStr, b: &OsStr) -> Ordering {
-    natural_text_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
+    natural_str_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
 }
 
-fn natural_text_cmp(a: &str, b: &str) -> Ordering {
-    let (mut left, mut right) = (a.chars().peekable(), b.chars().peekable());
+/// The text part of [`natural_cmp`], without the raw-bytes tie: letters
+/// compare case-insensitively and digit runs by value, so `a` and `A` are
+/// `Equal` here. Allocation free: the digit runs are borrowed slices.
+pub fn natural_str_cmp(a: &str, b: &str) -> Ordering {
+    let (mut left, mut right) = (a, b);
     // The first difference in leading zeros between numerically equal runs.
     let mut zeros = Ordering::Equal;
     loop {
-        match (left.peek().copied(), right.peek().copied()) {
+        match (left.as_bytes().first(), right.as_bytes().first()) {
             (None, None) => return zeros,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let run_a = take_digits(&mut left);
-                let run_b = take_digits(&mut right);
+                let (run_a, rest_a) = split_digits(left);
+                let (run_b, rest_b) = split_digits(right);
                 let (number_a, number_b) =
                     (run_a.trim_start_matches('0'), run_b.trim_start_matches('0'));
                 let by_number = number_a
@@ -95,25 +216,39 @@ fn natural_text_cmp(a: &str, b: &str) -> Ordering {
                 if zeros == Ordering::Equal {
                     zeros = run_a.len().cmp(&run_b.len());
                 }
+                (left, right) = (rest_a, rest_b);
             }
-            (Some(x), Some(y)) => {
+            // Two ASCII characters: their lowercase is one ASCII character.
+            (Some(x), Some(y)) if x.is_ascii() && y.is_ascii() => {
+                let by_char = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if by_char != Ordering::Equal {
+                    return by_char;
+                }
+                left = left.get(1..).unwrap_or_default();
+                right = right.get(1..).unwrap_or_default();
+            }
+            (Some(_), Some(_)) => {
+                let (Some(x), Some(y)) = (left.chars().next(), right.chars().next()) else {
+                    return Ordering::Equal;
+                };
                 let by_char = x.to_lowercase().cmp(y.to_lowercase());
                 if by_char != Ordering::Equal {
                     return by_char;
                 }
-                left.next();
-                right.next();
+                left = left.get(x.len_utf8()..).unwrap_or_default();
+                right = right.get(y.len_utf8()..).unwrap_or_default();
             }
         }
     }
 }
 
-fn take_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut run = String::new();
-    while let Some(digit) = chars.next_if(char::is_ascii_digit) {
-        run.push(digit);
-    }
-    run
+/// Splits the leading run of ASCII digits off `text`.
+fn split_digits(text: &str) -> (&str, &str) {
+    let end = text
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(text.len());
+    text.split_at(end)
 }
 
 /// Returns the indices of entries whose local name contains `query`
@@ -642,6 +777,212 @@ mod tests {
             again.reverse();
             again.sort_by(|a, b| natural_cmp(a, b));
             assert_eq!(names, again, "the order does not depend on the input order");
+        }
+    }
+
+    mod prefixes {
+        use super::super::{
+            compare_sort_prefixes, natural_cmp, natural_sort_prefix, natural_str_cmp, sort_entries,
+        };
+        use crate::core::{Entry, EntryKind};
+        use std::cmp::Ordering;
+        use std::path::PathBuf;
+
+        /// A tiny xorshift64*: deterministic and dependency free.
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+            }
+
+            fn name(&mut self) -> String {
+                const PIECES: [&str; 16] = [
+                    "a",
+                    "A",
+                    "b",
+                    "IMG_",
+                    "img",
+                    "1",
+                    "01",
+                    "007",
+                    "2",
+                    "10",
+                    "9",
+                    "é",
+                    "İ",
+                    "_",
+                    " ",
+                    "99999999999999999999",
+                ];
+                let count = 1 + self.next() % 6;
+                (0..count)
+                    .map(|_| {
+                        PIECES
+                            .get((self.next() % 16) as usize)
+                            .copied()
+                            .unwrap_or("x")
+                    })
+                    .collect()
+            }
+        }
+
+        /// The natural comparison as it was first written: characters and
+        /// owned digit runs, nothing clever.
+        fn plain_natural(a: &str, b: &str) -> Ordering {
+            let (mut left, mut right) = (a.chars().peekable(), b.chars().peekable());
+            let mut zeros = Ordering::Equal;
+            loop {
+                match (left.peek().copied(), right.peek().copied()) {
+                    (None, None) => return zeros,
+                    (None, Some(_)) => return Ordering::Less,
+                    (Some(_), None) => return Ordering::Greater,
+                    (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                        let run = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+                            let mut run = String::new();
+                            while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+                                run.push(digit);
+                            }
+                            run
+                        };
+                        let (run_a, run_b) = (run(&mut left), run(&mut right));
+                        let (number_a, number_b) =
+                            (run_a.trim_start_matches('0'), run_b.trim_start_matches('0'));
+                        let by_number = number_a
+                            .len()
+                            .cmp(&number_b.len())
+                            .then_with(|| number_a.cmp(number_b));
+                        if by_number != Ordering::Equal {
+                            return by_number;
+                        }
+                        if zeros == Ordering::Equal {
+                            zeros = run_a.len().cmp(&run_b.len());
+                        }
+                    }
+                    (Some(x), Some(y)) => {
+                        let by_char = x.to_lowercase().cmp(y.to_lowercase());
+                        if by_char != Ordering::Equal {
+                            return by_char;
+                        }
+                        left.next();
+                        right.next();
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_fast_natural_comparison_equals_the_plain_one() {
+            let mut rng = Rng(0xBEEF);
+            for _ in 0..40_000 {
+                let (a, b) = (rng.name(), rng.name());
+                assert_eq!(
+                    natural_str_cmp(&a, &b),
+                    plain_natural(&a, &b),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_deciding_prefix_comparison_is_the_natural_comparison() {
+            let mut rng = Rng(0x5EED);
+            let (mut decided, mut total) = (0, 0);
+            for _ in 0..40_000 {
+                let (a, b) = (rng.name(), rng.name());
+                total += 1;
+                if let Some(order) =
+                    compare_sort_prefixes(natural_sort_prefix(&a), natural_sort_prefix(&b))
+                {
+                    decided += 1;
+                    assert_eq!(order, natural_str_cmp(&a, &b), "{a:?} against {b:?}");
+                }
+            }
+            assert!(
+                decided * 4 > total,
+                "the prefixes should decide a good share of the pairs ({decided} of {total})"
+            );
+        }
+
+        #[test]
+        fn numbers_compare_by_value_inside_the_prefix() {
+            let before = |a: &str, b: &str| {
+                compare_sort_prefixes(natural_sort_prefix(a), natural_sort_prefix(b))
+            };
+            assert_eq!(before("img2", "img10"), Some(Ordering::Less));
+            assert_eq!(before("img10", "img9"), Some(Ordering::Greater));
+            assert_eq!(
+                before("img", "img1"),
+                Some(Ordering::Less),
+                "ended is lesser"
+            );
+            assert_eq!(
+                before("IMG1", "img1"),
+                None,
+                "case is a tie for the full order"
+            );
+            assert_eq!(before("a007", "a7"), None, "leading zeros are a tie");
+            assert_eq!(
+                before("a1", "ab"),
+                None,
+                "a number against a letter is exact work"
+            );
+            assert_eq!(
+                before("é1", "é2"),
+                None,
+                "past a non-ASCII character it stops"
+            );
+        }
+
+        fn entry(name: &str, kind: EntryKind, parent: &str) -> Entry {
+            Entry {
+                name: name.into(),
+                path: PathBuf::from(parent).join(name),
+                kind,
+                is_symlink: false,
+                size: None,
+                modified: None,
+                origin: None,
+            }
+        }
+
+        #[test]
+        fn sort_entries_orders_like_a_plain_comparison_sort() {
+            let mut rng = Rng(0xFEED);
+            for _ in 0..20 {
+                let mut entries: Vec<Entry> = (0..300)
+                    .map(|_| {
+                        let kind = if rng.next().is_multiple_of(4) {
+                            EntryKind::Directory
+                        } else {
+                            EntryKind::File
+                        };
+                        let parent = if rng.next().is_multiple_of(5) {
+                            "/b"
+                        } else {
+                            "/a"
+                        };
+                        entry(&rng.name(), kind, parent)
+                    })
+                    .collect();
+                let mut expected = entries.clone();
+                expected.sort_by(|a, b| {
+                    b.is_directory()
+                        .cmp(&a.is_directory())
+                        .then_with(|| natural_cmp(&a.name, &b.name))
+                        .then_with(|| a.path.cmp(&b.path))
+                });
+                sort_entries(&mut entries);
+                let paths = |list: &[Entry]| {
+                    list.iter()
+                        .map(|entry| (entry.path.clone(), entry.kind))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(paths(&entries), paths(&expected));
+            }
         }
     }
 }

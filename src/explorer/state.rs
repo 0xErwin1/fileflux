@@ -12,14 +12,18 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Local, TimeZone};
 
 use fileflux::core::navigation::Navigation;
 use fileflux::core::{Entry, Listing, Location};
 
-pub(crate) use super::arrange::{ArrangeCommand, Arrangement, FolderCounts, SortKey, SortSpec};
+use super::arrange::{ArrangeCache, ArrangeInputs};
+pub(crate) use super::arrange::{
+    ArrangeCommand, ArrangeIndex, ArrangeJob, ArrangeOutput, Arrangement, FolderCounts, SortKey,
+    SortSpec,
+};
 
 /// The two presentations of the folder contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +142,32 @@ impl Favorites {
     }
 }
 
+/// The folders up to this many entries are arranged on the calling thread:
+/// that is well under a frame even in a debug build.
+pub(crate) const INLINE_ARRANGE_ENTRIES: usize = 4_096;
+
+/// The arrangement cache behind a lock, so the read-only accessors
+/// (`visible_indices` and friends, called several times per frame) can fill
+/// it. It is only ever locked for one call of its own methods.
+#[derive(Debug, Default)]
+struct ArrangeSlot(Mutex<ArrangeCache>);
+
+impl ArrangeSlot {
+    fn with<R>(&self, work: impl FnOnce(&mut ArrangeCache) -> R) -> R {
+        work(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl Clone for ArrangeSlot {
+    /// A copy keeps the results but not the job in flight, whose output
+    /// belongs to the original.
+    fn clone(&self) -> Self {
+        let mut cache = self.with(|cache| cache.clone());
+        cache.cancel();
+        Self(Mutex::new(cache))
+    }
+}
+
 /// Selection, view, query and history for one tab, plus the
 /// scan-in-progress guard. All locations and entry paths are kept raw; only
 /// display strings are lossy.
@@ -173,6 +203,11 @@ pub(crate) struct ExplorerState {
     op_refresh_deferred: bool,
     /// Bumped on every scan that starts; completions compare against it.
     generation: u64,
+    /// Bumped on every committed listing: which listing an arrangement
+    /// result was computed for.
+    listing_epoch: u64,
+    /// The index and the results of arranging the listing.
+    arrange: ArrangeSlot,
     /// The home directory, when known, which `~` paths resolve against.
     home: Option<PathBuf>,
     /// Why the last scan failed; cleared by the next scan start.
@@ -200,6 +235,8 @@ impl ExplorerState {
             pending: None,
             op_refresh_deferred: false,
             generation: 1,
+            listing_epoch: 0,
+            arrange: ArrangeSlot::default(),
             home,
             load_error: None,
             path_error: None,
@@ -432,11 +469,43 @@ impl ExplorerState {
     /// navigation becomes committed, the listing is replaced, and the query,
     /// selection and notice are cleared: the folder (or its content) moved.
     pub(crate) fn commit(&mut self, scan: Scan, listing: Listing) -> bool {
+        self.commit_with_index(scan, listing, None)
+    }
+
+    /// [`Self::commit`] with the listing's [`ArrangeIndex`], built on the
+    /// scan's thread so the UI thread never walks the entries. An index of
+    /// another length is ignored.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the explorer view starts arrangement jobs off the UI thread"
+        )
+    )]
+    pub(crate) fn commit_indexed(
+        &mut self,
+        scan: Scan,
+        listing: Listing,
+        index: Arc<ArrangeIndex>,
+    ) -> bool {
+        self.commit_with_index(scan, listing, Some(index))
+    }
+
+    fn commit_with_index(
+        &mut self,
+        scan: Scan,
+        listing: Listing,
+        index: Option<Arc<ArrangeIndex>>,
+    ) -> bool {
         if scan.generation != self.generation {
             return false;
         }
         self.nav = scan.candidate;
         self.listing = listing;
+        self.listing_epoch += 1;
+        let index = index.filter(|index| index.len() == self.listing.entries.len());
+        let epoch = self.listing_epoch;
+        self.arrange.with(|cache| cache.reset(epoch, index));
         if scan.live {
             self.selected = retain_existing(&self.selected, &self.listing.entries);
             let still_there = |path: &Option<PathBuf>| {
@@ -499,17 +568,137 @@ impl ExplorerState {
     }
 
     /// [`Self::visible_indices`] at an explicit `now`, for the date filters.
-    pub(crate) fn visible_indices_at<Tz: TimeZone>(&self, now: &DateTime<Tz>) -> Vec<usize> {
-        self.arrangement
-            .arranged(&self.listing.entries, &self.query, &self.child_counts, now)
+    pub(crate) fn visible_indices_at<Tz>(&self, now: &DateTime<Tz>) -> Vec<usize>
+    where
+        Tz: TimeZone + Send + Sync + 'static,
+        Tz::Offset: Send + Sync + 'static,
+    {
+        self.visible_shared_at(now).as_ref().clone()
+    }
+
+    /// [`Self::visible_indices`] without copying: the cached order, shared.
+    /// Cheap to call every frame. With an arrangement job in flight (see
+    /// [`Self::begin_arrange`]) it is the last result of this listing, and
+    /// empty for a listing that has none yet; without one it is computed
+    /// here when the cache is not current.
+    pub(crate) fn visible_shared(&self) -> Arc<Vec<usize>> {
+        self.visible_shared_at(&Local::now())
+    }
+
+    /// [`Self::visible_shared`] at an explicit `now`.
+    pub(crate) fn visible_shared_at<Tz>(&self, now: &DateTime<Tz>) -> Arc<Vec<usize>>
+    where
+        Tz: TimeZone + Send + Sync + 'static,
+        Tz::Offset: Send + Sync + 'static,
+    {
+        let inputs = self.arrange_inputs(now);
+        self.arrange
+            .with(|cache| cache.resolve(&inputs, &self.listing.entries))
+    }
+
+    fn arrange_inputs<Tz>(&self, now: &DateTime<Tz>) -> ArrangeInputs
+    where
+        Tz: TimeZone + Send + Sync + 'static,
+        Tz::Offset: Send + Sync + 'static,
+    {
+        ArrangeInputs::new(
+            self.listing_epoch,
+            self.arrangement.clone(),
+            self.query.clone(),
+            Arc::clone(&self.child_counts),
+            now,
+        )
+    }
+
+    /// The arrangement job that makes the displayed order current, to run
+    /// off the UI thread (`ArrangeJob::run`) and hand back through
+    /// [`Self::commit_arrange`]; `None` when the order already is current or
+    /// a job for exactly the current query, sort, filters and counts is
+    /// running. Call it after every change of those, and after a commit of a
+    /// listing. Until the job lands, [`Self::visible_shared`] keeps the
+    /// previous order instead of computing on the calling thread.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the explorer view starts arrangement jobs off the UI thread"
+        )
+    )]
+    pub(crate) fn begin_arrange(&mut self) -> Option<ArrangeJob> {
+        let inputs = self.arrange_inputs(&Local::now());
+        self.arrange
+            .with(|cache| cache.begin(inputs, &self.listing.entries))
+    }
+
+    /// Makes the displayed order current. A folder of up to
+    /// [`INLINE_ARRANGE_ENTRIES`] entries is arranged right here (it costs
+    /// less than a frame, so the grid never flashes empty) and `None` is
+    /// returned; a larger one returns the job from [`Self::begin_arrange`]
+    /// for the caller to run off the UI thread. Call it after a listing
+    /// commit and after every change of the query, sort, filters or counts.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the explorer view starts arrangement jobs off the UI thread"
+        )
+    )]
+    pub(crate) fn refresh_arrangement(&mut self) -> Option<ArrangeJob> {
+        if self.listing.entries.len() > INLINE_ARRANGE_ENTRIES {
+            return self.begin_arrange();
+        }
+        self.cancel_arrange();
+        drop(self.visible_shared());
+        None
+    }
+
+    /// Settles an arrangement job. `false` (the order is untouched) when it
+    /// is stale: a newer job began since, the listing was replaced, or the
+    /// query, sort, filters or counts changed while it ran. After a `false`
+    /// call [`Self::begin_arrange`] again.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the explorer view starts arrangement jobs off the UI thread"
+        )
+    )]
+    pub(crate) fn commit_arrange(&mut self, output: ArrangeOutput) -> bool {
+        let current = self.arrange_inputs(&Local::now());
+        self.arrange.with(|cache| cache.commit(output, &current))
+    }
+
+    /// An arrangement job is in flight.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the explorer view starts arrangement jobs off the UI thread"
+        )
+    )]
+    pub(crate) fn is_arranging(&self) -> bool {
+        self.arrange.with(|cache| cache.is_pending())
+    }
+
+    /// Forgets the arrangement job in flight (its task was dropped), so
+    /// [`Self::begin_arrange`] starts a new one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the explorer view starts arrangement jobs off the UI thread"
+        )
+    )]
+    pub(crate) fn cancel_arrange(&mut self) {
+        self.arrange.with(ArrangeCache::cancel);
     }
 
     /// The visible entries in displayed order; used by the UI per frame and
     /// by tests through the public API.
     pub(crate) fn visible_entries(&self) -> Vec<&Entry> {
-        self.visible_indices()
-            .into_iter()
-            .filter_map(|index| self.listing.entries.get(index))
+        self.visible_shared()
+            .iter()
+            .filter_map(|&index| self.listing.entries.get(index))
             .collect()
     }
 
@@ -526,7 +715,7 @@ impl ExplorerState {
     /// The search or the filters hide every entry of a folder that has
     /// some; the UI shows a "no matches" state instead of "empty folder".
     pub(crate) fn is_no_result(&self) -> bool {
-        self.is_filtering() && self.visible_indices().is_empty()
+        self.is_filtering() && self.visible_shared().is_empty()
     }
 
     // --- selection ----------------------------------------------------------
@@ -598,7 +787,7 @@ impl ExplorerState {
     /// it, in displayed order. Without a selection it selects the first
     /// entry, like a plain arrow.
     pub(crate) fn extend_selection_by(&mut self, delta: isize) {
-        let count = self.visible_indices().len();
+        let count = self.visible_shared().len();
         if count == 0 {
             return;
         }
@@ -1981,6 +2170,201 @@ mod tests {
         let scan = visit_scan(&mut state, "/fixture/a")?;
         assert!(state.commit(scan, listing(&[("notes.txt", EntryKind::File)])));
         assert!(state.selection().is_empty());
+        Ok(())
+    }
+
+    // --- off-thread arrangement ---------------------------------------------
+
+    fn shown_names(state: &ExplorerState) -> Vec<String> {
+        state
+            .visible_shared()
+            .iter()
+            .filter_map(|&index| state.listing().entries.get(index))
+            .map(|entry| entry.name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn arrange_fixture() -> Listing {
+        listing(&[
+            ("alpha.txt", EntryKind::File),
+            ("beta.md", EntryKind::File),
+            ("Notes", EntryKind::Directory),
+            ("alphabet.rs", EntryKind::File),
+        ])
+    }
+
+    /// A committed explorer over [`arrange_fixture`] whose arrangement is
+    /// current, with the index built the way the scan thread does.
+    fn arranging() -> Result<ExplorerState, Box<dyn std::error::Error>> {
+        let mut state = state();
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        let fixture = arrange_fixture();
+        let index = Arc::new(ArrangeIndex::build(&fixture.entries));
+        assert!(state.commit_indexed(scan, fixture, index));
+        let job = state.begin_arrange().ok_or("a job for the new listing")?;
+        assert!(state.is_arranging());
+        assert!(state.commit_arrange(job.run()));
+        assert!(!state.is_arranging());
+        Ok(state)
+    }
+
+    #[test]
+    fn an_arrangement_job_replaces_the_order_only_when_it_lands() -> TestResult {
+        let mut state = arranging()?;
+        assert_eq!(
+            shown_names(&state),
+            ["Notes", "alpha.txt", "alphabet.rs", "beta.md"]
+        );
+        state.set_query("alpha".into());
+        let job = state.begin_arrange().ok_or("a job for the new query")?;
+        assert_eq!(
+            shown_names(&state).len(),
+            4,
+            "the previous order stays while the job runs"
+        );
+        assert!(state.begin_arrange().is_none(), "one job per input");
+        assert!(state.commit_arrange(job.run()));
+        assert_eq!(shown_names(&state), ["alpha.txt", "alphabet.rs"]);
+        assert_eq!(
+            state.visible_indices(),
+            *state.visible_shared(),
+            "both accessors agree"
+        );
+        assert!(state.begin_arrange().is_none(), "the order is current");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_arrangement_job_is_dropped_and_never_shown() -> TestResult {
+        let mut state = arranging()?;
+        state.set_query("a".into());
+        let slow = state.begin_arrange().ok_or("a job")?;
+        state.set_query("alphab".into());
+        let fast = state.begin_arrange().ok_or("a newer job")?;
+        assert!(state.commit_arrange(fast.run()));
+        assert!(!state.commit_arrange(slow.run()), "the older job is stale");
+        assert_eq!(shown_names(&state), ["alphabet.rs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_job_for_inputs_that_changed_meanwhile_is_dropped_and_restarted() -> TestResult {
+        let mut state = arranging()?;
+        state.set_query("beta".into());
+        let job = state.begin_arrange().ok_or("a job")?;
+        state.arrange(ArrangeCommand::SortBy(SortKey::Size));
+        assert!(!state.commit_arrange(job.run()), "the sort changed");
+        assert!(!state.is_arranging());
+        let job = state
+            .begin_arrange()
+            .ok_or("a job for the current inputs")?;
+        assert!(state.commit_arrange(job.run()));
+        assert_eq!(shown_names(&state), ["beta.md"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_job_of_the_previous_listing_is_dropped_by_the_next_commit() -> TestResult {
+        let mut state = arranging()?;
+        state.set_query("a".into());
+        let old = state.begin_arrange().ok_or("a job")?;
+        let scan = visit_scan(&mut state, "/fixture/b")?;
+        assert!(state.commit(scan, listing(&[("other.txt", EntryKind::File)])));
+        let new = state.begin_arrange().ok_or("a job for the new listing")?;
+        assert!(!state.commit_arrange(old.run()), "another listing");
+        assert!(
+            state.visible_shared().is_empty(),
+            "a fresh listing never shows the old one's indices"
+        );
+        assert!(state.commit_arrange(new.run()));
+        assert_eq!(shown_names(&state), ["other.txt"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_listing_without_a_job_is_arranged_in_place() -> TestResult {
+        // Callers that never begin a job (tests, small folders) still get
+        // the answer from the same accessor.
+        let mut state = state();
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        assert!(state.commit(scan, arrange_fixture()));
+        state.set_query("BETA".into());
+        assert_eq!(shown_names(&state), ["beta.md"]);
+        state.arrange(ArrangeCommand::ToggleFoldersFirst);
+        state.clear_query();
+        assert_eq!(
+            shown_names(&state),
+            ["alpha.txt", "alphabet.rs", "beta.md", "Notes"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_index_of_another_listing_is_ignored() -> TestResult {
+        let mut state = state();
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        let wrong = Arc::new(ArrangeIndex::build(
+            &listing(&[("x", EntryKind::File)]).entries,
+        ));
+        assert!(state.commit_indexed(scan, arrange_fixture(), wrong));
+        assert_eq!(shown_names(&state).len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancelled_job_lets_the_same_inputs_start_again() -> TestResult {
+        let mut state = arranging()?;
+        state.set_query("beta".into());
+        let _dropped = state.begin_arrange().ok_or("a job")?;
+        assert!(state.begin_arrange().is_none());
+        state.cancel_arrange();
+        assert!(!state.is_arranging());
+        assert!(state.begin_arrange().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_cloned_state_does_not_inherit_the_job_in_flight() -> TestResult {
+        let mut state = arranging()?;
+        state.set_query("beta".into());
+        let _running = state.begin_arrange().ok_or("a job")?;
+        let copy = state.clone();
+        assert!(state.is_arranging());
+        assert!(!copy.is_arranging());
+        assert_eq!(shown_names(&copy), ["beta.md"], "the copy computes its own");
+        Ok(())
+    }
+
+    #[test]
+    fn small_folders_are_arranged_in_place_and_large_ones_get_a_job() -> TestResult {
+        let mut small = state();
+        let scan = visit_scan(&mut small, "/fixture/a")?;
+        assert!(small.commit(scan, arrange_fixture()));
+        assert!(small.refresh_arrangement().is_none(), "no job to wait for");
+        assert!(!small.is_arranging());
+        assert_eq!(shown_names(&small).len(), 4);
+
+        let mut large = state();
+        let scan = visit_scan(&mut large, "/fixture/a")?;
+        let names: Vec<String> = (0..=INLINE_ARRANGE_ENTRIES)
+            .map(|serial| format!("file{serial}.txt"))
+            .collect();
+        let entries: Vec<(&str, EntryKind)> = names
+            .iter()
+            .map(|name| (name.as_str(), EntryKind::File))
+            .collect();
+        assert!(large.commit(scan, listing(&entries)));
+        let job = large
+            .refresh_arrangement()
+            .ok_or("a job for a large folder")?;
+        assert!(large.is_arranging());
+        assert!(
+            large.visible_shared().is_empty(),
+            "nothing yet, nothing computed here"
+        );
+        assert!(large.commit_arrange(job.run()));
+        assert_eq!(large.visible_shared().len(), names.len());
+        assert!(large.refresh_arrangement().is_none(), "already current");
         Ok(())
     }
 }

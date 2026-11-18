@@ -76,13 +76,23 @@ impl FileCategory {
         if is_directory {
             return Self::Folders;
         }
+        Self::of_parts(name, is_directory, extension_of(name).as_deref())
+    }
+
+    /// [`Self::of_name`] when the caller already has `extension`, the value
+    /// [`extension_of`] returns for `name`: the arrangement index computes it
+    /// once per entry for the category and the "Type" sort alike.
+    pub fn of_parts(name: &OsStr, is_directory: bool, extension: Option<&str>) -> Self {
+        if is_directory {
+            return Self::Folders;
+        }
         if is_image_name(name) {
             return Self::Images;
         }
-        let Some(extension) = extension_of(name) else {
+        let Some(extension) = extension else {
             return Self::Other;
         };
-        let listed = |known: &[&str]| known.contains(&extension.as_str());
+        let listed = |known: &[&str]| known.contains(&extension);
         if listed(VIDEO_EXTENSIONS) {
             Self::Videos
         } else if listed(AUDIO_EXTENSIONS) {
