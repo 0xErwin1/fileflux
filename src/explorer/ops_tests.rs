@@ -2050,3 +2050,13 @@ fn a_rename_that_is_refused_on_blur_cancels_and_changes_nothing() -> TestResult 
     assert_eq!(rename_step(check("a.txt"), false), RenameStep::Close);
     Ok(())
 }
+
+#[test]
+fn rename_seed_refuses_every_control_character() {
+    for name in [
+        "a\nb", "c\td", "e\u{1}f", "g\u{7f}h", "i\u{1b}j", "k\rl", "m\u{85}n",
+    ] {
+        assert!(rename_seed(OsStr::new(name)).is_err(), "{name:?}");
+    }
+    assert!(rename_seed(OsStr::new("zz\u{2028}line")).is_ok());
+}

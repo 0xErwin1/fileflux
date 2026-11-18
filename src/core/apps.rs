@@ -36,6 +36,10 @@ pub enum ExecError {
     UnclosedQuote,
     /// Nothing to run.
     Empty,
+    /// A field code sits inside a quoted argument. The Desktop Entry spec
+    /// forbids it, and expanding it would let a file name reach a shell
+    /// (`sh -c "echo %f"`), so such entries are refused.
+    QuotedFieldCode,
 }
 
 impl std::fmt::Display for ExecError {
@@ -43,6 +47,7 @@ impl std::fmt::Display for ExecError {
         f.write_str(match self {
             ExecError::UnclosedQuote => "the Exec line has an unclosed quote",
             ExecError::Empty => "the Exec line is empty",
+            ExecError::QuotedFieldCode => "the Exec line uses a field code inside quotes",
         })
     }
 }
@@ -132,7 +137,21 @@ pub fn parse_desktop_entry(content: &str) -> Option<DesktopEntry> {
 /// contain spaces, and inside quotes a backslash escapes `"`, `` ` ``, `$`
 /// and `\`. Nothing is expanded and no shell is involved.
 pub fn split_exec(exec: &str) -> Result<Vec<String>, ExecError> {
+    Ok(split_exec_tokens(exec)?
+        .into_iter()
+        .map(|token| token.text)
+        .collect())
+}
+
+/// One `Exec=` argument and whether any part of it was double-quoted.
+struct ExecToken {
+    text: String,
+    quoted: bool,
+}
+
+fn split_exec_tokens(exec: &str) -> Result<Vec<ExecToken>, ExecError> {
     let mut args = Vec::new();
+    let mut was_quoted = false;
     let mut current = String::new();
     let mut started = false;
     let mut quoted = false;
@@ -153,10 +172,14 @@ pub fn split_exec(exec: &str) -> Result<Vec<String>, ExecError> {
             }
         } else if c == '"' {
             quoted = true;
+            was_quoted = true;
             started = true;
         } else if c.is_whitespace() {
             if started {
-                args.push(std::mem::take(&mut current));
+                args.push(ExecToken {
+                    text: std::mem::take(&mut current),
+                    quoted: std::mem::take(&mut was_quoted),
+                });
                 started = false;
             }
         } else {
@@ -168,12 +191,26 @@ pub fn split_exec(exec: &str) -> Result<Vec<String>, ExecError> {
         return Err(ExecError::UnclosedQuote);
     }
     if started {
-        args.push(current);
+        args.push(ExecToken {
+            text: current,
+            quoted: was_quoted,
+        });
     }
     if args.is_empty() {
         return Err(ExecError::Empty);
     }
     Ok(args)
+}
+
+/// Whether `text` holds a field code other than the literal `%%`.
+fn has_field_code(text: &str) -> bool {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next() != Some('%') {
+            return true;
+        }
+    }
+    false
 }
 
 /// The argument list to run `exec` for `path`: `%f` and `%F` become the
@@ -184,7 +221,14 @@ pub fn split_exec(exec: &str) -> Result<Vec<String>, ExecError> {
 pub fn expand_exec(exec: &str, path: &Path) -> Result<Vec<OsString>, ExecError> {
     let uri = format!("file://{}", encode_percent(path.as_os_str().as_bytes()));
     let mut args = Vec::new();
-    for token in split_exec(exec)? {
+    for ExecToken {
+        text: token,
+        quoted,
+    } in split_exec_tokens(exec)?
+    {
+        if quoted && has_field_code(&token) {
+            return Err(ExecError::QuotedFieldCode);
+        }
         let mut out: Vec<u8> = Vec::new();
         let mut had_code = false;
         let mut chars = token.chars();
@@ -213,16 +257,29 @@ pub fn expand_exec(exec: &str, path: &Path) -> Result<Vec<OsString>, ExecError> 
     Ok(args)
 }
 
-/// Whether `exec` passes the file to the program (`%f`, `%F`, `%u`, `%U`);
-/// an application that does not cannot open anything.
+/// Whether `exec` passes the file to the program (`%f`, `%F`, `%u`, `%U`)
+/// in a form it can be run with; an application that does not cannot open
+/// anything, and one with a field code inside quotes is refused (see
+/// [`ExecError::QuotedFieldCode`]).
 pub fn takes_file(exec: &str) -> bool {
-    let mut chars = exec.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' && matches!(chars.next(), Some('f' | 'F' | 'u' | 'U')) {
-            return true;
-        }
+    let Ok(tokens) = split_exec_tokens(exec) else {
+        return false;
+    };
+    if tokens
+        .iter()
+        .any(|token| token.quoted && has_field_code(&token.text))
+    {
+        return false;
     }
-    false
+    tokens.iter().any(|token| {
+        let mut chars = token.text.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' && matches!(chars.next(), Some('f' | 'F' | 'u' | 'U')) {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// Whether an application listing `types` handles `mime`. Types compare
@@ -613,6 +670,23 @@ mod tests {
         assert!(!takes_file("a %i %c %k"));
         assert!(!takes_file("a 100%% done"));
         assert!(!takes_file("a"));
+        // A file code only inside a quoted argument is not usable.
+        assert!(!takes_file(r#"sh -c "echo \"%f\"""#));
+    }
+
+    #[test]
+    fn a_field_code_inside_a_quoted_argument_is_refused() {
+        let path = Path::new("/tmp/$(touch pwned);.txt");
+        assert_eq!(
+            expand_exec(r#"sh -c "echo \"%f\"""#, path),
+            Err(ExecError::QuotedFieldCode)
+        );
+        assert_eq!(
+            expand_exec(r#"app "--name=%u""#, path),
+            Err(ExecError::QuotedFieldCode)
+        );
+        // A quoted argument without codes stays fine, and %% is literal.
+        assert!(expand_exec(r#"app "two words" "100%%" %f"#, path).is_ok());
     }
 
     #[test]
