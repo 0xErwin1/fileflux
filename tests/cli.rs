@@ -94,3 +94,56 @@ fn more_than_one_path_is_rejected() {
         "fileflux: expected at most one path\nTry 'fileflux --help' for more information.\n"
     );
 }
+
+#[test]
+fn help_describes_the_image_viewer() {
+    assert!(fileflux::cli::USAGE.contains("image viewer"));
+    assert!(fileflux::cli::USAGE.contains("IMAGE..."));
+}
+
+#[test]
+fn several_paths_without_an_image_are_still_rejected() {
+    let cwd = scratch("many-files");
+    std::fs::write(cwd.join("notes.txt"), b"x").expect("fixture file is written");
+    let out = fileflux(&["notes.txt", "other.txt"], &cwd);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out.stdout), "");
+    assert_eq!(
+        text(&out.stderr),
+        "fileflux: expected at most one path\nTry 'fileflux --help' for more information.\n"
+    );
+}
+
+#[test]
+fn a_missing_image_path_is_rejected_without_opening_a_window() {
+    let cwd = scratch("missing-image");
+    let out = fileflux(&["gone.png"], &cwd);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out.stdout), "");
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "fileflux: '{}' does not exist\n",
+            cwd.join("gone.png").display()
+        )
+    );
+}
+
+/// The desktop entry must claim every image type the viewer opens, and the
+/// directory type so file managers can offer Fileflux.
+#[test]
+fn the_desktop_entry_lists_every_image_mime_type() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let entry = std::fs::read_to_string(root.join("packaging/fileflux.desktop"))
+        .expect("the desktop entry exists");
+    let mime_line = entry
+        .lines()
+        .find_map(|line| line.strip_prefix("MimeType="))
+        .expect("the desktop entry has a MimeType line");
+    let claimed: Vec<&str> = mime_line.split(';').filter(|m| !m.is_empty()).collect();
+    for mime in fileflux::core::images::IMAGE_MIME_TYPES {
+        assert!(claimed.contains(mime), "{mime} missing from MimeType");
+    }
+    assert!(claimed.contains(&"inode/directory"));
+    assert!(entry.lines().any(|line| line == "Exec=fileflux %F"));
+}

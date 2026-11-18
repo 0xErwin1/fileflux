@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Fileflux
+GenericName=File Manager and Image Viewer
+Comment=Browse files and view images
+Exec=fileflux %F
+Terminal=false
+StartupWMClass=fileflux
+Categories=System;FileManager;Graphics;Viewer;
+MimeType=inode/directory;image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/vnd.microsoft.icon;image/svg+xml;image/qoi;image/x-tga;image/vnd.radiance;image/x-exr;

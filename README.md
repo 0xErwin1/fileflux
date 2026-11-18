@@ -17,6 +17,7 @@ Review and authorize `.envrc` again after changing it. For shells without direnv
 
 ```text
 fileflux [OPTIONS] [PATH]
+fileflux [OPTIONS] IMAGE...
 ```
 
 | Input | Result |
@@ -24,11 +25,33 @@ fileflux [OPTIONS] [PATH]
 | no `PATH` | Opens your home directory (`/` when `$HOME` is unset). |
 | a directory | Opens it. Relative paths resolve against the current directory; a leading `~` expands against `$HOME` even when quoted. |
 | a file | Opens its parent directory. |
+| an image file (png, jpg/jpeg, gif, webp, bmp, tif/tiff, ico, svg, qoi, tga, hdr, exr) | Opens the [image viewer](#image-viewer) on it, browsing the other images of its folder. |
+| several image paths | Opens the viewer on exactly those images; directories and other files among them are ignored with a note on stderr. |
 | a missing path | Prints `fileflux: '<absolute path>' does not exist` and exits with status 2; no window opens. |
 | `-h`, `--help` / `-V`, `--version` | Prints the usage or `fileflux <version>` and exits with status 0. |
-| an unknown option or a second path | Prints the error plus `Try 'fileflux --help' for more information.` and exits with status 2. |
+| an unknown option, or a second path when the first is not an image | Prints the error plus `Try 'fileflux --help' for more information.` and exits with status 2. |
 
 Use `--` before a directory whose name starts with `-`. Pointing the explorer at a scratch directory (`fileflux /tmp/fixture`) keeps manual checks away from your real files.
+
+## Image viewer
+
+Opening an image (`fileflux photo.png`) shows it in a window of its own, with no sidebar.
+
+- **Navigate:** ←/→, PageUp/PageDown, Home/End, the mouse back/forward buttons, or the wheel. It does not wrap at the ends. Images are listed in the explorer's name order.
+- **Zoom:** the image fits the window by default and is never enlarged beyond 100% on fit. Ctrl+wheel or `+`/`-` zoom around the pointer, `0` fits, `1` shows 100%, double-click toggles. Drag to pan.
+- **Rotate:** `R` / `Shift+R` turn the image 90° clockwise / counter-clockwise. Animated images cannot be rotated.
+- **Other keys:** `I` toggles the info panel, `F`/`F11` fullscreen, `Esc`/`Q` closes the window.
+- **Animation and limits:** animated GIF and WebP play. Images beyond 16384 px on a side or 100 megapixels, damaged files, and unsupported formats (HEIC, AVIF, RAW) show a message instead.
+
+### Making Fileflux your default image viewer
+
+```sh
+scripts/install-desktop.sh                  # install the desktop entry (needs `fileflux` on PATH)
+scripts/install-desktop.sh --default-images # also make it the default for image types
+scripts/install-desktop.sh --uninstall      # undo exactly what was installed
+```
+
+The script only writes to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list`, and `--uninstall` restores the defaults it replaced.
 
 ## What the MVP does
 
