@@ -190,6 +190,7 @@ fn target(selected: usize, can_paste: bool, folder_selected: bool) -> MenuTarget
         terminal: false,
         can_paste,
         folder_selected,
+        single_file: false,
     }
 }
 
@@ -265,6 +266,7 @@ fn the_trash_view_never_offers_the_clipboard() {
             terminal: false,
             can_paste: true,
             folder_selected: false,
+            single_file: false,
         });
         for command in [
             MenuCommand::Cut,
@@ -421,6 +423,7 @@ fn report_of(items: Vec<ItemReport>, cancelled: bool) -> TransferReport {
         items,
         bytes: 0,
         cancelled,
+        leftovers: Vec::new(),
     }
 }
 
@@ -446,6 +449,30 @@ fn a_clean_transfer_says_what_was_copied_or_moved_and_where() {
     ];
     let (many, _) = summary(ClipMode::Cut, items, false);
     assert_eq!(many.text, "Moved 3 items to Pictures");
+}
+
+#[test]
+fn a_replace_that_could_not_clean_up_is_not_reported_as_clean() {
+    let mut report = report_of(vec![ok("/x/a", "/d/Pictures/a")], false);
+    report.leftovers.push((
+        p("/d/Pictures/.fileflux-aside-1-1"),
+        io::Error::from(io::ErrorKind::PermissionDenied),
+    ));
+    let (notice, details) = transfer_summary(ClipMode::Copy, &p("/d/Pictures"), &report, &[]);
+    assert_eq!(notice.severity, Severity::Warning);
+    assert!(
+        notice
+            .text
+            .contains("1 replaced original could not be removed"),
+        "{}",
+        notice.text
+    );
+    assert!(
+        details
+            .iter()
+            .any(|line| line.contains(".fileflux-aside-1-1") && line.contains("denied")),
+        "{details:?}"
+    );
 }
 
 #[test]
@@ -1252,6 +1279,23 @@ fn undoing_a_copy_moves_the_copies_to_the_trash_and_keeps_the_sources() -> TestR
     }
     let trashed = fs::read_dir(scratch.0.join("trash/files"))?.count();
     assert_eq!(trashed, 2, "to the Trash, never deleted");
+    Ok(())
+}
+
+#[test]
+fn undoing_one_copy_says_it_moved_the_copy_not_the_original() -> TestResult {
+    let scratch = Scratch::new("undo-one-copy")?;
+    let source = scratch.file("src/x.txt", "X")?;
+    let dest = scratch.dir("dest")?;
+    let ran = paste(vec![source.clone()], &dest, ClipMode::Copy, Vec::new())?;
+
+    let report = run_undo(&undo_of(&ran)?, &scratch);
+
+    assert_eq!(
+        text_of(&report),
+        "Moved the copy \u{201c}x.txt\u{201d} to Trash"
+    );
+    assert!(source.exists(), "the original stays");
     Ok(())
 }
 

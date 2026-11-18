@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fileflux::core::apps::{App, OpenWith};
+use fileflux::core::places::startup_trash_root;
 use fileflux::core::trash::TrashKind;
 
 use super::super::progress::Unit;
@@ -122,6 +124,27 @@ fn the_undo_stack_pops_the_newest_and_take_removes_only_that_entry() {
 }
 
 #[test]
+fn an_entry_remembers_its_toast_so_ctrl_z_can_close_the_stale_undo_button() {
+    let mut stack = UndoStack::default();
+    let a = stack.push(rename_action("/x/a", "/x/b"));
+    let b = stack.push(rename_action("/x/c", "/x/d"));
+    stack.attach_toast(a, 41);
+    stack.attach_toast(b, 42);
+    stack.attach_toast(99, 7); // an unknown entry changes nothing
+
+    // Ctrl+Z pops the newest entry and learns which toast offered its Undo.
+    assert_eq!(stack.pop().and_then(|entry| entry.toast), Some(42));
+    assert_eq!(stack.take(a).and_then(|entry| entry.toast), Some(41));
+
+    let c = stack.push(rename_action("/x/e", "/x/f"));
+    assert_eq!(
+        stack.take(c).and_then(|entry| entry.toast),
+        None,
+        "no toast was shown (or it was throttled): nothing to close"
+    );
+}
+
+#[test]
 fn the_undo_stack_is_bounded_and_forgets_the_oldest() {
     let mut stack = UndoStack::default();
     for n in 0..UNDO_LIMIT + 5 {
@@ -136,6 +159,35 @@ fn the_undo_stack_is_bounded_and_forgets_the_oldest() {
 }
 
 // --- rename helpers ------------------------------------------------------------
+
+#[test]
+fn names_the_single_line_editor_would_change_are_not_edited_inline() {
+    for name in [
+        "new\nline",
+        "tab\there",
+        "cr\rhere",
+        "bell\u{7}",
+        "nul\u{85}x",
+    ] {
+        assert_eq!(
+            rename_seed(OsStr::new(name)),
+            Err("This name has characters that can't be edited here"),
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        rename_seed(OsStr::new("report v1.txt")),
+        Ok("report v1.txt".to_owned())
+    );
+    assert_eq!(
+        rename_seed(OsStr::new(" padded ")),
+        Ok(" padded ".to_owned())
+    );
+    assert_eq!(
+        rename_seed(OsStr::new("ñandú \u{1F600}")),
+        Ok("ñandú \u{1F600}".to_owned())
+    );
+}
 
 #[test]
 fn the_rename_selection_covers_the_stem_only_for_files() {
@@ -266,6 +318,7 @@ fn target(in_trash: bool, selected: usize, folder_is_empty: bool, terminal: bool
         terminal,
         can_paste: false,
         folder_selected: false,
+        single_file: false,
     }
 }
 
@@ -744,6 +797,136 @@ fn a_trash_failure_is_reported_with_details_and_changes_nothing_else() -> TestRe
     );
     assert!(matches!(&report.undo, Some(UndoAction::Trash { items }) if items.len() == 1));
     Ok(())
+}
+
+#[test]
+fn the_startup_trash_root_serves_a_delete_before_places_are_discovered() -> TestResult {
+    let scratch = Scratch::new("startup-trash")?;
+    let home = scratch.dir("home")?;
+    let a = scratch.file("home/a.txt", "x")?;
+    let root = startup_trash_root(Some(home.as_os_str()), None).ok_or("no startup trash root")?;
+    assert_eq!(root, home.join(".local/share/Trash"));
+
+    // What the explorer builds before `discover()` has answered.
+    let ctx = JobCtx::from_env(root.clone(), Vec::new());
+    let report = run_job(Job::Trash(vec![a.clone()]), &ctx, &sink());
+
+    assert!(
+        report.needs_permanent.is_empty(),
+        "no permanent-delete offer"
+    );
+    assert!(!a.exists());
+    assert_eq!(fs::read(root.join("files/a.txt"))?, b"x");
+    Ok(())
+}
+
+fn app(id: &str, name: &str, exec: &str) -> App {
+    App {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        exec: exec.to_owned(),
+    }
+}
+
+#[test]
+fn open_with_is_offered_for_one_selected_file_only() {
+    let offers = |target: MenuTarget| {
+        menu_rows(&target)
+            .iter()
+            .any(|row| matches!(row, MenuRow::Item(spec) if spec.command == MenuCommand::OpenWith))
+    };
+    let one_file = MenuTarget {
+        single_file: true,
+        ..target(false, 1, false, false)
+    };
+    assert!(offers(one_file));
+    assert!(
+        !offers(target(false, 1, false, false)),
+        "a folder or link target"
+    );
+    assert!(!offers(target(false, 2, false, false)), "several entries");
+    assert!(!offers(target(false, 0, false, false)), "empty space");
+    assert!(
+        !offers(MenuTarget {
+            in_trash: true,
+            ..one_file
+        }),
+        "the Trash view"
+    );
+    let label = menu_rows(&one_file).into_iter().find_map(|row| match row {
+        MenuRow::Item(spec) if spec.command == MenuCommand::OpenWith => Some(spec.label),
+        _ => None,
+    });
+    assert_eq!(label, Some("Open with\u{2026}"));
+}
+
+#[test]
+fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
+    let found = OpenWith {
+        mime: "text/plain".to_owned(),
+        apps: vec![
+            app("a.desktop", "Alpha", "alpha %f"),
+            app("b.desktop", "Beta", "beta %f"),
+        ],
+    };
+    let dialog = DialogState::open_with(Path::new("/d/notes.txt"), &found);
+    assert_eq!(
+        dialog.text.title,
+        "Open \u{201c}notes.txt\u{201d} with\u{2026}"
+    );
+    assert_eq!(dialog.text.names, ["Alpha", "Beta"]);
+    assert_eq!(dialog.text.confirm, "Open");
+    assert_eq!(
+        dialog.initial_focus(),
+        DialogChoice::Confirm,
+        "Enter launches"
+    );
+    assert_eq!(
+        dialog.action,
+        DialogAction::OpenWith {
+            path: PathBuf::from("/d/notes.txt"),
+            apps: found.apps.clone(),
+            selected: 0,
+        }
+    );
+    // A delete confirmation still defaults to the safe button.
+    let delete = DialogState::new(
+        DialogKind::DeletePermanently,
+        &["a".to_owned()],
+        DialogAction::DeletePermanently(vec![PathBuf::from("/d/a")]),
+    );
+    assert_eq!(delete.initial_focus(), DialogChoice::Cancel);
+}
+
+#[test]
+fn the_open_with_selection_moves_within_the_list() {
+    assert_eq!(move_selection(0, 3, 1), 1);
+    assert_eq!(move_selection(2, 3, 1), 2, "stops at the last");
+    assert_eq!(move_selection(0, 3, -1), 0, "stops at the first");
+    assert_eq!(move_selection(1, 3, -1), 0);
+    assert_eq!(move_selection(0, 0, 1), 0, "an empty list stays put");
+}
+
+#[test]
+fn launching_an_app_runs_its_exec_in_the_files_folder() {
+    let chosen = app("v.desktop", "Viewer", "viewer --open %f");
+    let command = open_with_command(Path::new("/d/My Docs/a b.txt"), &chosen);
+    assert_eq!(
+        command,
+        Ok(OpenWithCommand {
+            program: PathBuf::from("viewer"),
+            args: vec![
+                OsString::from("--open"),
+                OsString::from("/d/My Docs/a b.txt")
+            ],
+            cwd: PathBuf::from("/d/My Docs"),
+        })
+    );
+    let broken = app("x.desktop", "Broken", "\"never closed %f");
+    assert_eq!(
+        open_with_command(Path::new("/d/a.txt"), &broken),
+        Err("Could not open with Broken: the Exec line has an unclosed quote".to_owned())
+    );
 }
 
 #[test]

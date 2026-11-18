@@ -22,12 +22,14 @@ use gpui::{
     Window,
 };
 
+use fileflux::core::apps::{self, App, OpenWith};
+
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
     MenuRow, MenuTarget, NewKind, Notice, RenameCheck, RenameStep, Report, Severity, UndoAction,
-    UndoEntry, check_rename, dismissed_notice, menu_rows, next_menu_index, no_trash_dialog,
-    rename_step, stem_range,
+    UndoEntry, check_rename, dismissed_notice, menu_rows, move_selection, next_menu_index,
+    no_trash_dialog, open_with_command, rename_seed, rename_step, stem_range,
 };
 use super::progress::{Sink, Unit};
 use super::view::Explorer;
@@ -233,7 +235,10 @@ impl Explorer {
         self.finish_paste(id, &report, window, cx);
         let undo_id = report.undo.take().map(|action| self.undo.push(action));
         if let Some(notice) = report.notice.take() {
-            self.push_toast(notice, &report.details, undo_id, window, cx);
+            let toast = self.push_toast(notice, &report.details, undo_id, window, cx);
+            if let (Some(undo_id), Some(toast)) = (undo_id, toast) {
+                self.undo.attach_toast(undo_id, toast);
+            }
         }
         // A cancelled job already said what it did not delete; otherwise
         // the follow-up dialog queues behind any dialog that is open now.
@@ -264,7 +269,7 @@ impl Explorer {
         undo_id: Option<u64>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<u64> {
         let mut toast = match notice.severity {
             Severity::Success => Toast::success(notice.text),
             Severity::Info => Toast::info(notice.text),
@@ -301,7 +306,12 @@ impl Explorer {
                     }),
             );
         }
+        // Ids only grow, so a different newest id is this toast; the same
+        // one means the host dropped it (throttled).
+        let before = self.toast_host.read(cx).latest_toast_id();
         toast.push(cx);
+        let after = self.toast_host.read(cx).latest_toast_id();
+        if after == before { None } else { after }
     }
 
     /// A plain message toast.
@@ -401,7 +411,13 @@ impl Explorer {
             return;
         };
         let is_dir = entry.is_directory() && !entry.is_symlink;
-        let seed = entry.name.to_string_lossy().into_owned();
+        let seed = match rename_seed(&entry.name) {
+            Ok(seed) => seed,
+            Err(message) => {
+                self.say(Severity::Warning, message, window, cx);
+                return;
+            }
+        };
         let range = stem_range(&seed, is_dir);
 
         let input = cx.new(|cx| InputState::new(window, cx));
@@ -765,6 +781,16 @@ impl Explorer {
             DialogAction::EmptyTrash(names) => {
                 ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
             }
+            DialogAction::OpenWith {
+                path,
+                apps,
+                selected,
+            } => {
+                if let Some(app) = apps.get(selected) {
+                    self.run_open_with(&path, app, cx);
+                }
+                return;
+            }
             DialogAction::Conflict { job, apply_all } => {
                 // Replace: the one destructive answer.
                 self.answer_conflict(
@@ -803,7 +829,14 @@ impl Explorer {
     /// Ctrl+Z: undoes the newest operation of the session.
     pub(crate) fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.undo.pop() {
-            Some(entry) => self.run_undo(entry, window, cx),
+            Some(entry) => {
+                // Its toast's Undo button would now do nothing: close it.
+                if let Some(toast) = entry.toast {
+                    self.toast_host
+                        .update(cx, |host, cx| host.dismiss(toast, cx));
+                }
+                self.run_undo(entry, window, cx);
+            }
             None => self.say(Severity::Info, "Nothing to undo", window, cx),
         }
     }
@@ -852,6 +885,7 @@ impl Explorer {
             terminal: self.terminal.is_some(),
             can_paste: self.can_paste(cx),
             folder_selected: matches!(selected.as_slice(), [(_, true)]),
+            single_file: matches!(selected.as_slice(), [(_, false)]),
         };
         let rows = menu_rows(&target);
         if rows.is_empty() {
@@ -911,6 +945,7 @@ impl Explorer {
         self.close_menu(window, cx);
         match command {
             MenuCommand::Open => self.open_selected(window, cx),
+            MenuCommand::OpenWith => self.open_with(window, cx),
             MenuCommand::Rename => self.start_rename(window, cx),
             MenuCommand::CopyPath => self.copy_selected_paths(cx),
             MenuCommand::Properties => {
@@ -933,6 +968,99 @@ impl Explorer {
     }
 
     // --- clipboard, open, terminal -------------------------------------------------------
+
+    /// "Open with…": looks up the applications for the single selected
+    /// file off the UI thread, then asks which one to run.
+    pub(crate) fn open_with(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_trash() {
+            return;
+        }
+        let selected = self.selected_visible_paths();
+        let [path] = selected.as_slice() else {
+            return;
+        };
+        let path = path.clone();
+        let lookup = {
+            let path = path.clone();
+            cx.background_executor()
+                .spawn(async move { apps::open_with_candidates(&path) })
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let found = lookup.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                this.offer_open_with(&path, &found, window, cx);
+            }) {
+                log::debug!("the explorer closed before the applications were found: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn offer_open_with(
+        &mut self,
+        path: &Path,
+        found: &OpenWith,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if found.apps.is_empty() {
+            let text = format!("No application found for {} ({})", quoted(path), found.mime);
+            self.say(Severity::Info, text, window, cx);
+            return;
+        }
+        self.offer_dialog(DialogState::open_with(path, found), window, cx);
+    }
+
+    /// Up / Down in the "Open with…" list.
+    pub(crate) fn move_open_with(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(DialogState {
+            action: DialogAction::OpenWith { apps, selected, .. },
+            ..
+        }) = self.dialogs.current_mut()
+        {
+            *selected = move_selection(*selected, apps.len(), delta);
+            cx.notify();
+        }
+    }
+
+    /// A click on one application of the "Open with…" list: choose it and
+    /// run it.
+    pub(crate) fn choose_open_with(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(DialogState {
+            action: DialogAction::OpenWith { apps, selected, .. },
+            ..
+        }) = self.dialogs.current_mut()
+            && index < apps.len()
+        {
+            *selected = index;
+        }
+        self.confirm_dialog(window, cx);
+    }
+
+    /// Runs the chosen application of a closed "Open with…" dialog.
+    fn run_open_with(&mut self, path: &Path, app: &App, cx: &mut Context<Self>) {
+        match open_with_command(path, app) {
+            Ok(command) => {
+                let failure = format!("Could not open {} with {}", quoted(path), app.name);
+                self.launch(
+                    command.program,
+                    command.args,
+                    Some(command.cwd),
+                    failure,
+                    cx,
+                );
+            }
+            Err(message) => {
+                self.state.set_notice(message);
+                cx.notify();
+            }
+        }
+    }
 
     /// Ctrl+Shift+C: the selected paths, one per line.
     pub(crate) fn copy_selected_paths(&mut self, cx: &mut Context<Self>) {

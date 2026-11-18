@@ -25,6 +25,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fileflux::core::apps::{App, OpenWith, expand_exec};
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
@@ -131,6 +132,8 @@ pub(crate) enum UndoAction {
 pub(crate) struct UndoEntry {
     pub(crate) id: u64,
     pub(crate) action: UndoAction,
+    /// The toast whose Undo button names this entry, once it is shown.
+    pub(crate) toast: Option<u64>,
 }
 
 /// The session's undo history: newest last, bounded, surviving navigation.
@@ -150,8 +153,18 @@ impl UndoStack {
         self.entries.push(UndoEntry {
             id: self.last_id,
             action,
+            toast: None,
         });
         self.last_id
+    }
+
+    /// Records which toast offers Undo for entry `id`, so undoing it some
+    /// other way (Ctrl+Z) can close that toast instead of leaving a button
+    /// that no longer does anything.
+    pub(crate) fn attach_toast(&mut self, id: u64, toast: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.toast = Some(toast);
+        }
     }
 
     /// Removes and returns the newest entry (Ctrl+Z).
@@ -345,7 +358,12 @@ fn create(dir: &Path, kind: NewKind) -> Report {
     // A name can be taken between choosing it and creating it; the next
     // unique name is then free again.
     for _ in 0..32 {
-        let name = core_ops::unique_name(dir, OsStr::new(kind.base_name()));
+        let name = match core_ops::unique_name(dir, OsStr::new(kind.base_name())) {
+            Ok(name) => name,
+            Err(error) => {
+                return Report::error(format!("Could not create the {}: {error}", kind.noun()));
+            }
+        };
         let made = match kind {
             NewKind::Folder => core_ops::create_dir(dir, &name),
             NewKind::File => core_ops::create_file(dir, &name),
@@ -1009,6 +1027,19 @@ fn undo_create(
 
 // --- inline rename ----------------------------------------------------------------
 
+/// The text the inline editor starts with for `name`, or why this name
+/// cannot be edited inline. The editor is a single-line field that drops
+/// line breaks and other control characters, so committing an untouched
+/// field would rename the file to a different name than the one shown;
+/// such names are refused up front and the file is left alone.
+pub(crate) fn rename_seed(name: &OsStr) -> Result<String, &'static str> {
+    let text = name.to_string_lossy();
+    if text.chars().any(char::is_control) {
+        return Err("This name has characters that can't be edited here");
+    }
+    Ok(text.into_owned())
+}
+
 /// The part of `name` the inline rename preselects: the stem of a file (up
 /// to its last dot, a leading dot is no extension), the whole name of a
 /// folder. Byte offsets.
@@ -1100,6 +1131,8 @@ pub(crate) fn rename_step(check: RenameCheck, from_blur: bool) -> RenameStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuCommand {
     Open,
+    /// Choose the application to open the single selected file with.
+    OpenWith,
     Rename,
     CopyPath,
     Properties,
@@ -1152,6 +1185,9 @@ pub(crate) struct MenuTarget {
     pub(crate) can_paste: bool,
     /// Exactly one entry is selected and it is a folder (not a link to one).
     pub(crate) folder_selected: bool,
+    /// Exactly one entry is selected and it is not a folder: "Open with…"
+    /// applies.
+    pub(crate) single_file: bool,
 }
 
 /// The menu rows for a target; empty when there is nothing to offer (the
@@ -1201,8 +1237,16 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         };
     }
     if target.selected > 0 {
-        let mut rows = vec![
-            item(MenuCommand::Open, "Open", Some("Enter"), false),
+        let mut rows = vec![item(MenuCommand::Open, "Open", Some("Enter"), false)];
+        if target.single_file {
+            rows.push(item(
+                MenuCommand::OpenWith,
+                "Open with\u{2026}",
+                None,
+                false,
+            ));
+        }
+        rows.extend([
             MenuRow::Separator,
             item(MenuCommand::Cut, "Cut", Some("Ctrl+X"), false),
             item(MenuCommand::Copy, "Copy", Some("Ctrl+C"), false),
@@ -1212,7 +1256,7 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
                 paste(MenuCommand::Paste, "Paste")
             },
             MenuRow::Separator,
-        ];
+        ]);
         if target.selected == 1 {
             rows.push(item(MenuCommand::Rename, "Rename", Some("F2"), false));
         }
@@ -1299,6 +1343,8 @@ pub(crate) enum DialogKind {
     DeleteFromTrash,
     /// Empty the Trash.
     EmptyTrash { count: usize },
+    /// Choose the application to open `file` (of type `mime`) with.
+    OpenWith { file: String, mime: String },
     /// A paste found `name` already in `folder`; the two lines describe the
     /// item there and the one arriving.
     Conflict {
@@ -1317,6 +1363,12 @@ pub(crate) enum DialogAction {
     DeleteFromTrash(Vec<OsString>),
     /// The Trash names the dialog counted; nothing else is deleted.
     EmptyTrash(Vec<OsString>),
+    /// Run `apps[selected]` on `path`.
+    OpenWith {
+        path: PathBuf,
+        apps: Vec<App>,
+        selected: usize,
+    },
     /// A running paste waits for the answer. `apply_all` is the checkbox
     /// "Apply to all remaining conflicts".
     Conflict {
@@ -1354,10 +1406,30 @@ impl DialogState {
         }
     }
 
+    /// The "Open with…" chooser for `path`: the applications are listed in
+    /// the order found, the first (the default application) selected.
+    pub(crate) fn open_with(path: &Path, found: &OpenWith) -> DialogState {
+        let names: Vec<String> = found.apps.iter().map(|app| app.name.clone()).collect();
+        DialogState::new(
+            DialogKind::OpenWith {
+                file: display_name(path),
+                mime: found.mime.clone(),
+            },
+            &names,
+            DialogAction::OpenWith {
+                path: path.to_path_buf(),
+                apps: found.apps.clone(),
+                selected: 0,
+            },
+        )
+    }
+
     /// The button that has the keyboard focus when the dialog opens: the
-    /// safe one, never the one that destroys something.
+    /// safe one, never the one that destroys something. Opening a file
+    /// destroys nothing, so Enter there launches the selected application.
     pub(crate) fn initial_focus(&self) -> DialogChoice {
         match self.kind {
+            DialogKind::OpenWith { .. } => DialogChoice::Confirm,
             DialogKind::Conflict { .. } => CONFLICT_DEFAULT,
             _ => DIALOG_DEFAULT,
         }
@@ -1611,6 +1683,11 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             "Replace it, skip this item, or keep both?".to_owned(),
             "Replace",
         ),
+        DialogKind::OpenWith { file, mime } => (
+            format!("Open \u{201c}{file}\u{201d} with\u{2026}"),
+            format!("Applications for {mime}. Up and Down choose, Enter opens."),
+            "Open",
+        ),
         DialogKind::EmptyTrash { count } => (
             "Empty the Trash?".to_owned(),
             if *count == 1 {
@@ -1631,6 +1708,8 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             format!("Existing  {existing}"),
             format!("Incoming  {incoming}"),
         ],
+        // Every application is a row of its own: none is folded away.
+        DialogKind::OpenWith { .. } => names.to_vec(),
         _ => listed(names),
     };
     DialogText {
@@ -1639,6 +1718,49 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         names,
         confirm,
     }
+}
+
+// --- open with ----------------------------------------------------------------------
+
+fn display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// The selected row after moving by `delta` in a list of `len` rows; it
+/// stops at both ends.
+pub(crate) fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
+    selected
+        .saturating_add_signed(delta)
+        .min(len.saturating_sub(1))
+}
+
+/// A program to start, detached, in `cwd`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenWithCommand {
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<OsString>,
+    /// The folder of the file.
+    pub(crate) cwd: PathBuf,
+}
+
+/// What running `app` on `path` starts: its `Exec=` line expanded for the
+/// file, in the file's folder.
+pub(crate) fn open_with_command(path: &Path, app: &App) -> Result<OpenWithCommand, String> {
+    let argv = expand_exec(&app.exec, path)
+        .map_err(|error| format!("Could not open with {}: {error}", app.name))?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| format!("Could not open with {}: nothing to run", app.name))?;
+    Ok(OpenWithCommand {
+        program: PathBuf::from(program),
+        args: args.to_vec(),
+        cwd: path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+    })
 }
 
 // --- terminal ----------------------------------------------------------------------

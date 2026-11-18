@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
@@ -175,6 +175,9 @@ pub struct TransferReport {
     /// Bytes of the items that completed.
     pub bytes: u64,
     pub cancelled: bool,
+    /// Hidden originals a successful Replace could not delete afterwards;
+    /// the transfer itself succeeded, but this data is still on disk.
+    pub leftovers: Vec<(PathBuf, io::Error)>,
 }
 
 /// Rejects names that are empty, `.`/`..`, contain `/` or NUL, or exceed
@@ -240,7 +243,7 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),
         Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP) => {
-            if exists(to) {
+            if occupied(to)? {
                 return Err(io::ErrorKind::AlreadyExists.into());
             }
             fs::rename(from, to)
@@ -249,10 +252,16 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// True when anything, including a dangling symlink, occupies `path`.
-/// Unreadable counts as present: never assume free.
-fn exists(path: &Path) -> bool {
-    !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+/// Whether anything, including a dangling symlink, occupies `path`. Only
+/// `NotFound` means free; any other failure (`ENAMETOOLONG`, `EACCES`, ...)
+/// is returned, because treating it as "taken" makes name searches spin on
+/// a name that can never be tested.
+fn occupied(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Byte offset where the extension starts (`.tar.*` counts as one), or
@@ -272,37 +281,78 @@ fn extension_start(name: &[u8]) -> Option<usize> {
     Some(last)
 }
 
-/// `name` with ` (n)` inserted before the extension (folders have none).
+/// `name` with ` (n)` inserted before the extension (folders have none),
+/// shortened so the result fits a file name.
 pub(crate) fn numbered_name(name: &OsStr, n: u32, is_dir: bool) -> OsString {
+    fit_name(name, &format!(" ({n})"), is_dir, MAX_NAME_BYTES)
+}
+
+/// `name` with `suffix` inserted before the extension (folders have none),
+/// at most `max` bytes long: when it would be longer, the stem is cut back
+/// (never into the middle of a UTF-8 sequence; names that are not UTF-8 are
+/// cut byte-wise) while the extension stays. An extension too long to leave
+/// room is treated as part of the stem.
+pub(crate) fn fit_name(name: &OsStr, suffix: &str, is_dir: bool, max: usize) -> OsString {
     let bytes = name.as_bytes();
-    let split = if is_dir {
+    let mut split = if is_dir {
         bytes.len()
     } else {
         extension_start(bytes).unwrap_or(bytes.len())
     };
-    let mut out = bytes.get(..split).unwrap_or(bytes).to_vec();
-    out.extend_from_slice(format!(" ({n})").as_bytes());
-    out.extend_from_slice(bytes.get(split..).unwrap_or_default());
+    if suffix.len() + bytes.len().saturating_sub(split) > max {
+        split = bytes.len();
+    }
+    let extension = bytes.get(split..).unwrap_or_default();
+    let room = max.saturating_sub(suffix.len() + extension.len());
+    let mut cut = split.min(room);
+    // Step back off UTF-8 continuation bytes (at most three of them).
+    for _ in 0..3 {
+        if cut > 0 && bytes.get(cut).is_some_and(|byte| byte & 0xC0 == 0x80) {
+            cut -= 1;
+        }
+    }
+    let mut out = bytes.get(..cut).unwrap_or_default().to_vec();
+    out.extend_from_slice(suffix.as_bytes());
+    out.extend_from_slice(extension);
     OsString::from_vec(out)
 }
 
+/// How many numbered candidates a name search tries before giving up.
+const MAX_NAME_ATTEMPTS: u32 = 100_000;
+
 /// A name for `dir` that does not exist yet: `name` itself when free, else
 /// "report.pdf" → "report (2).pdf", "archive.tar.gz" → "archive (2).tar.gz",
-/// "Photos" → "Photos (2)", counting up past existing entries.
-pub fn unique_name(dir: &Path, name: &OsStr) -> OsString {
+/// "Photos" → "Photos (2)", counting up past existing entries. Fails when a
+/// candidate cannot be tested (anything but "not found") or none is free
+/// within a bounded number of tries.
+pub fn unique_name(dir: &Path, name: &OsStr) -> io::Result<OsString> {
+    unique_name_cancellable(dir, name, &AtomicBool::new(false))
+}
+
+/// [`unique_name`] that gives up with `Interrupted` once `cancel` is set.
+pub fn unique_name_cancellable(
+    dir: &Path,
+    name: &OsStr,
+    cancel: &AtomicBool,
+) -> io::Result<OsString> {
     let first = dir.join(name);
-    if !exists(&first) {
-        return name.to_owned();
+    if !occupied(&first)? {
+        return Ok(name.to_owned());
     }
     let is_dir = fs::symlink_metadata(&first).is_ok_and(|meta| meta.is_dir());
-    let mut n = 2u32;
-    loop {
-        let candidate = numbered_name(name, n, is_dir);
-        if !exists(&dir.join(&candidate)) || n == u32::MAX {
-            return candidate;
+    for n in 2..=MAX_NAME_ATTEMPTS {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
         }
-        n += 1;
+        let candidate = numbered_name(name, n, is_dir);
+        if !occupied(&dir.join(&candidate))? {
+            return Ok(candidate);
+        }
     }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free numbered name",
+    ))
 }
 
 /// Copies or moves `sources` into `dest_dir`.
@@ -355,6 +405,7 @@ fn transfer_with(
         current: PathBuf::new(),
         seq: 0,
         deferred: Vec::new(),
+        leftovers: Vec::new(),
     };
     let mut report = TransferReport::default();
     for (source, size) in sources.iter().zip(sizes) {
@@ -379,6 +430,7 @@ fn transfer_with(
             outcome,
         });
     }
+    report.leftovers = ctx.leftovers;
     report
 }
 
@@ -419,6 +471,58 @@ fn remove_all(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Removes the moved-aside original of a replace. A read-only directory
+/// inside it would block the plain removal, so on failure the directories
+/// of this tree (and only them: nothing is followed, a symlink is just
+/// unlinked) get owner rwx and the removal is repeated.
+fn remove_aside(aside: &Path) -> io::Result<()> {
+    if remove_all(aside).is_ok() {
+        return Ok(());
+    }
+    remove_tree_unlocking(aside)
+}
+
+fn remove_tree_unlocking(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() {
+        return fs::remove_file(path);
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o700 != 0o700 {
+        unlock_directory(path, mode)?;
+    }
+    let mut first_error = None;
+    for entry in fs::read_dir(path)? {
+        let result = entry.and_then(|entry| remove_tree_unlocking(&entry.path()));
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => fs::remove_dir(path),
+    }
+}
+
+/// Gives the directory at `path` owner rwx. The directory is opened with
+/// `O_PATH | O_NOFOLLOW | O_DIRECTORY`, so a symlink (or anything swapped
+/// in for the directory) is refused instead of followed, and the mode is
+/// then changed through that descriptor.
+fn unlock_directory(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = rustix::fs::openat(
+        CWD,
+        path,
+        rustix::fs::OFlags::PATH
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let through_fd = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+    fs::set_permissions(through_fd, fs::Permissions::from_mode(mode | 0o700))
+}
+
 /// A directory whose mode and mtime are applied after its contents are in,
 /// so a read-only source directory neither blocks its own copy nor blocks
 /// cleanup of a failed one.
@@ -443,6 +547,7 @@ struct Ctx<'a> {
     current: PathBuf,
     seq: u32,
     deferred: Vec<DeferredDir>,
+    leftovers: Vec<(PathBuf, io::Error)>,
 }
 
 impl Ctx<'_> {
@@ -464,17 +569,30 @@ impl Ctx<'_> {
 
     /// A free hidden sibling name in `dir` for partial copies and the
     /// moved-aside original of a replace (see [`is_transfer_temp`]).
-    fn temp_name(&mut self, dir: &Path, tag: &str) -> PathBuf {
-        loop {
+    fn temp_name(&mut self, dir: &Path, tag: &str) -> io::Result<PathBuf> {
+        for _ in 0..MAX_NAME_ATTEMPTS {
             self.seq += 1;
             let candidate = dir.join(format!(
                 "{TEMP_PREFIX}{tag}-{}-{}",
                 std::process::id(),
                 self.seq
             ));
-            if !exists(&candidate) {
-                return candidate;
+            if !occupied(&candidate)? {
+                return Ok(candidate);
             }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no free temporary name",
+        ))
+    }
+
+    /// [`unique_name_cancellable`] bound to this transfer's cancel flag.
+    fn unique(&self, dir: &Path, name: &OsStr) -> Result<PathBuf, TransferError> {
+        match unique_name_cancellable(dir, name, self.cancel) {
+            Ok(unique) => Ok(dir.join(unique)),
+            Err(_) if self.cancel.load(Ordering::Relaxed) => Err(TransferError::Cancelled),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -534,13 +652,13 @@ impl Ctx<'_> {
         if dest_canon == parent_canon {
             match mode {
                 Mode::Move => return Ok(None),
-                Mode::Copy => target = dest_dir.join(unique_name(dest_dir, name)),
+                Mode::Copy => target = self.unique(dest_dir, name)?,
             }
-        } else if exists(&target) {
+        } else if occupied(&target)? {
             match conflict(&target) {
                 Conflict::Skip => return Ok(None),
                 Conflict::Cancel => return Err(TransferError::Cancelled),
-                Conflict::KeepBoth => target = dest_dir.join(unique_name(dest_dir, name)),
+                Conflict::KeepBoth => target = self.unique(dest_dir, name)?,
                 Conflict::Replace => {
                     if src_canon.starts_with(dest_canon.join(name)) {
                         return Err(TransferError::IntoItself);
@@ -567,7 +685,7 @@ impl Ctx<'_> {
     ) -> Result<Placed, TransferError> {
         let dir = target.parent().unwrap_or(Path::new("."));
         let aside = if replace {
-            let aside = self.temp_name(dir, "aside");
+            let aside = self.temp_name(dir, "aside")?;
             fs::rename(target, &aside)?;
             Some(aside)
         } else {
@@ -576,9 +694,11 @@ impl Ctx<'_> {
         match self.materialize(src, target, mode, size) {
             Ok(placed) => {
                 if let Some(aside) = aside {
-                    // The new copy is in place; a stuck aside copy is only
-                    // leftover hidden data, never a failure of the transfer.
-                    remove_all(&aside).ok();
+                    // The new copy is in place, so a stuck aside copy is not
+                    // a failure of the transfer; it is reported instead.
+                    if let Err(error) = remove_aside(&aside) {
+                        self.leftovers.push((aside, error));
+                    }
                 }
                 Ok(placed)
             }
@@ -612,7 +732,7 @@ impl Ctx<'_> {
         }
 
         let dir = target.parent().unwrap_or(Path::new("."));
-        let partial = self.temp_name(dir, "partial");
+        let partial = self.temp_name(dir, "partial")?;
         self.deferred.clear();
         let built = self
             .copy_node(src, &partial)
@@ -993,6 +1113,122 @@ mod tests {
         Ok(())
     }
 
+    /// Runs `work` on its own thread and fails instead of hanging when it
+    /// does not finish in time.
+    fn bounded<T: Send + 'static>(
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Box<dyn Error>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(work()).ok();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "operation did not finish in time".into())
+    }
+
+    #[test]
+    fn unique_name_terminates_for_long_names() -> TestResult {
+        let s = Scratch::new("longname")?;
+        let name = OsString::from("N".repeat(253));
+        fs::write(s.0.join(&name), b"x")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = s.0.clone();
+        let n = name.clone();
+        std::thread::spawn(move || {
+            tx.send(unique_name(&dir, &n)).ok();
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "unique_name hung")??;
+        assert!(got.len() <= 255 && !s.0.join(&got).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn numbered_name_fits_255_bytes_on_char_boundaries_and_keeps_the_extension() {
+        let accented = OsString::from(format!("{}.txt", "é".repeat(125)));
+        let got = numbered_name(&accented, 2, false);
+        assert!(got.len() <= 255, "{}", got.len());
+        let text = got.to_str().unwrap_or_default();
+        assert!(text.ends_with(" (2).txt"), "{text}");
+        assert!(text.starts_with('é'));
+
+        let raw = OsString::from_vec([&[0xFFu8; 253][..], b".gz"].concat());
+        let got = numbered_name(&raw, 12, false);
+        assert!(got.len() <= 255);
+        assert!(got.as_bytes().ends_with(b" (12).gz"));
+        assert!(got.as_bytes().starts_with(&[0xFF, 0xFF]));
+
+        // An absurd extension is treated as part of the stem.
+        let odd = OsString::from(format!("a.{}", "x".repeat(253)));
+        assert!(numbered_name(&odd, 2, false).len() <= 255);
+
+        // Short names are untouched.
+        assert_eq!(numbered_name(OsStr::new("a.txt"), 2, false), "a (2).txt");
+    }
+
+    #[test]
+    fn unique_name_propagates_errors_other_than_not_found() -> TestResult {
+        let scratch = Scratch::new("unique-eacces")?;
+        let locked = scratch.dir("locked")?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+        if fs::read_dir(&locked).is_ok() {
+            return Ok(()); // running as root: permissions do not apply
+        }
+        let got = bounded(move || unique_name(&locked, OsStr::new("a.txt")))?;
+        assert!(got.is_err(), "an unreadable folder is not 'free': {got:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unique_name_stops_when_cancelled() -> TestResult {
+        let scratch = Scratch::new("unique-cancel")?;
+        fs::write(scratch.path("a.txt"), b"x")?;
+        let cancel = AtomicBool::new(true);
+        let got = unique_name_cancellable(&scratch.0, OsStr::new("a.txt"), &cancel);
+        assert!(got.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn copy_into_its_own_folder_shortens_a_253_byte_name() -> TestResult {
+        let scratch = Scratch::new("copy-long")?;
+        let name = "L".repeat(253);
+        fs::write(scratch.path(&name), b"data")?;
+        let (src, dir) = (scratch.path(&name), scratch.0.clone());
+        let report = bounded(move || run(&[src], &dir, Mode::Copy, no_conflict))?;
+        let ItemOutcome::Ok { dest, .. } = only_item(&report)? else {
+            return Err(format!("not ok: {report:?}").into());
+        };
+        let copy_name = dest.file_name().ok_or("no name")?;
+        assert!(copy_name.len() <= 255 && copy_name.as_bytes().ends_with(b" (2)"));
+        assert_ne!(copy_name, OsStr::new(&name));
+        assert_eq!(fs::read(dest)?, b"data");
+        assert_eq!(fs::read(scratch.path(&name))?, b"data");
+        assert_eq!(names(&scratch.0)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn keep_both_shortens_a_253_byte_name() -> TestResult {
+        let scratch = Scratch::new("keep-long")?;
+        let dest = scratch.dir("dest")?;
+        let name = format!("{}.txt", "K".repeat(249));
+        fs::write(scratch.path(&name), b"new")?;
+        fs::write(dest.join(&name), b"old")?;
+        let src = scratch.path(&name);
+        let dest2 = dest.clone();
+        let report = bounded(move || run(&[src], &dest2, Mode::Copy, |_| Conflict::KeepBoth))?;
+        let ItemOutcome::Ok { dest: out, .. } = only_item(&report)? else {
+            return Err(format!("not ok: {report:?}").into());
+        };
+        let out_name = out.file_name().ok_or("no name")?;
+        assert!(out_name.len() <= 255 && out_name.as_bytes().ends_with(b" (2).txt"));
+        assert_eq!(fs::read(out)?, b"new");
+        assert_eq!(fs::read(dest.join(&name))?, b"old");
+        Ok(())
+    }
+
     // ---- unique_name ----
 
     #[test]
@@ -1006,16 +1242,19 @@ mod tests {
         fs::create_dir(dir.join("Photos"))?;
         fs::create_dir(dir.join("v1.2"))?;
 
-        assert_eq!(unique_name(dir, OsStr::new("report.pdf")), "report (2).pdf");
         assert_eq!(
-            unique_name(dir, OsStr::new("archive.tar.gz")),
+            unique_name(dir, OsStr::new("report.pdf"))?,
+            "report (2).pdf"
+        );
+        assert_eq!(
+            unique_name(dir, OsStr::new("archive.tar.gz"))?,
             "archive (2).tar.gz"
         );
-        assert_eq!(unique_name(dir, OsStr::new("noext")), "noext (2)");
-        assert_eq!(unique_name(dir, OsStr::new(".bashrc")), ".bashrc (2)");
-        assert_eq!(unique_name(dir, OsStr::new("Photos")), "Photos (2)");
-        assert_eq!(unique_name(dir, OsStr::new("v1.2")), "v1.2 (2)");
-        assert_eq!(unique_name(dir, OsStr::new("free.txt")), "free.txt");
+        assert_eq!(unique_name(dir, OsStr::new("noext"))?, "noext (2)");
+        assert_eq!(unique_name(dir, OsStr::new(".bashrc"))?, ".bashrc (2)");
+        assert_eq!(unique_name(dir, OsStr::new("Photos"))?, "Photos (2)");
+        assert_eq!(unique_name(dir, OsStr::new("v1.2"))?, "v1.2 (2)");
+        assert_eq!(unique_name(dir, OsStr::new("free.txt"))?, "free.txt");
         Ok(())
     }
 
@@ -1027,7 +1266,10 @@ mod tests {
         fs::write(dir.join("report (2).pdf"), b"")?;
         // A dangling symlink occupies a name too.
         symlink("nowhere", dir.join("report (3).pdf"))?;
-        assert_eq!(unique_name(dir, OsStr::new("report.pdf")), "report (4).pdf");
+        assert_eq!(
+            unique_name(dir, OsStr::new("report.pdf"))?,
+            "report (4).pdf"
+        );
         Ok(())
     }
 
@@ -1595,6 +1837,36 @@ mod tests {
             assert_eq!(names(&dest.join("tree"))?, ["keep.txt"]);
             assert!(tree.join("a.txt").exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn replace_leaves_no_hidden_aside() -> TestResult {
+        let scratch = Scratch::new("replace-aside")?;
+        let dest = scratch.dir("dest")?;
+        let outside = scratch.dir("outside")?;
+        fs::write(outside.join("precious.txt"), b"precious")?;
+        let old = dest.join("tree");
+        fs::create_dir_all(old.join("ro/deeper"))?;
+        fs::write(old.join("ro/file.txt"), b"old")?;
+        fs::write(old.join("ro/deeper/x"), b"old")?;
+        symlink(&outside, old.join("ro/link-out"))?;
+        fs::set_permissions(old.join("ro/deeper"), fs::Permissions::from_mode(0o000))?;
+        fs::set_permissions(old.join("ro"), fs::Permissions::from_mode(0o555))?;
+        let new = scratch.dir("new/tree")?;
+        fs::write(new.join("a.txt"), b"new")?;
+
+        let report = run(&[new], &dest, Mode::Copy, |_| Conflict::Replace);
+
+        assert!(matches!(only_item(&report)?, ItemOutcome::Ok { .. }));
+        assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+        assert_eq!(names(&dest)?, ["tree"], "no hidden aside left");
+        assert_eq!(fs::read(dest.join("tree/a.txt"))?, b"new");
+        assert_eq!(
+            fs::read(outside.join("precious.txt"))?,
+            b"precious",
+            "links inside the aside are never followed"
+        );
         Ok(())
     }
 

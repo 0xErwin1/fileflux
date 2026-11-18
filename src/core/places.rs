@@ -214,6 +214,24 @@ fn xdg_dir(variable: &str, warnings: &mut Vec<String>) -> Option<PathBuf> {
     }
 }
 
+/// The home Trash from the process environment alone (`$XDG_DATA_HOME`, an
+/// absolute value, else `$HOME/.local/share`, then `/Trash`), without any
+/// filesystem access, so it is known before places discovery finishes.
+/// `None` when `$HOME` is unset or empty.
+pub fn startup_trash_root(home: Option<&OsStr>, data_home: Option<&OsStr>) -> Option<PathBuf> {
+    let home = Path::new(home.filter(|value| !value.is_empty())?);
+    let data_home = data_home.map(Path::new).filter(|path| path.is_absolute());
+    Some(home_trash_root(home, data_home))
+}
+
+/// `$XDG_DATA_HOME/Trash`, or `home/.local/share/Trash` when it is unset.
+fn home_trash_root(home: &Path, data_home: Option<&Path>) -> PathBuf {
+    match data_home {
+        Some(data_home) => data_home.join("Trash"),
+        None => home.join(".local").join("share").join("Trash"),
+    }
+}
+
 /// Deterministic discovery against fixed fixtures: `data_home` and
 /// `config_home` stand in for `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME`
 /// (`None` means unset), and `mounts` for `/proc/self/mounts` bytes
@@ -292,10 +310,7 @@ pub fn discover_with(
         },
     ];
 
-    let trash_root = match data_home {
-        Some(data_home) => data_home.join("Trash"),
-        None => home.join(".local").join("share").join("Trash"),
-    };
+    let trash_root = home_trash_root(home, data_home);
 
     let mut volumes = Vec::new();
     if let Some(mounts) = mounts {
@@ -626,6 +641,28 @@ mod tests {
             .iter()
             .find(|place| place.label == label)
             .ok_or_else(|| Box::<dyn std::error::Error>::from(format!("{label} place missing")))
+    }
+
+    #[test]
+    fn the_startup_trash_root_needs_only_the_environment() {
+        let os = OsStr::new;
+        assert_eq!(
+            startup_trash_root(Some(os("/h")), None),
+            Some(PathBuf::from("/h/.local/share/Trash"))
+        );
+        assert_eq!(
+            startup_trash_root(Some(os("/h")), Some(os("/data"))),
+            Some(PathBuf::from("/data/Trash"))
+        );
+        for ignored in ["", "relative/data"] {
+            assert_eq!(
+                startup_trash_root(Some(os("/h")), Some(os(ignored))),
+                Some(PathBuf::from("/h/.local/share/Trash")),
+                "{ignored:?}"
+            );
+        }
+        assert_eq!(startup_trash_root(None, Some(os("/data"))), None);
+        assert_eq!(startup_trash_root(Some(os("")), None), None);
     }
 
     /// Default places, default Trash and no volumes from an isolated home.

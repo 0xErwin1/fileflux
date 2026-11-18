@@ -23,7 +23,7 @@ use bolt::controls::{Button, InputEvent, InputState};
 use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
-use fileflux::core::places::{Places, discover};
+use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::watch::{Debounce, WatchEvent, Watcher, nearest_existing_ancestor};
 use fileflux::core::{Listing, Location};
 use gpui::{
@@ -73,6 +73,8 @@ actions!(
         NewFolder,
         /// Renames the selected entry in place (F2).
         RenameSelected,
+        /// Selects every visible entry (Ctrl+A).
+        SelectAll,
         /// Moves the selected entries to the Trash (Del).
         TrashSelected,
         /// Asks to delete the selected entries for good (Shift+Del).
@@ -99,6 +101,10 @@ actions!(
         MenuCancel,
         /// Cancels the open confirmation dialog.
         DialogCancel,
+        /// Moves up in the "Open with…" list.
+        DialogUp,
+        /// Moves down in the "Open with…" list.
+        DialogDown,
     ]
 );
 
@@ -170,6 +176,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     // field, the context menu or a dialog has the keyboard.
     let operations = Some("FilefluxExplorer && !Input && !Modal && !FilefluxMenu");
     cx.bind_keys([
+        KeyBinding::new("ctrl-a", SelectAll, operations),
         KeyBinding::new("f2", RenameSelected, operations),
         KeyBinding::new("delete", TrashSelected, operations),
         KeyBinding::new("shift-delete", DeleteSelected, operations),
@@ -186,6 +193,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", MenuConfirm, Some(MENU_CONTEXT)),
         KeyBinding::new("escape", MenuCancel, Some(MENU_CONTEXT)),
         KeyBinding::new("escape", DialogCancel, Some("Modal")),
+        KeyBinding::new("up", DialogUp, Some("Modal")),
+        KeyBinding::new("down", DialogDown, Some("Modal")),
     ]);
     install_modal_seams(cx);
 }
@@ -423,7 +432,12 @@ impl Explorer {
             snapshot: Arc::new(Vec::new()),
             places: None,
             sidebar_error: None,
-            trash_root: None,
+            // Known from the environment at once, so Del has a Trash even
+            // before the places discovery answers.
+            trash_root: startup_trash_root(
+                std::env::var_os("HOME").as_deref(),
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+            ),
             path_input,
             path_seed: String::new(),
             path_edited: false,
@@ -1327,6 +1341,10 @@ impl Render for Explorer {
                 let count = this.state.visible_indices().len();
                 this.extend_selection_to_extreme(count.saturating_sub(1), cx);
             }))
+            .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
+                this.state.select_all_visible();
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
                 this.open_selected(window, cx);
             }))
@@ -1376,6 +1394,12 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &DialogCancel, window, cx| {
                 this.cancel_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DialogUp, _window, cx| {
+                this.move_open_with(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DialogDown, _window, cx| {
+                this.move_open_with(1, cx);
             }))
             .child(middle)
             .child(self.render_statusbar(cx))
@@ -1568,7 +1592,15 @@ impl Explorer {
             count_text.push_str(&format!(" \u{b7} from {}", origin.to_string_lossy()));
         }
 
-        let mut status = div().flex().items_center().gap(Spacing::SM).min_w_0();
+        // Long names and paths are cut with an ellipsis instead of running
+        // under the right-hand side of the bar.
+        let mut status = div()
+            .flex()
+            .items_center()
+            .gap(Spacing::SM)
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden();
         if self.state.is_loading() {
             status = status.child(
                 div()
@@ -1580,7 +1612,10 @@ impl Explorer {
             status = status.child(
                 div()
                     .id("explorer-status-rename-error")
-                    .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .border_1()
                     .border_color(colors.danger)
                     .px(Spacing::SM)
@@ -1591,7 +1626,10 @@ impl Explorer {
             status = status.child(
                 div()
                     .id("explorer-status-error")
-                    .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .border_1()
                     .border_color(colors.danger)
                     .px(Spacing::SM)
@@ -1602,7 +1640,10 @@ impl Explorer {
             status = status.child(
                 div()
                     .id("explorer-status-error")
-                    .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .border_1()
                     .border_color(colors.danger)
                     .px(Spacing::SM)
@@ -1613,6 +1654,10 @@ impl Explorer {
             status = status.child(
                 div()
                     .id("explorer-status-notice")
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_color(colors.muted)
                     .child(notice.to_owned()),
             );
@@ -1633,7 +1678,10 @@ impl Explorer {
             .child(
                 div()
                     .id("explorer-status-count")
-                    .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_color(if selection_active {
                         colors.foreground
                     } else {

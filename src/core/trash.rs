@@ -3,7 +3,7 @@
 //! never creates directories, writes configuration, restores, deletes or
 //! follows the recorded original paths.
 
-use super::ops::{numbered_name, rename_noreplace, unique_name, validate_name};
+use super::ops::{fit_name, rename_noreplace, unique_name, validate_name};
 use super::{Entry, EntryKind, Listing};
 use chrono::NaiveDateTime;
 use std::ffi::{OsStr, OsString};
@@ -344,6 +344,9 @@ pub fn encode_percent(input: &[u8]) -> String {
     out
 }
 
+/// Longest `files/` name whose `<name>.trashinfo` still fits 255 bytes.
+const MAX_TRASH_NAME_BYTES: usize = 255 - ".trashinfo".len();
+
 fn info_path_for(root: &Path, name: &OsStr) -> PathBuf {
     let mut file = name.as_bytes().to_vec();
     file.extend_from_slice(b".trashinfo");
@@ -469,10 +472,12 @@ pub fn put(
 
     let is_dir = fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
     for attempt in 1..=10_000u32 {
+        // The `.trashinfo` name must fit too, so the trash name may be a
+        // shortened form of the original (`Path=` stays exact).
         let name = if attempt == 1 {
-            base.to_owned()
+            fit_name(base, "", is_dir, MAX_TRASH_NAME_BYTES)
         } else {
-            numbered_name(base, attempt, is_dir)
+            fit_name(base, &format!(" ({attempt})"), is_dir, MAX_TRASH_NAME_BYTES)
         };
         let info_path = info_path_for(&target.root, &name);
         let mut info = match fs::OpenOptions::new()
@@ -532,7 +537,7 @@ pub fn restore(item: &TrashedItem, conflict: RestoreConflict) -> Result<PathBuf,
     fs::create_dir_all(parent)?;
     let destination = match conflict {
         RestoreConflict::Fail => item.original.clone(),
-        RestoreConflict::KeepBoth => parent.join(unique_name(parent, name)),
+        RestoreConflict::KeepBoth => parent.join(unique_name(parent, name)?),
     };
     // NOREPLACE keeps `Fail` honest even if the path appears meanwhile.
     rename_noreplace(&item.files_path(), &destination)?;
@@ -967,6 +972,52 @@ mod write_tests {
             listing.entries.first().and_then(|e| e.origin.clone()),
             Some(file)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn put_shortens_names_whose_info_file_would_exceed_255_bytes() -> TestResult {
+        let scratch = Scratch::new("put-long")?;
+        for len in [246usize, 253, 255] {
+            let name = format!("{}.txt", "T".repeat(len - 4));
+            let file = trash_file(&scratch, &format!("home/{len}/{name}"), b"data")?;
+            let target = scratch.target();
+
+            let item = put(&file, &target, when()?)?;
+
+            assert!(!file.exists(), "{len}: trashed");
+            assert_eq!(item.original, file, "{len}: Path stays exact");
+            assert!(item.name.len() + ".trashinfo".len() <= 255, "{len}");
+            assert_eq!(fs::read(item.files_path())?, b"data");
+            let info = fs::read_to_string(item.info_path())?;
+            assert!(info.contains(&format!("Path={}", file.to_string_lossy())));
+            let restored = restore(&item, RestoreConflict::Fail)?;
+            assert_eq!(restored, file, "{len}");
+            assert_eq!(fs::read(&file)?, b"data");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restore_keep_both_works_for_a_253_byte_name() -> TestResult {
+        let scratch = Scratch::new("restore-long")?;
+        let name = "R".repeat(253);
+        let file = trash_file(&scratch, &format!("home/{name}"), b"old")?;
+        let item = put(&file, &scratch.target(), when()?)?;
+        fs::write(&file, b"newer")?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(restore(&item, RestoreConflict::KeepBoth)).ok();
+        });
+        let restored = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "restore hung")??;
+
+        assert!(restored.file_name().is_some_and(|n| n.len() <= 255));
+        assert_ne!(restored, file);
+        assert_eq!(fs::read(&restored)?, b"old");
+        assert_eq!(fs::read(&file)?, b"newer");
         Ok(())
     }
 

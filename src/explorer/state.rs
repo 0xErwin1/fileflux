@@ -704,6 +704,23 @@ impl ExplorerState {
             .cloned()
     }
 
+    /// Ctrl+A: selects every entry on screen under the current filter, in
+    /// displayed order. Entries the filter hides are not selected, so an
+    /// operation never reaches what the user cannot see.
+    pub(crate) fn select_all_visible(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        let (Some(first), Some(last)) = (paths.first().cloned(), paths.last().cloned()) else {
+            return;
+        };
+        self.selected = paths.into_iter().collect();
+        self.anchor = Some(first);
+        self.cursor = Some(last);
+    }
+
     /// Empties the selection (Escape over the entries, folder change).
     pub(crate) fn clear_selection(&mut self) {
         self.selected.clear();
@@ -890,6 +907,26 @@ mod tests {
             .iter()
             .map(|entry| entry.display_name().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn select_all_selects_what_is_visible_and_nothing_else() -> TestResult {
+        let mut state = sized_state()?;
+        state.select_all_visible();
+        assert_eq!(state.selection().len(), 4);
+
+        state.set_query("b".into());
+        state.clear_selection();
+        state.select_all_visible();
+        let selected: Vec<_> = state.selection().iter().cloned().collect();
+        assert_eq!(selected, [PathBuf::from("/fixture/b")], "the filter holds");
+
+        // Empty folder or no match: nothing to select, nothing breaks.
+        state.set_query("zzz".into());
+        state.clear_selection();
+        state.select_all_visible();
+        assert!(state.selection().is_empty());
+        Ok(())
     }
 
     #[test]

@@ -557,7 +557,38 @@ pub(crate) fn transfer_summary(
             format!("Nothing was {}{skipped_tail}", mode.past().to_lowercase()),
         )
     };
+    let (severity, text) = with_leftovers(report, severity, text, &mut details);
     (Notice { severity, text }, details)
+}
+
+/// A Replace whose old original could not be deleted afterwards still left
+/// data on disk (hidden): say so instead of reporting a clean success.
+fn with_leftovers(
+    report: &TransferReport,
+    severity: Severity,
+    mut text: String,
+    details: &mut Vec<String>,
+) -> (Severity, String) {
+    if report.leftovers.is_empty() {
+        return (severity, text);
+    }
+    let count = report.leftovers.len();
+    text.push_str(&format!(
+        "; {count} replaced original{} could not be removed",
+        if count == 1 { "" } else { "s" }
+    ));
+    for (path, error) in &report.leftovers {
+        details.push(format!(
+            "{}: the replaced original is still there ({error})",
+            quote_path(path)
+        ));
+    }
+    let severity = if severity == Severity::Error {
+        severity
+    } else {
+        Severity::Warning
+    };
+    (severity, text)
 }
 
 /// What undoing a finished transfer would do. An item that replaced
@@ -703,7 +734,7 @@ fn run_steps(
 pub(crate) fn undo_copy(items: &[PlacedEntry], ctx: &JobCtx, sink: &Sink) -> Report {
     let wording = Wording {
         done: |done| match done {
-            [one] => format!("Moved {} to Trash", quote_path(one)),
+            [one] => format!("Moved the copy {} to Trash", quote_path(one)),
             many => format!("Moved {} copies to Trash", many.len()),
         },
         nothing: "moved to the Trash",

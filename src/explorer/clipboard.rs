@@ -156,7 +156,9 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         match plan_paste(mode, &sources, &dest) {
-            PastePlan::Nothing(notice) => self.push_toast(notice, &[], None, window, cx),
+            PastePlan::Nothing(notice) => {
+                self.push_toast(notice, &[], None, window, cx);
+            }
             PastePlan::Run => {
                 let title = paste_title(mode, &sources, &dest);
                 let (request_tx, request_rx) = channel();

@@ -13,8 +13,8 @@ use bolt::modals::Modal;
 use bolt::tokens::Spacing;
 use gpui::{
     Anchor, AnyElement, App, Context, InteractiveElement as _, IntoElement as _, MouseButton,
-    ParentElement as _, Styled as _, WeakEntity, Window, anchored, deferred, div, point,
-    prelude::FluentBuilder as _, px,
+    ParentElement as _, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, anchored,
+    deferred, div, point, prelude::FluentBuilder as _, px,
 };
 
 use super::actions::RenameView;
@@ -45,7 +45,7 @@ pub(crate) fn render(
 fn command_icon(command: MenuCommand) -> gpui_kit_assets::IconName {
     use gpui_kit_assets::IconName;
     match command {
-        MenuCommand::Open => IconName::FolderOpen,
+        MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
         MenuCommand::Rename => IconName::Pencil,
         MenuCommand::CopyPath | MenuCommand::CopyFolderPath => IconName::Link,
         MenuCommand::Properties => IconName::Info,
@@ -169,12 +169,48 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         _ => None,
     };
 
+    let open_with = match &dialog.action {
+        DialogAction::OpenWith { selected, .. } => Some(*selected),
+        _ => None,
+    };
     let body = div()
         .flex()
         .flex_col()
         .gap(Spacing::MD)
         .child(div().text_color(colors.foreground).child(text.body.clone()))
-        .children((!text.names.is_empty()).then(|| {
+        // "Open with…": one clickable row per application.
+        .children(open_with.map(|selected| {
+            div()
+                .id("explorer-open-with-list")
+                .flex()
+                .flex_col()
+                .max_h(px(280.0))
+                .overflow_y_scroll()
+                .bg(colors.background)
+                .border_1()
+                .border_color(colors.line)
+                .children(text.names.iter().enumerate().map(|(index, name)| {
+                    let click_weak = weak.clone();
+                    div()
+                        .id(("explorer-open-with-app", index))
+                        .px(Spacing::MD)
+                        .py(px(6.0))
+                        .cursor_pointer()
+                        .truncate()
+                        .text_color(colors.foreground)
+                        .when(index == selected, |row| row.bg(colors.line))
+                        .hover(|row| row.bg(colors.line))
+                        .child(name.clone())
+                        .on_click(move |_event, window, cx| {
+                            if let Err(error) = click_weak.update(cx, |this, cx| {
+                                this.choose_open_with(index, window, cx);
+                            }) {
+                                log::debug!("the dialog outlived its explorer: {error}");
+                            }
+                        })
+                }))
+        }))
+        .children((open_with.is_none() && !text.names.is_empty()).then(|| {
             div()
                 .flex()
                 .flex_col()
@@ -247,18 +283,29 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                 )
         })
         .child(
-            Button::new("explorer-dialog-confirm", text.confirm)
-                .danger()
-                .disabled(!armed)
-                .focus_handle(&this.dialog_confirm_focus)
-                .on_click(press(DialogChoice::Confirm)),
+            {
+                let confirm = Button::new("explorer-dialog-confirm", text.confirm);
+                if open_with.is_some() {
+                    confirm.primary()
+                } else {
+                    confirm.danger()
+                }
+            }
+            .disabled(!armed)
+            .focus_handle(&this.dialog_confirm_focus)
+            .on_click(press(DialogChoice::Confirm)),
         );
 
-    vec![
-        Modal::new(text.title.clone())
-            .id("explorer-dialog")
+    let modal = Modal::new(text.title.clone()).id("explorer-dialog");
+    let modal = if open_with.is_some() {
+        modal.icon(icon(gpui_kit_assets::IconName::FolderOpen))
+    } else {
+        modal
             .danger()
             .icon(icon(gpui_kit_assets::IconName::TriangleAlert))
+    };
+    vec![
+        modal
             .focus_handle(&this.dialog_focus)
             .on_close(move |window, cx| {
                 if let Err(error) = close_weak.update(cx, |this, cx| {
