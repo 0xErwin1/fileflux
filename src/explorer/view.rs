@@ -34,8 +34,9 @@ use fileflux::core::watch::{
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px,
+    KeyBinding, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollStrategy,
+    Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, actions, deferred, div,
+    prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::table::{TableEvent, TableState};
@@ -53,6 +54,7 @@ use crate::explorer::persist::{
     session_tab, view_from_pref, view_to_pref,
 };
 use crate::explorer::progress::Registry;
+use crate::explorer::sidebar::{Panel, PanelDrag};
 use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::tabs::{Affected, Placement, TabList};
@@ -299,10 +301,57 @@ fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<L
 /// itself sleeps in the kernel; this only drains its channel.
 const WATCH_STEP: Duration = Duration::from_millis(100);
 
-/// Where the toast stack starts, below the toolbar and the subbar.
-const TOAST_TOP: f32 = 150.0;
-/// The width the toast stack lays out in, in CSS pixels.
-const TOAST_STACK_WIDTH: f32 = 480.0;
+/// The width of one toast card (Bolt's `Feedback::TOAST_WIDTH`), under the
+/// 520 px cap the design allows.
+const TOAST_CARD_WIDTH: f32 = 440.0;
+/// The inset Bolt's toast host keeps from the top and right of the region it
+/// is mounted in; the stack is shifted back by it to sit where it is wanted.
+const TOAST_HOST_INSET: f32 = 16.0;
+/// How far under the toolbar's bottom edge the first toast starts.
+const TOAST_DROP: f32 = 4.0;
+/// The folder subbar's height.
+const SUBBAR_HEIGHT: f32 = 44.0;
+/// The subbar's horizontal padding.
+const SUBBAR_PADDING: f32 = 20.0;
+/// What the Sort, Filter and New folder buttons (and their gaps) take on the
+/// subbar's right; the Trash view's Empty Trash is a little wider.
+const SUBBAR_ACTIONS_RESERVE: f32 = 312.0;
+const SUBBAR_TRASH_ACTIONS_RESERVE: f32 = 332.0;
+
+/// Where the toast stack sits in the document island.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToastBand {
+    /// Top-centered over the subbar's empty middle band, just under the
+    /// toolbar.
+    Subbar,
+    /// Top-centered right under the subbar: the middle band is taken.
+    BelowSubbar,
+}
+
+/// What the subbar's title and meta take on its left, estimated from their
+/// character counts (16 px bold title, 12 px mono meta).
+pub(crate) fn subbar_left_reserve(title_chars: usize, meta_chars: usize) -> f32 {
+    SUBBAR_PADDING + title_chars as f32 * 9.0 + 10.0 + meta_chars as f32 * 7.4
+}
+
+/// Whether a centered toast card fits the subbar's middle band: the island
+/// must leave both sides (the larger of the two reserves, as the card is
+/// centered) free next to the card, and no filter chips may live there.
+/// Otherwise the stack drops under the subbar, so it never covers Sort,
+/// Filter, New folder or Empty Trash.
+pub(crate) fn toast_band(
+    island_width: f32,
+    left_reserve: f32,
+    right_reserve: f32,
+    has_chips: bool,
+) -> ToastBand {
+    let side = left_reserve.max(right_reserve);
+    if has_chips || island_width < TOAST_CARD_WIDTH + 2.0 * side {
+        ToastBand::BelowSubbar
+    } else {
+        ToastBand::Subbar
+    }
+}
 
 /// Below this viewport width the sidebar parks behind the sidebar toggle,
 /// so path, search and view stay reachable.
@@ -559,6 +608,10 @@ pub(crate) struct Explorer {
     /// The docked sidebar's width in CSS pixels: the saved preference (the
     /// reference design's 290 by default).
     pub(crate) sidebar_width: f32,
+    /// The details panel's width in CSS pixels: the saved preference.
+    pub(crate) details_width: f32,
+    /// The panel handle being dragged, if any.
+    pub(crate) panel_drag: Option<PanelDrag>,
     /// When and whether settings and session are written.
     persistence: Persistence,
     /// Restored tabs whose saved folder has not been read yet, by tab: if the
@@ -753,6 +806,8 @@ impl Explorer {
             entries_width: None,
             sidebar_open: !preferences.sidebar_collapsed,
             sidebar_width: preferences.sidebar_width as f32,
+            details_width: preferences.details_width as f32,
+            panel_drag: None,
             persistence,
             restore_pending,
             restore_fallbacks: 0,
@@ -841,6 +896,7 @@ impl Explorer {
                 view: view_to_pref(active.state.view()),
                 arrangement: arrangement_to_prefs(active.state.arrangement()),
                 sidebar_width: self.sidebar_width.round() as u32,
+                details_width: self.details_width.round() as u32,
                 sidebar_collapsed: !self.sidebar_open,
                 details_open: self.inspector_open,
                 window_width: f32::from(size.width).round() as u32,
@@ -1750,7 +1806,7 @@ impl Explorer {
     fn content_width(&self, window: &Window) -> f32 {
         let total = f32::from(window.viewport_size().width);
         let panel = if self.inspector_wanted(window) {
-            inspector::INSPECTOR_WIDTH
+            self.details_width
         } else {
             0.0
         };
@@ -1759,7 +1815,7 @@ impl Explorer {
 
     /// Everything in the window that is not the document island: the outer
     /// gutters and the docked sidebar with its gap.
-    fn shell_width(&self, window: &Window) -> f32 {
+    pub(crate) fn shell_width(&self, window: &Window) -> f32 {
         let narrow = f32::from(window.viewport_size().width) < NARROW_WIDTH;
         let sidebar = if self.sidebar_open && !narrow {
             self.sidebar_width + IslandMetrics::GAP.as_f32()
@@ -1775,6 +1831,7 @@ impl Explorer {
             self.inspector_open,
             f32::from(window.viewport_size().width),
             self.shell_width(window),
+            self.details_width,
         )
     }
 }
@@ -2001,7 +2058,21 @@ impl Render for Explorer {
             .px(IslandMetrics::GAP)
             .gap(IslandMetrics::GAP);
         match side {
-            Some(sidebar) if !narrow => middle = middle.child(sidebar).child(document),
+            Some(sidebar) if !narrow => {
+                // The handle sits in the gap between the two islands, so it
+                // never covers either one's content.
+                let handle = sidebar::resize_handle(
+                    "explorer-sidebar-resize",
+                    Panel::Sidebar,
+                    self.panel_drag
+                        .is_some_and(|drag| drag.panel == Panel::Sidebar),
+                    cx,
+                )
+                .left(px(IslandMetrics::GAP.as_f32()
+                    + self.sidebar_width
+                    + (IslandMetrics::GAP.as_f32() - sidebar::HANDLE_HIT) / 2.0));
+                middle = middle.child(sidebar).child(document).child(handle);
+            }
             Some(sidebar) => {
                 middle = middle.child(document).child(
                     div()
@@ -2212,16 +2283,28 @@ impl Render for Explorer {
             .child(self.render_statusbar(cx))
             .children(overlays)
             .children(cards)
-            .child(deferred(
-                // Below the toolbar and the subbar actions, which a toast
-                // would otherwise cover while it is up.
-                div()
-                    .absolute()
-                    .top(px(TOAST_TOP))
-                    .right_0()
-                    .w(px(TOAST_STACK_WIDTH))
-                    .child(self.toast_host.clone()),
-            ))
+            .children(self.panel_drag.is_some().then(|| {
+                // While a handle is dragged this shield takes the pointer:
+                // the col-resize cursor stays and nothing underneath reacts.
+                deferred(
+                    div()
+                        .id("explorer-resize-shield")
+                        .absolute()
+                        .size_full()
+                        .cursor_col_resize()
+                        .occlude()
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                            this.drag_panel(event.position.x, event.pressed_button, window, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                this.end_panel_drag(cx);
+                            }),
+                        ),
+                )
+                .with_priority(3)
+            }))
     }
 }
 
@@ -2251,13 +2334,24 @@ impl Explorer {
         self.inspector_shown = self.inspector_wanted(window);
         self.sync_permissions(cx);
         let panel = self.inspector_shown.then(|| inspector::render(self, cx));
+        // The details handle covers the panel's left edge.
+        let handle = self.inspector_shown.then(|| {
+            sidebar::resize_handle(
+                "explorer-details-resize",
+                Panel::Details,
+                self.panel_drag
+                    .is_some_and(|drag| drag.panel == Panel::Details),
+                cx,
+            )
+            .right(px(self.details_width - sidebar::HANDLE_HIT))
+        });
         Island::new()
             .flex_1()
             .min_w_0()
             .h_full()
             .children(tabstrip::render(self, cx))
             .child(toolbar::render(self, cx))
-            .child(self.render_subbar(cx))
+            .child(self.render_subbar(window, cx))
             .children(self.render_scope_line(cx))
             .child(
                 div()
@@ -2265,8 +2359,10 @@ impl Explorer {
                     .min_h_0()
                     .min_w_0()
                     .flex()
+                    .relative()
                     .child(entries::render(self, cx))
-                    .children(panel),
+                    .children(panel)
+                    .children(handle),
             )
     }
 
@@ -2303,7 +2399,7 @@ impl Explorer {
 
     /// The folder subbar under the toolbar: the current folder's title and
     /// its mono "4 folders · 7 files" meta.
-    fn render_subbar(&self, cx: &Context<Self>) -> Stateful<Div> {
+    fn render_subbar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let colors = bolt::colors(cx);
         let meta = if self.tab().state.is_loading() {
             String::new()
@@ -2315,14 +2411,17 @@ impl Explorer {
         } else {
             util::folder_counts_label(&self.tab().state.listing().entries)
         };
+        let toasts = self.render_toasts(window, &meta);
         div()
             .id("explorer-subbar")
+            .relative()
             .flex_none()
-            .h(px(44.0))
+            .h(px(SUBBAR_HEIGHT))
             .flex()
             .items_center()
             .gap(px(10.0))
-            .px(px(20.0))
+            .px(px(SUBBAR_PADDING))
+            .child(toasts)
             .child(
                 div()
                     .id("explorer-subbar-title")
@@ -2385,6 +2484,53 @@ impl Explorer {
                     }))
                     .into_any_element()
             })
+    }
+
+    /// The toast stack: top-centered in the document island, starting just
+    /// under the toolbar over the subbar's empty middle band, and growing
+    /// downward. It drops under the subbar when the band is not free (see
+    /// [`toast_band`]). `meta` is the subbar's meta text, which sizes the
+    /// band the title takes.
+    fn render_toasts(&self, window: &Window, meta: &str) -> impl IntoElement {
+        let island_width = f32::from(window.viewport_size().width) - self.shell_width(window);
+        let actions = if self.in_trash() {
+            SUBBAR_TRASH_ACTIONS_RESERVE
+        } else {
+            SUBBAR_ACTIONS_RESERVE
+        };
+        let band = toast_band(
+            island_width,
+            subbar_left_reserve(
+                self.current_label().chars().count().min(32),
+                meta.chars().count(),
+            ),
+            actions,
+            !self.tab().state.arrangement().filters.chips().is_empty(),
+        );
+        let top = match band {
+            ToastBand::Subbar => TOAST_DROP - TOAST_HOST_INSET,
+            ToastBand::BelowSubbar => SUBBAR_HEIGHT + TOAST_DROP - TOAST_HOST_INSET,
+        };
+        deferred(
+            div()
+                .absolute()
+                .top(px(top))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    // Bolt's host stacks from the top right of its parent
+                    // (inset 16 px): a zero-height column as wide as card
+                    // plus insets centers it.
+                    div()
+                        .relative()
+                        .flex_none()
+                        .h_0()
+                        .w(px(TOAST_CARD_WIDTH + 2.0 * TOAST_HOST_INSET))
+                        .child(self.toast_host.clone()),
+                ),
+        )
     }
 
     /// The active filters as removable chips, then "Clear all"; this is
@@ -2635,6 +2781,41 @@ pub(crate) fn path_argument_message(argument: &PathArgument) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wide island with nothing in the subbar's middle band puts the
+    /// toasts in the subbar; anything tighter drops them under it.
+    #[test]
+    fn toasts_sit_in_the_subbar_only_when_its_middle_band_is_free() {
+        let wide = 2.0 * 340.0 + TOAST_CARD_WIDTH;
+        assert_eq!(toast_band(wide, 200.0, 340.0, false), ToastBand::Subbar);
+        assert_eq!(
+            toast_band(wide - 1.0, 200.0, 340.0, false),
+            ToastBand::BelowSubbar,
+            "one pixel short of the free band"
+        );
+        assert_eq!(
+            toast_band(900.0, 200.0, 340.0, false),
+            ToastBand::BelowSubbar
+        );
+        // A long folder name eats the left side of the band.
+        assert_eq!(
+            toast_band(wide, 500.0, 340.0, false),
+            ToastBand::BelowSubbar
+        );
+        // Filter chips live in the middle band: never cover them.
+        assert_eq!(
+            toast_band(4000.0, 200.0, 340.0, true),
+            ToastBand::BelowSubbar
+        );
+    }
+
+    /// The left reserve grows with the folder title and its meta text and
+    /// never goes below the subbar's own padding.
+    #[test]
+    fn the_subbar_left_reserve_grows_with_its_text() {
+        assert!(subbar_left_reserve(4, 22) < subbar_left_reserve(30, 22));
+        assert!(subbar_left_reserve(0, 0) >= 20.0);
+    }
 
     /// The finding: a successful edited-path submission reseeds the path
     /// field — even while it stays focused — so a second Enter reloads the

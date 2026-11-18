@@ -404,6 +404,87 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
 }
 
 #[test]
+fn the_menu_header_names_what_the_menu_acts_on() {
+    let names = |list: &[&str]| {
+        list.iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(menu_title(&names(&["report.pdf"]), "Home"), "report.pdf");
+    assert_eq!(menu_title(&names(&["a", "b", "c"]), "Home"), "3 items");
+    assert_eq!(menu_title(&names(&["a", "b"]), "Home"), "2 items");
+    assert_eq!(menu_title(&[], "Home"), "Home (this folder)");
+    assert_eq!(menu_title(&[], "Home Trash"), "Home Trash (this folder)");
+}
+
+#[test]
+fn a_sidebar_row_menu_offers_open_tab_favorite_copy_and_properties() {
+    let rows = sidebar_menu_rows(&SidebarTarget {
+        trash: false,
+        favorite: false,
+    });
+    assert_eq!(
+        flat(&rows),
+        [
+            "Open",
+            "Open in new tab",
+            "-",
+            "Add to favorites",
+            "Copy path",
+            "-",
+            "Properties"
+        ]
+    );
+    assert!(item(&rows, MenuCommand::AddFavorite).is_some());
+    assert!(item(&rows, MenuCommand::RemoveFavorite).is_none());
+    assert!(
+        rows.iter()
+            .all(|row| !matches!(row, MenuRow::Item(item) if !item.enabled || item.danger)),
+        "every sidebar row works and none is destructive"
+    );
+}
+
+#[test]
+fn a_favorite_row_offers_remove_instead_of_add() {
+    let rows = sidebar_menu_rows(&SidebarTarget {
+        trash: false,
+        favorite: true,
+    });
+    assert_eq!(
+        flat(&rows),
+        [
+            "Open",
+            "Open in new tab",
+            "-",
+            "Remove from favorites",
+            "Copy path",
+            "-",
+            "Properties"
+        ]
+    );
+    assert!(item(&rows, MenuCommand::RemoveFavorite).is_some());
+    assert!(item(&rows, MenuCommand::AddFavorite).is_none());
+}
+
+#[test]
+fn the_sidebar_trash_row_offers_open_new_tab_and_empty_trash_only() {
+    // A favorite flag is meaningless for the Trash: it is never favorited.
+    for favorite in [false, true] {
+        let rows = sidebar_menu_rows(&SidebarTarget {
+            trash: true,
+            favorite,
+        });
+        assert_eq!(
+            flat(&rows),
+            ["Open", "Open in new tab", "-", "Empty Trash\u{2026}"]
+        );
+        assert!(item(&rows, MenuCommand::EmptyTrash).is_some_and(|item| item.danger));
+        assert!(item(&rows, MenuCommand::AddFavorite).is_none());
+        assert!(item(&rows, MenuCommand::CopyPath).is_none());
+    }
+}
+
+#[test]
 fn the_trash_menu_restores_and_deletes_and_never_creates() {
     let rows = menu_rows(&target(true, 2, false, true));
     assert_eq!(

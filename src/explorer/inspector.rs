@@ -12,6 +12,9 @@ use std::time::Duration;
 
 use bolt::primitives::Icon;
 use fileflux::core::places::format_bytes;
+#[cfg(test)]
+use fileflux::core::settings::DEFAULT_DETAILS_WIDTH;
+use fileflux::core::settings::DETAILS_WIDTH_RANGE;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Stateful,
@@ -22,8 +25,9 @@ use super::state::ExplorerState;
 use super::view::{Explorer, TabId};
 use super::{entries, icon, util};
 
-/// Width of the details panel.
-pub(crate) const INSPECTOR_WIDTH: f32 = 300.0;
+/// Default width of the details panel (see [`DEFAULT_DETAILS_WIDTH`]).
+#[cfg(test)]
+pub(crate) const INSPECTOR_WIDTH: f32 = DEFAULT_DETAILS_WIDTH as f32;
 /// The document island's horizontal padding (16 px each side) that the
 /// entries area loses on top of the shell and the panel.
 pub(crate) const ISLAND_PADDING: f32 = 2.0 * 16.0;
@@ -43,8 +47,21 @@ const PREVIEW_FOLDER: f32 = 80.0;
 /// least [`MIN_ENTRIES_WIDTH`] once the panel, the island's own padding and
 /// the shell around it take their room. `shell_width` is everything in the
 /// window that is not the document island (gutters plus the docked sidebar).
-pub(crate) fn panel_visible(open: bool, window_width: f32, shell_width: f32) -> bool {
-    open && window_width - shell_width - ISLAND_PADDING - INSPECTOR_WIDTH >= MIN_ENTRIES_WIDTH
+pub(crate) fn panel_visible(
+    open: bool,
+    window_width: f32,
+    shell_width: f32,
+    panel_width: f32,
+) -> bool {
+    open && window_width - shell_width - ISLAND_PADDING - panel_width >= MIN_ENTRIES_WIDTH
+}
+
+/// The widest the panel may be dragged in this window: past it the entries
+/// area would drop below [`MIN_ENTRIES_WIDTH`] and the panel would hide under
+/// the pointer. Never below the panel's own minimum.
+pub(crate) fn max_panel_width(window_width: f32, shell_width: f32) -> f32 {
+    (window_width - shell_width - ISLAND_PADDING - MIN_ENTRIES_WIDTH)
+        .clamp(DETAILS_WIDTH_RANGE.0 as f32, DETAILS_WIDTH_RANGE.1 as f32)
 }
 
 /// The kind line: `Folder`, `Image · JPG`, `Document · PDF`. The category
@@ -336,7 +353,7 @@ fn wrappable(text: &str) -> String {
     text.replace('/', "/\u{200b}")
 }
 
-/// The panel: `.inspector` — 300 px, left line border, scrollable.
+/// The panel: `.inspector` — resizable, left line border, scrollable.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let selected = selected_entries(&this.tab().state);
@@ -348,7 +365,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     div()
         .id("explorer-inspector")
         .flex_none()
-        .w(px(INSPECTOR_WIDTH))
+        .w(px(this.details_width))
         .h_full()
         .border_l_1()
         .border_color(colors.line)
@@ -611,25 +628,53 @@ mod tests {
     #[test]
     fn panel_hides_when_the_entries_area_would_drop_below_its_minimum() {
         // Window 1440, 16 px gutters + 290 sidebar + 8 gap: 1440-314-32-300.
-        assert!(panel_visible(true, 1440.0, 314.0));
+        assert!(panel_visible(true, 1440.0, 314.0, INSPECTOR_WIDTH));
         // The island's 2x16 px padding is part of the budget: exactly the
         // minimum still fits, one pixel less does not.
         let exact = 314.0 + ISLAND_PADDING + INSPECTOR_WIDTH + MIN_ENTRIES_WIDTH;
-        assert!(panel_visible(true, exact, 314.0));
-        assert!(!panel_visible(true, exact - 1.0, 314.0));
+        assert!(panel_visible(true, exact, 314.0, INSPECTOR_WIDTH));
+        assert!(!panel_visible(true, exact - 1.0, 314.0, INSPECTOR_WIDTH));
         assert_eq!(ISLAND_PADDING, 32.0);
         // Without the padding term this window would have fit 520 px of
         // entries minus 32: it must hide.
         assert!(!panel_visible(
             true,
             314.0 + INSPECTOR_WIDTH + MIN_ENTRIES_WIDTH,
-            314.0
+            314.0,
+            INSPECTOR_WIDTH
         ));
         // The user's toggle always wins.
-        assert!(!panel_visible(false, 4000.0, 314.0));
+        assert!(!panel_visible(false, 4000.0, 314.0, INSPECTOR_WIDTH));
         // A narrow window without a docked sidebar: 900-16-32-300=552.
-        assert!(panel_visible(true, 900.0, 16.0));
-        assert!(!panel_visible(true, 800.0, 16.0));
+        assert!(panel_visible(true, 900.0, 16.0, INSPECTOR_WIDTH));
+        assert!(!panel_visible(true, 800.0, 16.0, INSPECTOR_WIDTH));
+    }
+
+    /// The drag cap leaves the entries area its minimum and stays in range.
+    #[test]
+    fn the_drag_cap_keeps_the_entries_area_alive() {
+        assert_eq!(max_panel_width(4000.0, 314.0), 600.0);
+        assert_eq!(
+            max_panel_width(1400.0, 314.0),
+            1400.0 - 314.0 - ISLAND_PADDING - MIN_ENTRIES_WIDTH
+        );
+        assert_eq!(
+            max_panel_width(600.0, 314.0),
+            240.0,
+            "never below the minimum"
+        );
+    }
+
+    /// The auto-hide threshold follows the panel's current width: a wider
+    /// panel hides at a larger window, a narrower one keeps showing.
+    #[test]
+    fn the_auto_hide_threshold_uses_the_current_panel_width() {
+        let exact = |panel: f32| 314.0 + ISLAND_PADDING + panel + MIN_ENTRIES_WIDTH;
+        assert!(panel_visible(true, exact(500.0), 314.0, 500.0));
+        assert!(!panel_visible(true, exact(500.0) - 1.0, 314.0, 500.0));
+        // 1000 px fits a 240 px panel but not a 500 px one.
+        assert!(panel_visible(true, exact(240.0), 314.0, 240.0));
+        assert!(!panel_visible(true, exact(240.0), 314.0, 500.0));
     }
 
     fn p(path: &str) -> PathBuf {

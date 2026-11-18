@@ -55,7 +55,10 @@ const SESSION_FILE: &str = "session.toml";
 
 /// The sidebar's width bounds, in CSS pixels, and its default.
 pub const SIDEBAR_WIDTH_RANGE: (u32, u32) = (200, 600);
-const DEFAULT_SIDEBAR_WIDTH: u32 = 290;
+pub const DEFAULT_SIDEBAR_WIDTH: u32 = 290;
+/// The details panel's width bounds, in CSS pixels, and its default.
+pub const DETAILS_WIDTH_RANGE: (u32, u32) = (240, 600);
+pub const DEFAULT_DETAILS_WIDTH: u32 = 300;
 /// The window size bounds and defaults (the design brief's 1440×900).
 pub const WINDOW_WIDTH_RANGE: (u32, u32) = (480, 16_384);
 pub const WINDOW_HEIGHT_RANGE: (u32, u32) = (320, 16_384);
@@ -282,6 +285,9 @@ pub struct Preferences {
     /// active tab's.
     pub arrangement: ArrangementPrefs,
     pub sidebar_width: u32,
+    /// The details panel's width; files written before it existed load the
+    /// default.
+    pub details_width: u32,
     pub sidebar_collapsed: bool,
     /// The details panel (Ctrl+I) is open.
     pub details_open: bool,
@@ -295,6 +301,7 @@ impl Default for Preferences {
             view: ViewMode::Grid,
             arrangement: ArrangementPrefs::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            details_width: DEFAULT_DETAILS_WIDTH,
             sidebar_collapsed: false,
             details_open: true,
             window_width: DEFAULT_WINDOW.0,
@@ -304,13 +311,16 @@ impl Default for Preferences {
 }
 
 impl Preferences {
-    /// The preferences with the sidebar and window size clamped to sane
+    /// The preferences with the panel and window sizes clamped to sane
     /// bounds, so a hand-edited file cannot open an unusable window.
     #[must_use]
     pub fn sanitized(mut self) -> Self {
         self.sidebar_width = self
             .sidebar_width
             .clamp(SIDEBAR_WIDTH_RANGE.0, SIDEBAR_WIDTH_RANGE.1);
+        self.details_width = self
+            .details_width
+            .clamp(DETAILS_WIDTH_RANGE.0, DETAILS_WIDTH_RANGE.1);
         self.window_width = self
             .window_width
             .clamp(WINDOW_WIDTH_RANGE.0, WINDOW_WIDTH_RANGE.1);

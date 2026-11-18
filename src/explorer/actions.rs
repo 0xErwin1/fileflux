@@ -35,8 +35,10 @@ use super::ops::{
     move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command, rename_seed,
     rename_step, stem_range,
 };
+use super::ops::{SidebarTarget, menu_title, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
-use super::tabs::{Affected, tabs_to_refresh};
+use super::state::Transition;
+use super::tabs::{Affected, Placement, tabs_to_refresh};
 use super::view::{Explorer, OpContext, TabId};
 
 /// How long a toast with an Undo button waits before it goes away.
@@ -76,8 +78,26 @@ impl Renaming {
     }
 }
 
+/// What an open context menu was opened on, so the thing it acts on can be
+/// outlined for as long as the menu is up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MenuOn {
+    /// A toolbar button's Sort or Filter menu: nothing to outline.
+    Nothing,
+    /// The selected entries of the shown folder.
+    Entries,
+    /// The empty space of the entries area: the folder itself.
+    EmptySpace,
+    /// One sidebar row, by its element id, and the place it stands for.
+    Sidebar { row: String, location: Location },
+}
+
 /// The open context menu.
 pub(crate) struct MenuState {
+    /// What the menu acts on.
+    pub(crate) on: MenuOn,
+    /// The header naming what the menu acts on, when it has one.
+    pub(crate) title: Option<String>,
     pub(crate) position: Point<Pixels>,
     pub(crate) rows: Vec<MenuRow>,
     /// The highlighted row (keyboard or hover).
@@ -970,6 +990,17 @@ impl Explorer {
             single_file: matches!(selected.as_slice(), [(_, false)]),
         };
         let mut rows = menu_rows(&target);
+        let names: Vec<String> = self
+            .selected_visible_paths()
+            .iter()
+            .map(|path| display_name(path))
+            .collect();
+        let title = menu_title(&names, &self.current_label());
+        let menu_on = if on.is_some() {
+            MenuOn::Entries
+        } else {
+            MenuOn::EmptySpace
+        };
         let one_image =
             matches!(self.selected_visible_paths().as_slice(), [path] if is_image_path(path));
         if target.single_file && one_image && !target.in_trash {
@@ -979,7 +1010,40 @@ impl Explorer {
             cx.notify();
             return;
         }
-        self.show_menu(position, rows, MenuPage::Context, window, cx);
+        self.show_menu(
+            position,
+            rows,
+            MenuPage::Context,
+            (menu_on, Some(title)),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the menu of one sidebar row, named after it, and outlines the
+    /// row until the menu closes. The Trash can neither be pinned nor copied.
+    pub(crate) fn open_sidebar_menu(
+        &mut self,
+        position: Point<Pixels>,
+        row: String,
+        name: String,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_rename(window, cx);
+        let rows = sidebar_menu_rows(&SidebarTarget {
+            trash: location == Location::Trash,
+            favorite: self.favorites.contains(&location),
+        });
+        self.show_menu(
+            position,
+            rows,
+            MenuPage::Context,
+            (MenuOn::Sidebar { row, location }, Some(name)),
+            window,
+            cx,
+        );
     }
 
     /// Opens the menu with `rows` and gives it the keyboard.
@@ -988,10 +1052,13 @@ impl Explorer {
         position: Point<Pixels>,
         rows: Vec<MenuRow>,
         page: MenuPage,
+        (on, title): (MenuOn, Option<String>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.menu = Some(MenuState {
+            on,
+            title,
             position,
             rows,
             selected: None,
@@ -1017,7 +1084,7 @@ impl Explorer {
     ) {
         self.cancel_rename(window, cx);
         let rows = page_rows(page, self.tab().state.arrangement(), false);
-        self.show_menu(position, rows, page, window, cx);
+        self.show_menu(position, rows, page, (MenuOn::Nothing, None), window, cx);
     }
 
     /// Changes the active tab's sort or filters (menus, chips, Ctrl+H).
@@ -1105,8 +1172,17 @@ impl Explorer {
             MenuCommand::Page(page) => return self.show_menu_page(page, cx),
             _ => {}
         }
+        // A sidebar row's menu acts on that row's place, not on the entries.
+        let sidebar = match self.menu.as_ref().map(|menu| &menu.on) {
+            Some(MenuOn::Sidebar { location, .. }) => Some(location.clone()),
+            _ => None,
+        };
         self.close_menu(window, cx);
+        if let Some(location) = sidebar {
+            return self.run_sidebar_command(command, location, window, cx);
+        }
         match command {
+            MenuCommand::AddFavorite | MenuCommand::RemoveFavorite => {}
             MenuCommand::Arrange(_) | MenuCommand::Page(_) => {}
             MenuCommand::Open => self.open_selected(window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
@@ -1131,6 +1207,94 @@ impl Explorer {
             MenuCommand::Paste => self.paste(PasteInto::CurrentFolder, window, cx),
             MenuCommand::PasteIntoFolder => self.paste(PasteInto::SelectedFolder, window, cx),
         }
+    }
+
+    /// What a sidebar row's menu item does to the row's `location`, reusing
+    /// the commands the toolbar, the tabs and the Trash already have.
+    fn run_sidebar_command(
+        &mut self,
+        command: MenuCommand,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            MenuCommand::Open => {
+                self.navigate(Transition::Visit(location), window, cx);
+            }
+            MenuCommand::OpenInNewTab => {
+                self.open_tab(location, Placement::Background, window, cx);
+            }
+            MenuCommand::AddFavorite if !self.favorites.contains(&location) => {
+                self.favorites.toggle(&location);
+                cx.notify();
+            }
+            MenuCommand::RemoveFavorite if self.favorites.contains(&location) => {
+                self.favorites.toggle(&location);
+                cx.notify();
+            }
+            MenuCommand::CopyPath => {
+                if let Location::Directory(path) = &location {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        path.to_string_lossy().into_owned(),
+                    ));
+                    self.tab_mut()
+                        .state
+                        .set_notice("Copied the path".to_owned());
+                    cx.notify();
+                }
+            }
+            // Properties: show the folder, with the details panel open.
+            MenuCommand::Properties => {
+                self.navigate(Transition::Visit(location), window, cx);
+                self.inspector_open = true;
+                cx.notify();
+            }
+            MenuCommand::EmptyTrash => self.request_empty_trash_anywhere(window, cx),
+            _ => {}
+        }
+    }
+
+    /// "Empty Trash…" from the sidebar: the Trash need not be the shown
+    /// location, so its content is read off the UI thread first, then the
+    /// usual confirmation opens.
+    fn request_empty_trash_anywhere(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.trash_root.clone() else {
+            return;
+        };
+        let read = cx
+            .background_executor()
+            .spawn(async move { fileflux::core::trash::read_trash(&root) });
+        cx.spawn_in(window, async move |this, cx| {
+            let listing = read.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| match listing {
+                Ok(listing) => {
+                    let names: Vec<OsString> = listing
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.path.file_name().map(OsString::from))
+                        .collect();
+                    if names.is_empty() {
+                        this.say(Severity::Info, "The Trash is already empty", window, cx);
+                    } else {
+                        this.open_dialog(
+                            DialogKind::EmptyTrash { count: names.len() },
+                            &[],
+                            DialogAction::EmptyTrash(names),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                Err(error) => {
+                    let text = format!("Could not read the Trash: {error}");
+                    this.say(Severity::Error, text, window, cx);
+                }
+            }) {
+                log::debug!("the explorer closed before the Trash was read: {error}");
+            }
+        })
+        .detach();
     }
 
     // --- clipboard, open, terminal -------------------------------------------------------

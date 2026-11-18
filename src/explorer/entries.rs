@@ -29,7 +29,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme;
 
-use super::actions::RenameView;
+use super::actions::{MenuOn, RenameView};
 use super::dnd::{self, DropTarget};
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
@@ -74,6 +74,23 @@ const TILE_GAP: f32 = 6.0;
 pub(crate) const CUT_OPACITY: f32 = 0.45;
 /// Alpha of the tint border around a selected tile (artboard `.35`).
 const SELECTION_BORDER_ALPHA: f32 = 0.35;
+/// Alpha of the tint outline around what an open context menu acts on:
+/// clearly stronger than a plain selection's border.
+pub(crate) const CONTEXT_OUTLINE_ALPHA: f32 = 0.9;
+/// Alpha of the tint wash under that outline.
+pub(crate) const CONTEXT_WASH_ALPHA: f32 = 0.14;
+/// Alpha of the quieter inset border around the entries area while the
+/// menu of its empty space is open.
+const AREA_OUTLINE_ALPHA: f32 = 0.5;
+/// Alpha of the strong-text wash a hovered, unselected entry draws. The
+/// palette's own hover wash is 4 % and cannot be told from the island.
+const HOVER_WASH_ALPHA: f32 = 0.08;
+
+/// The wash under the pointer on an unselected entry: visible on the panel
+/// fill yet distinct from the tinted selection.
+pub(crate) fn hover_wash(colors: &bolt::colors::Colors) -> Hsla {
+    colors.strong.opacity(HOVER_WASH_ALPHA)
+}
 /// Horizontal padding of the entries area.
 const ENTRIES_PADDING: f32 = 16.0;
 /// Grid top padding under the folder subbar (artboard 4 px).
@@ -239,6 +256,11 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let colors = bolt::colors(cx);
     let visible: Arc<Vec<usize>> = Arc::new(this.tab().state.visible_indices());
     let count = visible.len();
+    // The empty space's menu is open: the area shows it acts on the folder.
+    let empty_space_menu = this
+        .menu
+        .as_ref()
+        .is_some_and(|menu| menu.on == MenuOn::EmptySpace);
 
     let container = div()
         .id("explorer-entries")
@@ -266,7 +288,14 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         // The 1 px border is transparent until a drop is hovering: the
         // highlight then never moves the layout.
         .border_1()
-        .border_color(gpui::transparent_black());
+        .border_color(if empty_space_menu {
+            ChromeColors::tint(cx.theme()).opacity(AREA_OUTLINE_ALPHA)
+        } else {
+            gpui::transparent_black()
+        })
+        .when(empty_space_menu, |container| {
+            container.bg(ChromeColors::tint(cx.theme()).opacity(0.04))
+        });
     // The empty space of a shown folder takes drops into that folder (an
     // entry that is no target covers it while dragging, see
     // `dnd::block_while_dragging`). The Trash view takes none.
@@ -373,12 +402,18 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         )
     });
     let drag_for_rows = drag.clone();
+    // The selection is what the open entry menu acts on.
+    let outlined = this
+        .menu
+        .as_ref()
+        .is_some_and(|menu| menu.on == MenuOn::Entries);
 
     // One vertical scroll owner per presentation: the two modes count rows
     // in different units (entries versus rows of tiles), so they keep
     // separate handles and separate list element ids.
     let rows = if list_view {
-        super::table::render_list(this, visible, selected, drag, &weak, cx).into_any_element()
+        super::table::render_list(this, visible, selected, drag, outlined, &weak, cx)
+            .into_any_element()
     } else {
         gpui::uniform_list(
             "explorer-grid-rows",
@@ -394,6 +429,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             child_counts: &counts_for_rows,
                             renaming: renaming_for_rows.as_ref(),
                             drag: drag_for_rows.as_ref(),
+                            outlined,
                         };
                         render_grid_row(&data, row, columns, &weak_for_rows, cx)
                     })
@@ -460,6 +496,8 @@ struct GridData<'a> {
     renaming: Option<&'a RenameView>,
     /// The visible selection, when tiles may start a drag (not in the Trash).
     drag: Option<&'a Arc<Vec<PathBuf>>>,
+    /// The selection is the target of an open context menu.
+    outlined: bool,
 }
 
 /// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a
@@ -479,6 +517,7 @@ fn render_grid_row(
         child_counts,
         renaming,
         drag,
+        outlined,
     } = *data;
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
@@ -531,7 +570,10 @@ fn render_grid_row(
             format!("explorer-tile-{row}-{index}").into(),
         ))
         .selected(tile_selected)
+        // Bolt's own hover wash is 4 %: the tile draws a visible one below.
+        .interactive(false)
         .build(cx)
+        .cursor_pointer()
         .w(px(TILE_WIDTH))
         .flex_none()
         .h_full()
@@ -542,10 +584,18 @@ fn render_grid_row(
         .pb(px(TILE_BOTTOM_PADDING))
         .px(Spacing::XS)
         .border_1()
-        .border_color(if tile_selected {
+        .border_color(if tile_selected && outlined {
+            tint.opacity(CONTEXT_OUTLINE_ALPHA)
+        } else if tile_selected {
             tint.opacity(SELECTION_BORDER_ALPHA)
         } else {
             gpui::transparent_black()
+        })
+        .when(tile_selected && outlined, |tile| {
+            tile.bg(tint.opacity(CONTEXT_WASH_ALPHA))
+        })
+        .when(!tile_selected, |tile| {
+            tile.hover(|tile| tile.bg(hover_wash(&colors)).border_color(colors.line_2))
         })
         .when(tile_cut, |tile| tile.opacity(CUT_OPACITY))
         .on_click(entry_click(weak, path.clone()))

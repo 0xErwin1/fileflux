@@ -88,6 +88,7 @@ fn settings_round_trip_keeps_every_preference_and_a_non_utf8_favorite() {
     settings.preferences.view = ViewMode::List;
     settings.preferences.arrangement = busy_arrangement();
     settings.preferences.sidebar_width = 333;
+    settings.preferences.details_width = 411;
     settings.preferences.sidebar_collapsed = true;
     settings.preferences.details_open = false;
     settings.preferences.window_width = 1111;
@@ -742,4 +743,37 @@ fn healing_overwrites_an_invalid_file_without_a_base() {
     std::fs::write(&path, "version = [[[ oops").expect("fixture writes");
     save_settings_ordered(&path, &favorites_of(&["/a"]), None, 1).expect("heals");
     assert_eq!(paths(&load_settings(&path, now()).value), ["/a"]);
+}
+
+#[test]
+fn the_details_width_defaults_and_is_clamped() {
+    let defaults = Settings::default().preferences;
+    assert_eq!(defaults.details_width, 300);
+    assert_eq!(defaults.sidebar_width, 290);
+
+    let mut settings = Settings::default();
+    settings.preferences.details_width = 5;
+    assert_eq!(settings.preferences.clone().sanitized().details_width, 240);
+    settings.preferences.details_width = 90_000;
+    assert_eq!(settings.preferences.sanitized().details_width, 600);
+}
+
+#[test]
+fn a_file_without_the_details_width_loads_and_unknown_keys_are_ignored() {
+    let scratch = Scratch::new("details-width");
+    let path = scratch.path().join("settings.toml");
+    std::fs::write(
+        &path,
+        "version = 1\n[preferences]\nsidebar_width = 333\nfuture_key = true\n",
+    )
+    .expect("fixture writes");
+    let loaded = load_settings(&path, now());
+    assert_eq!(loaded.notice, None);
+    assert_eq!(loaded.value.preferences.sidebar_width, 333);
+    assert_eq!(loaded.value.preferences.details_width, 300);
+
+    std::fs::write(&path, "version = 1\n[preferences]\ndetails_width = 420\n")
+        .expect("fixture writes");
+    let loaded = load_settings(&path, now());
+    assert_eq!(loaded.value.preferences.details_width, 420);
 }

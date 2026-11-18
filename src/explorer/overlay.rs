@@ -51,6 +51,8 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::Page(MenuPage::Sort) => IconName::ArrowUpDown,
         MenuCommand::Page(MenuPage::Filter) => IconName::ListFilter,
         MenuCommand::Page(MenuPage::Context) => IconName::ChevronLeft,
+        MenuCommand::AddFavorite => IconName::Star,
+        MenuCommand::RemoveFavorite => IconName::StarFill,
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
         MenuCommand::OpenInViewer => IconName::Image,
         MenuCommand::OpenInNewTab => IconName::ExternalLink,
@@ -75,6 +77,25 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
         return Vec::new();
     };
     let weak = cx.entity().downgrade();
+    // The target header: what the rows below act on. Only the context page
+    // shows it (the Sort and Filter pages carry their own captions), and it
+    // takes no part in the row indices, hover or keyboard.
+    let title = menu
+        .title
+        .as_ref()
+        .filter(|_| menu.page == MenuPage::Context)
+        .map(|title| {
+            div()
+                .id("explorer-menu-title")
+                .max_w(px(320.0))
+                .child(
+                    div()
+                        .truncate()
+                        .child(render_menu_header(&MenuItem::header(title.clone()), cx)),
+                )
+                .child(render_separator(cx))
+                .into_any_element()
+        });
     let children: Vec<AnyElement> = menu
         .rows
         .iter()
@@ -148,6 +169,7 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
         .max_h(px(700.0))
         .overflow_y_scroll()
         .children(children);
+    let rows = div().flex().flex_col().children(title).child(rows);
     let panel = render_menu_container(vec![rows], cx).min_w(px(250.0));
     vec![
         // Under the menu: any click elsewhere closes it.

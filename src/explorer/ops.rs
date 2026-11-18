@@ -1161,6 +1161,10 @@ pub(crate) enum MenuCommand {
     Arrange(ArrangeCommand),
     /// Shows another page of the open menu ("Sort by", "Filter").
     Page(MenuPage),
+    /// Sidebar rows: pin the row's folder to the Favorites.
+    AddFavorite,
+    /// Sidebar rows: unpin the row's folder from the Favorites.
+    RemoveFavorite,
 }
 
 /// Which page of the one menu is showing. The empty-space menu opens on
@@ -1397,6 +1401,57 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         None,
         false,
     ));
+    rows
+}
+
+/// The title of the context menu: the single entry's name, "N items" for a
+/// multi-selection, or "<Folder> (this folder)" on the empty space.
+pub(crate) fn menu_title(selected: &[String], folder: &str) -> String {
+    match selected {
+        [] => format!("{folder} (this folder)"),
+        [name] => name.clone(),
+        many => format!("{} items", many.len()),
+    }
+}
+
+/// What a sidebar row's menu is opened on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SidebarTarget {
+    /// The virtual Trash row.
+    pub(crate) trash: bool,
+    /// The row's folder is already a favorite.
+    pub(crate) favorite: bool,
+}
+
+/// The menu of a sidebar row. Every row opens in place or in a new tab; a
+/// folder can be pinned or unpinned, copied and inspected; the Trash is
+/// never pinned and can be emptied.
+pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
+    let item = |command, label, danger| {
+        MenuRow::Item(MenuItemSpec {
+            danger,
+            ..MenuItemSpec::new(command, label)
+        })
+    };
+    let mut rows = vec![
+        item(MenuCommand::Open, "Open", false),
+        item(MenuCommand::OpenInNewTab, "Open in new tab", false),
+        MenuRow::Separator,
+    ];
+    if target.trash {
+        rows.push(item(MenuCommand::EmptyTrash, "Empty Trash\u{2026}", true));
+        return rows;
+    }
+    rows.push(if target.favorite {
+        item(MenuCommand::RemoveFavorite, "Remove from favorites", false)
+    } else {
+        item(MenuCommand::AddFavorite, "Add to favorites", false)
+    });
+    rows.extend([
+        item(MenuCommand::CopyPath, "Copy path", false),
+        MenuRow::Separator,
+        item(MenuCommand::Properties, "Properties", false),
+    ]);
     rows
 }
 

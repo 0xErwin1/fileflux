@@ -261,6 +261,8 @@ pub(crate) struct EntryTableDelegate {
     renaming: Option<RenameView>,
     /// The visible selection a row drag carries; `None` in the Trash view.
     dragged: Option<Arc<Vec<PathBuf>>>,
+    /// The selection is what an open context menu acts on.
+    outlined: bool,
     weak: WeakEntity<Explorer>,
 }
 
@@ -280,6 +282,7 @@ impl EntryTableDelegate {
             widths: LIST_DEFAULT_WIDTHS,
             renaming: None,
             dragged: None,
+            outlined: false,
             weak,
         }
     }
@@ -340,6 +343,11 @@ impl EntryTableDelegate {
     /// cannot be dragged (the Trash view).
     pub(crate) fn set_dragged(&mut self, dragged: Option<Arc<Vec<PathBuf>>>) {
         self.dragged = dragged;
+    }
+
+    /// Whether the selected rows are the target of an open context menu.
+    pub(crate) fn set_outlined(&mut self, outlined: bool) {
+        self.outlined = outlined;
     }
 
     /// Applies recomputed column widths (the caller then calls
@@ -571,6 +579,14 @@ impl TableDelegate for EntryTableDelegate {
         if selected {
             row = row.bg(cx.theme().tokens.table_active);
         }
+        let tint = ChromeColors::tint(cx.theme());
+        if selected && self.outlined {
+            // What the open menu acts on: tint wash and a full outline.
+            row = row
+                .bg(tint.opacity(entries::CONTEXT_WASH_ALPHA))
+                .border_1()
+                .border_color(tint.opacity(entries::CONTEXT_OUTLINE_ALPHA));
+        }
         if self
             .entry_at(row_ix)
             .is_some_and(|entry| self.cut.contains(&entry.path))
@@ -650,6 +666,7 @@ pub(crate) fn render_list(
     visible: Arc<Vec<usize>>,
     selected: Arc<BTreeSet<PathBuf>>,
     dragged: Option<Arc<Vec<PathBuf>>>,
+    outlined: bool,
     _weak: &WeakEntity<Explorer>,
     cx: &mut Context<Explorer>,
 ) -> impl IntoElement {
@@ -663,6 +680,7 @@ pub(crate) fn render_list(
             delegate.set_child_counts(Arc::clone(explorer.tab().state.child_counts()));
         delegate.set_selection(Arc::clone(&selected));
         delegate.set_dragged(dragged);
+        delegate.set_outlined(outlined);
         let cut_changed = delegate.set_cut(explorer.clipboard.cut_paths());
         let renaming_changed = delegate.set_renaming(
             explorer
