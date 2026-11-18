@@ -23,11 +23,13 @@ use fileflux::core::places::{Places, discover};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, ParentElement, Render, ScrollHandle, ScrollStrategy, Stateful, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
+    KeyBinding, ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px,
 };
+use gpui_component::table::{TableEvent, TableState};
 
 use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
+use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::{entries, sidebar, toolbar, util};
 
 /// Key context of the whole explorer window.
@@ -156,15 +158,14 @@ pub(crate) struct Explorer {
     pub(crate) shell_focus: FocusHandle,
     /// The entries area focus, which carries the arrow keys.
     pub(crate) entries_focus: FocusHandle,
-    /// The vertical scroll handle of the details list. The two
-    /// presentations count rows in different units — entries versus rows of
-    /// tiles — so each keeps its own handle and its own list element id.
-    pub(crate) list_scroll: UniformListScrollHandle,
+    /// The details table's state entity: one per explorer, so no row data
+    /// leaks across windows; the delegate answers the current snapshot.
+    pub(crate) table: Entity<TableState<EntryTableDelegate>>,
+    /// The column widths the user dragged on the details table, honored by
+    /// [`crate::explorer::table::distribute_widths`] on every render.
+    pub(crate) list_widths: ListWidths,
     /// The vertical scroll handle of the tile grid.
     pub(crate) grid_scroll: UniformListScrollHandle,
-    /// The horizontal scroll handle of the details-list viewport, which
-    /// Bolt's `GridOverflow` drives for header and rows together.
-    pub(crate) list_hscroll: ScrollHandle,
     /// The entries area's measured inner width, recorded by the draw-nothing
     /// measuring canvas every frame; `None` until the first layout reached
     /// it, so the first frame draws with the estimate below.
@@ -175,6 +176,8 @@ pub(crate) struct Explorer {
     _path_events: Option<Subscription>,
     /// The search field's Change subscription.
     _search_events: Option<Subscription>,
+    /// The details table's width-drag events.
+    _table_events: Option<Subscription>,
     /// Whether the sidebar is shown; narrow windows park it behind the
     /// sidebar toggle.
     pub(crate) sidebar_open: bool,
@@ -216,6 +219,24 @@ impl Explorer {
             input
         });
 
+        let weak_this = cx.entity().downgrade();
+        // The details table's state: one entity per explorer, with the
+        // table's internal selection off — the explorer's raw-path selection
+        // (single, Ctrl-toggle, keyboard) drives everything through the
+        // delegate's row clicks, so the table can never clobber it.
+        let table = cx.new(|cx| {
+            TableState::new(
+                EntryTableDelegate::new(weak_this, Arc::new(Vec::new()), Arc::new(Vec::new())),
+                window,
+                cx,
+            )
+            .row_selectable(false)
+            .col_selectable(false)
+            .cell_selectable(false)
+            .sortable(false)
+            .col_movable(false)
+        });
+
         let mut this = Self {
             state,
             snapshot: Arc::new(Vec::new()),
@@ -230,15 +251,16 @@ impl Explorer {
             search_input,
             shell_focus: cx.focus_handle(),
             entries_focus: cx.focus_handle(),
-            list_scroll: UniformListScrollHandle::new(),
+            table,
+            list_widths: ListWidths::default(),
             grid_scroll: UniformListScrollHandle::new(),
-            list_hscroll: ScrollHandle::new(),
             entries_width: None,
             scan_task: None,
             sidebar_open: true,
             rendered_columns: 1,
             _path_events: None,
             _search_events: None,
+            _table_events: None,
         };
 
         // The path field: Enter submits, typing clears the path error, and
@@ -275,6 +297,27 @@ impl Explorer {
                 if let InputEvent::Change = event {
                     let text = this.search_input.read(cx).value().to_string();
                     this.state.set_query(text);
+                    cx.notify();
+                }
+            },
+        ));
+
+        // The details table's column drags: only widths that actually moved
+        // against the delegate's applied widths are deliberate, so an
+        // undragged column keeps re-filling when the pane changes.
+        this._table_events = Some(cx.subscribe(
+            &this.table,
+            |this, _table, event: &TableEvent, cx| {
+                if let TableEvent::ColumnWidthsChanged(widths) = event {
+                    let applied = *this.table.read(cx).delegate().widths();
+                    for (column, width) in widths.iter().enumerate() {
+                        let Some(applied) = applied.get(column) else {
+                            continue;
+                        };
+                        if (width.as_f32() - applied).abs() > crate::explorer::table::DRAG_EPSILON {
+                            this.list_widths.record(column, width.as_f32());
+                        }
+                    }
                     cx.notify();
                 }
             },
@@ -378,8 +421,7 @@ impl Explorer {
                 // the presentation that is showing; a reload keeps the
                 // reader at the place they were reading.
                 if !scan.refresh {
-                    self.active_scroll_handle()
-                        .scroll_to_item(0, ScrollStrategy::Top);
+                    self.scroll_active_to_top(cx);
                 }
                 self.refresh_snapshot();
                 // Consume the submitted edit only when this completion is
@@ -588,7 +630,7 @@ impl Explorer {
             None => 0,
         };
         self.state.select_visible(target);
-        self.scroll_selected_row(target);
+        self.scroll_selected_row(target, cx);
         cx.notify();
     }
 
@@ -598,25 +640,42 @@ impl Explorer {
             return;
         }
         self.state.select_visible(position);
-        self.scroll_selected_row(position);
+        self.scroll_selected_row(position, cx);
         cx.notify();
     }
 
-    fn scroll_selected_row(&self, position: usize) {
-        let row = match self.state.view() {
-            View::List => position,
-            View::Grid => util::grid_row(position, self.rendered_columns.max(1)),
-        };
-        self.active_scroll_handle()
-            .scroll_to_item(row, ScrollStrategy::Nearest);
+    fn scroll_selected_row(&mut self, position: usize, cx: &mut Context<Self>) {
+        match self.state.view() {
+            View::List => {
+                // Reveal only the nearest edge, preserving visible context
+                // when keyboard selection crosses the viewport boundary.
+                self.table.update(cx, |table, cx| {
+                    table
+                        .vertical_scroll_handle
+                        .scroll_to_item(position, ScrollStrategy::Nearest);
+                    cx.notify();
+                });
+            }
+            View::Grid => {
+                self.grid_scroll.scroll_to_item(
+                    util::grid_row(position, self.rendered_columns.max(1)),
+                    ScrollStrategy::Nearest,
+                );
+            }
+        }
     }
 
-    /// The vertical scroll handle of the presentation that is showing: the
-    /// two views count rows in different units, so they never share one.
-    fn active_scroll_handle(&self) -> &UniformListScrollHandle {
+    /// Returns the presentation that is showing to its top: the details
+    /// table scrolls its own rows, the tile grid its own handle.
+    fn scroll_active_to_top(&mut self, cx: &mut Context<Self>) {
         match self.state.view() {
-            View::List => &self.list_scroll,
-            View::Grid => &self.grid_scroll,
+            View::List => {
+                self.table
+                    .update(cx, |table, cx| table.scroll_to_row(0, cx));
+            }
+            View::Grid => {
+                self.grid_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
         }
     }
 
@@ -628,8 +687,7 @@ impl Explorer {
             return;
         }
         self.state.set_view(view);
-        self.active_scroll_handle()
-            .scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll_active_to_top(cx);
         cx.notify();
     }
 
