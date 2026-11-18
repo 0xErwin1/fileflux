@@ -8,10 +8,27 @@ Prerequisites: Nix with flakes enabled, direnv installed, and the direnv hook en
 
 1. Review the project's `.envrc` (`use flake`), then run `direnv allow` once to authorize it locally.
 2. Enter the project directory; direnv loads the development shell from `flake.nix` (Rust toolchain, mold, native libraries).
-3. `cargo run` — build and launch the explorer at your home directory.
+3. `cargo run` — build and launch the explorer at your home directory (`cargo run -- ~/Pictures` opens another folder; see [Command line](#command-line)).
 4. Confirm the window opens titled *Home — Fileflux*, with the places sidebar on the left and the folder grid in the middle.
 
 Review and authorize `.envrc` again after changing it. For shells without direnv integration, `nix develop` remains a manual fallback: `nix develop --command cargo run`.
+
+## Command line
+
+```text
+fileflux [OPTIONS] [PATH]
+```
+
+| Input | Result |
+|---|---|
+| no `PATH` | Opens your home directory (`/` when `$HOME` is unset). |
+| a directory | Opens it. Relative paths resolve against the current directory; a leading `~` expands against `$HOME` even when quoted. |
+| a file | Opens its parent directory. |
+| a missing path | Prints `fileflux: '<absolute path>' does not exist` and exits with status 2; no window opens. |
+| `-h`, `--help` / `-V`, `--version` | Prints the usage or `fileflux <version>` and exits with status 0. |
+| an unknown option or a second path | Prints the error plus `Try 'fileflux --help' for more information.` and exits with status 2. |
+
+Use `--` before a directory whose name starts with `-`. Pointing the explorer at a scratch directory (`fileflux /tmp/fixture`) keeps manual checks away from your real files.
 
 ## What the MVP does
 

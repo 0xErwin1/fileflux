@@ -199,15 +199,16 @@ impl Explorer {
         self.entries_focus.clone()
     }
 
-    /// Builds the explorer: the first scan of the home (or the honest root
-    /// fallback when `$HOME` is missing) and the places discovery both
-    /// start off the UI thread right away.
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Builds the explorer: the first scan of `start` (the command-line
+    /// path), else the home (or the honest root fallback when `$HOME` is
+    /// missing), and the places discovery both start off the UI thread
+    /// right away.
+    pub(crate) fn new(start: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let home = std::env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        let initial = home
-            .clone()
+        let initial = start
+            .or_else(|| home.clone())
             .map(Location::Directory)
             .unwrap_or_else(|| Location::Directory(PathBuf::from("/")));
         let state = ExplorerState::new(initial.clone(), home);

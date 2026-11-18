@@ -3,6 +3,7 @@
 //! startup lifecycle the setup screen proved.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -17,8 +18,8 @@ use crate::theme;
 const MAIN_WINDOW_SIZE: (f32, f32) = (1440.0, 900.0);
 
 /// Initializes logging, installs the Bolt theme and opens the explorer
-/// window, running until the last window closes.
-pub(crate) fn open() -> std::process::ExitCode {
+/// window at `start` (the home directory when `None`), running until the last window closes.
+pub(crate) fn open(start: Option<PathBuf>) -> std::process::ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let startup_error: Rc<RefCell<Option<anyhow::Error>>> = Rc::default();
@@ -36,7 +37,7 @@ pub(crate) fn open() -> std::process::ExitCode {
             })
             .detach();
 
-            if let Err(error) = open_explorer_window(cx) {
+            if let Err(error) = open_explorer_window(start.clone(), cx) {
                 error_slot.replace(Some(error));
                 cx.quit();
             }
@@ -60,7 +61,7 @@ fn assets() -> impl gpui::AssetSource {
 
 /// Installs the theme, binds the explorer's keys and opens the explorer
 /// window wrapped in gpui-component's [`Root`].
-fn open_explorer_window(cx: &mut App) -> Result<()> {
+fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
     theme::install(theme::STARTUP_PALETTE, cx);
     bind_keys(cx);
 
@@ -80,7 +81,7 @@ fn open_explorer_window(cx: &mut App) -> Result<()> {
     };
 
     cx.open_window(options, |window, cx| {
-        let explorer = cx.new(|cx| Explorer::new(window, cx));
+        let explorer = cx.new(|cx| Explorer::new(start, window, cx));
         explorer.update(cx, |explorer, cx| {
             explorer.initial_focus().focus(window, cx);
         });
