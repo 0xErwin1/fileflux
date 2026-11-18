@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+pub mod apps;
 pub mod fs;
 pub mod navigation;
 pub mod ops;
