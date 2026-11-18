@@ -18,55 +18,107 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bolt::composites::ListRow;
-use bolt::primitives::Icon;
-use bolt::tokens::Spacing;
+use bolt::primitives::{Icon, WhenFocusVisible};
+use bolt::tokens::{Borders, ChromeColors, Spacing};
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
     ParentElement, Stateful, Styled, WeakEntity, Window, canvas, div, prelude::*, px,
 };
+use gpui_component::ActiveTheme;
 
 use super::icon;
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
 
-/// Tile width of the reference grid (normal density); every tile draws at
-/// exactly this width, so a partial last row matches a full one.
-const TILE_WIDTH: f32 = 104.0;
-/// Tile top padding above the icon slot.
+/// Tile width of the reference grid (the artboard's 112 px minimum); every
+/// tile draws at exactly this width, so a partial last row matches a full
+/// one.
+const TILE_WIDTH: f32 = 112.0;
+/// Tile top padding above the thumbnail slot.
 const TILE_TOP_PADDING: f32 = 12.0;
-/// Height of the one icon slot every glyph draws in, so the folder
-/// silhouette and the file glyphs share a baseline row.
-const ICON_SLOT: f32 = 32.0;
-/// Gap between the icon slot and the filename.
+/// Width of the thumbnail slot every glyph, folder and photo draws in.
+const THUMB_WIDTH: f32 = 64.0;
+/// Height of the thumbnail slot, so the folder silhouette, the file glyphs
+/// and the photo thumbnails share a baseline row.
+const THUMB_HEIGHT: f32 = 52.0;
+/// Size of a file glyph inside the thumbnail slot (thinner and larger than
+/// the earlier 32 px glyph, as in the artboard).
+const GLYPH_SIZE: f32 = 40.0;
+/// Gap between the thumbnail slot and the filename.
 const NAME_GAP: f32 = 8.0;
 /// One filename line's height; long names clip at two lines.
-const NAME_LINE: f32 = 18.0;
-/// Tile bottom padding under the filename.
-const TILE_BOTTOM_PADDING: f32 = 8.0;
-/// Tile height: top padding, the icon slot, the name gap, two clamped
-/// filename lines and bottom padding — half of the earlier grid's vertical
-/// dead space, with the filename at the primary 13 px text size.
-const TILE_HEIGHT: f32 =
-    TILE_TOP_PADDING + ICON_SLOT + NAME_GAP + 2.0 * NAME_LINE + TILE_BOTTOM_PADDING;
+const NAME_LINE: f32 = 17.0;
+/// Gap between the filename and the size subline.
+const SUB_GAP: f32 = 2.0;
+/// The mono 11 px subline's height.
+const SUB_LINE: f32 = 14.0;
+/// Tile bottom padding under the subline.
+const TILE_BOTTOM_PADDING: f32 = 4.0;
+/// Tile height: top padding, the thumbnail slot, the name gap, two clamped
+/// filename lines, the subline gap and subline, and bottom padding.
+const TILE_HEIGHT: f32 = TILE_TOP_PADDING
+    + THUMB_HEIGHT
+    + NAME_GAP
+    + 2.0 * NAME_LINE
+    + SUB_GAP
+    + SUB_LINE
+    + TILE_BOTTOM_PADDING;
 /// Gap between tiles.
-const TILE_GAP: f32 = 8.0;
+const TILE_GAP: f32 = 6.0;
+/// Alpha of the tint border around a selected tile (artboard `.35`).
+const SELECTION_BORDER_ALPHA: f32 = 0.35;
 /// Horizontal padding of the entries area.
 const ENTRIES_PADDING: f32 = 16.0;
+/// Grid top padding so the first row never touches the toolbar border. The
+/// artboard uses 4 px under a folder subbar; until that subbar exists the
+/// grid carries 12 px itself.
+const GRID_TOP_PADDING: f32 = 12.0;
 
-/// The compact filled folder silhouette drawn in a tile's icon slot: the
-/// bundled Lucide folder glyph is stroke-only, so the fill is composed
-/// natively from a tab and a body of existing info blue — a silhouette, not
-/// a square colored app-icon chip.
-const FOLDER_WIDTH: f32 = 40.0;
-/// Silhouette height; fits [`ICON_SLOT`].
-const FOLDER_HEIGHT: f32 = 32.0;
-/// Width of the raised folder tab.
-const FOLDER_TAB_WIDTH: f32 = 16.0;
-/// How far the tab rises above the body.
-const FOLDER_TAB_HEIGHT: f32 = 14.0;
-/// Where the body starts under the tab.
-const FOLDER_BODY_TOP: f32 = 8.0;
+/// The photo thumbnail box (artboard `.photo`): 62×46 with a 1 px border.
+const PHOTO_WIDTH: f32 = 62.0;
+const PHOTO_HEIGHT: f32 = 46.0;
+
+/// The folder silhouette is composed from the artboard's 59×50 `folderArt`
+/// viewBox, scaled so its height fills [`THUMB_HEIGHT`]; the bundled Lucide
+/// folder glyph is stroke-only, so the two tones are composed natively.
+const FOLDER_VIEW_WIDTH: f32 = 59.0;
+const FOLDER_VIEW_HEIGHT: f32 = 50.0;
+/// Scale from artboard viewBox units to pixels.
+const FOLDER_SCALE: f32 = THUMB_HEIGHT / FOLDER_VIEW_HEIGHT;
+/// Silhouette width in pixels; fits [`THUMB_WIDTH`].
+const FOLDER_WIDTH: f32 = FOLDER_VIEW_WIDTH * FOLDER_SCALE;
+
+/// Whether a file gets a real thumbnail: decided from the extension alone,
+/// never by reading the file. Only formats GPUI's image loader decodes
+/// (heic and svg stay on the glyph).
+pub(crate) fn has_thumbnail(name: &OsStr) -> bool {
+    let extension = Path::new(name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
+}
+
+/// The tile subline for a file: B/KB/MB/GB as in the artboard's `fmtSize`
+/// (decimal units; KB whole, MB one decimal, GB two). `None` yields no
+/// subline.
+pub(crate) fn tile_size_label(size: Option<u64>) -> Option<String> {
+    let bytes = size?;
+    let value = bytes as f64;
+    Some(if bytes < 1_000 {
+        format!("{bytes} B")
+    } else if bytes < 1_000_000 {
+        format!("{:.0} KB", value / 1e3)
+    } else if bytes < 1_000_000_000 {
+        format!("{:.1} MB", value / 1e6)
+    } else {
+        format!("{:.2} GB", value / 1e9)
+    })
+}
 
 /// Chooses the bundled Lucide glyph for a non-directory entry from the
 /// file name's extension alone: no file contents are read and no MIME
@@ -101,32 +153,72 @@ pub(crate) fn file_glyph(name: &OsStr) -> gpui_kit_assets::IconName {
     }
 }
 
-/// The folder silhouette: one relative frame holding the filled tab and
-/// the filled body, both in the given info blue. Two rectangles compose the
-/// classic tab-and-body folder shape without any stroke or outline.
-fn folder_silhouette(color: Hsla) -> impl IntoElement {
+/// One rectangle of the folder silhouette, given in artboard viewBox units.
+fn folder_part(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Div {
+    div()
+        .absolute()
+        .left(px(x * FOLDER_SCALE))
+        .top(px(y * FOLDER_SCALE))
+        .w(px(width * FOLDER_SCALE))
+        .h(px(height * FOLDER_SCALE))
+        .bg(color)
+}
+
+/// The two-tone folder of the artboard's `folderArt`: the back layer (tab
+/// plus back panel) in info at reduced opacity, the front body in full
+/// info, and a faint lighter top edge in strong.
+fn folder_silhouette(info: Hsla, strong: Hsla) -> impl IntoElement {
+    let back = info.opacity(0.55);
     div()
         .relative()
         .w(px(FOLDER_WIDTH))
-        .h(px(FOLDER_HEIGHT))
+        .h(px(THUMB_HEIGHT))
+        .child(folder_part(2.0, 6.0, 20.0, 5.0, back))
+        .child(folder_part(2.0, 11.0, 55.0, 4.0, back))
+        .child(folder_part(2.0, 15.0, 55.0, 31.0, info))
+        .child(folder_part(2.0, 15.0, 55.0, 3.0, strong.opacity(0.18)))
+}
+
+/// A file glyph centered in the thumbnail slot.
+fn file_glyph_element(name: gpui_kit_assets::IconName, color: Hsla) -> gpui::AnyElement {
+    Icon::new(icon(name))
+        .size(px(GLYPH_SIZE))
+        .color(color)
+        .into_any_element()
+}
+
+/// The real thumbnail of an image file: GPUI's image loader decodes the
+/// path off the UI thread; while loading or on error the extension glyph
+/// shows instead. Object-fit cover inside the 62×46 bordered box.
+fn photo_thumbnail(path: PathBuf, name: &OsStr, colors: &bolt::colors::Colors) -> gpui::AnyElement {
+    let glyph = file_glyph(name);
+    let muted = colors.muted;
+    div()
+        .w(px(PHOTO_WIDTH))
+        .h(px(PHOTO_HEIGHT))
+        .border_1()
+        .border_color(colors.line_2)
+        .bg(colors.raised)
+        .overflow_hidden()
         .child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .top(px(0.0))
-                .w(px(FOLDER_TAB_WIDTH))
-                .h(px(FOLDER_TAB_HEIGHT))
-                .bg(color),
+            gpui::img(path)
+                .size_full()
+                .object_fit(gpui::ObjectFit::Cover)
+                .with_loading(move || centered_glyph(glyph, muted))
+                .with_fallback(move || centered_glyph(glyph, muted)),
         )
-        .child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .top(px(FOLDER_BODY_TOP))
-                .bottom(px(0.0))
-                .bg(color),
-        )
+        .into_any_element()
+}
+
+/// A glyph centered in the photo box, for the loading and error states.
+fn centered_glyph(name: gpui_kit_assets::IconName, color: Hsla) -> gpui::AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(Icon::new(icon(name)).size(px(28.0)).color(color))
+        .into_any_element()
 }
 
 /// Derives the grid column count from the entries area's **inner** width —
@@ -165,7 +257,10 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .flex()
         .flex_col()
         .when(this.state.view() != View::List, |container| {
-            container.px(px(ENTRIES_PADDING)).pb(Spacing::XL)
+            container
+                .px(px(ENTRIES_PADDING))
+                .pt(px(GRID_TOP_PADDING))
+                .pb(Spacing::XL)
         });
 
     if this.state.is_loading() && count == 0 {
@@ -322,6 +417,7 @@ fn render_grid_row(
     cx: &mut App,
 ) -> gpui::AnyElement {
     let colors = bolt::colors(cx);
+    let tint = ChromeColors::tint(cx.theme());
     let mut row_element = div()
         .id(ElementId::Name(format!("explorer-grid-row-{row}").into()))
         .flex()
@@ -338,62 +434,101 @@ fn render_grid_row(
         let broken = tile.is_symlink && tile.kind == EntryKind::Symlink;
         let tile_selected = selected.contains(&path);
 
-        // Folders draw the filled blue silhouette; a resolvable symlink
-        // draws the symlink glyph; a broken one the warning glyph; every
-        // other entry the extension-derived file glyph. Selection, hover
-        // and clicks keep the raw path — the glyphs are display-only.
-        let glyph = if broken {
-            Icon::new(icon(gpui_kit_assets::IconName::Link2Off))
-                .size(px(ICON_SLOT))
-                .color(colors.warning)
-                .into_any_element()
+        // Folders draw the two-tone silhouette; a resolvable symlink the
+        // symlink glyph; a broken one the warning glyph; image files a real
+        // thumbnail; every other entry the extension-derived file glyph.
+        // Selection, hover and clicks keep the raw path — the art is
+        // display-only.
+        let thumb = if broken {
+            file_glyph_element(gpui_kit_assets::IconName::Link2Off, colors.warning)
         } else if tile.is_symlink {
-            Icon::new(icon(gpui_kit_assets::IconName::FileSymlink))
-                .size(px(ICON_SLOT))
-                .color(colors.muted)
-                .into_any_element()
+            file_glyph_element(gpui_kit_assets::IconName::FileSymlink, colors.muted)
         } else if is_folder {
-            folder_silhouette(colors.info).into_any_element()
+            folder_silhouette(colors.info, colors.strong).into_any_element()
+        } else if has_thumbnail(&tile.name) {
+            photo_thumbnail(path.clone(), &tile.name, &colors)
         } else {
-            Icon::new(icon(file_glyph(&tile.name)))
-                .size(px(ICON_SLOT))
-                .color(colors.muted)
-                .into_any_element()
+            file_glyph_element(file_glyph(&tile.name), colors.muted)
+        };
+        // Folders carry no subline: the model knows no child count and the
+        // grid never scans.
+        let subline = if is_folder {
+            None
+        } else {
+            tile_size_label(tile.size)
         };
 
-        row_element = row_element.child(
-            ListRow::new(ElementId::Name(
-                format!("explorer-tile-{row}-{index}").into(),
-            ))
-            .selected(tile_selected)
-            .selection_bar(true)
-            .build(cx)
-            .w(px(TILE_WIDTH))
-            .flex_none()
-            .h_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(TILE_TOP_PADDING))
-            .pb(px(TILE_BOTTOM_PADDING))
-            .px(Spacing::XS)
-            .on_click(entry_click(weak, path))
-            .child(glyph)
-            .child(
-                div()
-                    .mt(px(NAME_GAP))
-                    .text_size(px(13.0))
-                    .line_height(px(NAME_LINE))
-                    .line_clamp(2)
-                    .text_center()
-                    .text_color(if tile_selected {
-                        colors.strong
-                    } else {
-                        colors.foreground
-                    })
-                    .child(name),
-            ),
+        let mut tile_element = ListRow::new(ElementId::Name(
+            format!("explorer-tile-{row}-{index}").into(),
+        ))
+        .selected(tile_selected)
+        .build(cx)
+        .w(px(TILE_WIDTH))
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .pt(px(TILE_TOP_PADDING))
+        .pb(px(TILE_BOTTOM_PADDING))
+        .px(Spacing::XS)
+        .border_1()
+        .border_color(if tile_selected {
+            tint.opacity(SELECTION_BORDER_ALPHA)
+        } else {
+            gpui::transparent_black()
+        })
+        .on_click(entry_click(weak, path))
+        .child(
+            div()
+                .w(px(THUMB_WIDTH))
+                .h(px(THUMB_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(thumb),
+        )
+        .child(
+            div()
+                .mt(px(NAME_GAP))
+                .max_w_full()
+                .text_size(px(13.0))
+                .line_height(px(NAME_LINE))
+                .line_clamp(2)
+                .text_center()
+                .text_color(if tile_selected {
+                    colors.strong
+                } else {
+                    colors.foreground
+                })
+                .child(name),
         );
+        if let Some(subline) = subline {
+            tile_element = tile_element.child(
+                div()
+                    .mt(px(SUB_GAP))
+                    .h(px(SUB_LINE))
+                    .font_family(bolt::fonts::editor_family(cx))
+                    .text_size(px(11.0))
+                    .line_height(px(SUB_LINE))
+                    .text_color(colors.muted)
+                    .child(subline),
+            );
+        }
+        if tile_selected {
+            // Keyboard focus ring: a 1.5 px tint outline inside the tile,
+            // shown only in keyboard modality and distinct from the washed,
+            // 1 px bordered selection.
+            tile_element = tile_element.child(WhenFocusVisible::new(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .border(Borders::FOCUS_RING)
+                    .border_color(tint),
+            ));
+        }
+        row_element = row_element.child(tile_element);
     }
     row_element.into_any_element()
 }
@@ -528,21 +663,60 @@ mod tests {
         assert_eq!(glyph("readme.txt.bak"), IconName::File);
     }
 
-    /// The tile height is exactly its composition — top padding, one icon
-    /// slot, the name gap and two clamped filename lines plus bottom
-    /// padding — so the fixed row height can never silently grow away from
-    /// the geometry the tiles draw, and the folder silhouette fits the same
-    /// icon slot the file glyphs use.
+    /// The tile height is exactly its composition, the folder silhouette
+    /// fits the thumbnail slot, and the photo box fits it too.
     #[test]
     fn tile_height_matches_its_composition_and_slot() {
-        let composed =
-            TILE_TOP_PADDING + ICON_SLOT + NAME_GAP + 2.0 * NAME_LINE + TILE_BOTTOM_PADDING;
+        let composed = TILE_TOP_PADDING
+            + THUMB_HEIGHT
+            + NAME_GAP
+            + 2.0 * NAME_LINE
+            + SUB_GAP
+            + SUB_LINE
+            + TILE_BOTTOM_PADDING;
         assert_eq!(
             TILE_HEIGHT, composed,
             "the row height is the tile's own sum"
         );
-        let (slot, folder_height, folder_width) = (ICON_SLOT, FOLDER_HEIGHT, FOLDER_WIDTH);
-        assert!(folder_height <= slot, "silhouette fits the icon slot");
-        assert!(folder_width <= TILE_WIDTH, "silhouette fits the tile width");
+        assert_eq!(TILE_WIDTH, 112.0);
+        assert_eq!(THUMB_HEIGHT, 52.0);
+        let (folder_width, thumb_width) = (FOLDER_WIDTH, THUMB_WIDTH);
+        assert!(
+            folder_width <= thumb_width,
+            "silhouette fits the slot width"
+        );
+        let tile_width = TILE_WIDTH;
+        assert!(thumb_width <= tile_width, "slot fits the tile width");
+        assert!((PHOTO_WIDTH, PHOTO_HEIGHT) <= (THUMB_WIDTH, THUMB_HEIGHT));
+        let (glyph, thumb_height) = (GLYPH_SIZE, THUMB_HEIGHT);
+        assert!(glyph <= thumb_height);
+    }
+
+    /// Thumbnails are chosen from the extension alone, case-insensitively,
+    /// for decodable raster formats only.
+    #[test]
+    fn thumbnails_are_decided_by_extension_alone() {
+        let eligible = |name: &str| has_thumbnail(std::ffi::OsStr::new(name));
+        for name in ["a.png", "a.JPG", "a.jpeg", "a.gif", "a.webp", "a.bmp"] {
+            assert!(eligible(name), "{name}");
+        }
+        for name in ["a.heic", "a.svg", "a.txt", "png", ".png", "a.png.bak", "a"] {
+            assert!(!eligible(name), "{name}");
+        }
+    }
+
+    /// The subline follows the artboard's `fmtSize`; no size, no subline.
+    #[test]
+    fn tile_size_label_follows_the_artboard_format() {
+        assert_eq!(tile_size_label(None), None);
+        assert_eq!(tile_size_label(Some(0)).as_deref(), Some("0 B"));
+        assert_eq!(tile_size_label(Some(999)).as_deref(), Some("999 B"));
+        assert_eq!(tile_size_label(Some(1_000)).as_deref(), Some("1 KB"));
+        assert_eq!(tile_size_label(Some(48_200)).as_deref(), Some("48 KB"));
+        assert_eq!(tile_size_label(Some(2_400_000)).as_deref(), Some("2.4 MB"));
+        assert_eq!(
+            tile_size_label(Some(1_234_000_000)).as_deref(),
+            Some("1.23 GB")
+        );
     }
 }
