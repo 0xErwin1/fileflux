@@ -16,13 +16,112 @@ pub struct Place {
     pub path: PathBuf,
 }
 
+/// A mounted storage volume: its place plus what the mount table and
+/// `statvfs` could tell about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    pub label: String,
+    pub path: PathBuf,
+    /// Mounted under a removable-media root (`/run/media`, `/media`).
+    pub removable: bool,
+    /// `None` when the filesystem could not be queried: no numbers are made up.
+    pub usage: Option<Usage>,
+}
+
+impl Volume {
+    fn from_place(place: Place) -> Self {
+        Self {
+            removable: is_removable_mount(&place.path),
+            label: place.label,
+            path: place.path,
+            usage: None,
+        }
+    }
+}
+
+/// Capacity and free space of a volume, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub total: u64,
+    pub free: u64,
+}
+
+/// Used share above which the meter switches to the warning color.
+const HIGH_USAGE: f64 = 0.85;
+
+impl Usage {
+    /// Builds usage from `statvfs` counters; `None` for an empty filesystem
+    /// or counters that overflow.
+    pub fn from_blocks(fragment_size: u64, blocks: u64, available: u64) -> Option<Self> {
+        let total = blocks.checked_mul(fragment_size)?;
+        let free = available.checked_mul(fragment_size)?.min(total);
+        (total > 0).then_some(Self { total, free })
+    }
+
+    /// Used share of the capacity in `0.0..=1.0`.
+    pub fn used_fraction(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (1.0 - self.free as f64 / self.total as f64).clamp(0.0, 1.0)
+    }
+
+    /// Whether the volume is nearly full (more than 85% used).
+    pub fn is_high(&self) -> bool {
+        self.used_fraction() > HIGH_USAGE
+    }
+
+    /// The sidebar line, e.g. `188 GB free of 498 GB`.
+    pub fn label(&self) -> String {
+        format!(
+            "{} free of {}",
+            format_bytes(self.free),
+            format_bytes(self.total)
+        )
+    }
+}
+
+/// Queries the filesystem mounted at `path`; any failure is `None`.
+pub fn volume_usage(path: &Path) -> Option<Usage> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    Usage::from_blocks(stat.f_frsize, stat.f_blocks, stat.f_bavail)
+}
+
+/// SI byte formatting: whole bytes below 1 kB, otherwise one decimal under
+/// 100 of the unit (trailing `.0` dropped) and none from 100 up.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    value /= 1000.0;
+    while (value * 10.0).round() / 10.0 >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    let unit_label = UNITS.get(unit).copied().unwrap_or("PB");
+    if value >= 99.95 {
+        return format!("{value:.0} {unit_label}");
+    }
+    let text = format!("{value:.1}");
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{text} {unit_label}")
+}
+
+/// Mounts under the removable-media roots are USB-style removable storage.
+fn is_removable_mount(path: &Path) -> bool {
+    path.starts_with("/run/media") || path.starts_with("/media")
+}
+
 /// Completed discovery. Configuration problems are explicit warnings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Places {
     pub home: PathBuf,
     pub desktop: PathBuf,
     pub places: Vec<Place>,
-    pub volumes: Vec<Place>,
+    pub volumes: Vec<Volume>,
     pub trash_root: PathBuf,
     pub warnings: Vec<String>,
 }
@@ -78,6 +177,10 @@ pub fn discover() -> io::Result<Places> {
     )?;
     warnings.extend(discovered.warnings);
     discovered.warnings = warnings;
+    // Discovery already runs off the UI thread, so statvfs may block here.
+    for volume in &mut discovered.volumes {
+        volume.usage = volume_usage(&volume.path);
+    }
     Ok(discovered)
 }
 
@@ -185,7 +288,7 @@ pub fn discover_with(
     let mut volumes = Vec::new();
     if let Some(mounts) = mounts {
         let table = parse_mounts(mounts, home.file_name());
-        volumes = table.volumes;
+        volumes = table.volumes.into_iter().map(Volume::from_place).collect();
         warnings.extend(table.warnings);
     }
 
@@ -708,6 +811,101 @@ tmpmount /run/temp tmpfs rw 0 0\n";
             .map(|v| v.path.to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths, vec!["/srv/data"]);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_fraction_threshold_and_label() -> TestResult {
+        let usage = Usage::from_blocks(4096, 1_000, 250).ok_or("non-empty filesystem")?;
+        assert_eq!(usage.total, 4_096_000);
+        assert_eq!(usage.free, 1_024_000);
+        assert!((usage.used_fraction() - 0.75).abs() < 1e-9);
+        assert!(!usage.is_high());
+        // Exactly 85% used is not yet high; just above is.
+        assert!(
+            !Usage {
+                total: 100,
+                free: 15
+            }
+            .is_high()
+        );
+        assert!(
+            Usage {
+                total: 100,
+                free: 14
+            }
+            .is_high()
+        );
+        assert_eq!(
+            Usage {
+                total: 498_000_000_000,
+                free: 188_000_000_000
+            }
+            .label(),
+            "188 GB free of 498 GB"
+        );
+        assert_eq!(
+            Usage {
+                total: 32_000_000_000,
+                free: 19_800_000_000
+            }
+            .label(),
+            "19.8 GB free of 32 GB"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_rejects_empty_or_overflowing_counters() -> TestResult {
+        assert_eq!(Usage::from_blocks(4096, 0, 0), None);
+        assert_eq!(Usage::from_blocks(u64::MAX, 2, 1), None);
+        // More available than total is clamped, never negative usage.
+        let clamped = Usage::from_blocks(1, 10, 20).ok_or("non-empty")?;
+        assert_eq!(clamped.free, 10);
+        assert_eq!(clamped.used_fraction(), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn format_bytes_uses_si_units_with_artboard_precision() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1 KB");
+        assert_eq!(format_bytes(1_500_000), "1.5 MB");
+        assert_eq!(format_bytes(19_800_000_000), "19.8 GB");
+        assert_eq!(format_bytes(32_000_000_000), "32 GB");
+        assert_eq!(format_bytes(188_000_000_000), "188 GB");
+        assert_eq!(format_bytes(931_000_000_000), "931 GB");
+        assert_eq!(format_bytes(99_960_000_000), "100 GB");
+        assert_eq!(format_bytes(999_950_000_000), "1 TB");
+        assert_eq!(format_bytes(2_000_000_000_000), "2 TB");
+    }
+
+    #[test]
+    fn statvfs_failure_leaves_no_usage() {
+        assert_eq!(
+            volume_usage(Path::new("/nonexistent/fileflux-volume")),
+            None
+        );
+        assert!(volume_usage(Path::new("/")).is_some());
+    }
+
+    #[test]
+    fn removable_media_roots_are_flagged() -> TestResult {
+        let mounts = b"/dev/sda1 /run/media/me/USB vfat rw 0 0\n/dev/sdb1 /mnt/data ext4 rw 0 0\n";
+        let discovered = discover_with(Path::new("/home/me"), None, None, Some(mounts))?;
+        let flags: Vec<(String, bool, bool)> = discovered
+            .volumes
+            .iter()
+            .map(|v| (v.label.clone(), v.removable, v.usage.is_none()))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("data".to_owned(), false, true),
+                ("USB".to_owned(), true, true)
+            ]
+        );
         Ok(())
     }
 

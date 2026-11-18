@@ -1,18 +1,25 @@
 //! The sidebar island: standard places, the session favorites and the
-//! mounted volumes, discovered off the UI thread.
+//! mounted devices, discovered off the UI thread.
 //!
-//! Rows navigate on click; the active row shows the 2 px tint bar of the
+//! Rows show the name only and navigate on click; the full path is the
+//! row's tooltip and the active row shows the 2 px tint bar of the
 //! reference design. Favorites are session-only (nothing is written) and
 //! are added and removed for the current directory with the toolbar's star
-//! button; the virtual Trash is never favorited. Volumes show their exact
-//! mount paths and nothing invented: no free-space numbers.
+//! button; the virtual Trash is never favorited. Devices add a 3 px usage
+//! meter and a "free of" line only when `statvfs` answered; nothing is
+//! invented otherwise.
 
 use bolt::composites::{Island, ListRow};
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, IslandMetrics, Spacing, TreeMetrics};
 use fileflux::core::Location;
-use gpui::{App, Context, Div, ElementId, ParentElement, Stateful, Styled, div, prelude::*, px};
-use gpui_component::ActiveTheme;
+use fileflux::core::places::Volume;
+use std::path::Path;
+
+use gpui::{
+    App, Context, Div, ElementId, ParentElement, Stateful, Styled, div, prelude::*, px, relative,
+};
+use gpui_component::{ActiveTheme, tooltip::Tooltip};
 
 use super::icon;
 use super::state::Transition;
@@ -33,7 +40,6 @@ pub(crate) fn render(
     let mut island = Island::new()
         .w(px(SIDEBAR_WIDTH))
         .h_full()
-        .child(header(cx))
         .child(places_section(this, cx))
         .child(favorites_section(this, cx))
         .child(volumes_section(this, cx));
@@ -51,16 +57,6 @@ pub(crate) fn render(
                 )),
         );
     }
-
-    let island = island.child(
-        div()
-            .flex_none()
-            .min_h(px(46.0))
-            .p(Spacing::LG)
-            .text_size(px(12.0))
-            .text_color(colors.muted)
-            .child("Local files, read-only"),
-    );
 
     if narrow {
         // The parked sidebar overlays the content island from the left.
@@ -86,27 +82,6 @@ pub(crate) fn render(
             .overflow_y_scroll()
             .child(island),
     )
-}
-
-/// The `Explorer` header row of the sidebar island.
-fn header(cx: &App) -> Stateful<Div> {
-    let colors = bolt::colors(cx);
-    div()
-        .id("explorer-sidebar-header")
-        .flex_none()
-        .min_h(px(46.0))
-        .flex()
-        .items_center()
-        .gap(Spacing::SM)
-        .px(Spacing::LG)
-        .border_b_1()
-        .border_color(colors.line)
-        .text_color(colors.strong)
-        .child(
-            Icon::new(icon(gpui_kit_assets::IconName::FolderOpen))
-                .color(ChromeColors::tint(cx.theme())),
-        )
-        .child("Explorer")
 }
 
 /// One section label.
@@ -179,20 +154,23 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
 /// The Favorites section: session-only rows, with an empty hint.
 fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let mut section = div().flex_none().flex().flex_col();
-    section = section.child(section_label(
-        "favorites-label",
-        "Favorites (session only)",
-        cx,
-    ));
+    section = section.child(section_label("favorites-label", "Favorites", cx));
     if this.state.favorites().is_empty() {
+        let colors = bolt::colors(cx);
         return section.child(
             div()
                 .id("explorer-favorites-empty")
-                .px(Spacing::LG)
-                .pb(Spacing::SM)
+                .mx(Spacing::LG)
+                .mt(px(2.0))
+                .px(px(10.0))
+                .py(Spacing::MD)
+                .border_1()
+                .border_dashed()
+                .border_color(colors.line_2)
                 .text_size(px(12.0))
-                .text_color(bolt::colors(cx).muted)
-                .child("No favorites yet — use the star in the toolbar."),
+                .line_height(px(17.0))
+                .text_color(colors.muted)
+                .child("Star a folder to pin it here."),
         );
     }
     for (index, path) in this.state.favorites().iter().enumerate() {
@@ -213,54 +191,104 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     section
 }
 
-/// The Volumes section: the mount table's real storage volumes, at their
-/// exact mount paths.
+/// The Devices section: the mount table's real storage volumes with a
+/// usage meter when `statvfs` answered.
 fn volumes_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let mut section = div().flex_none().flex().flex_col().pb(Spacing::MD);
-    section = section.child(section_label("volumes-label", "Volumes", cx));
+    section = section.child(section_label("volumes-label", "Devices", cx));
     let Some(places) = this.places.clone() else {
         return section;
     };
     for (index, volume) in places.volumes.iter().enumerate() {
-        section = section.child(nav_row(
-            format!("volume-{index}"),
-            &volume.label,
-            volume.path.to_string_lossy().into_owned(),
-            gpui_kit_assets::IconName::HardDrive,
-            &Location::Directory(volume.path.clone()),
-            Some(places.home.as_path()),
-            this,
-            cx,
-        ));
+        section = section.child(volume_row(index, volume, places.home.as_path(), this, cx));
     }
     section
 }
 
-/// One sidebar navigation row: icon, label, the exact path as a truncated
-/// subtitle, and the active treatment for the current location.
-#[allow(clippy::too_many_arguments)]
-fn nav_row(
-    id: String,
-    label: &str,
-    subtitle: String,
-    glyph: gpui_kit_assets::IconName,
-    location: &Location,
-    home: Option<&std::path::Path>,
+/// One device row: icon and name, then the 3 px meter and the mono
+/// "free of" line, both left out without usage numbers.
+fn volume_row(
+    index: usize,
+    volume: &Volume,
+    home: &Path,
     this: &Explorer,
     cx: &mut Context<Explorer>,
 ) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
-    let source = icon(glyph);
-    let active = this.state.current() == location;
-    let home_label = home.is_some_and(|home| location == &Location::Directory(home.to_path_buf()));
-    let shown_label = if home_label {
+    let location = Location::Directory(volume.path.clone());
+    let active = this.state.current() == &location;
+    let glyph = if volume.removable {
+        gpui_kit_assets::IconName::Usb
+    } else {
+        gpui_kit_assets::IconName::HardDrive
+    };
+    let name = if volume.path == home {
         "Home".to_owned()
     } else {
-        label.to_owned()
+        volume.label.clone()
     };
-    let target = location.clone();
-    ListRow::new(ElementId::Name(id.into()))
+    let top = div()
+        .flex()
+        .items_center()
+        .gap(Spacing::SM)
+        .child(
+            Icon::new(icon(glyph))
+                .size(TreeMetrics::ICON)
+                .color(if active { tint } else { colors.muted }),
+        )
+        .child(name);
+    let mut row = row_shell(
+        format!("volume-{index}"),
+        volume.path.to_string_lossy().into_owned(),
+        location,
+        active,
+        cx,
+    )
+    .py(Spacing::SM)
+    .flex_col()
+    .items_stretch()
+    .gap(px(5.0))
+    .child(top);
+    if let Some(usage) = volume.usage {
+        let fill = if usage.is_high() {
+            colors.warning
+        } else {
+            colors.info
+        };
+        let indent = px(25.0);
+        row = row
+            .child(
+                div().ml(indent).h(px(3.0)).bg(colors.raised).child(
+                    div()
+                        .h_full()
+                        .w(relative(usage.used_fraction() as f32))
+                        .bg(fill),
+                ),
+            )
+            .child(
+                div()
+                    .ml(indent)
+                    .font_family(bolt::fonts::editor_family(cx))
+                    .text_size(px(11.0))
+                    .text_color(colors.muted)
+                    .child(usage.label()),
+            );
+    }
+    row
+}
+
+/// The shared row chrome: selection bar, click navigation and the full
+/// path as the tooltip (skipped when there is no path to show).
+fn row_shell(
+    id: String,
+    path: String,
+    location: Location,
+    active: bool,
+    cx: &mut Context<Explorer>,
+) -> Stateful<Div> {
+    let colors = bolt::colors(cx);
+    let row = ListRow::new(ElementId::Name(id.into()))
         .selected(active)
         .selection_bar(true)
         .build(cx)
@@ -277,23 +305,43 @@ fn nav_row(
             colors.foreground
         })
         .on_click(cx.listener(move |this, _event, window, cx| {
-            this.navigate(Transition::Visit(target.clone()), window, cx);
-        }))
-        .child(Icon::new(source).size(TreeMetrics::ICON).color(if active {
-            tint
-        } else {
-            colors.muted
-        }))
-        .child(shown_label)
+            this.navigate(Transition::Visit(location.clone()), window, cx);
+        }));
+    if path.is_empty() {
+        return row;
+    }
+    row.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+}
+
+/// One sidebar navigation row: icon and name, with the exact path as the
+/// tooltip and the active treatment for the current location.
+#[allow(clippy::too_many_arguments)]
+fn nav_row(
+    id: String,
+    label: &str,
+    path: String,
+    glyph: gpui_kit_assets::IconName,
+    location: &Location,
+    home: Option<&Path>,
+    this: &Explorer,
+    cx: &mut Context<Explorer>,
+) -> Stateful<Div> {
+    let colors = bolt::colors(cx);
+    let tint = ChromeColors::tint(cx.theme());
+    let active = this.state.current() == location;
+    let home_label = home.is_some_and(|home| location == &Location::Directory(home.to_path_buf()));
+    let shown_label = if home_label {
+        "Home".to_owned()
+    } else {
+        label.to_owned()
+    };
+    row_shell(id, path, location.clone(), active, cx)
         .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .text_size(px(10.5))
-                .text_color(colors.muted)
-                .child(subtitle),
+            Icon::new(icon(glyph))
+                .size(TreeMetrics::ICON)
+                .color(if active { tint } else { colors.muted }),
         )
+        .child(shown_label)
 }
 
 // The favorites rows show their own file names; no home rewriting, so

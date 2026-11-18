@@ -1686,12 +1686,14 @@ version = "0.1.0-dev.0"
 dependencies = [
  "anyhow",
  "bolt",
+ "chrono",
  "env_logger",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "log",
+ "rustix",
 ]
 
 [[package]]
