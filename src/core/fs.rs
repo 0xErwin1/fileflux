@@ -35,6 +35,10 @@ pub fn read_directory(path: &Path) -> io::Result<Listing> {
                 continue;
             }
         };
+        // In-flight copies and replaced originals are not user files.
+        if crate::core::ops::is_transfer_temp(&dir_entry.file_name()) {
+            continue;
+        }
         match build_entry(dir_entry) {
             Ok(entry) => listing.entries.push(entry),
             Err(warning) => listing.warnings.push(warning),
@@ -358,6 +362,21 @@ mod tests {
                 .iter()
                 .all(|entry| entry.path.parent() == Some(scratch.path()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn read_directory_hides_in_flight_transfer_files() -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = scratch("in-flight")?;
+        fs::write(scratch.path().join(".fileflux-partial-42-1"), b"half")?;
+        fs::write(scratch.path().join(".fileflux-aside-42-2"), b"old")?;
+        fs::write(scratch.path().join(".fileflux-notes"), b"user file")?;
+        fs::write(scratch.path().join("report.pdf"), b"pdf")?;
+
+        let listing = read_directory(scratch.path())?;
+
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec![".fileflux-notes", "report.pdf"]);
         Ok(())
     }
 
