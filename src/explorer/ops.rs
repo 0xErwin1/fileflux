@@ -25,7 +25,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fileflux::core::Entry;
 use fileflux::core::apps::{App, OpenWith, expand_exec};
+use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
@@ -1131,6 +1133,8 @@ pub(crate) fn rename_step(check: RenameCheck, from_blur: bool) -> RenameStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuCommand {
     Open,
+    /// Open the single selected image in the viewer window.
+    OpenInViewer,
     /// Open the single selected folder in a new background tab.
     OpenInNewTab,
     /// Choose the application to open the single selected file with.
@@ -1190,6 +1194,57 @@ pub(crate) struct MenuTarget {
     /// Exactly one entry is selected and it is not a folder: "Open with…"
     /// applies.
     pub(crate) single_file: bool,
+}
+
+/// What opening one entry's file does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenTarget {
+    /// The viewer window, on `list[index]`, walking `list`.
+    Viewer { list: Vec<PathBuf>, index: usize },
+    /// The system's default application (`xdg-open`).
+    External,
+}
+
+/// Which window opens `path`: an image opens the viewer, walking the
+/// images of `displayed` (the folder's entries in the order the explorer
+/// shows them); everything else goes to the default application. An image
+/// that is not among `displayed` is viewed on its own.
+pub(crate) fn open_target(path: &Path, displayed: &[&Entry]) -> OpenTarget {
+    if !is_image_path(path) {
+        return OpenTarget::External;
+    }
+    let list: Vec<PathBuf> = displayed
+        .iter()
+        .filter(|entry| !entry.is_directory() && is_image_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect();
+    match list.iter().position(|candidate| candidate == path) {
+        Some(index) => OpenTarget::Viewer { list, index },
+        None => OpenTarget::Viewer {
+            list: vec![path.to_path_buf()],
+            index: 0,
+        },
+    }
+}
+
+/// Adds "Open in viewer" right after "Open" in the menu of one selected
+/// image. A menu without an "Open" row is left alone.
+pub(crate) fn add_viewer_row(rows: &mut Vec<MenuRow>) {
+    let after_open = rows
+        .iter()
+        .position(|row| matches!(row, MenuRow::Item(spec) if spec.command == MenuCommand::Open));
+    if let Some(at) = after_open {
+        rows.insert(
+            at + 1,
+            MenuRow::Item(MenuItemSpec {
+                command: MenuCommand::OpenInViewer,
+                label: "Open in viewer",
+                shortcut: None,
+                danger: false,
+                enabled: true,
+            }),
+        );
+    }
 }
 
 /// The menu rows for a target; empty when there is nothing to offer (the

@@ -2095,3 +2095,108 @@ fn rename_seed_refuses_every_control_character() {
     }
     assert!(rename_seed(OsStr::new("zz\u{2028}line")).is_ok());
 }
+
+// --- opening images in the viewer --------------------------------------------------
+
+fn listed(name: &str, kind: fileflux::core::EntryKind) -> Entry {
+    Entry {
+        name: name.into(),
+        path: PathBuf::from("/pics").join(name),
+        kind,
+        is_symlink: false,
+        size: None,
+        modified: None,
+        origin: None,
+    }
+}
+
+fn paths(names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| PathBuf::from("/pics").join(name))
+        .collect()
+}
+
+#[test]
+fn an_image_opens_the_viewer_on_the_displayed_images_in_displayed_order() {
+    use fileflux::core::EntryKind::{Directory, File};
+    // The displayed order is not the name order (a size or date sort).
+    let entries = [
+        listed("sub", Directory),
+        listed("c.png", File),
+        listed("notes.txt", File),
+        listed("A.JPG", File),
+        listed("b.gif", File),
+        listed("fake.png", Directory),
+    ];
+    let displayed: Vec<&Entry> = entries.iter().collect();
+    assert_eq!(
+        open_target(Path::new("/pics/A.JPG"), &displayed),
+        OpenTarget::Viewer {
+            list: paths(&["c.png", "A.JPG", "b.gif"]),
+            index: 1,
+        }
+    );
+    assert_eq!(
+        open_target(Path::new("/pics/c.png"), &displayed),
+        OpenTarget::Viewer {
+            list: paths(&["c.png", "A.JPG", "b.gif"]),
+            index: 0,
+        }
+    );
+}
+
+#[test]
+fn an_image_outside_the_displayed_entries_is_viewed_alone() {
+    use fileflux::core::EntryKind::File;
+    let entries = [listed("a.png", File)];
+    let displayed: Vec<&Entry> = entries.iter().collect();
+    assert_eq!(
+        open_target(Path::new("/pics/hidden.png"), &displayed),
+        OpenTarget::Viewer {
+            list: paths(&["hidden.png"]),
+            index: 0,
+        }
+    );
+}
+
+#[test]
+fn other_files_keep_the_default_application() {
+    use fileflux::core::EntryKind::File;
+    let entries = [listed("a.png", File), listed("notes.txt", File)];
+    let displayed: Vec<&Entry> = entries.iter().collect();
+    for name in ["notes.txt", "photo.avif", "png", "Makefile"] {
+        assert_eq!(
+            open_target(&PathBuf::from("/pics").join(name), &displayed),
+            OpenTarget::External,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn open_in_viewer_follows_open_and_leaves_open_with_in_place() {
+    let one_file = MenuTarget {
+        single_file: true,
+        ..target(false, 1, false, false)
+    };
+    let mut rows = menu_rows(&one_file);
+    let before = flat(&rows);
+    add_viewer_row(&mut rows);
+    let mut expected = before.clone();
+    expected.insert(1, "Open in viewer".to_owned());
+    assert_eq!(flat(&rows), expected);
+    assert!(item(&rows, MenuCommand::OpenWith).is_some());
+    assert_eq!(
+        item(&rows, MenuCommand::OpenInViewer).map(|spec| (spec.enabled, spec.danger)),
+        Some((true, false))
+    );
+
+    // Without an "Open" row (the empty space, the Trash) nothing is added.
+    for target in [target(false, 0, false, true), target(true, 1, false, false)] {
+        let mut rows = menu_rows(&target);
+        let before = flat(&rows);
+        add_viewer_row(&mut rows);
+        assert_eq!(flat(&rows), before);
+    }
+}

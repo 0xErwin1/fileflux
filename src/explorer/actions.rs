@@ -23,13 +23,15 @@ use gpui::{
 };
 
 use fileflux::core::apps::{self, App, OpenWith};
+use fileflux::core::images::is_image_path;
 
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
-    MenuRow, MenuTarget, NewKind, Notice, RenameCheck, RenameStep, Report, Severity, UndoAction,
-    UndoEntry, check_rename, dismissed_notice, menu_rows, move_selection, next_menu_index,
-    no_trash_dialog, open_with_command, rename_seed, rename_step, stem_range,
+    MenuRow, MenuTarget, NewKind, Notice, OpenTarget, RenameCheck, RenameStep, Report, Severity,
+    UndoAction, UndoEntry, add_viewer_row, check_rename, dismissed_notice, menu_rows,
+    move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command, rename_seed,
+    rename_step, stem_range,
 };
 use super::progress::{Sink, Unit};
 use super::tabs::{Affected, tabs_to_refresh};
@@ -959,7 +961,12 @@ impl Explorer {
             folder_selected: matches!(selected.as_slice(), [(_, true)]),
             single_file: matches!(selected.as_slice(), [(_, false)]),
         };
-        let rows = menu_rows(&target);
+        let mut rows = menu_rows(&target);
+        let one_image =
+            matches!(self.selected_visible_paths().as_slice(), [path] if is_image_path(path));
+        if target.single_file && one_image && !target.in_trash {
+            add_viewer_row(&mut rows);
+        }
         if rows.is_empty() {
             cx.notify();
             return;
@@ -1017,6 +1024,7 @@ impl Explorer {
         self.close_menu(window, cx);
         match command {
             MenuCommand::Open => self.open_selected(window, cx),
+            MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
             MenuCommand::OpenInNewTab => self.open_selected_in_new_tab(window, cx),
             MenuCommand::OpenWith => self.open_with(window, cx),
             MenuCommand::Rename => self.start_rename(window, cx),
@@ -1170,8 +1178,10 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Opens a file with the default application: `xdg-open <path>`,
-    /// detached, no shell. A trashed file opens only after it is restored.
+    /// Opens a file: an image in the viewer window (walking the images of
+    /// the folder as displayed), anything else with the default
+    /// application: `xdg-open <path>`, detached, no shell. A trashed file
+    /// opens only after it is restored.
     pub(crate) fn open_file(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.in_trash() {
             self.tab_mut()
@@ -1180,14 +1190,50 @@ impl Explorer {
             cx.notify();
             return;
         }
-        let failure = format!("Could not open {}", quoted(path));
-        self.launch(
-            PathBuf::from("xdg-open"),
-            vec![path.as_os_str().to_owned()],
-            None,
-            failure,
-            cx,
-        );
+        let target = open_target(path, &self.tab().state.visible_entries());
+        match target {
+            OpenTarget::Viewer { list, index } => self.show_in_viewer(&list, index, path, cx),
+            OpenTarget::External => {
+                let failure = format!("Could not open {}", quoted(path));
+                self.launch(
+                    PathBuf::from("xdg-open"),
+                    vec![path.as_os_str().to_owned()],
+                    None,
+                    failure,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// "Open in viewer": the single selected image, even when it is not
+    /// what Enter would open.
+    pub(crate) fn open_in_viewer(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_trash() {
+            return;
+        }
+        let selected = self.selected_visible_paths();
+        let [path] = selected.as_slice() else {
+            return;
+        };
+        let path = path.clone();
+        self.open_file(&path, cx);
+    }
+
+    fn show_in_viewer(
+        &mut self,
+        list: &[PathBuf],
+        index: usize,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = crate::viewer::open_list(list.to_vec(), index, cx) {
+            log::warn!("cannot open the viewer: {error}");
+            self.tab_mut()
+                .state
+                .set_notice(format!("Could not open {} in the viewer", quoted(path)));
+            cx.notify();
+        }
     }
 
     /// "Open terminal here": `$TERMINAL` or `xdg-terminal-exec`, started in
