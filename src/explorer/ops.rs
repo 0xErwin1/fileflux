@@ -16,6 +16,7 @@
 //! rename checks, the context-menu model, the confirmation texts and the
 //! terminal lookup.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -57,15 +58,58 @@ impl NewKind {
     }
 }
 
+/// Which file a path named when an operation finished: device and inode.
+/// An undo acts only when the item at the recorded location is still this
+/// one; a different file under the same name is someone else's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Identity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl Identity {
+    fn from_meta(meta: &fs::Metadata) -> Identity {
+        Identity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+
+    /// The identity of what `path` names now; a symlink is itself, never
+    /// its target.
+    pub(crate) fn of(path: &Path) -> io::Result<Identity> {
+        fs::symlink_metadata(path).map(|meta| Identity::from_meta(&meta))
+    }
+}
+
+/// One item a Trash job moved, with what its undo must re-check: which
+/// Trash it went to (to re-read its `.trashinfo`) and which file it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrashedEntry {
+    pub(crate) item: TrashedItem,
+    pub(crate) target: TrashTarget,
+    pub(crate) identity: Identity,
+}
+
 /// One reversible operation, with what undoing it needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UndoAction {
-    /// Undo: rename `new` back to `old`'s name.
-    Rename { old: PathBuf, new: PathBuf },
-    /// Undo: restore the items to where they came from.
-    Trash { items: Vec<TrashedItem> },
-    /// Undo: move the (still empty) new item to the Trash.
-    Create { path: PathBuf, kind: NewKind },
+    /// Undo: rename `new` back to `old`'s name, if `new` is still the
+    /// item that was renamed.
+    Rename {
+        old: PathBuf,
+        new: PathBuf,
+        identity: Identity,
+    },
+    /// Undo: restore the items to where they came from, each only if it is
+    /// still the item that was trashed.
+    Trash { items: Vec<TrashedEntry> },
+    /// Undo: move the (still empty, still the same) new item to the Trash.
+    Create {
+        path: PathBuf,
+        kind: NewKind,
+        identity: Identity,
+    },
 }
 
 /// An undo action with the id a toast's Undo button names it by.
@@ -288,10 +332,16 @@ fn create(dir: &Path, kind: NewKind) -> Report {
         };
         match made {
             Ok(path) => {
+                // Without an identity there is nothing safe to undo.
+                let undo = Identity::of(&path).ok().map(|identity| UndoAction::Create {
+                    path: path.clone(),
+                    kind,
+                    identity,
+                });
                 return Report {
-                    select: vec![path.clone()],
+                    select: vec![path],
                     begin_rename: true,
-                    undo: Some(UndoAction::Create { path, kind }),
+                    undo,
                     ..Report::default()
                 };
             }
@@ -311,11 +361,19 @@ fn rename(path: &Path, new_name: &OsStr) -> Report {
     match core_ops::rename(path, new_name) {
         Ok(new) if new == path => Report::default(),
         Ok(new) => Report {
-            select: vec![new.clone()],
-            undo: Some(UndoAction::Rename {
+            undo: Identity::of(&new).ok().map(|identity| UndoAction::Rename {
                 old: path.to_path_buf(),
-                new,
+                new: new.clone(),
+                identity,
             }),
+            notice: has_padding(new_name).then(|| Notice {
+                severity: Severity::Info,
+                text: format!(
+                    "Renamed to {}; its leading or trailing spaces are kept",
+                    quote(new_name)
+                ),
+            }),
+            select: vec![new],
             ..Report::default()
         },
         Err(error) if error.is_already_exists() => {
@@ -323,6 +381,11 @@ fn rename(path: &Path, new_name: &OsStr) -> Report {
         }
         Err(error) => Report::error(format!("Could not rename {}: {error}", quote_path(path))),
     }
+}
+
+/// Whether a name starts or ends with whitespace (kept, but worth saying).
+fn has_padding(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| name != name.trim())
 }
 
 /// The "N could not be …" tail and details shared by the item loops.
@@ -333,7 +396,7 @@ fn failure_line(path: &Path, error: impl std::fmt::Display) -> String {
 fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
     sink.set_total(paths.len() as u64);
     let now = chrono::Local::now().naive_local();
-    let mut items: Vec<TrashedItem> = Vec::new();
+    let mut items: Vec<TrashedEntry> = Vec::new();
     let mut needs_permanent = Vec::new();
     let mut details = Vec::new();
     let mut cancelled = false;
@@ -349,8 +412,19 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
                 |name| name.to_string_lossy().into_owned(),
             ),
         );
-        match (ctx.target_for)(path).and_then(|target| trash::put(path, &target, now)) {
-            Ok(item) => items.push(item),
+        let trashed = (ctx.target_for)(path).and_then(|target| {
+            // Read before the move: if the path is swapped in between, the
+            // identity is the old one and an undo refuses (the safe side).
+            let identity = Identity::of(path)?;
+            let item = trash::put(path, &target, now)?;
+            Ok(TrashedEntry {
+                item,
+                target,
+                identity,
+            })
+        });
+        match trashed {
+            Ok(entry) => items.push(entry),
             Err(TrashError::NoTrash(_)) => needs_permanent.push(path.clone()),
             Err(error) => details.push(failure_line(path, error)),
         }
@@ -361,7 +435,7 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
     let notice = if moved > 0 {
         let first = items
             .first()
-            .and_then(|item| item.original.file_name())
+            .and_then(|entry| entry.item.original.file_name())
             .map(quote)
             .unwrap_or_default();
         let mut text = if moved == 1 {
@@ -401,6 +475,27 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
     } else {
         None
     };
+    // A cancelled job never asks about permanent deletion: what needed it
+    // is said in the summary instead of silently dropped.
+    let mut notice = notice;
+    if cancelled && !needs_permanent.is_empty() {
+        let mut shown = notice.take().unwrap_or(Notice {
+            severity: Severity::Info,
+            text: "Cancelled".to_owned(),
+        });
+        shown
+            .text
+            .push_str(&format!("; {}", not_deleted(needs_permanent.len())));
+        if matches!(shown.severity, Severity::Success | Severity::Info) {
+            shown.severity = Severity::Warning;
+        }
+        details.extend(
+            needs_permanent
+                .iter()
+                .map(|path| failure_line(path, "not deleted (no Trash available)")),
+        );
+        notice = Some(shown);
+    }
     Report {
         notice,
         undo: (!items.is_empty()).then_some(UndoAction::Trash { items }),
@@ -409,6 +504,21 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
         cancelled,
         ..Report::default()
     }
+}
+
+/// "1 item" / "3 items".
+fn items_label(count: usize) -> String {
+    if count == 1 {
+        "1 item".to_owned()
+    } else {
+        plural_items(count)
+    }
+}
+
+/// What is said about items that were neither moved to the Trash nor
+/// deleted because there is no Trash for them.
+fn not_deleted(count: usize) -> String {
+    format!("{} not deleted (no Trash available)", items_label(count))
 }
 
 fn lowercase_first(text: &str) -> String {
@@ -646,12 +756,16 @@ fn empty_trash(ctx: &JobCtx, names: Vec<OsString>, sink: &Sink) -> Report {
 
 /// Reverses one action, but only if the world is still as it left it.
 /// Anything that changed is an `Err` with the reason, and nothing is
-/// touched.
+/// touched. A Trash undo is item by item and answers its own summary.
 fn undo(action: &UndoAction, ctx: &JobCtx, sink: &Sink) -> Result<Report, String> {
     match action {
-        UndoAction::Rename { old, new } => undo_rename(old, new),
-        UndoAction::Trash { items } => undo_trash(items, sink),
-        UndoAction::Create { path, kind } => undo_create(path, *kind, ctx),
+        UndoAction::Rename { old, new, identity } => undo_rename(old, new, *identity),
+        UndoAction::Trash { items } => Ok(undo_trash(items, sink)),
+        UndoAction::Create {
+            path,
+            kind,
+            identity,
+        } => undo_create(path, *kind, *identity, ctx),
     }
 }
 
@@ -663,10 +777,18 @@ fn presence(path: &Path) -> Result<Option<fs::Metadata>, String> {
     }
 }
 
-fn undo_rename(old: &Path, new: &Path) -> Result<Report, String> {
-    if presence(new)?.is_none() {
-        return Err(format!("{} no longer exists", quote_path(new)));
+/// What `path` is now, if it is still the item with `expected` identity.
+/// `verb` completes "changed since it was …".
+fn same_item(path: &Path, expected: Identity, verb: &str) -> Result<fs::Metadata, String> {
+    let meta = presence(path)?.ok_or_else(|| format!("{} no longer exists", quote_path(path)))?;
+    if Identity::from_meta(&meta) != expected {
+        return Err(format!("{} changed since it was {verb}", quote_path(path)));
     }
+    Ok(meta)
+}
+
+fn undo_rename(old: &Path, new: &Path, identity: Identity) -> Result<Report, String> {
+    same_item(new, identity, "renamed")?;
     let old_name = old
         .file_name()
         .ok_or_else(|| "the original name is unknown".to_owned())?;
@@ -686,61 +808,157 @@ fn undo_rename(old: &Path, new: &Path) -> Result<Report, String> {
     }
 }
 
-fn undo_trash(items: &[TrashedItem], sink: &Sink) -> Result<Report, String> {
-    let mut restored = Vec::new();
-    let mut problems = Vec::new();
-    sink.set_total(items.len() as u64);
-    for (index, item) in items.iter().enumerate() {
+/// What happened to one item of a Trash undo.
+enum Step {
+    Restored(PathBuf),
+    /// It can never be restored (gone, or no longer the same item): skipped
+    /// for good.
+    Gone(String),
+    /// Its original path is taken: skipped, retry after freeing the name.
+    Blocked(String),
+    /// An I/O error: nothing changed, retry later.
+    Failed(String),
+}
+
+fn restore_one(entry: &TrashedEntry) -> Step {
+    let original = entry
+        .item
+        .original
+        .file_name()
+        .map(quote)
+        .unwrap_or_else(|| quote(&entry.item.name));
+    let content = match presence(&entry.item.files_path()) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Step::Gone(format!("{original} is no longer in the Trash")),
+        Err(reason) => return Step::Failed(reason),
+    };
+    let changed = || Step::Gone(format!("{original} changed since it was trashed"));
+    if Identity::from_meta(&content) != entry.identity {
+        return changed();
+    }
+    // The `.trashinfo` is re-read: if it now names another origin, or is
+    // gone, this is no longer the entry we trashed.
+    match TrashedItem::load(&entry.target, &entry.item.name) {
+        Ok(current) if current.original == entry.item.original => {}
+        Err(TrashError::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
+            return Step::Failed(format!("{original}: {error}"));
+        }
+        Ok(_) | Err(_) => return changed(),
+    }
+    // `Fail`: if the original path was taken since, nothing is replaced
+    // and nothing is renamed behind the user's back.
+    match trash::restore(&entry.item, RestoreConflict::Fail) {
+        Ok(dest) => Step::Restored(dest),
+        Err(error) if error.is_already_exists() => {
+            Step::Blocked(format!("{original} already exists"))
+        }
+        Err(error) => Step::Failed(format!("{original}: {error}")),
+    }
+}
+
+fn undo_trash(entries: &[TrashedEntry], sink: &Sink) -> Report {
+    restore_entries(entries, sink, |_| sink.cancelled())
+}
+
+/// Restores item by item: a problem with one never stops the others, and
+/// `stop(index)` (the cancel flag) is asked before each. What was not
+/// restored and still can be stays undoable through the report's undo.
+fn restore_entries(
+    entries: &[TrashedEntry],
+    sink: &Sink,
+    mut stop: impl FnMut(usize) -> bool,
+) -> Report {
+    sink.set_total(entries.len() as u64);
+    let mut restored: Vec<PathBuf> = Vec::new();
+    let mut remaining: Vec<TrashedEntry> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let (mut skipped, mut failed) = (0usize, 0usize);
+    let mut cancelled = false;
+    for (index, entry) in entries.iter().enumerate() {
+        if stop(index) {
+            cancelled = true;
+            let rest = entries.get(index..).unwrap_or_default();
+            skipped += rest.len();
+            remaining.extend(rest.iter().cloned());
+            break;
+        }
         sink.advance(
             index as u64,
-            &item.original.file_name().map_or_else(
-                || item.name.to_string_lossy().into_owned(),
+            &entry.item.original.file_name().map_or_else(
+                || entry.item.name.to_string_lossy().into_owned(),
                 |name| name.to_string_lossy().into_owned(),
             ),
         );
-        let original = item
-            .original
-            .file_name()
-            .map(quote)
-            .unwrap_or_else(|| quote(&item.name));
-        if presence(&item.files_path())?.is_none() {
-            problems.push(format!("{original} is no longer in the Trash"));
-            continue;
-        }
-        // `Fail`: if the original path was taken since, nothing is replaced
-        // and nothing is renamed behind the user's back.
-        match trash::restore(item, RestoreConflict::Fail) {
-            Ok(dest) => restored.push(dest),
-            Err(error) if error.is_already_exists() => {
-                problems.push(format!("{original} already exists"));
+        match restore_one(entry) {
+            Step::Restored(dest) => restored.push(dest),
+            Step::Gone(reason) => {
+                skipped += 1;
+                problems.push(reason);
             }
-            Err(error) => problems.push(format!("{original}: {error}")),
+            Step::Blocked(reason) => {
+                skipped += 1;
+                problems.push(reason);
+                remaining.push(entry.clone());
+            }
+            Step::Failed(reason) => {
+                failed += 1;
+                problems.push(reason);
+                remaining.push(entry.clone());
+            }
         }
     }
-    if restored.is_empty() {
-        return Err(problems.join("; "));
+    sink.advance(entries.len() as u64, "");
+
+    let mut report = match restored.as_slice() {
+        [] if cancelled => Report::say(
+            if problems.is_empty() {
+                Severity::Info
+            } else {
+                Severity::Warning
+            },
+            "Cancelled: nothing was restored",
+        ),
+        [] => Report::error(format!("Can't undo: {}", problems.join("; "))),
+        some => {
+            let done = match some {
+                [only] => format!("Restored {}", quote_path(only)),
+                many => format!("Restored {}", plural_items(many.len())),
+            };
+            let mut text = if cancelled {
+                format!("Cancelled: {}", lowercase_first(&done))
+            } else {
+                done
+            };
+            if skipped > 0 {
+                text.push_str(&format!("; {skipped} skipped"));
+            }
+            if failed > 0 {
+                text.push_str(&format!("; {failed} failed"));
+            }
+            let severity = match (problems.is_empty(), cancelled) {
+                (false, _) => Severity::Warning,
+                (true, true) => Severity::Info,
+                (true, false) => Severity::Success,
+            };
+            Report::say(severity, text)
+        }
+    };
+    if !restored.is_empty() || cancelled {
+        report.details = problems;
     }
-    let done = match restored.as_slice() {
-        [only] => format!("Restored {}", quote_path(only)),
-        many => format!("Restored {}", plural_items(many.len())),
-    };
-    let mut report = if problems.is_empty() {
-        Report::say(Severity::Success, done)
-    } else {
-        Report::say(
-            Severity::Warning,
-            format!("{done}; {} could not be restored", problems.len()),
-        )
-    };
-    report.details = problems;
     report.select = restored;
-    Ok(report)
+    report.cancelled = cancelled;
+    report.undo = (!remaining.is_empty()).then_some(UndoAction::Trash { items: remaining });
+    report
 }
 
-fn undo_create(path: &Path, kind: NewKind, ctx: &JobCtx) -> Result<Report, String> {
-    let Some(meta) = presence(path)? else {
-        return Err(format!("{} no longer exists", quote_path(path)));
-    };
+fn undo_create(
+    path: &Path,
+    kind: NewKind,
+    identity: Identity,
+    ctx: &JobCtx,
+) -> Result<Report, String> {
+    let meta = same_item(path, identity, "created")?;
     let untouched = match kind {
         NewKind::Folder => {
             meta.is_dir()
@@ -800,9 +1018,14 @@ pub(crate) fn check_rename<'a>(
     typed: &str,
     mut siblings: impl Iterator<Item = &'a OsStr>,
 ) -> RenameCheck {
-    let typed = typed.trim();
+    // The name is judged exactly as typed: Linux allows leading and
+    // trailing spaces, and silently trimming would rename to a name the
+    // user did not write (and make "unchanged" depend on what was hidden).
     if typed.is_empty() {
         return RenameCheck::Invalid("The name can't be empty.".to_owned());
+    }
+    if typed.trim().is_empty() {
+        return RenameCheck::Invalid("The name can't be blank.".to_owned());
     }
     let name = OsStr::new(typed);
     if name == old {
@@ -821,6 +1044,32 @@ pub(crate) fn check_rename<'a>(
         return RenameCheck::Invalid(format!("{} already exists here", quote(name)));
     }
     RenameCheck::Rename(name.to_owned())
+}
+
+/// What the inline editor does with a [`RenameCheck`]. Blur is a commit
+/// that must never leave an editor nobody is typing in: a name it cannot
+/// accept cancels the rename (disk untouched) with a message.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RenameStep {
+    /// Close the editor, rename nothing.
+    Close,
+    /// Close the editor, rename nothing, and say why.
+    Cancel(String),
+    /// Keep the editor open with this under the field.
+    KeepOpen(String),
+    /// Close the editor and rename to this name.
+    Run(OsString),
+}
+
+pub(crate) fn rename_step(check: RenameCheck, from_blur: bool) -> RenameStep {
+    match check {
+        RenameCheck::Unchanged => RenameStep::Close,
+        RenameCheck::Invalid(message) if from_blur => {
+            RenameStep::Cancel(format!("Rename canceled: {message}"))
+        }
+        RenameCheck::Invalid(message) => RenameStep::KeepOpen(message),
+        RenameCheck::Rename(name) => RenameStep::Run(name),
+    }
 }
 
 // --- context menu model -------------------------------------------------------------
@@ -992,6 +1241,122 @@ pub(crate) enum DialogKind {
     /// Empty the Trash.
     EmptyTrash { count: usize },
 }
+
+/// What a confirmed dialog does. It carries exactly what its own dialog
+/// showed: nothing that happens while the dialog is open can change it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DialogAction {
+    DeletePermanently(Vec<PathBuf>),
+    DeleteFromTrash(Vec<OsString>),
+    /// The Trash names the dialog counted; nothing else is deleted.
+    EmptyTrash(Vec<OsString>),
+}
+
+/// One confirmation: its words and the action its danger button runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DialogState {
+    pub(crate) kind: DialogKind,
+    pub(crate) text: DialogText,
+    pub(crate) action: DialogAction,
+}
+
+impl DialogState {
+    pub(crate) fn new(kind: DialogKind, names: &[String], action: DialogAction) -> DialogState {
+        DialogState {
+            text: dialog_text(&kind, names),
+            kind,
+            action,
+        }
+    }
+
+    /// The button that has the keyboard focus when the dialog opens.
+    pub(crate) fn initial_focus(&self) -> DialogChoice {
+        DIALOG_DEFAULT
+    }
+}
+
+/// The dialog that asks about permanently deleting what had no Trash,
+/// bound to exactly these paths.
+pub(crate) fn no_trash_dialog(paths: Vec<PathBuf>) -> DialogState {
+    let names: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    DialogState::new(
+        DialogKind::NoTrash,
+        &names,
+        DialogAction::DeletePermanently(paths),
+    )
+}
+
+/// What dismissing a dialog says: declining "delete permanently" for items
+/// that had no Trash leaves them where they are, and that is reported
+/// rather than silently dropped.
+pub(crate) fn dismissed_notice(dialog: &DialogState) -> Option<Notice> {
+    match (&dialog.kind, &dialog.action) {
+        (DialogKind::NoTrash, DialogAction::DeletePermanently(paths)) => Some(Notice {
+            severity: Severity::Info,
+            text: not_deleted(paths.len()),
+        }),
+        _ => None,
+    }
+}
+
+/// Dialogs wait in line: one is open, a background job's follow-up queues
+/// behind it and opens only after the open one closed.
+#[derive(Debug, Default)]
+pub(crate) struct DialogQueue {
+    open: Option<DialogState>,
+    waiting: VecDeque<DialogState>,
+}
+
+impl DialogQueue {
+    /// Opens `dialog` now when none is open, else queues it.
+    pub(crate) fn offer(&mut self, dialog: DialogState) {
+        if self.open.is_none() {
+            self.open = Some(dialog);
+        } else {
+            self.waiting.push_back(dialog);
+        }
+    }
+
+    pub(crate) fn current(&self) -> Option<&DialogState> {
+        self.open.as_ref()
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Closes the open dialog, returns it, and opens the next in line.
+    pub(crate) fn close(&mut self) -> Option<DialogState> {
+        let closed = self.open.take();
+        self.open = self.waiting.pop_front();
+        closed
+    }
+}
+
+/// The buttons of a confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DialogChoice {
+    Cancel,
+    Confirm,
+}
+
+/// The button a dialog opens focused on: the safe one. Enter presses the
+/// focused button, so with this default Enter alone never confirms a
+/// deletion; only a deliberate move of the focus does.
+pub(crate) const DIALOG_DEFAULT: DialogChoice = DialogChoice::Cancel;
 
 /// The words of a confirmation dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]

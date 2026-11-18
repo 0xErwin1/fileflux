@@ -23,8 +23,10 @@ use gpui::{
 };
 
 use super::ops::{
-    DialogKind, Job, JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, RenameCheck,
-    Report, Severity, UndoEntry, check_rename, dialog_text, menu_rows, next_menu_index, stem_range,
+    DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand, MenuRow,
+    MenuTarget, NewKind, Notice, RenameCheck, RenameStep, Report, Severity, UndoAction, UndoEntry,
+    check_rename, dismissed_notice, menu_rows, next_menu_index, no_trash_dialog, rename_step,
+    stem_range,
 };
 use super::progress::Unit;
 use super::view::Explorer;
@@ -72,20 +74,6 @@ pub(crate) struct MenuState {
     pub(crate) rows: Vec<MenuRow>,
     /// The highlighted row (keyboard or hover).
     pub(crate) selected: Option<usize>,
-}
-
-/// What a confirmed dialog does.
-pub(crate) enum DialogAction {
-    DeletePermanently(Vec<PathBuf>),
-    DeleteFromTrash(Vec<OsString>),
-    /// The Trash names the dialog counted; nothing else is deleted.
-    EmptyTrash(Vec<OsString>),
-}
-
-/// The open confirmation dialog.
-pub(crate) struct DialogState {
-    pub(crate) text: super::ops::DialogText,
-    pub(crate) action: DialogAction,
 }
 
 /// What to select (and whether to start renaming) once the listing that
@@ -208,19 +196,11 @@ impl Explorer {
         if let Some(notice) = report.notice.take() {
             self.push_toast(notice, &report.details, undo_id, window, cx);
         }
+        // A cancelled job already said what it did not delete; otherwise
+        // the follow-up dialog queues behind any dialog that is open now.
         if !report.needs_permanent.is_empty() && !report.cancelled {
-            let names: Vec<String> = report
-                .needs_permanent
-                .iter()
-                .map(|path| display_name(path))
-                .collect();
-            self.open_dialog(
-                DialogKind::NoTrash,
-                &names,
-                DialogAction::DeletePermanently(std::mem::take(&mut report.needs_permanent)),
-                window,
-                cx,
-            );
+            let dialog = no_trash_dialog(std::mem::take(&mut report.needs_permanent));
+            self.offer_dialog(dialog, window, cx);
         }
         if !report.select.is_empty() {
             self.pending = Some(PendingSelect {
@@ -442,6 +422,8 @@ impl Explorer {
             return;
         };
         let typed = renaming.input.read(cx).value().to_string();
+        // Exactly as typed: no trimming, so "unchanged" and the new name
+        // are judged on the same string.
         let check = if typed == renaming.seed {
             RenameCheck::Unchanged
         } else {
@@ -455,24 +437,19 @@ impl Explorer {
                     .map(|entry| entry.name.as_os_str()),
             )
         };
-        match check {
-            RenameCheck::Unchanged => self.finish_rename(from_blur, window, cx),
-            RenameCheck::Invalid(message) if from_blur => {
+        match rename_step(check, from_blur) {
+            RenameStep::Close => self.finish_rename(from_blur, window, cx),
+            RenameStep::Cancel(message) => {
                 self.finish_rename(true, window, cx);
-                self.say(
-                    Severity::Warning,
-                    format!("Rename canceled: {message}"),
-                    window,
-                    cx,
-                );
+                self.say(Severity::Warning, message, window, cx);
             }
-            RenameCheck::Invalid(message) => {
+            RenameStep::KeepOpen(message) => {
                 if let Some(renaming) = self.renaming.as_mut() {
                     renaming.error = Some(message);
                 }
                 cx.notify();
             }
-            RenameCheck::Rename(new_name) => {
+            RenameStep::Run(new_name) => {
                 let path = renaming.path.clone();
                 self.finish_rename(from_blur, window, cx);
                 let title = format!("Renaming {}", quoted(&path));
@@ -604,24 +581,65 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.offer_dialog(DialogState::new(kind, names, action), window, cx);
+    }
+
+    /// Opens `dialog`, or queues it behind the one that is open: nothing
+    /// that finishes in the background may replace a confirmation the user
+    /// is reading.
+    fn offer_dialog(&mut self, dialog: DialogState, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menu(window, cx);
-        self.dialog = Some(DialogState {
-            text: dialog_text(&kind, names),
-            action,
-        });
-        // The safe button is the default: Enter alone never deletes.
-        cx.defer_in(window, |this, window, cx| {
-            this.dialog_cancel_focus.focus(window, cx);
-        });
+        self.dialogs.offer(dialog);
+        self.focus_dialog_default(window, cx);
         cx.notify();
     }
 
-    /// The danger button: runs what the dialog asked for.
-    pub(crate) fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialog.take() else {
+    /// The safe button is the default: Enter alone never deletes.
+    fn focus_dialog_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialogs.current() else {
             return;
         };
-        self.entries_focus.focus(window, cx);
+        let choice = dialog.initial_focus();
+        cx.defer_in(window, move |this, window, cx| {
+            match choice {
+                DialogChoice::Cancel => &this.dialog_cancel_focus,
+                DialogChoice::Confirm => &this.dialog_confirm_focus,
+            }
+            .focus(window, cx);
+        });
+    }
+
+    /// After a dialog closed: the next one in line takes the keyboard at
+    /// its safe button, else the entries get it back.
+    fn dialog_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialogs.is_open() {
+            self.focus_dialog_default(window, cx);
+        } else {
+            self.entries_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// A press of one of the dialog's two buttons.
+    pub(crate) fn choose_dialog(
+        &mut self,
+        choice: DialogChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match choice {
+            DialogChoice::Cancel => self.cancel_dialog(window, cx),
+            DialogChoice::Confirm => self.confirm_dialog(window, cx),
+        }
+    }
+
+    /// The danger button: runs what the open dialog asked for, bound to the
+    /// paths that dialog showed.
+    pub(crate) fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialogs.close() else {
+            return;
+        };
+        self.dialog_closed(window, cx);
         let (title, job) = match dialog.action {
             DialogAction::DeletePermanently(paths) => (
                 match paths.as_slice() {
@@ -642,11 +660,16 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Cancel, Escape or a click on the scrim: nothing happens.
+    /// Cancel, Escape or a click on the scrim: nothing is deleted. What the
+    /// dialog was about to delete for lack of a Trash is reported, not
+    /// silently dropped.
     pub(crate) fn cancel_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dialog.take().is_some() {
-            self.entries_focus.focus(window, cx);
-            cx.notify();
+        let Some(dialog) = self.dialogs.close() else {
+            return;
+        };
+        self.dialog_closed(window, cx);
+        if let Some(notice) = dismissed_notice(&dialog) {
+            self.push_toast(notice, &[], None, window, cx);
         }
     }
 
@@ -669,7 +692,10 @@ impl Explorer {
     }
 
     fn run_undo(&mut self, entry: UndoEntry, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_job("Undoing", Job::Undo(entry.action), false, window, cx);
+        // Restoring several items takes a while: it can be cancelled, and
+        // what was not restored stays undoable.
+        let cancellable = matches!(entry.action, UndoAction::Trash { .. });
+        self.start_job("Undoing", Job::Undo(entry.action), cancellable, window, cx);
     }
 
     // --- context menu ----------------------------------------------------------------

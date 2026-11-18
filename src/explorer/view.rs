@@ -33,8 +33,9 @@ use gpui::{
 };
 use gpui_component::table::{TableEvent, TableState};
 
-use crate::explorer::actions::{DialogState, MenuState, PendingSelect, Renaming};
+use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
 use crate::explorer::inspector::{self, PermissionProbe};
+use crate::explorer::ops::DialogQueue;
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::progress::Registry;
 use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
@@ -318,12 +319,14 @@ pub(crate) struct Explorer {
     pub(crate) menu: Option<MenuState>,
     /// The focus of the open context menu.
     pub(crate) menu_focus: FocusHandle,
-    /// The open confirmation dialog, if any.
-    pub(crate) dialog: Option<DialogState>,
+    /// The open confirmation dialog and those waiting behind it.
+    pub(crate) dialogs: DialogQueue,
     /// The focus of the dialog's backdrop (the focus trap).
     pub(crate) dialog_focus: FocusHandle,
     /// The dialog's default button: Cancel.
     pub(crate) dialog_cancel_focus: FocusHandle,
+    /// The danger button; focused only by a deliberate move.
+    pub(crate) dialog_confirm_focus: FocusHandle,
     /// What to select (and whether to rename) once the next listing shows it.
     pub(crate) pending: Option<PendingSelect>,
     /// Bolt's toast stack: operation summaries, with Undo.
@@ -429,9 +432,10 @@ impl Explorer {
             renaming: None,
             menu: None,
             menu_focus: cx.focus_handle(),
-            dialog: None,
+            dialogs: DialogQueue::default(),
             dialog_focus: cx.focus_handle(),
             dialog_cancel_focus: cx.focus_handle(),
+            dialog_confirm_focus: cx.focus_handle(),
             pending: None,
             toast_host,
             terminal,
@@ -637,6 +641,10 @@ impl Explorer {
                 }
                 self.sync_search_input(window, cx);
                 self.after_listing_changed(window, cx);
+                // An operation that finished while this navigation was
+                // pending refreshes the folder now shown.
+                let postponed = self.state.begin_deferred_op_refresh();
+                self.start_scan(postponed, window, cx);
                 cx.notify();
             }
             Err(_) if scan.live => {
@@ -652,6 +660,9 @@ impl Explorer {
                     return;
                 }
                 log::warn!("directory scan failed: {error}");
+                // The folder still shown is what the operation changed.
+                let postponed = self.state.begin_deferred_op_refresh();
+                self.start_scan(postponed, window, cx);
                 cx.notify();
             }
         }

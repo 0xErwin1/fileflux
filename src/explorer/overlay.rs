@@ -19,7 +19,7 @@ use gpui::{
 
 use super::actions::RenameView;
 use super::icon;
-use super::ops::{MenuCommand, MenuRow};
+use super::ops::{DialogChoice, MenuCommand, MenuRow};
 use super::view::{Explorer, MENU_CONTEXT};
 
 /// The menu and the dialog, when open. Also hands the keyboard back to the
@@ -33,7 +33,7 @@ pub(crate) fn render(
     if this.menu.is_none() && this.menu_focus.is_focused(window) {
         this.entries_focus.focus(window, cx);
     }
-    if this.dialog.is_none() && this.dialog_focus.contains_focused(window, cx) {
+    if !this.dialogs.is_open() && this.dialog_focus.contains_focused(window, cx) {
         this.entries_focus.focus(window, cx);
     }
     let mut layers = Vec::new();
@@ -149,7 +149,7 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
 }
 
 fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
-    let Some(dialog) = this.dialog.as_ref() else {
+    let Some(dialog) = this.dialogs.current() else {
         return Vec::new();
     };
     let colors = bolt::colors(cx);
@@ -193,7 +193,7 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                 .focus_handle(&this.dialog_cancel_focus)
                 .on_click(move |_event, window, cx| {
                     if let Err(error) = cancel_weak.update(cx, |this, cx| {
-                        this.cancel_dialog(window, cx);
+                        this.choose_dialog(DialogChoice::Cancel, window, cx);
                     }) {
                         log::debug!("the dialog outlived its explorer: {error}");
                     }
@@ -202,9 +202,10 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         .child(
             Button::new("explorer-dialog-confirm", text.confirm)
                 .danger()
+                .focus_handle(&this.dialog_confirm_focus)
                 .on_click(move |_event, window, cx| {
                     if let Err(error) = confirm_weak.update(cx, |this, cx| {
-                        this.confirm_dialog(window, cx);
+                        this.choose_dialog(DialogChoice::Confirm, window, cx);
                     }) {
                         log::debug!("the dialog outlived its explorer: {error}");
                     }

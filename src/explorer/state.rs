@@ -241,6 +241,9 @@ pub(crate) struct ExplorerState {
     favorites: Vec<PathBuf>,
     /// The scan waiting for its listing, if any.
     pending: Option<Scan>,
+    /// An operation finished while a navigation was pending: its refresh
+    /// runs once that navigation has committed.
+    op_refresh_deferred: bool,
     /// Bumped on every scan that starts; completions compare against it.
     generation: u64,
     /// The home directory, when known, which `~` paths resolve against.
@@ -268,6 +271,7 @@ impl ExplorerState {
             selected: BTreeSet::new(),
             favorites: Vec::new(),
             pending: None,
+            op_refresh_deferred: false,
             generation: 1,
             home,
             load_error: None,
@@ -374,9 +378,28 @@ impl ExplorerState {
     /// refresh it supersedes a scan in flight: that scan may have read the
     /// location before the operation changed it, and a newer generation
     /// discards it. The commit keeps the selection of entries that remain.
+    ///
+    /// A pending *navigation* (or fallback) is different: the user asked
+    /// for another folder, and that wins. The refresh is postponed
+    /// ([`Self::begin_deferred_op_refresh`]) and returns `None` now.
     pub(crate) fn begin_op_refresh(&mut self) -> Option<Scan> {
+        if self.pending.as_ref().is_some_and(|scan| !scan.live) {
+            self.op_refresh_deferred = true;
+            return None;
+        }
         let current = self.nav.current().clone();
         self.begin_scan(Transition::Visit(current), true, None)
+    }
+
+    /// The operation refresh a navigation postponed, now that the
+    /// navigation has committed: re-reads the folder that is shown now.
+    /// `None` when nothing was postponed or another scan is pending.
+    pub(crate) fn begin_deferred_op_refresh(&mut self) -> Option<Scan> {
+        if !self.op_refresh_deferred || self.pending.is_some() {
+            return None;
+        }
+        self.op_refresh_deferred = false;
+        self.begin_op_refresh()
     }
 
     /// Navigates to `ancestor` after the shown folder vanished; the commit
@@ -1571,11 +1594,9 @@ mod tests {
     /// Our own operation refreshes even the Trash and supersedes a scan in
     /// flight, which may have read the location before the operation ran.
     #[test]
-    fn an_operation_refresh_supersedes_a_pending_scan_and_covers_the_trash() -> TestResult {
+    fn an_operation_refresh_supersedes_a_pending_refresh_and_covers_the_trash() -> TestResult {
         let mut state = state();
-        let stale = state
-            .begin(Transition::Visit(dir("/fixture")))
-            .ok_or("scan")?;
+        let stale = state.begin_live_refresh().ok_or("a live scan")?;
         let fresh = state.begin_op_refresh().ok_or("an operation refresh")?;
         assert!(fresh.live);
         assert!(!state.commit(stale, listing(&[("old", EntryKind::File)])));
@@ -1591,6 +1612,64 @@ mod tests {
         assert_eq!(again.location, Location::Trash);
         assert!(state.commit(again, listing(&[("t", EntryKind::File)])));
         assert_eq!(state.selection().len(), 1, "the selection survives");
+        Ok(())
+    }
+
+    /// A job finishing while the user navigates must not cancel the
+    /// navigation: the navigation wins and the operation's refresh is
+    /// postponed until the new folder is the one shown.
+    #[test]
+    fn an_operation_refresh_never_drops_a_pending_navigation() -> TestResult {
+        let mut state = state();
+        let navigating = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("scan")?;
+        assert!(
+            state.begin_op_refresh().is_none(),
+            "the operation refresh must not supersede a navigation"
+        );
+        assert!(state.is_loading(), "the navigation is still pending");
+        assert!(
+            state.commit(navigating, listing(&[("n", EntryKind::File)])),
+            "the navigation still commits"
+        );
+        assert_eq!(state.current(), &dir("/fixture/a"));
+        assert!(!state.navigation().can_forward());
+
+        let after = state
+            .begin_deferred_op_refresh()
+            .ok_or("the postponed refresh")?;
+        assert_eq!(after.location, dir("/fixture/a"), "the folder now shown");
+        assert!(after.live);
+        assert!(state.commit(after, listing(&[("n", EntryKind::File)])));
+        assert!(
+            state.begin_deferred_op_refresh().is_none(),
+            "it is postponed once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_operation_refresh_never_drops_a_pending_fallback_either() -> TestResult {
+        let mut state = state();
+        let fallback = state
+            .begin_fallback(PathBuf::from("/fixture"), "gone".to_owned())
+            .ok_or("fallback")?;
+        assert!(state.begin_op_refresh().is_none());
+        assert!(state.commit(fallback, listing(&[])));
+        assert_eq!(state.notice(), Some("gone"), "the fallback notice survives");
+        assert!(state.begin_deferred_op_refresh().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn without_an_operation_refresh_nothing_is_postponed() -> TestResult {
+        let mut state = state();
+        let navigating = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("scan")?;
+        assert!(state.commit(navigating, listing(&[])));
+        assert!(state.begin_deferred_op_refresh().is_none());
         Ok(())
     }
 
