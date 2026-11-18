@@ -10,9 +10,10 @@ Goal: sort and filter the entries of a folder in grid and list, per tab, session
 - S6: "Primero, me gustaria que estuvieran tambien en el menu contextual." — Sort and Filter submenus also in the empty-space context menu.
 
 ## Tasks
-- T1 | S1-S5 | route: writer | pending | Sort model shared by grid and list (4 keys, asc/desc, folders-first toggle, natural order), filter model (type categories, hidden toggle Ctrl+H, date ranges, size ranges) combined with name search, subbar Sort/Filter menus + removable active chips, per-tab state, keyboard/selection/viewer/paste order follow the result, counts "N of M", tests + native validation | commit: -
+- T1 | S1-S5 | route: writer | done | Sort model shared by grid and list (4 keys, asc/desc, folders-first toggle, natural order), filter model (type categories, hidden toggle Ctrl+H, date ranges, size ranges) combined with name search, subbar Sort/Filter menus + removable active chips, per-tab state, keyboard/selection/viewer/paste order follow the result, counts "N of M", tests + native validation | commit: db728f2
 
 ## Log
 - L1: "me falta filtros y sort en los archivos"
 - L2: Answers recorded as S2-S5 (all filters, all sort options, subbar controls, per-tab session-only).
 - L3: "Primero, me gustaria que estuvieran tambien en el menu contextual. Segundo, estaria bien ir pensando en presisntecia de perferencias y settings" → S6 added to T1; persistence is a design discussion (separate feature), not part of T1.
+- L4: T1 (db728f2): RED natural_cmp 5/8, arrange 13/15, menu rows; some tests not RED-run. Tests 170+313+9+4. Native Xvfb (pinned DISPLAY) PASS: 4 sort keys both ways grid/list, folders-first off, natural IMG_2<IMG_10, each filter and combos, chips + Clear all, 'N of M', Ctrl+H, context menu Sort by/Filter pages synced with subbar, tabs inherit then diverge, viewer follows filtered order. Decisions: hidden files visible by default (previous behavior), size ranges never apply to folders, date ranges apply to folders only when Folders is the only type chip, unknown metadata never matches a range, drill-in menu pages (no flyout submenus in bolt). State is plain data (Arrangement) ready for persistence.
