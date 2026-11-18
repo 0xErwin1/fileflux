@@ -9,9 +9,17 @@
 //! fails: unknown keys are ignored, missing keys take their defaults, a
 //! corrupt file loads defaults and is kept aside as `<name>.bad-<timestamp>`,
 //! and a file written by a *newer* Fileflux loads defaults and is never
-//! overwritten, so the newer app's file survives. Saving writes a temporary
-//! file next to the target, syncs it and renames it over, so a crash never
-//! leaves half a file.
+//! overwritten, so the newer app's file survives. A corrupt file is healed:
+//! once its copy is safely aside, the next save writes a valid file. If the
+//! copy cannot be made the file is left alone, never overwritten.
+//!
+//! Saving writes a uniquely named temporary file next to the target (so two
+//! instances never share one), syncs it and renames it over, so a crash never
+//! leaves half a file. A symlinked file (a dotfile manager) is written
+//! through to its target and stays a symlink. Saves carry a generation so a
+//! stale one never overwrites a newer write, and the settings of another
+//! instance that changed the file meanwhile are merged (see
+//! [`merge_settings`]).
 //!
 //! Paths are stored losslessly: a UTF-8 path is a plain TOML string, any
 //! other path is `{ bytes = [..] }` holding its raw bytes, so a favorite or
@@ -19,12 +27,14 @@
 //!
 //! Both files are written with mode `0600`: they list the user's folders.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{self, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -420,6 +430,9 @@ pub struct Loaded<T> {
     /// Whether the app may write the file: `false` when it was written by a
     /// newer version or could not be read, so it is never overwritten.
     pub writable: bool,
+    /// The file was invalid and its copy is safely aside: the next save
+    /// should replace it with a valid file, so the notice shows once.
+    pub heal: bool,
 }
 
 /// Reads `settings.toml` at `path`; `now` stamps the aside copy of a corrupt
@@ -433,6 +446,38 @@ pub fn load_session(path: &Path, now: SystemTime) -> Loaded<Session> {
     load(path, now)
 }
 
+/// How a file's bytes read.
+enum Parsed<T> {
+    Value(T),
+    /// Written by a newer Fileflux: its `version`.
+    Newer(i64),
+    /// Not UTF-8, not TOML, or not the expected shape.
+    Invalid(String),
+}
+
+fn parse<T: Stored>(bytes: &[u8]) -> Parsed<T> {
+    let parsed = std::str::from_utf8(bytes)
+        .map_err(|error| error.to_string())
+        .and_then(|text| {
+            text.parse::<toml::Table>()
+                .map_err(|error| error.to_string())
+        });
+    let table = match parsed {
+        Ok(table) => table,
+        Err(reason) => return Parsed::Invalid(reason),
+    };
+    // A newer version may have changed the shape: do not guess, and keep it.
+    if let Some(version) = table.get("version").and_then(toml::Value::as_integer)
+        && version > i64::from(T::VERSION)
+    {
+        return Parsed::Newer(version);
+    }
+    match table.try_into::<T>() {
+        Ok(value) => Parsed::Value(value),
+        Err(error) => Parsed::Invalid(error.to_string()),
+    }
+}
+
 fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
     let file_name = path
         .file_name()
@@ -444,6 +489,7 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
                 value: T::default(),
                 notice: None,
                 writable: true,
+                heal: false,
             };
         }
         Err(error) => {
@@ -454,26 +500,19 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
                     T::LABEL
                 )),
                 writable: false,
+                heal: false,
             };
         }
     };
 
-    let parsed = std::str::from_utf8(&bytes)
-        .map_err(|error| error.to_string())
-        .and_then(|text| {
-            text.parse::<toml::Table>()
-                .map_err(|error| error.to_string())
-        });
-    let table = match parsed {
-        Ok(table) => table,
-        Err(reason) => return corrupt(path, &file_name, now, &reason),
-    };
-
-    // A newer version may have changed the shape: do not guess, and keep it.
-    if let Some(version) = table.get("version").and_then(toml::Value::as_integer)
-        && version > i64::from(T::VERSION)
-    {
-        return Loaded {
+    match parse::<T>(&bytes) {
+        Parsed::Value(value) => Loaded {
+            value,
+            notice: None,
+            writable: true,
+            heal: false,
+        },
+        Parsed::Newer(version) => Loaded {
             value: T::default(),
             notice: Some(format!(
                 "{} file {file_name} was written by a newer Fileflux (version {version}); \
@@ -481,36 +520,39 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
                 T::LABEL
             )),
             writable: false,
-        };
-    }
-
-    match table.try_into::<T>() {
-        Ok(value) => Loaded {
-            value,
-            notice: None,
-            writable: true,
+            heal: false,
         },
-        Err(error) => corrupt(path, &file_name, now, &error.to_string()),
+        Parsed::Invalid(reason) => corrupt(path, &file_name, now, &reason),
     }
 }
 
-/// Defaults for a file that cannot be parsed, after copying it aside.
+/// Defaults for a file that cannot be parsed, after copying it aside. When
+/// the copy cannot be made the file is the only copy of what the user wrote:
+/// it is left untouched and never written.
 fn corrupt<T: Stored>(path: &Path, file_name: &str, now: SystemTime, reason: &str) -> Loaded<T> {
     log::warn!("{} is invalid: {reason}", path.display());
-    let notice = match keep_aside(path, file_name, now) {
-        Ok(kept) => format!(
-            "{} file was invalid; using defaults (kept as {kept})",
-            T::LABEL
+    let (notice, kept) = match keep_aside(path, file_name, now) {
+        Ok(kept) => (
+            format!(
+                "{} file was invalid; using defaults (kept as {kept})",
+                T::LABEL
+            ),
+            true,
         ),
-        Err(error) => format!(
-            "{} file was invalid; using defaults (could not keep a copy: {error})",
-            T::LABEL
+        Err(error) => (
+            format!(
+                "{} file was invalid; using defaults (could not keep a copy: {error}; \
+                 leaving it untouched)",
+                T::LABEL
+            ),
+            false,
         ),
     };
     Loaded {
         value: T::default(),
         notice: Some(notice),
-        writable: true,
+        writable: kept,
+        heal: kept,
     }
 }
 
@@ -546,9 +588,32 @@ fn keep_aside(path: &Path, file_name: &str, now: SystemTime) -> io::Result<Strin
 
 // --- saving -------------------------------------------------------------------
 
-/// Serializes writers, so the debounced background save and the save on
-/// close never share a temporary file.
-static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// What this process last wrote to a path, behind the lock that serializes
+/// its writers (the debounced background save and the save on close).
+#[derive(Default)]
+struct Written {
+    /// The newest generation written: an older one never overwrites it.
+    generation: u64,
+    /// The settings this process last wrote there (as it held them, before
+    /// any merge): what a change by another instance is measured against.
+    settings: Option<Settings>,
+}
+
+static WRITER: Mutex<BTreeMap<PathBuf, Written>> = Mutex::new(BTreeMap::new());
+
+fn writer() -> MutexGuard<'static, BTreeMap<PathBuf, Written>> {
+    WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What an ordered save did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Written,
+    /// A newer generation was already written; the file was not touched.
+    Superseded,
+}
 
 /// Writes `settings.toml` atomically, creating its directory.
 ///
@@ -556,7 +621,10 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Any I/O failure; the previous file is left as it was.
 pub fn save_settings(path: &Path, settings: &Settings) -> io::Result<()> {
-    save(path, settings)
+    let mut written = writer();
+    write_value(path, settings)?;
+    written.entry(path.to_path_buf()).or_default().settings = Some(settings.clone());
+    Ok(())
 }
 
 /// Writes `session.toml` atomically, creating its directory.
@@ -565,40 +633,184 @@ pub fn save_settings(path: &Path, settings: &Settings) -> io::Result<()> {
 ///
 /// Any I/O failure; the previous file is left as it was.
 pub fn save_session(path: &Path, session: &Session) -> io::Result<()> {
-    save(path, session)
+    let _written = writer();
+    write_value(path, session)
 }
 
-fn save<T: Stored>(path: &Path, value: &T) -> io::Result<()> {
+/// [`save_settings`] for a numbered snapshot: under the write lock, a
+/// `generation` older than the newest one written to `path` is skipped, so a
+/// slow background save never overwrites what the close wrote after it.
+///
+/// `base` is the settings this process last loaded or wrote when it has not
+/// written `path` yet (`None`: overwrite whatever is there, as when healing
+/// an invalid file). When the file holds something else than the base, another
+/// instance changed it: the favorites are merged ([`merge_settings`]) and the
+/// rest is ours.
+///
+/// # Errors
+///
+/// Any I/O failure, or the file changed to something invalid or newer, which
+/// is left untouched; the previous file is left as it was.
+pub fn save_settings_ordered(
+    path: &Path,
+    settings: &Settings,
+    base: Option<&Settings>,
+    generation: u64,
+) -> io::Result<SaveOutcome> {
+    let mut written = writer();
+    let entry = written.entry(path.to_path_buf()).or_default();
+    if generation < entry.generation {
+        return Ok(SaveOutcome::Superseded);
+    }
+    let merged = match entry.settings.as_ref().or(base) {
+        Some(base) => merge_with_disk(path, base, settings)?,
+        None => settings.clone(),
+    };
+    write_value(path, &merged)?;
+    entry.generation = generation;
+    entry.settings = Some(settings.clone());
+    Ok(SaveOutcome::Written)
+}
+
+/// [`save_session`] for a numbered snapshot; see [`save_settings_ordered`].
+/// The session is not merged: the last writer wins.
+///
+/// # Errors
+///
+/// Any I/O failure; the previous file is left as it was.
+pub fn save_session_ordered(
+    path: &Path,
+    session: &Session,
+    generation: u64,
+) -> io::Result<SaveOutcome> {
+    let mut written = writer();
+    let entry = written.entry(path.to_path_buf()).or_default();
+    if generation < entry.generation {
+        return Ok(SaveOutcome::Superseded);
+    }
+    write_value(path, session)?;
+    entry.generation = generation;
+    Ok(SaveOutcome::Written)
+}
+
+fn write_value<T: Stored>(path: &Path, value: &T) -> io::Result<()> {
     let text = toml::to_string_pretty(value).map_err(io::Error::other)?;
-    let _guard = WRITE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     write_atomic(path, text.as_bytes())
 }
 
-/// Temporary file in the same directory (so the rename stays on one
-/// filesystem), synced, then renamed over `path`; the directory is synced
+/// What is on disk now merged with `ours`; see [`merge_settings`].
+fn merge_with_disk(path: &Path, base: &Settings, ours: &Settings) -> io::Result<Settings> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ours.clone()),
+        Err(error) => return Err(error),
+    };
+    match parse::<Settings>(&bytes) {
+        Parsed::Value(disk) => Ok(merge_settings(base, ours, &disk)),
+        Parsed::Newer(version) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the file was changed to version {version} by a newer Fileflux; left untouched"
+            ),
+        )),
+        Parsed::Invalid(reason) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the file was changed on disk and is not valid ({reason}); left untouched"),
+        )),
+    }
+}
+
+/// Our settings merged with what another instance left on disk since `base`
+/// (what we last loaded or wrote). Favorites are a three-way set merge:
+/// what the other instance added stays, what we added is added, what either
+/// side removed from `base` stays removed. Every other field is ours (the
+/// last writer wins).
+#[must_use]
+pub fn merge_settings(base: &Settings, ours: &Settings, disk: &Settings) -> Settings {
+    let removed_by_us: BTreeSet<&Path> = base
+        .favorites
+        .iter()
+        .filter(|path| !ours.favorites.contains(path))
+        .map(PathBuf::as_path)
+        .collect();
+    let mut favorites: Vec<PathBuf> = Vec::new();
+    for path in &disk.favorites {
+        if !removed_by_us.contains(path.as_path()) && !favorites.contains(path) {
+            favorites.push(path.clone());
+        }
+    }
+    for path in &ours.favorites {
+        // In the base and gone from the disk: the other instance removed it.
+        if !base.favorites.contains(path) && !favorites.contains(path) {
+            favorites.push(path.clone());
+        }
+    }
+    Settings {
+        favorites,
+        ..ours.clone()
+    }
+}
+
+/// Counts the temporary files this process created, so names never repeat.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `<name>.<pid>.<counter>.tmp` beside `target`: unique per process and per
+/// write, so two instances never share (or truncate) a temporary file.
+fn tmp_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_owned();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    target.with_file_name(name)
+}
+
+/// The most symlinks followed before giving up, like the kernel's limit.
+const MAX_LINK_HOPS: usize = 40;
+
+/// The file a write to `path` must replace: `path` itself, or what a chain
+/// of symlinks (a dotfile manager's) finally points at, which may not exist
+/// yet. The symlink itself is never replaced.
+fn write_target(path: &Path) -> io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&current)?;
+                current = current.parent().map_or(link.clone(), |dir| dir.join(&link));
+            }
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
+/// Unique temporary file in the target's directory (so the rename stays on
+/// one filesystem), opened with `create_new` and without following a
+/// symlink, synced, then renamed over the target; the directory is synced
 /// after, best effort. The temporary file is removed when anything fails.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path
+    let target = write_target(path)?;
+    let dir = target
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
+    let tmp = tmp_path(&target);
 
     let written = (|| {
         let mut out = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
             .open(&tmp)?;
         out.write_all(bytes)?;
         out.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, &target)
     })();
     if written.is_err() {
         if let Err(error) = std::fs::remove_file(&tmp) {
@@ -609,7 +821,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Ok(dir) = std::fs::File::open(dir)
         && let Err(error) = dir.sync_all()
     {
-        log::debug!("cannot sync {}: {error}", path.display());
+        log::debug!("cannot sync {}: {error}", target.display());
     }
     Ok(())
 }
@@ -622,8 +834,8 @@ pub struct RestoredTab {
     pub location: Location,
     pub view: ViewMode,
     pub arrangement: ArrangementPrefs,
-    /// The saved folder that no longer exists, when `location` is the
-    /// fallback that replaced it.
+    /// The saved folder that cannot be opened as written (a relative path),
+    /// when `location` is the fallback that replaced it.
     pub fell_back_from: Option<PathBuf>,
 }
 
@@ -634,30 +846,24 @@ pub struct Restored {
     pub active: usize,
 }
 
-/// The tabs a saved session reopens. Every saved tab comes back, in order: a
-/// folder that is gone is replaced by its nearest existing ancestor (so the
-/// tab still opens somewhere sensible), else by `home`, else by `/`.
-/// `is_dir` answers whether a folder exists. The active index is clamped.
-pub fn restore_session(
-    session: &Session,
-    home: Option<&Path>,
-    is_dir: impl Fn(&Path) -> bool,
-) -> Restored {
+/// The tabs a saved session reopens, in order, with the saved folders as
+/// they are: nothing here touches the filesystem, so startup never waits on a
+/// slow or unmounted folder. The explorer opens each tab optimistically; one
+/// whose folder turns out to be gone gets [`restore_fallback`] after its
+/// scan fails. Only a relative path, which no scan could resolve, is
+/// replaced up front (by `home`, else `/`). The active index is clamped.
+pub fn restore_session(session: &Session, home: Option<&Path>) -> Restored {
     let tabs: Vec<RestoredTab> = session
         .tabs
         .iter()
         .map(|tab| {
             let (location, fell_back_from) = match &tab.path {
                 _ if tab.trash => (Location::Trash, None),
-                Some(path) if is_dir(path) => (Location::Directory(path.clone()), None),
-                Some(path) => {
-                    let ancestor = path.ancestors().skip(1).find(|dir| is_dir(dir));
-                    let fallback = ancestor
-                        .map(Path::to_path_buf)
-                        .or_else(|| home.map(Path::to_path_buf))
-                        .unwrap_or_else(|| PathBuf::from("/"));
-                    (Location::Directory(fallback), Some(path.clone()))
-                }
+                Some(path) if path.is_absolute() => (Location::Directory(path.clone()), None),
+                Some(path) => (
+                    Location::Directory(home.map_or_else(|| PathBuf::from("/"), Path::to_path_buf)),
+                    Some(path.clone()),
+                ),
                 None => (
                     Location::Directory(home.map_or_else(|| PathBuf::from("/"), Path::to_path_buf)),
                     None,
@@ -675,10 +881,86 @@ pub fn restore_session(
     Restored { tabs, active }
 }
 
+/// Where a restored tab whose folder `missing` is gone opens instead: its
+/// nearest existing ancestor, else `home`, else `/`. `is_dir` answers whether
+/// a folder exists; it blocks, so call this off the UI thread.
+pub fn restore_fallback(
+    missing: &Path,
+    home: Option<&Path>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    missing
+        .ancestors()
+        .skip(1)
+        .find(|dir| is_dir(dir))
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 /// Whether this launch reopens the saved session and keeps saving it. A
 /// path on the command line wins: it opens only that folder, and the saved
 /// session is neither restored nor overwritten, so a quick `fileflux ~/x`
 /// never replaces the tabs of the last regular run.
 pub fn launch_uses_session(cli_start: Option<&Path>) -> bool {
     cli_start.is_none()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_names_carry_the_pid_and_never_repeat() {
+        let target = Path::new("/d/settings.toml");
+        let first = tmp_path(target);
+        let second = tmp_path(target);
+        assert_ne!(first, second);
+        let name = first.file_name().expect("has a name").to_string_lossy();
+        assert!(
+            name.starts_with(&format!("settings.toml.{}.", std::process::id())),
+            "{name}"
+        );
+        assert!(name.ends_with(".tmp"), "{name}");
+        assert_eq!(first.parent(), Some(Path::new("/d")));
+    }
+
+    #[test]
+    fn concurrent_writers_never_tear_the_file() {
+        // Two threads write without the in-process lock, as two instances
+        // would: unique temporary names keep each write whole.
+        let dir = std::env::temp_dir().join(format!("fileflux-tear-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("dir creates");
+        let path = dir.join("settings.toml");
+        let payload = |byte: char| byte.to_string().repeat(64 * 1024) + "\n";
+        std::thread::scope(|scope| {
+            for byte in ['a', 'b'] {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        write_atomic(path, payload(byte).as_bytes()).expect("write succeeds");
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..400 {
+                    if let Ok(read) = std::fs::read_to_string(&path) {
+                        assert!(
+                            read == payload('a') || read == payload('b'),
+                            "a torn file of {} bytes",
+                            read.len()
+                        );
+                    }
+                }
+            });
+        });
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir reads")
+            .map(|entry| entry.expect("entry reads").file_name())
+            .collect();
+        assert_eq!(leftovers, [OsStr::new("settings.toml")]);
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }

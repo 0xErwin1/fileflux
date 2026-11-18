@@ -341,6 +341,35 @@ mod tests {
         assert_eq!(*tabs.active(), "a");
     }
 
+    /// Opens a restored session the way the explorer does: the first tab
+    /// alone, the rest behind it as background tabs, then the saved active
+    /// tab takes over.
+    fn restore(saved: &[&'static str], active: usize) -> TabList<&'static str> {
+        let Some((first, rest)) = saved.split_first() else {
+            return TabList::new("");
+        };
+        let mut tabs = TabList::new(*first);
+        for tab in rest {
+            tabs.open(*tab, Placement::Background);
+        }
+        tabs.activate(active);
+        tabs
+    }
+
+    #[test]
+    fn restored_tabs_keep_their_saved_order_and_active_index() {
+        let saved = ["a", "b", "c", "d"];
+        for active in 0..saved.len() {
+            let tabs = restore(&saved, active);
+            assert_eq!(order(&tabs), saved, "left to right, as saved");
+            assert_eq!(tabs.active_index(), active);
+            assert_eq!(Some(tabs.active()), saved.get(active));
+        }
+        let single = restore(&["only"], 0);
+        assert_eq!(order(&single), ["only"]);
+        assert_eq!(single.active_index(), 0);
+    }
+
     #[test]
     fn the_background_run_restarts_after_the_active_tab_changes() {
         let mut tabs = list(&["a", "b"]);

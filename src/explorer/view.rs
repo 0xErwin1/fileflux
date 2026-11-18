@@ -25,7 +25,9 @@ use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
-use fileflux::core::settings::{Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings};
+use fileflux::core::settings::{
+    self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
+};
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
@@ -47,8 +49,8 @@ use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{DialogQueue, MenuPage};
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::persist::{
-    Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, session_tab,
-    view_from_pref, view_to_pref,
+    Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
+    session_tab, view_from_pref, view_to_pref,
 };
 use crate::explorer::progress::Registry;
 use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
@@ -559,6 +561,11 @@ pub(crate) struct Explorer {
     pub(crate) sidebar_width: f32,
     /// When and whether settings and session are written.
     persistence: Persistence,
+    /// Restored tabs whose saved folder has not been read yet, by tab: if the
+    /// first scan finds it gone, the tab falls back to an existing ancestor.
+    restore_pending: HashMap<TabId, PathBuf>,
+    /// How many restored tabs fell back so far, for the status notice.
+    restore_fallbacks: usize,
     /// A settings problem for the status bar (an invalid file at startup, a
     /// failed save); the next navigation dismisses it.
     settings_notice: Option<String>,
@@ -701,6 +708,12 @@ impl Explorer {
             ExplorerState::new(Location::Directory(PathBuf::from("/")), home.clone())
         });
         let initial = first_state.current().clone();
+        let mut restore_pending = HashMap::new();
+        if restored.is_some()
+            && let Location::Directory(path) = &initial
+        {
+            restore_pending.insert(0, path.clone());
+        }
         let first = Tab::new(0, first_state, window, cx);
         let remaining: Vec<ExplorerState> = rest.collect();
 
@@ -741,6 +754,8 @@ impl Explorer {
             sidebar_open: !preferences.sidebar_collapsed,
             sidebar_width: preferences.sidebar_width as f32,
             persistence,
+            restore_pending,
+            restore_fallbacks: 0,
             settings_notice: None,
             rendered_columns: 1,
             inspector_open: preferences.details_open,
@@ -802,6 +817,9 @@ impl Explorer {
         if !remaining.is_empty() {
             for state in remaining {
                 let location = state.current().clone();
+                if let Location::Directory(path) = &location {
+                    this.restore_pending.insert(this.next_tab_id, path.clone());
+                }
                 this.open_tab_with(state, location, Placement::Background, window, cx);
             }
             this.activate_tab(active_tab, window, cx);
@@ -858,9 +876,9 @@ impl Explorer {
         };
         let write = cx.background_executor().spawn(async move { job.run() });
         cx.spawn(async move |this, cx| {
-            let errors = write.await;
+            let report = write.await;
             if let Err(error) = this.update(cx, |this, cx| {
-                if let Some(notice) = this.persistence.finished(&errors) {
+                if let Some(notice) = this.persistence.finished(&report, Instant::now()) {
                     this.settings_notice = Some(notice);
                     cx.notify();
                 }
@@ -876,7 +894,7 @@ impl Explorer {
     pub(crate) fn flush_persistence(&mut self, window: &Window) {
         let (settings, session) = self.persist_snapshot(window);
         if let Some(job) = self.persistence.flush(settings, session) {
-            for error in job.run() {
+            for error in job.run().errors() {
                 log::warn!("settings were not saved on close: {error}");
             }
         }
@@ -1035,6 +1053,30 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         let active = id == self.active_id();
+        // A restored tab's first scan decides whether its saved folder is
+        // still there; any other scan of the tab has nothing to decide.
+        let unverified = if self
+            .restore_pending
+            .get(&id)
+            .is_some_and(|saved| scan.location == Location::Directory(saved.clone()))
+        {
+            self.restore_pending.remove(&id)
+        } else {
+            None
+        };
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        if let (Err(error), Some(saved)) = (&result, unverified)
+            && error.kind() == io::ErrorKind::NotFound
+            && tab
+                .state
+                .commit_failure(scan.clone(), "the folder no longer exists".to_owned())
+        {
+            self.restore_fallback(id, saved, window, cx);
+            cx.notify();
+            return;
+        }
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
@@ -1245,6 +1287,48 @@ impl Explorer {
         }
         self.tab_mut().state.set_notice(notice.to_owned());
         cx.notify();
+    }
+
+    /// The saved folder of restored tab `id` is gone: finds the nearest
+    /// existing ancestor off the UI thread, then opens it in that tab with a
+    /// status notice.
+    fn restore_fallback(
+        &mut self,
+        id: TabId,
+        saved: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let home = self.home.clone();
+        let missing = saved.clone();
+        let probe = cx.background_executor().spawn(async move {
+            settings::restore_fallback(&missing, home.as_deref(), Path::is_dir)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let fallback = probe.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                let Some(tab) = this.tabs.by_id_mut(id) else {
+                    return;
+                };
+                // The user may have navigated away while the probe ran.
+                if tab.state.current() != &Location::Directory(saved.clone()) {
+                    return;
+                }
+                this.restore_fallbacks += 1;
+                this.settings_notice = Some(restore_fallback_notice(this.restore_fallbacks));
+                let notice = format!(
+                    "{} no longer exists; showing {}",
+                    saved.display(),
+                    fallback.display()
+                );
+                let scan = tab.state.begin_fallback(fallback, notice);
+                this.start_scan_in(id, scan, window, cx);
+                cx.notify();
+            }) {
+                log::debug!("the explorer closed before the restore fallback: {error}");
+            }
+        })
+        .detach();
     }
 
     /// The folder tab `id` shows was deleted or moved away: fall back to the
