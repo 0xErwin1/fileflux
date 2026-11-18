@@ -10,7 +10,7 @@ Safety defaults (not optional): Del moves to the freedesktop Trash; permanent de
 - S5 (UI reference): design/file-explorer/04-refined-shell.html context menu (`openMenu`), F2 inline rename, trash toast with Undo, New folder chip.
 
 ## Tasks
-- T1 | S3,S4 | route: writer (core, parallel with refined-shell follow-ups) | pending | `src/core/ops.rs` + trash write side: create dir/file, validated rename (no-replace), copy/move with conflict policy, EXDEV copy+verify+delete, cancel/progress, freedesktop trash put/restore/delete/empty, all tested on tmp | commit: -
+- T1 | S3,S4 | route: writer (core, parallel with refined-shell follow-ups) | done | `src/core/ops.rs` + trash write side: create dir/file, validated rename (no-replace), copy/move with conflict policy, EXDEV copy+verify+delete, cancel/progress, freedesktop trash put/restore/delete/empty, all tested on tmp | commit: 4a686e1
 - T2 | S4 | route: writer after T1 | pending | Live refresh: watch the current directory (inotify via rustix, no new dependency) and rescan on change, debounced; own operations also rescan | commit: -
 - T3 | S3,S5 | route: writer after T1 | pending | UI: context menu, F2 rename, New folder/file, Del → Trash with undo toast, Shift+Del confirm, Ctrl+C/X/V with progress + conflict dialog, Ctrl+Z undo (rename/move/trash/new), Enter/double-click opens files with xdg-open, Open with…, open terminal here, copy path; Trash view Restore / Delete permanently / Empty with confirm | commit: -
 - T4 | S3 | route: writer after T3 | pending | Drag & drop inside the window (move; Ctrl = copy) onto folders and sidebar places | commit: -
@@ -19,3 +19,4 @@ Safety defaults (not optional): Del moves to the freedesktop Trash; permanent de
 ## Log
 - L1: "Tambien de paso dame una lista de feature a agregar, falta todo lo que es CRUD, preview y demas"
 - L2: "continua no estoy para validar yo, validas vos" → start CRUD after the refined shell; the agent validates (native Xvfb checks + independent verifier).
+- L3: T1 done (4a686e1): 36 ops + 22 trash write tests, RED observed for 34/36 and 19 new trash tests (6 tests have no RED, listed in report). renameat2 NOREPLACE used; EXDEV move = partial copy + verify + atomic place + then remove source (SourceNotRemoved keeps both copies). Gaps: no shared $topdir/.Trash, no directorysizes, restore across devices fails with EXDEV (no change), symlink mtimes not preserved, dirs not fsynced. trash_dir_for takes uid explicitly (std has no getuid; rustix process feature off).
