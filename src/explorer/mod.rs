@@ -1,6 +1,7 @@
 //! The Fileflux explorer: the native Bolt shell, from browsing to the first file operations.
 
 pub(crate) mod actions;
+pub(crate) mod clipboard;
 pub(crate) mod entries;
 pub(crate) mod inspector;
 pub(crate) mod ops;

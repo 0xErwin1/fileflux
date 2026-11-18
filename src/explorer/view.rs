@@ -34,8 +34,10 @@ use gpui::{
 use gpui_component::table::{TableEvent, TableState};
 
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
+use crate::explorer::clipboard::PasteHandle;
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::DialogQueue;
+use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::progress::Registry;
 use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
@@ -75,10 +77,16 @@ actions!(
         TrashSelected,
         /// Asks to delete the selected entries for good (Shift+Del).
         DeleteSelected,
-        /// Undoes the last rename, trash or creation (Ctrl+Z).
+        /// Undoes the last rename, trash, creation, copy or move (Ctrl+Z).
         UndoLast,
         /// Copies the path of the selected entries to the clipboard.
         CopyPathSelected,
+        /// Copies the selected entries (Ctrl+C), to paste them elsewhere.
+        CopyEntries,
+        /// Cuts the selected entries (Ctrl+X): pasting moves them.
+        CutEntries,
+        /// Pastes the clipboard's entries into the shown folder (Ctrl+V).
+        PasteEntries,
         /// Opens the context menu on the selection (Menu key, Shift+F10).
         OpenContextMenu,
         /// Highlights the previous context-menu item.
@@ -168,6 +176,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-n", NewFolder, operations),
         KeyBinding::new("ctrl-z", UndoLast, operations),
         KeyBinding::new("ctrl-shift-c", CopyPathSelected, operations),
+        KeyBinding::new("ctrl-c", CopyEntries, operations),
+        KeyBinding::new("ctrl-x", CutEntries, operations),
+        KeyBinding::new("ctrl-v", PasteEntries, operations),
         KeyBinding::new("menu", OpenContextMenu, operations),
         KeyBinding::new("shift-f10", OpenContextMenu, operations),
         KeyBinding::new("up", MenuUp, Some(MENU_CONTEXT)),
@@ -327,6 +338,17 @@ pub(crate) struct Explorer {
     pub(crate) dialog_cancel_focus: FocusHandle,
     /// The danger button; focused only by a deliberate move.
     pub(crate) dialog_confirm_focus: FocusHandle,
+    /// A conflict question's Skip button: its default focus.
+    pub(crate) dialog_skip_focus: FocusHandle,
+    /// A conflict question's Keep both button.
+    pub(crate) dialog_keep_focus: FocusHandle,
+    /// What Copy / Cut took, waiting for Paste.
+    pub(crate) clipboard: ClipboardState,
+    /// The text Copy / Cut wrote to the system clipboard: when something
+    /// else is there later, the internal clipboard is stale.
+    pub(crate) clipboard_text: Option<String>,
+    /// The pastes running now, by operation id, with their conflict channel.
+    pub(crate) pastes: HashMap<u64, PasteHandle>,
     /// What to select (and whether to rename) once the next listing shows it.
     pub(crate) pending: Option<PendingSelect>,
     /// Bolt's toast stack: operation summaries, with Undo.
@@ -436,6 +458,11 @@ impl Explorer {
             dialog_focus: cx.focus_handle(),
             dialog_cancel_focus: cx.focus_handle(),
             dialog_confirm_focus: cx.focus_handle(),
+            dialog_skip_focus: cx.focus_handle(),
+            dialog_keep_focus: cx.focus_handle(),
+            clipboard: ClipboardState::default(),
+            clipboard_text: None,
+            pastes: HashMap::new(),
             pending: None,
             toast_host,
             terminal,
@@ -1316,6 +1343,15 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &CopyPathSelected, _window, cx| {
                 this.copy_selected_paths(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyEntries, _window, cx| {
+                this.copy_selection(ClipMode::Copy, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CutEntries, _window, cx| {
+                this.copy_selection(ClipMode::Cut, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PasteEntries, window, cx| {
+                this.paste(PasteInto::CurrentFolder, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenContextMenu, window, cx| {
                 let position = window.mouse_position();

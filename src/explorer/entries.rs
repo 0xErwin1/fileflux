@@ -69,6 +69,8 @@ const TILE_HEIGHT: f32 = TILE_TOP_PADDING
     + TILE_BOTTOM_PADDING;
 /// Gap between tiles.
 const TILE_GAP: f32 = 6.0;
+/// Opacity of an entry that was cut and waits for Paste.
+pub(crate) const CUT_OPACITY: f32 = 0.45;
 /// Alpha of the tint border around a selected tile (artboard `.35`).
 const SELECTION_BORDER_ALPHA: f32 = 0.35;
 /// Horizontal padding of the entries area.
@@ -332,6 +334,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let weak_for_rows = weak.clone();
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);
+    let cut: Arc<BTreeSet<PathBuf>> = Arc::new(this.clipboard.cut_paths());
     let renaming = this.renaming.as_ref().map(super::actions::Renaming::view);
     let renaming_for_rows = renaming.clone();
 
@@ -351,6 +354,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             snapshot: &snapshot,
                             visible: &visible_for_rows,
                             selected: &selected_for_rows,
+                            cut: &cut,
                             child_counts: &counts_for_rows,
                             renaming: renaming_for_rows.as_ref(),
                         };
@@ -412,6 +416,8 @@ struct GridData<'a> {
     snapshot: &'a [Entry],
     visible: &'a [usize],
     selected: &'a BTreeSet<PathBuf>,
+    /// Entries cut and waiting for Paste, drawn dimmed.
+    cut: &'a BTreeSet<PathBuf>,
     child_counts: &'a HashMap<PathBuf, Option<usize>>,
     /// The inline rename editor, drawn in place of its entry's name.
     renaming: Option<&'a RenameView>,
@@ -430,6 +436,7 @@ fn render_grid_row(
         snapshot,
         visible,
         selected,
+        cut,
         child_counts,
         renaming,
     } = *data;
@@ -450,6 +457,7 @@ fn render_grid_row(
         let is_folder = tile.kind == EntryKind::Directory && !tile.is_symlink;
         let broken = tile.is_symlink && tile.kind == EntryKind::Symlink;
         let tile_selected = selected.contains(&path);
+        let tile_cut = cut.contains(&path);
 
         // Folders draw the two-tone silhouette; a resolvable symlink the
         // symlink glyph; a broken one the warning glyph; image files a real
@@ -499,6 +507,7 @@ fn render_grid_row(
         } else {
             gpui::transparent_black()
         })
+        .when(tile_cut, |tile| tile.opacity(CUT_OPACITY))
         .on_click(entry_click(weak, path.clone()))
         .on_mouse_down(MouseButton::Right, entry_context_menu(weak, path.clone()))
         .child(

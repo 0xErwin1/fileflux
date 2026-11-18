@@ -7,7 +7,7 @@
 //! once an operation has run for [`SHOW_AFTER`]; faster operations give their
 //! feedback through the summary toast alone, so nothing flashes. The card
 //! shows a title, a bar, the progress text with speed or ETA when they mean
-//! something, the current item and a Cancel button. The paste task reuses it
+//! something, the current item and a Cancel button. Paste reuses it
 //! by registering a [`Unit::Bytes`] operation with the core transfer's
 //! progress callback and cancel flag.
 
@@ -103,6 +103,11 @@ impl Sink {
 
     pub(crate) fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The flag itself, for core operations that poll it between chunks.
+    pub(crate) fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
     }
 }
 
@@ -341,10 +346,9 @@ fn render_card(op: &ActiveOp, now: Instant, weak: &WeakEntity<Explorer>, cx: &Ap
                         Button::new(("explorer-progress-cancel", id), "Cancel")
                             .ghost()
                             .disabled(cancelling)
-                            .on_click(move |_event, _window, cx| {
+                            .on_click(move |_event, window, cx| {
                                 if let Err(error) = weak.update(cx, |this, cx| {
-                                    this.progress.cancel(id);
-                                    cx.notify();
+                                    this.cancel_operation(id, window, cx);
                                 }) {
                                     log::debug!("the card outlived its explorer: {error}");
                                 }

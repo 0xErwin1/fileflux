@@ -8,7 +8,7 @@
 use bolt::composites::{
     MenuItem, render_menu_container, render_menu_item, render_menu_overlay, render_separator,
 };
-use bolt::controls::{Button, Input, InputEnter, InputEscape};
+use bolt::controls::{Button, Checkbox, Input, InputEnter, InputEscape};
 use bolt::modals::Modal;
 use bolt::tokens::Spacing;
 use gpui::{
@@ -19,7 +19,7 @@ use gpui::{
 
 use super::actions::RenameView;
 use super::icon;
-use super::ops::{DialogChoice, MenuCommand, MenuRow};
+use super::ops::{DialogAction, DialogChoice, MenuCommand, MenuRow};
 use super::view::{Explorer, MENU_CONTEXT};
 
 /// The menu and the dialog, when open. Also hands the keyboard back to the
@@ -56,6 +56,9 @@ fn command_icon(command: MenuCommand) -> gpui_kit_assets::IconName {
         MenuCommand::NewFile => IconName::FilePlus,
         MenuCommand::OpenTerminal => IconName::Terminal,
         MenuCommand::Restore => IconName::Undo2,
+        MenuCommand::Cut => IconName::Scissors,
+        MenuCommand::Copy => IconName::Copy,
+        MenuCommand::Paste | MenuCommand::PasteIntoFolder => IconName::ClipboardPaste,
     }
 }
 
@@ -77,6 +80,9 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
                 }
                 if spec.danger {
                     item = item.danger();
+                }
+                if !spec.enabled {
+                    item = item.disabled();
                 }
                 let command = spec.command;
                 let click_weak = weak.clone();
@@ -155,6 +161,13 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     let colors = bolt::colors(cx);
     let weak = cx.entity().downgrade();
     let text = &dialog.text;
+    // The danger button ignores the pointer (and is drawn disabled) while
+    // the dialog is fresh; see `ops::ARM_DELAY`.
+    let armed = this.dialogs.armed_at(std::time::Instant::now());
+    let apply_all = match dialog.action {
+        DialogAction::Conflict { apply_all, .. } => Some(apply_all),
+        _ => None,
+    };
 
     let body = div()
         .flex()
@@ -178,11 +191,36 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                         .text_color(colors.muted)
                         .child(name.clone())
                 }))
+        }))
+        .children(apply_all.map(|checked| {
+            let toggle_weak = weak.clone();
+            Checkbox::new("explorer-conflict-apply-all")
+                .checked(checked)
+                .label("Apply to all remaining conflicts")
+                .on_click(move |checked, _window, cx| {
+                    let checked = *checked;
+                    if let Err(error) = toggle_weak.update(cx, |this, cx| {
+                        this.set_apply_all(checked, cx);
+                    }) {
+                        log::debug!("the dialog outlived its explorer: {error}");
+                    }
+                })
         }));
 
-    let cancel_weak = weak.clone();
-    let confirm_weak = weak.clone();
-    let close_weak = weak;
+    let close_weak = weak.clone();
+    // One button per choice; `choose_dialog` is the single place a press
+    // is acted on.
+    let press = |choice: DialogChoice| {
+        let weak = weak.clone();
+        move |_event: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+            if let Err(error) = weak.update(cx, |this, cx| {
+                this.choose_dialog(choice, window, cx);
+            }) {
+                log::debug!("the dialog outlived its explorer: {error}");
+            }
+        }
+    };
+    let conflict = apply_all.is_some();
     let footer = div()
         .flex()
         .items_center()
@@ -191,25 +229,29 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
             Button::new("explorer-dialog-cancel", "Cancel")
                 .secondary()
                 .focus_handle(&this.dialog_cancel_focus)
-                .on_click(move |_event, window, cx| {
-                    if let Err(error) = cancel_weak.update(cx, |this, cx| {
-                        this.choose_dialog(DialogChoice::Cancel, window, cx);
-                    }) {
-                        log::debug!("the dialog outlived its explorer: {error}");
-                    }
-                }),
+                .on_click(press(DialogChoice::Cancel)),
         )
+        .when(conflict, |footer| {
+            footer
+                .child(
+                    Button::new("explorer-dialog-keep", "Keep both")
+                        .secondary()
+                        .focus_handle(&this.dialog_keep_focus)
+                        .on_click(press(DialogChoice::KeepBoth)),
+                )
+                .child(
+                    Button::new("explorer-dialog-skip", "Skip")
+                        .secondary()
+                        .focus_handle(&this.dialog_skip_focus)
+                        .on_click(press(DialogChoice::Skip)),
+                )
+        })
         .child(
             Button::new("explorer-dialog-confirm", text.confirm)
                 .danger()
+                .disabled(!armed)
                 .focus_handle(&this.dialog_confirm_focus)
-                .on_click(move |_event, window, cx| {
-                    if let Err(error) = confirm_weak.update(cx, |this, cx| {
-                        this.choose_dialog(DialogChoice::Confirm, window, cx);
-                    }) {
-                        log::debug!("the dialog outlived its explorer: {error}");
-                    }
-                }),
+                .on_click(press(DialogChoice::Confirm)),
         );
 
     vec![

@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bolt::controls::{InputEvent, InputState};
 use bolt::toast::{Toast, ToastAction};
@@ -22,13 +22,14 @@ use gpui::{
     Window,
 };
 
+use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
-    DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand, MenuRow,
-    MenuTarget, NewKind, Notice, RenameCheck, RenameStep, Report, Severity, UndoAction, UndoEntry,
-    check_rename, dismissed_notice, menu_rows, next_menu_index, no_trash_dialog, rename_step,
-    stem_range,
+    ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
+    MenuRow, MenuTarget, NewKind, Notice, RenameCheck, RenameStep, Report, Severity, UndoAction,
+    UndoEntry, check_rename, dismissed_notice, menu_rows, next_menu_index, no_trash_dialog,
+    rename_step, stem_range,
 };
-use super::progress::Unit;
+use super::progress::{Sink, Unit};
 use super::view::Explorer;
 
 /// How long a toast with an Undo button waits before it goes away.
@@ -99,14 +100,14 @@ fn count_label(count: usize) -> String {
 }
 
 impl Explorer {
-    fn in_trash(&self) -> bool {
+    pub(crate) fn in_trash(&self) -> bool {
         *self.state.current() == Location::Trash
     }
 
     /// The selected entries that are on screen under the current filter.
     /// Operations act on these only: a selection the filter hides is never
     /// trashed or deleted behind the user's back.
-    fn selected_visible_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn selected_visible_paths(&self) -> Vec<PathBuf> {
         let selection = self.state.selection();
         self.state
             .visible_entries()
@@ -118,7 +119,7 @@ impl Explorer {
 
     // --- jobs ------------------------------------------------------------------
 
-    fn job_ctx(&self) -> JobCtx {
+    pub(crate) fn job_ctx(&self) -> JobCtx {
         let mounts = self.places.as_ref().map_or_else(Vec::new, |places| {
             places
                 .volumes
@@ -142,11 +143,31 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (id, sink) = self.progress.start(title, Unit::Items, cancellable);
         let ctx = self.job_ctx();
-        let work = cx
-            .background_executor()
-            .spawn(async move { super::ops::run_job(job, &ctx, &sink) });
+        self.start_work(
+            title,
+            Unit::Items,
+            cancellable,
+            move |sink| super::ops::run_job(job, &ctx, &sink),
+            window,
+            cx,
+        );
+    }
+
+    /// Runs `work` on the background executor with the progress sink of a
+    /// new registered operation, and applies its [`Report`] when it ends.
+    /// Returns the operation's id.
+    pub(crate) fn start_work(
+        &mut self,
+        title: impl Into<String>,
+        unit: Unit,
+        cancellable: bool,
+        work: impl FnOnce(Sink) -> Report + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let (id, sink) = self.progress.start(title, unit, cancellable);
+        let work = cx.background_executor().spawn(async move { work(sink) });
 
         // Repaints the card while the operation runs; dropped with it.
         let ticker = cx.spawn(async move |this, cx| {
@@ -180,6 +201,23 @@ impl Explorer {
         })
         .detach();
         cx.notify();
+        id
+    }
+
+    /// Asks a running operation to stop (a card's Cancel button). A conflict
+    /// question it is waiting on is withdrawn: nobody is listening for the
+    /// answer any more.
+    pub(crate) fn cancel_operation(
+        &mut self,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.progress.cancel(id);
+        if self.dialogs.discard_conflicts_of(id, Instant::now()) {
+            self.dialog_closed(window, cx);
+        }
+        cx.notify();
     }
 
     /// Applies a finished job: undo entry, toast, confirmation for what
@@ -192,6 +230,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         self.progress.finish(id);
+        self.finish_paste(id, &report, window, cx);
         let undo_id = report.undo.take().map(|action| self.undo.push(action));
         if let Some(notice) = report.notice.take() {
             self.push_toast(notice, &report.details, undo_id, window, cx);
@@ -587,31 +626,52 @@ impl Explorer {
     /// Opens `dialog`, or queues it behind the one that is open: nothing
     /// that finishes in the background may replace a confirmation the user
     /// is reading.
-    fn offer_dialog(&mut self, dialog: DialogState, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn offer_dialog(
+        &mut self,
+        dialog: DialogState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_menu(window, cx);
         self.dialogs.offer(dialog);
         self.focus_dialog_default(window, cx);
         cx.notify();
     }
 
-    /// The safe button is the default: Enter alone never deletes.
+    /// The safe button is the default: Enter alone never deletes. The queue
+    /// decides which one, for a dialog that opened at once and for one that
+    /// was promoted from the line alike. Also repaints once the dialog's
+    /// danger button arms.
     fn focus_dialog_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialogs.current() else {
+        let Some(choice) = self.dialogs.default_focus() else {
             return;
         };
-        let choice = dialog.initial_focus();
         cx.defer_in(window, move |this, window, cx| {
-            match choice {
-                DialogChoice::Cancel => &this.dialog_cancel_focus,
-                DialogChoice::Confirm => &this.dialog_confirm_focus,
-            }
-            .focus(window, cx);
+            this.dialog_focus_handle(choice).focus(window, cx);
         });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(ARM_DELAY + Duration::from_millis(30))
+                .await;
+            if let Err(error) = this.update(cx, |_, cx| cx.notify()) {
+                log::debug!("the explorer closed before its dialog armed: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn dialog_focus_handle(&self, choice: DialogChoice) -> &gpui::FocusHandle {
+        match choice {
+            DialogChoice::Cancel => &self.dialog_cancel_focus,
+            DialogChoice::Confirm => &self.dialog_confirm_focus,
+            DialogChoice::Skip => &self.dialog_skip_focus,
+            DialogChoice::KeepBoth => &self.dialog_keep_focus,
+        }
     }
 
     /// After a dialog closed: the next one in line takes the keyboard at
     /// its safe button, else the entries get it back.
-    fn dialog_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dialog_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialogs.is_open() {
             self.focus_dialog_default(window, cx);
         } else {
@@ -630,12 +690,51 @@ impl Explorer {
         match choice {
             DialogChoice::Cancel => self.cancel_dialog(window, cx),
             DialogChoice::Confirm => self.confirm_dialog(window, cx),
+            DialogChoice::Skip | DialogChoice::KeepBoth => {
+                self.answer_open_conflict(choice, window, cx);
+            }
         }
+    }
+
+    /// The checkbox "Apply to all remaining conflicts" of the open question.
+    pub(crate) fn set_apply_all(&mut self, checked: bool, cx: &mut Context<Self>) {
+        if let Some(DialogState {
+            action: DialogAction::Conflict { apply_all, .. },
+            ..
+        }) = self.dialogs.current_mut()
+        {
+            *apply_all = checked;
+            cx.notify();
+        }
+    }
+
+    /// Skip or Keep both: closes the open conflict question and answers the
+    /// waiting paste. A dialog that is not a conflict question ignores them.
+    fn answer_open_conflict(
+        &mut self,
+        choice: DialogChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(DialogAction::Conflict { job, apply_all }) =
+            self.dialogs.current().map(|dialog| dialog.action.clone())
+        else {
+            return;
+        };
+        self.dialogs.close();
+        self.dialog_closed(window, cx);
+        self.answer_conflict(job, answer_for(choice, apply_all), window, cx);
     }
 
     /// The danger button: runs what the open dialog asked for, bound to the
     /// paths that dialog showed.
     pub(crate) fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A dialog that has just appeared ignores its danger button: the
+        // trailing click of a double-click on the dialog before it must not
+        // confirm this one.
+        if !self.dialogs.accepts(DialogChoice::Confirm, Instant::now()) {
+            return;
+        }
         let Some(dialog) = self.dialogs.close() else {
             return;
         };
@@ -655,6 +754,16 @@ impl Explorer {
             DialogAction::EmptyTrash(names) => {
                 ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
             }
+            DialogAction::Conflict { job, apply_all } => {
+                // Replace: the one destructive answer.
+                self.answer_conflict(
+                    job,
+                    answer_for(DialogChoice::Confirm, apply_all),
+                    window,
+                    cx,
+                );
+                return;
+            }
         };
         self.start_job(title, job, true, window, cx);
         cx.notify();
@@ -668,6 +777,11 @@ impl Explorer {
             return;
         };
         self.dialog_closed(window, cx);
+        if let DialogAction::Conflict { job, apply_all } = dialog.action {
+            // Escape or Cancel on a conflict question cancels the whole job.
+            self.answer_conflict(job, answer_for(DialogChoice::Cancel, apply_all), window, cx);
+            return;
+        }
         if let Some(notice) = dismissed_notice(&dialog) {
             self.push_toast(notice, &[], None, window, cx);
         }
@@ -694,7 +808,10 @@ impl Explorer {
     fn run_undo(&mut self, entry: UndoEntry, window: &mut Window, cx: &mut Context<Self>) {
         // Restoring several items takes a while: it can be cancelled, and
         // what was not restored stays undoable.
-        let cancellable = matches!(entry.action, UndoAction::Trash { .. });
+        let cancellable = !matches!(
+            entry.action,
+            UndoAction::Rename { .. } | UndoAction::Create { .. }
+        );
         self.start_job("Undoing", Job::Undo(entry.action), cancellable, window, cx);
     }
 
@@ -716,11 +833,14 @@ impl Explorer {
             Some(_) => {}
             None => self.state.clear_selection(),
         }
+        let selected = self.selected_with_kind();
         let target = MenuTarget {
             in_trash: self.in_trash(),
-            selected: self.selected_visible_paths().len(),
+            selected: selected.len(),
             folder_is_empty: self.state.listing().entries.is_empty(),
             terminal: self.terminal.is_some(),
+            can_paste: self.can_paste(cx),
+            folder_selected: matches!(selected.as_slice(), [(_, true)]),
         };
         let rows = menu_rows(&target);
         if rows.is_empty() {
@@ -762,8 +882,8 @@ impl Explorer {
             .as_ref()
             .and_then(|menu| menu.selected.and_then(|at| menu.rows.get(at)))
             .and_then(|row| match row {
-                MenuRow::Item(item) => Some(item.command),
-                MenuRow::Separator => None,
+                MenuRow::Item(item) if item.enabled => Some(item.command),
+                MenuRow::Item(_) | MenuRow::Separator => None,
             });
         if let Some(command) = command {
             self.run_menu_command(command, window, cx);
@@ -794,6 +914,10 @@ impl Explorer {
             MenuCommand::CopyFolderPath => self.copy_folder_path(window, cx),
             MenuCommand::Restore => self.restore_selected(window, cx),
             MenuCommand::EmptyTrash => self.request_empty_trash(window, cx),
+            MenuCommand::Cut => self.copy_selection(ClipMode::Cut, cx),
+            MenuCommand::Copy => self.copy_selection(ClipMode::Copy, cx),
+            MenuCommand::Paste => self.paste(PasteInto::CurrentFolder, window, cx),
+            MenuCommand::PasteIntoFolder => self.paste(PasteInto::SelectedFolder, window, cx),
         }
     }
 

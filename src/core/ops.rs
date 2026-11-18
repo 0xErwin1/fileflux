@@ -236,7 +236,7 @@ pub fn rename(path: &Path, new_name: &OsStr) -> Result<PathBuf, OpError> {
 /// `renameat2(RENAME_NOREPLACE)`. On filesystems or kernels without it the
 /// fallback is a pre-check followed by a plain rename, which has a window
 /// in which a concurrent writer can create `to` and be replaced.
-pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),
         Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP) => {
@@ -463,12 +463,12 @@ impl Ctx<'_> {
     }
 
     /// A free hidden sibling name in `dir` for partial copies and the
-    /// moved-aside original of a replace.
+    /// moved-aside original of a replace (see [`is_transfer_temp`]).
     fn temp_name(&mut self, dir: &Path, tag: &str) -> PathBuf {
         loop {
             self.seq += 1;
             let candidate = dir.join(format!(
-                ".fileflux-{tag}-{}-{}",
+                "{TEMP_PREFIX}{tag}-{}-{}",
                 std::process::id(),
                 self.seq
             ));
@@ -706,6 +706,21 @@ impl Ctx<'_> {
         output.set_permissions(meta.permissions())?;
         Ok(())
     }
+}
+
+/// Prefix of the hidden names a transfer works under before it places an
+/// item; with [`TEMP_TAGS`] it identifies them for listings.
+const TEMP_PREFIX: &str = ".fileflux-";
+/// The temp-name tags `transfer` uses: partial copies and moved-aside
+/// originals of a replace.
+const TEMP_TAGS: [&str; 2] = ["partial-", "aside-"];
+
+/// Whether `name` is an in-flight transfer temp file (a partial copy or a
+/// moved-aside original), which listings hide so users never act on it.
+pub fn is_transfer_temp(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(TEMP_PREFIX))
+        .is_some_and(|rest| TEMP_TAGS.iter().any(|tag| rest.starts_with(tag)))
 }
 
 #[cfg(test)]

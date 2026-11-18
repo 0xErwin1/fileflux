@@ -23,6 +23,7 @@ use std::io;
 use std::ops::Range;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::trash::{
@@ -31,6 +32,12 @@ use fileflux::core::trash::{
 use fileflux::core::watch::nearest_existing_ancestor;
 
 use super::progress::Sink;
+
+#[path = "paste.rs"]
+pub(crate) mod paste;
+
+pub(crate) use paste::PlacedEntry;
+use paste::{ConflictRequest, PasteJob};
 
 /// How many undoable operations a session remembers.
 pub(crate) const UNDO_LIMIT: usize = 50;
@@ -110,6 +117,13 @@ pub(crate) enum UndoAction {
         kind: NewKind,
         identity: Identity,
     },
+    /// Undo of a paste that copied: move the created copies to the Trash,
+    /// each only if it is still the item that was created.
+    Copy { items: Vec<PlacedEntry> },
+    /// Undo of a paste that moved: move the items back to where they came
+    /// from, each only if it is still the item that was moved, never
+    /// replacing anything.
+    Move { items: Vec<PlacedEntry> },
 }
 
 /// An undo action with the id a toast's Undo button names it by.
@@ -191,6 +205,9 @@ pub(crate) struct Report {
     pub(crate) details: Vec<String>,
     /// The user cancelled; what was done before stays done.
     pub(crate) cancelled: bool,
+    /// Sources a paste moved away from their original place (a cut that
+    /// is only partly done keeps the rest on the clipboard).
+    pub(crate) moved: Vec<PathBuf>,
 }
 
 impl Report {
@@ -232,6 +249,8 @@ pub(crate) enum Job {
     /// Items trashed after the dialog opened are never part of it.
     EmptyTrash(Vec<OsString>),
     Undo(UndoAction),
+    /// Copy or move from the clipboard; asks the UI about conflicts.
+    Paste(PasteJob),
 }
 
 /// Chooses the Trash a path goes to.
@@ -314,6 +333,7 @@ pub(crate) fn run_job(job: Job, ctx: &JobCtx, sink: &Sink) -> Report {
         Job::Restore(names) => restore_items(&names, ctx, sink),
         Job::DeleteFromTrash(names) => delete_from_trash(&names, ctx, sink),
         Job::EmptyTrash(names) => empty_trash(ctx, names, sink),
+        Job::Paste(job) => paste::run_paste(job, sink),
         Job::Undo(action) => match undo(&action, ctx, sink) {
             Ok(report) => report,
             Err(reason) => Report::error(format!("Can't undo: {reason}")),
@@ -766,6 +786,8 @@ fn undo(action: &UndoAction, ctx: &JobCtx, sink: &Sink) -> Result<Report, String
             kind,
             identity,
         } => undo_create(path, *kind, *identity, ctx),
+        UndoAction::Copy { items } => Ok(paste::undo_copy(items, ctx, sink)),
+        UndoAction::Move { items } => Ok(paste::undo_move(items, sink)),
     }
 }
 
@@ -1089,6 +1111,12 @@ pub(crate) enum MenuCommand {
     CopyFolderPath,
     Restore,
     EmptyTrash,
+    Cut,
+    Copy,
+    /// Paste into the folder that is shown.
+    Paste,
+    /// Paste into the single selected folder ("Paste into folder").
+    PasteIntoFolder,
 }
 
 /// One drawn menu item.
@@ -1098,6 +1126,9 @@ pub(crate) struct MenuItemSpec {
     pub(crate) label: &'static str,
     pub(crate) shortcut: Option<&'static str>,
     pub(crate) danger: bool,
+    /// A disabled item is drawn dimmed, skipped by the arrow keys and does
+    /// nothing when activated.
+    pub(crate) enabled: bool,
 }
 
 /// A row of the menu.
@@ -1117,11 +1148,14 @@ pub(crate) struct MenuTarget {
     pub(crate) folder_is_empty: bool,
     /// Whether a terminal can be opened (see [`pick_terminal`]).
     pub(crate) terminal: bool,
+    /// Whether the clipboard holds something to paste.
+    pub(crate) can_paste: bool,
+    /// Exactly one entry is selected and it is a folder (not a link to one).
+    pub(crate) folder_selected: bool,
 }
 
 /// The menu rows for a target; empty when there is nothing to offer (the
-/// caller then opens no menu). Clipboard and drag & drop items come with
-/// their own task.
+/// caller then opens no menu). Drag & drop comes with its own task.
 pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
     let item = |command, label, shortcut, danger| {
         MenuRow::Item(MenuItemSpec {
@@ -1129,6 +1163,18 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
             label,
             shortcut,
             danger,
+            enabled: true,
+        })
+    };
+    // Paste needs something on the clipboard; Cut and Copy are only ever
+    // offered on a selection.
+    let paste = |command, label| {
+        MenuRow::Item(MenuItemSpec {
+            command,
+            label,
+            shortcut: Some("Ctrl+V"),
+            danger: false,
+            enabled: target.can_paste,
         })
     };
     let properties = || item(MenuCommand::Properties, "Properties", Some("Ctrl+I"), false);
@@ -1158,6 +1204,14 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         let mut rows = vec![
             item(MenuCommand::Open, "Open", Some("Enter"), false),
             MenuRow::Separator,
+            item(MenuCommand::Cut, "Cut", Some("Ctrl+X"), false),
+            item(MenuCommand::Copy, "Copy", Some("Ctrl+C"), false),
+            if target.folder_selected {
+                paste(MenuCommand::PasteIntoFolder, "Paste into folder")
+            } else {
+                paste(MenuCommand::Paste, "Paste")
+            },
+            MenuRow::Separator,
         ];
         if target.selected == 1 {
             rows.push(item(MenuCommand::Rename, "Rename", Some("F2"), false));
@@ -1185,6 +1239,8 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         ),
         item(MenuCommand::NewFile, "New file", None, false),
         MenuRow::Separator,
+        paste(MenuCommand::Paste, "Paste"),
+        MenuRow::Separator,
     ];
     if target.terminal {
         rows.push(item(
@@ -1204,7 +1260,7 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
 }
 
 /// The row the arrow keys move to from `current` (`None`: nothing
-/// highlighted yet), skipping separators and wrapping around. `forward`
+/// highlighted yet), skipping separators and disabled items and wrapping around. `forward`
 /// false goes up. `None` when the menu has no item.
 pub(crate) fn next_menu_index(
     rows: &[MenuRow],
@@ -1220,7 +1276,10 @@ pub(crate) fn next_menu_index(
             (Some(at), true) => (at + 1) % count,
             (Some(at), false) => (at + count - 1) % count,
         });
-        if matches!(index.and_then(|at| rows.get(at)), Some(MenuRow::Item(_))) {
+        if matches!(
+            index.and_then(|at| rows.get(at)),
+            Some(MenuRow::Item(MenuItemSpec { enabled: true, .. }))
+        ) {
             return index;
         }
     }
@@ -1240,6 +1299,14 @@ pub(crate) enum DialogKind {
     DeleteFromTrash,
     /// Empty the Trash.
     EmptyTrash { count: usize },
+    /// A paste found `name` already in `folder`; the two lines describe the
+    /// item there and the one arriving.
+    Conflict {
+        name: String,
+        folder: String,
+        existing: String,
+        incoming: String,
+    },
 }
 
 /// What a confirmed dialog does. It carries exactly what its own dialog
@@ -1250,6 +1317,12 @@ pub(crate) enum DialogAction {
     DeleteFromTrash(Vec<OsString>),
     /// The Trash names the dialog counted; nothing else is deleted.
     EmptyTrash(Vec<OsString>),
+    /// A running paste waits for the answer. `apply_all` is the checkbox
+    /// "Apply to all remaining conflicts".
+    Conflict {
+        job: u64,
+        apply_all: bool,
+    },
 }
 
 /// One confirmation: its words and the action its danger button runs.
@@ -1269,9 +1342,33 @@ impl DialogState {
         }
     }
 
-    /// The button that has the keyboard focus when the dialog opens.
+    /// The dialog a paste opens when its target already exists.
+    pub(crate) fn conflict(job: u64, request: ConflictRequest) -> DialogState {
+        DialogState {
+            text: dialog_text(&request.kind, &[]),
+            kind: request.kind,
+            action: DialogAction::Conflict {
+                job,
+                apply_all: false,
+            },
+        }
+    }
+
+    /// The button that has the keyboard focus when the dialog opens: the
+    /// safe one, never the one that destroys something.
     pub(crate) fn initial_focus(&self) -> DialogChoice {
-        DIALOG_DEFAULT
+        match self.kind {
+            DialogKind::Conflict { .. } => CONFLICT_DEFAULT,
+            _ => DIALOG_DEFAULT,
+        }
+    }
+
+    /// The paste this dialog speaks for, when it is a conflict question.
+    pub(crate) fn conflict_job(&self) -> Option<u64> {
+        match self.action {
+            DialogAction::Conflict { job, .. } => Some(job),
+            _ => None,
+        }
     }
 }
 
@@ -1307,30 +1404,73 @@ pub(crate) fn dismissed_notice(dialog: &DialogState) -> Option<Notice> {
     }
 }
 
+/// How long a dialog that has just appeared ignores its danger button.
+/// A double-click on the button of the dialog before it would otherwise
+/// land its second click on whatever dialog is promoted under the pointer.
+pub(crate) const ARM_DELAY: Duration = Duration::from_millis(400);
+
+/// Whether a dialog that appeared at `opened_at` accepts its danger button
+/// at `now`.
+pub(crate) fn is_armed(opened_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(opened_at) >= ARM_DELAY
+}
+
 /// Dialogs wait in line: one is open, a background job's follow-up queues
-/// behind it and opens only after the open one closed.
+/// behind it and opens only after the open one closed. A dialog's clock
+/// starts when it *appears*, whether it was offered to an empty queue or
+/// promoted from the line.
 #[derive(Debug, Default)]
 pub(crate) struct DialogQueue {
-    open: Option<DialogState>,
+    open: Option<(DialogState, Instant)>,
     waiting: VecDeque<DialogState>,
 }
 
 impl DialogQueue {
     /// Opens `dialog` now when none is open, else queues it.
     pub(crate) fn offer(&mut self, dialog: DialogState) {
+        self.offer_at(dialog, Instant::now());
+    }
+
+    pub(crate) fn offer_at(&mut self, dialog: DialogState, now: Instant) {
         if self.open.is_none() {
-            self.open = Some(dialog);
+            self.open = Some((dialog, now));
         } else {
             self.waiting.push_back(dialog);
         }
     }
 
     pub(crate) fn current(&self) -> Option<&DialogState> {
-        self.open.as_ref()
+        self.open.as_ref().map(|(dialog, _)| dialog)
+    }
+
+    pub(crate) fn current_mut(&mut self) -> Option<&mut DialogState> {
+        self.open.as_mut().map(|(dialog, _)| dialog)
     }
 
     pub(crate) fn is_open(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// Whether the open dialog accepts its danger button at `now`; false
+    /// while it is still too fresh, and when none is open.
+    pub(crate) fn armed_at(&self, now: Instant) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|(_, opened_at)| is_armed(*opened_at, now))
+    }
+
+    /// Whether a press of `choice` is acted on at `now`: nothing is open,
+    /// or the danger button is still too fresh, and the press is ignored.
+    pub(crate) fn accepts(&self, choice: DialogChoice, now: Instant) -> bool {
+        self.is_open() && (!choice.is_danger() || self.armed_at(now))
+    }
+
+    /// The button the open dialog takes the keyboard on. This is the one
+    /// place the default is decided, for a dialog that opened at once and
+    /// one promoted from the line alike: Enter presses the focused button,
+    /// so Enter alone never reaches a danger button.
+    pub(crate) fn default_focus(&self) -> Option<DialogChoice> {
+        self.current().map(DialogState::initial_focus)
     }
 
     #[cfg(test)]
@@ -1340,23 +1480,58 @@ impl DialogQueue {
 
     /// Closes the open dialog, returns it, and opens the next in line.
     pub(crate) fn close(&mut self) -> Option<DialogState> {
-        let closed = self.open.take();
-        self.open = self.waiting.pop_front();
+        self.close_at(Instant::now())
+    }
+
+    pub(crate) fn close_at(&mut self, now: Instant) -> Option<DialogState> {
+        let closed = self.open.take().map(|(dialog, _)| dialog);
+        self.open = self.waiting.pop_front().map(|next| (next, now));
         closed
+    }
+
+    /// Drops every conflict question of `job` (the job ended or was
+    /// cancelled, nobody is waiting for the answer any more). Returns
+    /// whether the open dialog changed.
+    pub(crate) fn discard_conflicts_of(&mut self, job: u64, now: Instant) -> bool {
+        self.waiting
+            .retain(|dialog| dialog.conflict_job() != Some(job));
+        let open_is_it = self
+            .current()
+            .is_some_and(|dialog| dialog.conflict_job() == Some(job));
+        if open_is_it {
+            self.close_at(now);
+        }
+        open_is_it
     }
 }
 
-/// The buttons of a confirmation.
+/// The buttons of a dialog. A confirmation has Cancel and its danger
+/// button; a conflict question has all four.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DialogChoice {
     Cancel,
+    /// The danger button: Delete permanently, Empty Trash, Replace.
     Confirm,
+    Skip,
+    KeepBoth,
 }
 
-/// The button a dialog opens focused on: the safe one. Enter presses the
-/// focused button, so with this default Enter alone never confirms a
+impl DialogChoice {
+    /// The button that destroys something and is therefore armed late and
+    /// never focused first.
+    pub(crate) fn is_danger(self) -> bool {
+        self == DialogChoice::Confirm
+    }
+}
+
+/// The button a confirmation opens focused on: the safe one. Enter presses
+/// the focused button, so with this default Enter alone never confirms a
 /// deletion; only a deliberate move of the focus does.
 pub(crate) const DIALOG_DEFAULT: DialogChoice = DialogChoice::Cancel;
+
+/// The button a conflict question opens focused on: Skip touches nothing.
+/// Replace is never the default.
+pub(crate) const CONFLICT_DEFAULT: DialogChoice = DialogChoice::Skip;
 
 /// The words of a confirmation dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1431,6 +1606,11 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             },
             "Delete permanently",
         ),
+        DialogKind::Conflict { name, folder, .. } => (
+            format!("\u{201c}{name}\u{201d} already exists in {folder}"),
+            "Replace it, skip this item, or keep both?".to_owned(),
+            "Replace",
+        ),
         DialogKind::EmptyTrash { count } => (
             "Empty the Trash?".to_owned(),
             if *count == 1 {
@@ -1444,10 +1624,19 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             "Empty Trash",
         ),
     };
+    let names = match kind {
+        DialogKind::Conflict {
+            existing, incoming, ..
+        } => vec![
+            format!("Existing  {existing}"),
+            format!("Incoming  {incoming}"),
+        ],
+        _ => listed(names),
+    };
     DialogText {
         title,
         body,
-        names: listed(names),
+        names,
         confirm,
     }
 }

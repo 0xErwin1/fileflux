@@ -264,6 +264,8 @@ fn target(in_trash: bool, selected: usize, folder_is_empty: bool, terminal: bool
         selected,
         folder_is_empty,
         terminal,
+        can_paste: false,
+        folder_selected: false,
     }
 }
 
@@ -274,6 +276,10 @@ fn the_menu_of_one_selected_entry_matches_the_artboard() {
         flat(&rows),
         [
             "Open",
+            "-",
+            "Cut",
+            "Copy",
+            "Paste",
             "-",
             "Rename",
             "Copy path",
@@ -312,6 +318,8 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "New folder",
             "New file",
             "-",
+            "Paste",
+            "-",
             "Open terminal here",
             "Copy folder path"
         ]
@@ -323,7 +331,14 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
     let without = menu_rows(&target(false, 0, false, false));
     assert_eq!(
         flat(&without),
-        ["New folder", "New file", "-", "Copy folder path"],
+        [
+            "New folder",
+            "New file",
+            "-",
+            "Paste",
+            "-",
+            "Copy folder path"
+        ],
         "no dead 'Open terminal here' item"
     );
 }
@@ -350,18 +365,27 @@ fn the_trash_menu_restores_and_deletes_and_never_creates() {
 #[test]
 fn the_arrow_keys_walk_the_items_skip_separators_and_wrap() {
     let rows = menu_rows(&target(false, 1, false, true));
-    // Open, -, Rename, Copy path, -, Properties, Move to Trash, Delete…
+    // 0 Open, 1 -, 2 Cut, 3 Copy, 4 Paste (disabled: nothing to paste),
+    // 5 -, 6 Rename, 7 Copy path, 8 -, 9 Properties, 10 Trash, 11 Delete…
     assert_eq!(next_menu_index(&rows, None, true), Some(0));
     assert_eq!(
         next_menu_index(&rows, Some(0), true),
         Some(2),
         "skips the separator"
     );
-    assert_eq!(next_menu_index(&rows, Some(3), true), Some(5));
-    assert_eq!(next_menu_index(&rows, Some(7), true), Some(0), "wraps down");
-    assert_eq!(next_menu_index(&rows, None, false), Some(7));
-    assert_eq!(next_menu_index(&rows, Some(2), false), Some(0));
-    assert_eq!(next_menu_index(&rows, Some(0), false), Some(7), "wraps up");
+    assert_eq!(
+        next_menu_index(&rows, Some(3), true),
+        Some(6),
+        "skips the disabled Paste and the separator"
+    );
+    assert_eq!(
+        next_menu_index(&rows, Some(11), true),
+        Some(0),
+        "wraps down"
+    );
+    assert_eq!(next_menu_index(&rows, None, false), Some(11));
+    assert_eq!(next_menu_index(&rows, Some(6), false), Some(3));
+    assert_eq!(next_menu_index(&rows, Some(0), false), Some(11), "wraps up");
     assert_eq!(next_menu_index(&[MenuRow::Separator], None, true), None);
     assert_eq!(next_menu_index(&[], None, false), None);
 }
@@ -1614,18 +1638,187 @@ fn enter_alone_never_confirms_a_dialog() {
     );
 }
 
-#[test]
-fn every_confirmation_opens_on_its_safe_button() {
+/// Every kind of dialog the explorer can open, with a conflict question.
+fn every_dialog() -> Vec<DialogState> {
     let kinds = [
         DialogKind::DeletePermanently,
         DialogKind::NoTrash,
         DialogKind::DeleteFromTrash,
         DialogKind::EmptyTrash { count: 2 },
     ];
-    for kind in kinds {
-        let dialog = DialogState::new(kind, &names(&["a"]), DialogAction::EmptyTrash(Vec::new()));
-        assert_eq!(dialog.initial_focus(), DialogChoice::Cancel);
+    let mut dialogs: Vec<DialogState> = kinds
+        .into_iter()
+        .map(|kind| DialogState::new(kind, &names(&["a"]), DialogAction::EmptyTrash(Vec::new())))
+        .collect();
+    dialogs.push(DialogState::conflict(
+        1,
+        paste::ConflictRequest {
+            kind: DialogKind::Conflict {
+                name: "a".to_owned(),
+                folder: "b".to_owned(),
+                existing: "1 B".to_owned(),
+                incoming: "2 B".to_owned(),
+            },
+        },
+    ));
+    dialogs
+}
+
+#[test]
+fn every_dialog_opens_on_a_safe_button_whether_it_opened_at_once_or_was_promoted() {
+    let t0 = Instant::now();
+    for dialog in every_dialog() {
+        // Opened at once, in an empty queue.
+        let mut queue = DialogQueue::default();
+        queue.offer_at(dialog.clone(), t0);
+        let at_once = queue.default_focus();
+        assert!(
+            at_once.is_some_and(|choice| !choice.is_danger()),
+            "{dialog:?}"
+        );
+
+        // Promoted from the line behind another dialog.
+        let mut queue = DialogQueue::default();
+        queue.offer_at(delete_dialog("/x/first"), t0);
+        queue.offer_at(dialog.clone(), t0);
+        assert_eq!(queue.default_focus(), Some(DialogChoice::Cancel));
+        queue.close_at(t0);
+        assert_eq!(queue.default_focus(), at_once, "promotion decides the same");
     }
+}
+
+#[test]
+fn a_conflict_question_opens_on_skip_and_a_confirmation_on_cancel() {
+    let t0 = Instant::now();
+    let mut queue = DialogQueue::default();
+    queue.offer_at(delete_dialog("/x/a"), t0);
+    assert_eq!(queue.default_focus(), Some(DialogChoice::Cancel));
+    for dialog in every_dialog() {
+        let expected = match dialog.kind {
+            DialogKind::Conflict { .. } => DialogChoice::Skip,
+            _ => DialogChoice::Cancel,
+        };
+        assert_eq!(dialog.initial_focus(), expected);
+    }
+    assert!(
+        !CONFLICT_DEFAULT.is_danger(),
+        "Replace is never the default"
+    );
+    assert!(!DIALOG_DEFAULT.is_danger());
+    assert!(DialogChoice::Confirm.is_danger());
+}
+
+#[test]
+fn enter_on_the_focused_button_never_reaches_a_danger_button() {
+    // Enter presses the button that has the focus; the queue decides that
+    // focus, and a press of it is accepted at once without being a danger
+    // press, even before the dialog is armed.
+    let t0 = Instant::now();
+    for dialog in every_dialog() {
+        let mut queue = DialogQueue::default();
+        queue.offer_at(delete_dialog("/x/first"), t0);
+        queue.offer_at(dialog, t0);
+        queue.close_at(t0);
+        let focused = queue.default_focus();
+        assert!(focused.is_some_and(|choice| !choice.is_danger()));
+        let pressed = focused.unwrap_or(DialogChoice::Confirm);
+        assert!(queue.accepts(pressed, t0));
+        assert_ne!(pressed, DialogChoice::Confirm);
+    }
+}
+
+#[test]
+fn the_danger_button_arms_after_the_delay_and_not_before() {
+    let t0 = Instant::now();
+    assert!(!is_armed(t0, t0));
+    assert!(!is_armed(t0, t0 + ARM_DELAY - Duration::from_millis(1)));
+    assert!(is_armed(t0, t0 + ARM_DELAY));
+    assert!(is_armed(t0, t0 + Duration::from_secs(60)));
+    // A clock that went backwards never arms early.
+    assert!(!is_armed(t0 + Duration::from_secs(5), t0));
+    assert_eq!(ARM_DELAY, Duration::from_millis(400));
+}
+
+#[test]
+fn a_new_dialog_ignores_its_danger_button_for_the_arming_delay() {
+    let t0 = Instant::now();
+    let mut queue = DialogQueue::default();
+    assert!(!queue.armed_at(t0), "nothing open, nothing to confirm");
+    assert!(!queue.accepts(DialogChoice::Cancel, t0));
+
+    queue.offer_at(delete_dialog("/x/a"), t0);
+    let early = t0 + Duration::from_millis(399);
+    assert!(!queue.accepts(DialogChoice::Confirm, early));
+    assert!(
+        queue.accepts(DialogChoice::Cancel, early),
+        "cancel is always live"
+    );
+    assert!(queue.accepts(DialogChoice::Confirm, t0 + ARM_DELAY));
+}
+
+#[test]
+fn a_promoted_dialog_starts_its_own_clock_when_it_appears() {
+    let t0 = Instant::now();
+    let mut queue = DialogQueue::default();
+    queue.offer_at(delete_dialog("/x/a"), t0);
+    queue.offer_at(no_trash_dialog(vec![PathBuf::from("/x/b")]), t0);
+
+    // The user double-clicks "Delete permanently" long after the second
+    // dialog was queued: the first click closes the first dialog, the
+    // second click lands on the promoted one.
+    let click = t0 + Duration::from_secs(30);
+    assert!(queue.accepts(DialogChoice::Confirm, click));
+    queue.close_at(click);
+    let trailing = click + Duration::from_millis(80);
+    assert!(
+        !queue.accepts(DialogChoice::Confirm, trailing),
+        "the trailing click must not confirm the dialog that just appeared"
+    );
+    assert!(queue.is_open(), "and it leaves the dialog open");
+    assert!(queue.accepts(DialogChoice::Confirm, click + ARM_DELAY));
+}
+
+#[test]
+fn a_conflict_question_of_a_finished_job_is_withdrawn_from_the_line() {
+    let t0 = Instant::now();
+    let question = |job| {
+        DialogState::conflict(
+            job,
+            paste::ConflictRequest {
+                kind: DialogKind::Conflict {
+                    name: "a".to_owned(),
+                    folder: "b".to_owned(),
+                    existing: String::new(),
+                    incoming: String::new(),
+                },
+            },
+        )
+    };
+    let mut queue = DialogQueue::default();
+    queue.offer_at(question(1), t0);
+    queue.offer_at(delete_dialog("/x/a"), t0);
+    queue.offer_at(question(2), t0);
+
+    assert!(
+        !queue.discard_conflicts_of(2, t0),
+        "a waiting question going away leaves the open dialog alone"
+    );
+    assert_eq!(queue.waiting(), 1, "only its own question is dropped");
+    assert!(
+        queue
+            .current()
+            .is_some_and(|dialog| dialog.conflict_job() == Some(1))
+    );
+
+    // The open one: dropped, and the next in line appears (and arms later).
+    assert!(queue.discard_conflicts_of(1, t0));
+    let now_open = queue.current();
+    assert!(now_open.is_some_and(|dialog| dialog.kind == DialogKind::DeletePermanently));
+    assert!(!queue.armed_at(t0));
+    assert!(
+        !queue.discard_conflicts_of(9, t0),
+        "an unknown job changes nothing"
+    );
 }
 
 #[test]

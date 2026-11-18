@@ -250,6 +250,8 @@ pub(crate) struct EntryTableDelegate {
     /// The sort the header shows; the state owns it.
     sort: SortSpec,
     selected: Arc<BTreeSet<PathBuf>>,
+    /// Entries cut and waiting for Paste, drawn dimmed.
+    cut: Arc<BTreeSet<PathBuf>>,
     /// Folder item counts, counted off the UI thread after the scan.
     child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     widths: [f32; COLUMN_COUNT],
@@ -269,6 +271,7 @@ impl EntryTableDelegate {
             visible,
             sort: SortSpec::default(),
             selected: Arc::new(BTreeSet::new()),
+            cut: Arc::new(BTreeSet::new()),
             child_counts: Arc::new(HashMap::new()),
             widths: LIST_DEFAULT_WIDTHS,
             renaming: None,
@@ -315,6 +318,15 @@ impl EntryTableDelegate {
     }
 
     /// Re-points the delegate at the current selection.
+    /// Sets the entries drawn dimmed. `true` when the set changed.
+    pub(crate) fn set_cut(&mut self, cut: BTreeSet<PathBuf>) -> bool {
+        if *self.cut == cut {
+            return false;
+        }
+        self.cut = Arc::new(cut);
+        true
+    }
+
     pub(crate) fn set_selection(&mut self, selected: Arc<BTreeSet<PathBuf>>) {
         self.selected = selected;
     }
@@ -548,6 +560,12 @@ impl TableDelegate for EntryTableDelegate {
         if selected {
             row = row.bg(cx.theme().tokens.table_active);
         }
+        if self
+            .entry_at(row_ix)
+            .is_some_and(|entry| self.cut.contains(&entry.path))
+        {
+            row = row.opacity(entries::CUT_OPACITY);
+        }
         if let Some(path) = self.path_of(row_ix).map(Path::to_path_buf) {
             row = row.on_mouse_down(
                 gpui::MouseButton::Right,
@@ -609,6 +627,7 @@ pub(crate) fn render_list(
         let sort_changed = delegate.set_sort(explorer.state.sort());
         let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.child_counts));
         delegate.set_selection(Arc::clone(&selected));
+        let cut_changed = delegate.set_cut(explorer.clipboard.cut_paths());
         let renaming_changed = delegate.set_renaming(
             explorer
                 .renaming
@@ -619,7 +638,13 @@ pub(crate) fn render_list(
         if widths_changed {
             delegate.set_widths(desired);
         }
-        if data_changed || sort_changed || counts_changed || widths_changed || renaming_changed {
+        if data_changed
+            || sort_changed
+            || counts_changed
+            || widths_changed
+            || renaming_changed
+            || cut_changed
+        {
             table.refresh(cx);
         }
     });
