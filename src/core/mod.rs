@@ -9,6 +9,7 @@ pub mod navigation;
 pub mod ops;
 pub mod places;
 pub mod trash;
+pub mod watch;
 
 /// A navigable directory or the virtual read-only home Trash.
 #[derive(Clone, Debug, PartialEq, Eq)]

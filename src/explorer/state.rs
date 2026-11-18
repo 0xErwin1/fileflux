@@ -193,6 +193,23 @@ pub(crate) struct Scan {
     pub(crate) candidate: Navigation,
     /// Whether the visit re-reads the location the explorer already shows.
     pub(crate) refresh: bool,
+    /// A background refresh of the shown folder: the commit keeps the
+    /// selection (of entries that still exist), the filter and the notice.
+    pub(crate) live: bool,
+    /// The status message the commit shows, for a fallback navigation.
+    pub(crate) notice: Option<String>,
+}
+
+/// The selected paths that still name an entry of `entries`.
+pub(crate) fn retain_existing(
+    selected: &BTreeSet<PathBuf>,
+    entries: &[Entry],
+) -> BTreeSet<PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| selected.contains(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 /// Selection, view, query and history for one explorer window, plus the
@@ -337,6 +354,39 @@ impl ExplorerState {
     /// older scan; the path error is cleared only by
     /// [`Self::clear_path_error`], since it describes the field, not a scan.
     pub(crate) fn begin(&mut self, transition: Transition) -> Option<Scan> {
+        self.begin_scan(transition, false, None)
+    }
+
+    /// A background re-read of the shown folder after the watcher saw a
+    /// change. `None` while another scan is pending (it must not be
+    /// cancelled) and for the Trash, which is not watched.
+    pub(crate) fn begin_live_refresh(&mut self) -> Option<Scan> {
+        if self.pending.is_some() {
+            return None;
+        }
+        let current = match self.nav.current() {
+            Location::Directory(path) => Location::Directory(path.clone()),
+            Location::Trash => return None,
+        };
+        self.begin_scan(Transition::Visit(current), true, None)
+    }
+
+    /// Navigates to `ancestor` after the shown folder vanished; the commit
+    /// shows `notice`. It supersedes any pending scan.
+    pub(crate) fn begin_fallback(&mut self, ancestor: PathBuf, notice: String) -> Option<Scan> {
+        self.begin_scan(
+            Transition::Visit(Location::Directory(ancestor)),
+            false,
+            Some(notice),
+        )
+    }
+
+    fn begin_scan(
+        &mut self,
+        transition: Transition,
+        live: bool,
+        notice: Option<String>,
+    ) -> Option<Scan> {
         let (location, candidate, refresh) = match transition {
             Transition::Visit(location) => {
                 let refresh = *self.nav.current() == location;
@@ -376,6 +426,8 @@ impl ExplorerState {
             location: location.clone(),
             candidate,
             refresh,
+            live,
+            notice,
         });
         self.pending.clone()
     }
@@ -391,10 +443,24 @@ impl ExplorerState {
         }
         self.nav = scan.candidate;
         self.listing = listing;
-        self.query.clear();
-        self.selected.clear();
-        self.cursor = None;
-        self.notice = None;
+        if scan.live {
+            self.selected = retain_existing(&self.selected, &self.listing.entries);
+            let still_there = |path: &Option<PathBuf>| {
+                path.as_ref()
+                    .is_some_and(|path| self.listing.entries.iter().any(|e| e.path == *path))
+            };
+            if !still_there(&self.cursor) {
+                self.cursor = None;
+            }
+            if !still_there(&self.anchor) {
+                self.anchor = None;
+            }
+        } else {
+            self.query.clear();
+            self.selected.clear();
+            self.cursor = None;
+            self.notice = scan.notice;
+        }
         self.pending = None;
         self.load_error = None;
         true
@@ -1426,6 +1492,98 @@ mod tests {
             Some(3),
             "the cursor is the moving end"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retaining_a_selection_keeps_only_paths_that_still_exist() {
+        let entries = listing(&[("a", EntryKind::File), ("c", EntryKind::File)]).entries;
+        let selected: BTreeSet<PathBuf> = ["/fixture/a", "/fixture/b", "/fixture/c"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let kept = retain_existing(&selected, &entries);
+        let names: Vec<_> = kept.iter().map(|path| path.to_string_lossy()).collect();
+        assert_eq!(names, ["/fixture/a", "/fixture/c"]);
+    }
+
+    #[test]
+    fn a_live_refresh_keeps_selection_query_and_notice_of_surviving_entries() -> TestResult {
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(dir("/fixture")))
+            .ok_or("scan")?;
+        assert!(state.commit(
+            scan,
+            listing(&[
+                ("a", EntryKind::File),
+                ("b", EntryKind::File),
+                ("c", EntryKind::File)
+            ])
+        ));
+        state.select_only(Path::new("/fixture/b"));
+        state.toggle(Path::new("/fixture/c"));
+        state.set_query("b".to_owned());
+        let history = state.navigation().can_back();
+
+        let scan = state.begin_live_refresh().ok_or("a live scan")?;
+        assert!(state.is_loading());
+        assert!(state.commit(
+            scan,
+            listing(&[("a", EntryKind::File), ("b", EntryKind::File)])
+        ));
+        assert_eq!(
+            state.selection().iter().cloned().collect::<Vec<_>>(),
+            [PathBuf::from("/fixture/b")],
+            "the vanished entry leaves the selection, the survivor stays"
+        );
+        assert_eq!(state.query(), "b", "the filter is kept");
+        assert_eq!(state.navigation().can_back(), history, "no history entry");
+        Ok(())
+    }
+
+    #[test]
+    fn a_live_refresh_never_overlaps_a_pending_scan_or_the_trash() -> TestResult {
+        let mut state = state();
+        let navigating = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("scan")?;
+        assert!(
+            state.begin_live_refresh().is_none(),
+            "a refresh must not cancel a navigation in flight"
+        );
+        assert!(state.commit(navigating, listing(&[])));
+        let trash = state
+            .begin(Transition::Visit(Location::Trash))
+            .ok_or("scan")?;
+        assert!(state.commit(trash, listing(&[])));
+        assert!(
+            state.begin_live_refresh().is_none(),
+            "the Trash is not live"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fallback_navigates_to_the_ancestor_and_keeps_its_notice() -> TestResult {
+        let mut state = committed()?;
+        state.select_only(Path::new("/fixture/notes.txt"));
+        let scan = state.begin_fallback(PathBuf::from("/fixture"), "gone".to_owned());
+        let scan = scan.ok_or("a fallback scan")?;
+        assert!(state.commit(scan, listing(&[])));
+        assert_eq!(state.current(), &dir("/fixture"));
+        assert_eq!(state.notice(), Some("gone"), "the commit keeps the message");
+        assert!(state.selection().is_empty(), "a folder change clears it");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_reload_still_clears_the_selection() -> TestResult {
+        let mut state = committed()?;
+        state.select_only(Path::new("/fixture/notes.txt"));
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        assert!(state.commit(scan, listing(&[("notes.txt", EntryKind::File)])));
+        assert!(state.selection().is_empty());
         Ok(())
     }
 }

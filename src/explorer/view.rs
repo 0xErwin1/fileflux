@@ -16,11 +16,13 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bolt::composites::Island;
 use bolt::controls::{InputEvent, InputState};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover};
+use fileflux::core::watch::{Debounce, WatchEvent, Watcher, nearest_existing_ancestor};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -139,6 +141,9 @@ fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<L
     }
 }
 
+/// How long one blocking watcher wait lasts on the background executor.
+const WATCH_STEP: Duration = Duration::from_millis(100);
+
 /// Sidebar width of the reference design, in CSS pixels.
 pub(crate) const SIDEBAR_WIDTH: f32 = 290.0;
 /// Below this viewport width the sidebar parks behind the sidebar toggle,
@@ -226,6 +231,10 @@ pub(crate) struct Explorer {
     pub(crate) child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
+    /// The folder the live-refresh watcher observes, if any.
+    watched: Option<PathBuf>,
+    /// The retained watch loop; replacing or dropping it ends the watcher.
+    watch_task: Option<Task<()>>,
 }
 
 impl Focusable for Explorer {
@@ -309,6 +318,8 @@ impl Explorer {
             permission_task: None,
             child_counts: Arc::new(HashMap::new()),
             counts_task: None,
+            watched: None,
+            watch_task: None,
             _path_events: None,
             _search_events: None,
             _table_events: None,
@@ -470,6 +481,16 @@ impl Explorer {
                 if !self.state.commit(scan.clone(), listing) {
                     return;
                 }
+                self.sync_watcher(window, cx);
+                if scan.live {
+                    // A background refresh only swaps the listing: focus,
+                    // path editing, scroll position and the filter stay.
+                    self.refresh_snapshot();
+                    self.start_child_counts(cx);
+                    self.permissions = None;
+                    cx.notify();
+                    return;
+                }
                 // A genuine folder change returns the reader to the top of
                 // the presentation that is showing; a reload keeps the
                 // reader at the place they were reading.
@@ -496,6 +517,13 @@ impl Explorer {
                 self.sync_search_input(window, cx);
                 cx.notify();
             }
+            Err(_) if scan.live => {
+                // The folder became unreadable or vanished mid-scan; the
+                // watcher reports a vanished folder, so keep what is shown.
+                self.state
+                    .commit_failure(scan, "the folder could not be refreshed".to_owned());
+                cx.notify();
+            }
             Err(error) => {
                 self.submitted_edit = None;
                 if !self.state.commit_failure(scan, error.to_string()) {
@@ -506,6 +534,87 @@ impl Explorer {
             }
         }
         self.sync_window_title(window);
+    }
+
+    /// Makes the watcher observe the committed folder: a new folder
+    /// replaces (and thereby stops) the previous watch, the Trash is not
+    /// watched. The loop blocks only on the background executor, debounces
+    /// bursts, and ends when the folder vanishes or the task is replaced.
+    fn sync_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Location::Directory(path) = self.state.current().clone() else {
+            self.watched = None;
+            self.watch_task = None;
+            return;
+        };
+        if self.watched.as_ref() == Some(&path) && self.watch_task.is_some() {
+            return;
+        }
+        self.watched = Some(path.clone());
+        self.watch_task = None;
+        let watcher = match Watcher::new(&path) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                log::warn!("cannot watch {}: {error}", path.display());
+                return;
+            }
+        };
+        let executor = cx.background_executor().clone();
+        self.watch_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut watcher = watcher;
+            let mut debounce = Debounce::default();
+            loop {
+                let step = executor.spawn(async move {
+                    let event = watcher.wait(WATCH_STEP);
+                    (watcher, event)
+                });
+                let (back, event) = step.await;
+                watcher = back;
+                let now = Instant::now();
+                match event {
+                    WatchEvent::Changed => debounce.note(now),
+                    WatchEvent::Idle => {}
+                    WatchEvent::Gone => {
+                        let gone = path.clone();
+                        if let Err(error) = this.update_in(cx, |this, window, cx| {
+                            this.watched_folder_gone(&gone, window, cx);
+                        }) {
+                            log::debug!("the explorer closed before the folder fallback: {error}");
+                        }
+                        return;
+                    }
+                }
+                if debounce.ready(now) {
+                    debounce.reset();
+                    let alive = this.update_in(cx, |this, window, cx| {
+                        let scan = this.state.begin_live_refresh();
+                        this.start_scan(scan, window, cx);
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    /// The shown folder was deleted or moved away: fall back to the nearest
+    /// existing ancestor with a status message, like a failed scan would.
+    fn watched_folder_gone(&mut self, gone: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if self.watched.as_deref() != Some(gone) {
+            return;
+        }
+        // The loop that reported this returns on its own; only forget the path.
+        self.watched = None;
+        let Some(ancestor) = nearest_existing_ancestor(gone) else {
+            return;
+        };
+        let notice = format!(
+            "{} no longer exists; showing {}",
+            gone.display(),
+            ancestor.display()
+        );
+        let scan = self.state.begin_fallback(ancestor, notice);
+        self.start_scan(scan, window, cx);
     }
 
     /// Counts the entries of every folder of the committed listing on the
