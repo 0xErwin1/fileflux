@@ -21,6 +21,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, tooltip::Tooltip};
 
+use super::dnd::{self, DropTarget};
 use super::icon;
 use super::state::Transition;
 use super::view::{Explorer, SIDEBAR_WIDTH};
@@ -288,6 +289,11 @@ fn row_shell(
     cx: &mut Context<Explorer>,
 ) -> Stateful<Div> {
     let colors = bolt::colors(cx);
+    // Dropping on a row is dropping on its place: a folder, or the Trash.
+    let target = match &location {
+        Location::Directory(path) => DropTarget::Folder(path.clone()),
+        Location::Trash => DropTarget::Trash,
+    };
     let row = ListRow::new(ElementId::Name(id.into()))
         .selected(active)
         .selection_bar(true)
@@ -298,6 +304,10 @@ fn row_shell(
         .items_center()
         .gap(Spacing::SM)
         .px(Spacing::LG)
+        // Transparent until a drop is hovering, so the highlight never
+        // moves the row.
+        .border_1()
+        .border_color(gpui::transparent_black())
         .text_size(px(13.0))
         .text_color(if active {
             colors.strong
@@ -307,6 +317,7 @@ fn row_shell(
         .on_click(cx.listener(move |this, _event, window, cx| {
             this.navigate(Transition::Visit(location.clone()), window, cx);
         }));
+    let row = dnd::drop_target(row, target, &cx.entity().downgrade(), cx);
     if path.is_empty() {
         return row;
     }

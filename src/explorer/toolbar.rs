@@ -16,6 +16,7 @@ use gpui::{Context, Div, Stateful, Styled, div, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 use gpui_component::tooltip::Tooltip;
 
+use super::dnd::{self, DropTarget};
 use super::icon;
 use super::state::{Transition, View};
 use super::util::{self, CrumbKind};
@@ -276,10 +277,17 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
         }
         let is_last = index == last;
         let target = crumb.target.clone();
+        let drop = match &crumb.target {
+            Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
+            Location::Trash => None,
+        };
         let mut segment = div()
             .id(("explorer-crumb", index))
             .h(px(22.0))
             .px(px(7.0))
+            // Transparent until a drop is hovering (no layout shift).
+            .border_1()
+            .border_color(gpui::transparent_black())
             .flex()
             .items_center()
             .gap(px(6.0))
@@ -309,6 +317,9 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
                     .size(px(14.0))
                     .color(if is_last { colors.strong } else { colors.muted }),
             );
+        }
+        if let Some(drop) = drop {
+            segment = dnd::drop_target(segment, drop, &cx.entity().downgrade(), cx);
         }
         bar = bar.child(segment.child(crumb.label));
     }

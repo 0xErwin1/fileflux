@@ -2,6 +2,7 @@
 
 pub(crate) mod actions;
 pub(crate) mod clipboard;
+pub(crate) mod dnd;
 pub(crate) mod entries;
 pub(crate) mod inspector;
 pub(crate) mod ops;

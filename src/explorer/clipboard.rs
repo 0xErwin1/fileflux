@@ -29,8 +29,8 @@ const PUMP_EVERY: Duration = Duration::from_millis(50);
 /// The UI's end of a running paste.
 pub(crate) struct PasteHandle {
     pub(crate) mode: ClipMode,
-    /// The clipboard this paste started from.
-    pub(crate) generation: u64,
+    /// The clipboard this paste started from; a drop has none.
+    pub(crate) generation: Option<u64>,
     requests: Receiver<ConflictRequest>,
     replies: Sender<ConflictAnswer>,
     /// Looks for questions while the paste runs; dropped with the handle.
@@ -112,7 +112,7 @@ impl Explorer {
             && self
                 .pastes
                 .values()
-                .any(|running| running.generation == clip.generation)
+                .any(|running| running.generation == Some(clip.generation))
         {
             self.say(
                 Severity::Info,
@@ -132,16 +132,39 @@ impl Explorer {
             );
             return;
         };
-        match plan_paste(clip.mode, &clip.paths, &dest) {
+        self.start_paste(
+            clip.paths,
+            dest,
+            clip.mode,
+            Some(clip.generation),
+            window,
+            cx,
+        );
+    }
+
+    /// Starts a transfer of `sources` into `dest`: what Ctrl+V does with the
+    /// clipboard and what a drop does with the dragged entries. The one
+    /// path for both: the conflict dialog, the progress card and the undo
+    /// all come from here. `generation` is the clipboard a cut came from.
+    pub(crate) fn start_paste(
+        &mut self,
+        sources: Vec<std::path::PathBuf>,
+        dest: std::path::PathBuf,
+        mode: ClipMode,
+        generation: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match plan_paste(mode, &sources, &dest) {
             PastePlan::Nothing(notice) => self.push_toast(notice, &[], None, window, cx),
             PastePlan::Run => {
-                let title = paste_title(clip.mode, &clip.paths, &dest);
+                let title = paste_title(mode, &sources, &dest);
                 let (request_tx, request_rx) = channel();
                 let (reply_tx, reply_rx) = channel();
                 let job = PasteJob {
-                    sources: clip.paths,
+                    sources,
                     dest,
-                    mode: clip.mode,
+                    mode,
                     link: ConflictLink {
                         requests: request_tx,
                         replies: reply_rx,
@@ -170,8 +193,8 @@ impl Explorer {
                 self.pastes.insert(
                     id,
                     PasteHandle {
-                        mode: clip.mode,
-                        generation: clip.generation,
+                        mode,
+                        generation,
                         requests: request_rx,
                         replies: reply_tx,
                         _pump: pump,
@@ -226,9 +249,11 @@ impl Explorer {
         let Some(paste) = self.pastes.remove(&id) else {
             return;
         };
-        if paste.mode == ClipMode::Cut {
+        if paste.mode == ClipMode::Cut
+            && let Some(generation) = paste.generation
+        {
             self.clipboard
-                .finish_cut(paste.generation, &report.moved, report.cancelled);
+                .finish_cut(generation, &report.moved, report.cancelled);
             if self.clipboard.get().is_none() {
                 self.clipboard_text = None;
             }

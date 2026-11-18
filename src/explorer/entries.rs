@@ -30,6 +30,7 @@ use gpui::{
 use gpui_component::ActiveTheme;
 
 use super::actions::RenameView;
+use super::dnd::{self, DropTarget};
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
 use super::{icon, util};
@@ -261,7 +262,24 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.open_context_menu(event.position, None, window, cx);
             }),
-        );
+        )
+        // The 1 px border is transparent until a drop is hovering: the
+        // highlight then never moves the layout.
+        .border_1()
+        .border_color(gpui::transparent_black());
+    // The empty space of a shown folder takes drops into that folder (an
+    // entry that is no target covers it while dragging, see
+    // `dnd::block_while_dragging`). The Trash view takes none.
+    let weak_for_drops = cx.entity().downgrade();
+    let container = match this.state.current() {
+        Location::Directory(dir) => dnd::drop_target(
+            container,
+            DropTarget::Folder(dir.clone()),
+            &weak_for_drops,
+            cx,
+        ),
+        Location::Trash => container,
+    };
 
     if this.state.is_loading() && count == 0 {
         return container.justify_center().child(
@@ -337,12 +355,24 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let cut: Arc<BTreeSet<PathBuf>> = Arc::new(this.clipboard.cut_paths());
     let renaming = this.renaming.as_ref().map(super::actions::Renaming::view);
     let renaming_for_rows = renaming.clone();
+    // Entries drag from the folder views, never from the Trash view.
+    let drag: Option<Arc<Vec<PathBuf>>> = (!this.in_trash()).then(|| {
+        Arc::new(
+            this.state
+                .visible_entries()
+                .into_iter()
+                .filter(|entry| selected.contains(&entry.path))
+                .map(|entry| entry.path.clone())
+                .collect(),
+        )
+    });
+    let drag_for_rows = drag.clone();
 
     // One vertical scroll owner per presentation: the two modes count rows
     // in different units (entries versus rows of tiles), so they keep
     // separate handles and separate list element ids.
     let rows = if list_view {
-        super::table::render_list(this, visible, selected, &weak, cx).into_any_element()
+        super::table::render_list(this, visible, selected, drag, &weak, cx).into_any_element()
     } else {
         gpui::uniform_list(
             "explorer-grid-rows",
@@ -357,6 +387,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             cut: &cut,
                             child_counts: &counts_for_rows,
                             renaming: renaming_for_rows.as_ref(),
+                            drag: drag_for_rows.as_ref(),
                         };
                         render_grid_row(&data, row, columns, &weak_for_rows, cx)
                     })
@@ -421,6 +452,8 @@ struct GridData<'a> {
     child_counts: &'a HashMap<PathBuf, Option<usize>>,
     /// The inline rename editor, drawn in place of its entry's name.
     renaming: Option<&'a RenameView>,
+    /// The visible selection, when tiles may start a drag (not in the Trash).
+    drag: Option<&'a Arc<Vec<PathBuf>>>,
 }
 
 /// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a
@@ -439,6 +472,7 @@ fn render_grid_row(
         cut,
         child_counts,
         renaming,
+        drag,
     } = *data;
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
@@ -509,38 +543,64 @@ fn render_grid_row(
         })
         .when(tile_cut, |tile| tile.opacity(CUT_OPACITY))
         .on_click(entry_click(weak, path.clone()))
-        .on_mouse_down(MouseButton::Right, entry_context_menu(weak, path.clone()))
-        .child(
-            div()
-                .w(px(THUMB_WIDTH))
-                .h(px(THUMB_HEIGHT))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(thumb),
-        )
-        .child(match renaming.filter(|view| view.path == path) {
-            Some(view) => div()
-                .mt(px(NAME_GAP))
-                .w_full()
-                .child(super::overlay::renamer(view, weak, true, cx))
-                .into_any_element(),
-            None => div()
-                .mt(px(NAME_GAP))
-                .max_w_full()
-                .text_size(px(13.0))
-                .line_height(px(NAME_LINE))
-                .line_clamp(2)
-                .text_center()
-                .text_color(if tile_selected {
-                    colors.strong
-                } else {
-                    colors.foreground
-                })
-                .child(name)
-                .into_any_element(),
-        });
+        .on_mouse_down(MouseButton::Right, entry_context_menu(weak, path.clone()));
+        let renaming_this = renaming.is_some_and(|view| view.path == path);
+        if let Some(selection) = drag.filter(|_| !renaming_this) {
+            let glyph = if is_folder {
+                gpui_kit_assets::IconName::Folder
+            } else {
+                file_glyph(&tile.name)
+            };
+            tile_element = dnd::drag_source(
+                tile_element,
+                path.clone(),
+                glyph,
+                is_folder,
+                tile_selected,
+                selection,
+                weak,
+            );
+        }
+        // A real folder takes drops; any other tile only hides what is
+        // behind it while dragging.
+        tile_element = if is_folder && drag.is_some() {
+            dnd::drop_target(tile_element, DropTarget::Folder(path.clone()), weak, cx)
+        } else {
+            tile_element
+        };
+        tile_element = dnd::block_while_dragging(tile_element, cx);
+        let mut tile_element = tile_element
+            .child(
+                div()
+                    .w(px(THUMB_WIDTH))
+                    .h(px(THUMB_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(thumb),
+            )
+            .child(match renaming.filter(|view| view.path == path) {
+                Some(view) => div()
+                    .mt(px(NAME_GAP))
+                    .w_full()
+                    .child(super::overlay::renamer(view, weak, true, cx))
+                    .into_any_element(),
+                None => div()
+                    .mt(px(NAME_GAP))
+                    .max_w_full()
+                    .text_size(px(13.0))
+                    .line_height(px(NAME_LINE))
+                    .line_clamp(2)
+                    .text_center()
+                    .text_color(if tile_selected {
+                        colors.strong
+                    } else {
+                        colors.foreground
+                    })
+                    .child(name)
+                    .into_any_element(),
+            });
         if let Some(subline) = subline {
             tile_element = tile_element.child(
                 div()

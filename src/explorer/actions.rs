@@ -524,6 +524,17 @@ impl Explorer {
             return;
         }
         let paths = self.selected_visible_paths();
+        self.trash_paths(paths, window, cx);
+    }
+
+    /// Moves `paths` to the Trash through the undoable trash job: Del on the
+    /// selection and a drop on the sidebar's Trash row.
+    pub(crate) fn trash_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = match paths.as_slice() {
             [] => return,
             [one] => format!("Moving {} to Trash", quoted(one)),

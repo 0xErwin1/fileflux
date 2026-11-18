@@ -46,6 +46,7 @@ use gpui_component::{
 };
 
 use super::actions::RenameView;
+use super::dnd::{self, DropTarget};
 use super::entries;
 use super::state::{SortKey, SortSpec};
 use super::util;
@@ -257,6 +258,8 @@ pub(crate) struct EntryTableDelegate {
     widths: [f32; COLUMN_COUNT],
     /// The inline rename editor, drawn in the name cell of its row.
     renaming: Option<RenameView>,
+    /// The visible selection a row drag carries; `None` in the Trash view.
+    dragged: Option<Arc<Vec<PathBuf>>>,
     weak: WeakEntity<Explorer>,
 }
 
@@ -275,6 +278,7 @@ impl EntryTableDelegate {
             child_counts: Arc::new(HashMap::new()),
             widths: LIST_DEFAULT_WIDTHS,
             renaming: None,
+            dragged: None,
             weak,
         }
     }
@@ -329,6 +333,12 @@ impl EntryTableDelegate {
 
     pub(crate) fn set_selection(&mut self, selected: Arc<BTreeSet<PathBuf>>) {
         self.selected = selected;
+    }
+
+    /// The visible selection rows start a drag with; `None` where entries
+    /// cannot be dragged (the Trash view).
+    pub(crate) fn set_dragged(&mut self, dragged: Option<Arc<Vec<PathBuf>>>) {
+        self.dragged = dragged;
     }
 
     /// Applies recomputed column widths (the caller then calls
@@ -567,6 +577,23 @@ impl TableDelegate for EntryTableDelegate {
             row = row.opacity(entries::CUT_OPACITY);
         }
         if let Some(path) = self.path_of(row_ix).map(Path::to_path_buf) {
+            if let Some(entry) = self.entry_at(row_ix)
+                && let Some(selection) = &self.dragged
+                && !self.renaming.as_ref().is_some_and(|view| view.path == path)
+            {
+                let folder = entry.is_directory() && !entry.is_symlink;
+                let glyph = if folder {
+                    gpui_kit_assets::IconName::Folder
+                } else {
+                    entries::file_glyph(&entry.name)
+                };
+                row =
+                    dnd::drag_source(row, path.clone(), glyph, folder, selected, selection, &weak);
+                if folder {
+                    row = dnd::drop_target(row, DropTarget::Folder(path.clone()), &weak, cx);
+                }
+            }
+            row = dnd::block_while_dragging(row, cx);
             row = row.on_mouse_down(
                 gpui::MouseButton::Right,
                 entries::entry_context_menu(&weak, path.clone()),
@@ -617,6 +644,7 @@ pub(crate) fn render_list(
     explorer: &Explorer,
     visible: Arc<Vec<usize>>,
     selected: Arc<BTreeSet<PathBuf>>,
+    dragged: Option<Arc<Vec<PathBuf>>>,
     _weak: &WeakEntity<Explorer>,
     cx: &mut Context<Explorer>,
 ) -> impl IntoElement {
@@ -627,6 +655,7 @@ pub(crate) fn render_list(
         let sort_changed = delegate.set_sort(explorer.state.sort());
         let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.child_counts));
         delegate.set_selection(Arc::clone(&selected));
+        delegate.set_dragged(dragged);
         let cut_changed = delegate.set_cut(explorer.clipboard.cut_paths());
         let renaming_changed = delegate.set_renaming(
             explorer

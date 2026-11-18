@@ -953,6 +953,10 @@ impl Explorer {
     /// the focus to the shell, so a second Escape never reaches the
     /// window close path by accident.
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape while dragging cancels the drag and nothing else.
+        if cx.stop_active_drag(window) {
+            return;
+        }
         if !self.state.selection().is_empty() {
             self.state.clear_selection();
         }
