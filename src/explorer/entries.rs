@@ -24,10 +24,12 @@ use fileflux::core::places::format_bytes;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
-    ParentElement, Stateful, Styled, WeakEntity, Window, canvas, div, prelude::*, px,
+    MouseButton, MouseDownEvent, ParentElement, Stateful, Styled, WeakEntity, Window, canvas, div,
+    prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 
+use super::actions::RenameView;
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
 use super::{icon, util};
@@ -249,7 +251,15 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .px(px(ENTRIES_PADDING))
                 .pt(px(GRID_TOP_PADDING))
                 .pb(Spacing::XL)
-        });
+        })
+        // Right click on the empty space: the folder's menu. A click on an
+        // entry stops here first (see `entry_context_menu`).
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.open_context_menu(event.position, None, window, cx);
+            }),
+        );
 
     if this.state.is_loading() && count == 0 {
         return container.justify_center().child(
@@ -322,6 +332,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let weak_for_rows = weak.clone();
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);
+    let renaming = this.renaming.as_ref().map(super::actions::Renaming::view);
+    let renaming_for_rows = renaming.clone();
 
     // One vertical scroll owner per presentation: the two modes count rows
     // in different units (entries versus rows of tiles), so they keep
@@ -340,6 +352,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             visible: &visible_for_rows,
                             selected: &selected_for_rows,
                             child_counts: &counts_for_rows,
+                            renaming: renaming_for_rows.as_ref(),
                         };
                         render_grid_row(&data, row, columns, &weak_for_rows, cx)
                     })
@@ -400,6 +413,8 @@ struct GridData<'a> {
     visible: &'a [usize],
     selected: &'a BTreeSet<PathBuf>,
     child_counts: &'a HashMap<PathBuf, Option<usize>>,
+    /// The inline rename editor, drawn in place of its entry's name.
+    renaming: Option<&'a RenameView>,
 }
 
 /// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a
@@ -416,6 +431,7 @@ fn render_grid_row(
         visible,
         selected,
         child_counts,
+        renaming,
     } = *data;
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
@@ -483,7 +499,8 @@ fn render_grid_row(
         } else {
             gpui::transparent_black()
         })
-        .on_click(entry_click(weak, path))
+        .on_click(entry_click(weak, path.clone()))
+        .on_mouse_down(MouseButton::Right, entry_context_menu(weak, path.clone()))
         .child(
             div()
                 .w(px(THUMB_WIDTH))
@@ -494,8 +511,13 @@ fn render_grid_row(
                 .justify_center()
                 .child(thumb),
         )
-        .child(
-            div()
+        .child(match renaming.filter(|view| view.path == path) {
+            Some(view) => div()
+                .mt(px(NAME_GAP))
+                .w_full()
+                .child(super::overlay::renamer(view, weak, true, cx))
+                .into_any_element(),
+            None => div()
                 .mt(px(NAME_GAP))
                 .max_w_full()
                 .text_size(px(13.0))
@@ -507,8 +529,9 @@ fn render_grid_row(
                 } else {
                     colors.foreground
                 })
-                .child(name),
-        );
+                .child(name)
+                .into_any_element(),
+        });
         if let Some(subline) = subline {
             tile_element = tile_element.child(
                 div()
@@ -569,6 +592,25 @@ pub(crate) fn handle_entry_click(
         }
     }) {
         log::debug!("the row outlived its explorer: {error}");
+    }
+}
+
+/// The right-click handler of one entry: selects it (unless it is already
+/// part of the selection) and opens the menu under the pointer. Stops the
+/// press so the entries area behind it does not open the empty-space menu.
+pub(crate) fn entry_context_menu(
+    weak: &WeakEntity<Explorer>,
+    path: PathBuf,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    let weak = weak.clone();
+    move |event: &MouseDownEvent, window, cx| {
+        cx.stop_propagation();
+        if let Err(error) = weak.update(cx, |this, cx| {
+            this.entries_focus.focus(window, cx);
+            this.open_context_menu(event.position, Some(&path), window, cx);
+        }) {
+            log::debug!("the row outlived its explorer: {error}");
+        }
     }
 }
 

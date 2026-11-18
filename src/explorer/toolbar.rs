@@ -191,6 +191,20 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     this.navigate(Transition::Visit(current), window, cx);
                 })),
         )
+        // The context menu for keyboard-less pointer users: the same menu
+        // as a right click, on the current selection or the folder.
+        .child(
+            Button::new("explorer-more", "More actions")
+                .ghost()
+                .icon_only()
+                .icon(icon(gpui_kit_assets::IconName::Ellipsis))
+                .tooltip("More actions (right click, Menu key or Shift+F10)")
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                    let position = super::overlay::below(event.position());
+                    let on = this.state.activation_candidate();
+                    this.open_context_menu(position, on.as_deref(), window, cx);
+                })),
+        )
 }
 
 /// The editable path field in the breadcrumb bar's place.

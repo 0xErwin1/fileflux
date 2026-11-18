@@ -316,11 +316,9 @@ impl ExplorerState {
         self.notice.as_deref()
     }
 
-    /// Shows the honest read-only note for an entry the MVP will not open.
-    pub(crate) fn set_open_notice(&mut self, name: &str) {
-        self.notice = Some(format!(
-            "Fileflux is read-only: \"{name}\" cannot be opened or previewed here."
-        ));
+    /// Shows a status note until the next folder change or click.
+    pub(crate) fn set_notice(&mut self, text: String) {
+        self.notice = Some(text);
     }
 
     /// Clears the status note.
@@ -368,6 +366,16 @@ impl ExplorerState {
             Location::Directory(path) => Location::Directory(path.clone()),
             Location::Trash => return None,
         };
+        self.begin_scan(Transition::Visit(current), true, None)
+    }
+
+    /// A re-read of the shown location after one of our own operations
+    /// finished, Trash included (it is not watched). Unlike the watcher's
+    /// refresh it supersedes a scan in flight: that scan may have read the
+    /// location before the operation changed it, and a newer generation
+    /// discards it. The commit keeps the selection of entries that remain.
+    pub(crate) fn begin_op_refresh(&mut self) -> Option<Scan> {
+        let current = self.nav.current().clone();
         self.begin_scan(Transition::Visit(current), true, None)
     }
 
@@ -1336,14 +1344,10 @@ mod tests {
     }
 
     #[test]
-    fn open_notice_is_honest_and_clears_on_the_next_folder() -> TestResult {
+    fn a_notice_shows_until_the_next_folder() -> TestResult {
         let mut state = committed()?;
-        state.set_open_notice("report.pdf");
-        assert!(
-            state
-                .notice()
-                .is_some_and(|note| note.contains("read-only"))
-        );
+        state.set_notice("Copied the path".to_owned());
+        assert_eq!(state.notice(), Some("Copied the path"));
 
         let scan = visit_scan(&mut state, "/fixture/a/b")?;
         state.commit(scan, listing(&[]));
@@ -1561,6 +1565,32 @@ mod tests {
             state.begin_live_refresh().is_none(),
             "the Trash is not live"
         );
+        Ok(())
+    }
+
+    /// Our own operation refreshes even the Trash and supersedes a scan in
+    /// flight, which may have read the location before the operation ran.
+    #[test]
+    fn an_operation_refresh_supersedes_a_pending_scan_and_covers_the_trash() -> TestResult {
+        let mut state = state();
+        let stale = state
+            .begin(Transition::Visit(dir("/fixture")))
+            .ok_or("scan")?;
+        let fresh = state.begin_op_refresh().ok_or("an operation refresh")?;
+        assert!(fresh.live);
+        assert!(!state.commit(stale, listing(&[("old", EntryKind::File)])));
+        assert!(state.commit(fresh, listing(&[("new", EntryKind::File)])));
+        assert_eq!(state.listing().entries.len(), 1);
+
+        let trash = state
+            .begin(Transition::Visit(Location::Trash))
+            .ok_or("scan")?;
+        assert!(state.commit(trash, listing(&[("t", EntryKind::File)])));
+        state.select_only(Path::new("/fixture/t"));
+        let again = state.begin_op_refresh().ok_or("a Trash refresh")?;
+        assert_eq!(again.location, Location::Trash);
+        assert!(state.commit(again, listing(&[("t", EntryKind::File)])));
+        assert_eq!(state.selection().len(), 1, "the selection survives");
         Ok(())
     }
 

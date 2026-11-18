@@ -45,6 +45,7 @@ use gpui_component::{
     table::{Column, DataTable, TableDelegate, TableState},
 };
 
+use super::actions::RenameView;
 use super::entries;
 use super::state::{SortKey, SortSpec};
 use super::util;
@@ -252,6 +253,8 @@ pub(crate) struct EntryTableDelegate {
     /// Folder item counts, counted off the UI thread after the scan.
     child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     widths: [f32; COLUMN_COUNT],
+    /// The inline rename editor, drawn in the name cell of its row.
+    renaming: Option<RenameView>,
     weak: WeakEntity<Explorer>,
 }
 
@@ -268,6 +271,7 @@ impl EntryTableDelegate {
             selected: Arc::new(BTreeSet::new()),
             child_counts: Arc::new(HashMap::new()),
             widths: LIST_DEFAULT_WIDTHS,
+            renaming: None,
             weak,
         }
     }
@@ -299,6 +303,14 @@ impl EntryTableDelegate {
     ) -> bool {
         let changed = !Arc::ptr_eq(&self.child_counts, &counts);
         self.child_counts = counts;
+        changed
+    }
+
+    /// Re-points the delegate at the rename editor; `true` when it changed,
+    /// so the caller refreshes the table.
+    pub(crate) fn set_renaming(&mut self, renaming: Option<RenameView>) -> bool {
+        let changed = self.renaming != renaming;
+        self.renaming = renaming;
         changed
     }
 
@@ -451,6 +463,15 @@ impl TableDelegate for EntryTableDelegate {
         let Some(spec) = self.cell(row_ix, col_ix) else {
             return div().size_full().into_any_element();
         };
+        let editing = (col_ix == 0)
+            .then(|| {
+                let entry = self.entry_at(row_ix)?;
+                self.renaming
+                    .as_ref()
+                    .filter(|view| view.path == entry.path)
+            })
+            .flatten()
+            .cloned();
         let text = div()
             .min_w_0()
             .flex_1()
@@ -485,7 +506,17 @@ impl TableDelegate for EntryTableDelegate {
                 .flex_none()
                 .child(Icon::new(super::icon(icon)).size(px(14.0)).color(color));
         }
-        cell.child(text).into_any_element()
+        match editing {
+            Some(view) => cell
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(super::overlay::renamer(&view, &self.weak, false, cx)),
+                )
+                .into_any_element(),
+            None => cell.child(text).into_any_element(),
+        }
     }
 
     /// No trailing spacer column: the widths already fill the pane, and a
@@ -518,6 +549,10 @@ impl TableDelegate for EntryTableDelegate {
             row = row.bg(cx.theme().tokens.table_active);
         }
         if let Some(path) = self.path_of(row_ix).map(Path::to_path_buf) {
+            row = row.on_mouse_down(
+                gpui::MouseButton::Right,
+                entries::entry_context_menu(&weak, path.clone()),
+            );
             row = row.on_click(
                 move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
                     // The actual event's modifiers decide: Ctrl toggles the
@@ -574,11 +609,17 @@ pub(crate) fn render_list(
         let sort_changed = delegate.set_sort(explorer.state.sort());
         let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.child_counts));
         delegate.set_selection(Arc::clone(&selected));
+        let renaming_changed = delegate.set_renaming(
+            explorer
+                .renaming
+                .as_ref()
+                .map(super::actions::Renaming::view),
+        );
         let widths_changed = delegate.widths() != &desired;
         if widths_changed {
             delegate.set_widths(desired);
         }
-        if data_changed || sort_changed || counts_changed || widths_changed {
+        if data_changed || sort_changed || counts_changed || widths_changed || renaming_changed {
             table.refresh(cx);
         }
     });

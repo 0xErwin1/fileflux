@@ -402,6 +402,14 @@ fn tree_size(path: &Path) -> u64 {
     }
 }
 
+/// Deletes `path` for good: a file or link is unlinked (a link is never
+/// followed), a directory is removed recursively with every link inside it
+/// removed as a link. There is no undo; the UI only calls this behind a
+/// confirmation (Shift+Del, the Trash view, or a missing Trash).
+pub fn remove_permanently(path: &Path) -> io::Result<()> {
+    remove_all(path)
+}
+
 /// Removes a file, link or directory tree without following symlinks.
 fn remove_all(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.is_dir() {
@@ -1633,6 +1641,25 @@ mod tests {
             Some(ItemOutcome::Ok { .. })
         ));
         assert_eq!(fs::read(dest.join("a.txt"))?, b"a");
+        Ok(())
+    }
+
+    #[test]
+    fn remove_permanently_deletes_trees_and_links_without_following() -> TestResult {
+        let scratch = Scratch::new("remove-permanently")?;
+        let outside = scratch.dir("outside")?;
+        fs::write(outside.join("precious.txt"), b"precious")?;
+        let tree = scratch.dir("tree/sub")?;
+        fs::write(tree.join("file.txt"), b"x")?;
+        std::os::unix::fs::symlink(&outside, scratch.path("tree/link"))?;
+        remove_permanently(&scratch.path("tree"))?;
+        assert!(!scratch.path("tree").exists());
+        assert_eq!(fs::read(outside.join("precious.txt"))?, b"precious");
+
+        std::os::unix::fs::symlink(&outside, scratch.path("lone-link"))?;
+        remove_permanently(&scratch.path("lone-link"))?;
+        assert!(outside.is_dir(), "a lone link is unlinked, not followed");
+        assert!(remove_permanently(&scratch.path("missing")).is_err());
         Ok(())
     }
 }

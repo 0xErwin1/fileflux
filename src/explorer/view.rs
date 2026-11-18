@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bolt::composites::Island;
-use bolt::controls::{InputEvent, InputState};
+use bolt::controls::{Button, InputEvent, InputState};
+use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
+use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover};
 use fileflux::core::watch::{Debounce, WatchEvent, Watcher, nearest_existing_ancestor};
@@ -27,14 +29,17 @@ use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
     KeyBinding, ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px,
+    UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px,
 };
 use gpui_component::table::{TableEvent, TableState};
 
+use crate::explorer::actions::{DialogState, MenuState, PendingSelect, Renaming};
 use crate::explorer::inspector::{self, PermissionProbe};
+use crate::explorer::ops::{UndoStack, pick_terminal};
+use crate::explorer::progress::Registry;
 use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
-use crate::explorer::{entries, sidebar, toolbar, util};
+use crate::explorer::{entries, overlay, progress, sidebar, toolbar, util};
 
 /// Key context of the whole explorer window.
 pub(crate) const EXPLORER_CONTEXT: &str = "FilefluxExplorer";
@@ -61,8 +66,35 @@ actions!(
         Reload,
         /// Shows or hides the details panel.
         ToggleInspector,
+        /// Creates a folder in the shown folder and renames it in place.
+        NewFolder,
+        /// Renames the selected entry in place (F2).
+        RenameSelected,
+        /// Moves the selected entries to the Trash (Del).
+        TrashSelected,
+        /// Asks to delete the selected entries for good (Shift+Del).
+        DeleteSelected,
+        /// Undoes the last rename, trash or creation (Ctrl+Z).
+        UndoLast,
+        /// Copies the path of the selected entries to the clipboard.
+        CopyPathSelected,
+        /// Opens the context menu on the selection (Menu key, Shift+F10).
+        OpenContextMenu,
+        /// Highlights the previous context-menu item.
+        MenuUp,
+        /// Highlights the next context-menu item.
+        MenuDown,
+        /// Runs the highlighted context-menu item.
+        MenuConfirm,
+        /// Closes the context menu.
+        MenuCancel,
+        /// Cancels the open confirmation dialog.
+        DialogCancel,
     ]
 );
+
+/// Key context of the open context menu.
+pub(crate) const MENU_CONTEXT: &str = "FilefluxMenu";
 
 actions!(
     fileflux_entries,
@@ -91,8 +123,8 @@ actions!(
         ExtendToFirst,
         /// Extends the selection to the last visible entry.
         ExtendToLast,
-        /// Opens the selected directory; other entries answer honestly
-        /// read-only.
+        /// Opens the selected directory, or the selected file with the
+        /// default application.
         OpenSelected,
     ]
 );
@@ -124,6 +156,42 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-end", ExtendToLast, entries),
         KeyBinding::new("enter", OpenSelected, entries),
     ]);
+
+    // The file operations answer anywhere in the window except while a text
+    // field, the context menu or a dialog has the keyboard.
+    let operations = Some("FilefluxExplorer && !Input && !Modal && !FilefluxMenu");
+    cx.bind_keys([
+        KeyBinding::new("f2", RenameSelected, operations),
+        KeyBinding::new("delete", TrashSelected, operations),
+        KeyBinding::new("shift-delete", DeleteSelected, operations),
+        KeyBinding::new("ctrl-shift-n", NewFolder, operations),
+        KeyBinding::new("ctrl-z", UndoLast, operations),
+        KeyBinding::new("ctrl-shift-c", CopyPathSelected, operations),
+        KeyBinding::new("menu", OpenContextMenu, operations),
+        KeyBinding::new("shift-f10", OpenContextMenu, operations),
+        KeyBinding::new("up", MenuUp, Some(MENU_CONTEXT)),
+        KeyBinding::new("down", MenuDown, Some(MENU_CONTEXT)),
+        KeyBinding::new("enter", MenuConfirm, Some(MENU_CONTEXT)),
+        KeyBinding::new("escape", MenuCancel, Some(MENU_CONTEXT)),
+        KeyBinding::new("escape", DialogCancel, Some("Modal")),
+    ]);
+    install_modal_seams(cx);
+}
+
+/// What Bolt's [`Modal`](bolt::modals::Modal) needs from the product: Escape
+/// cancels. Enter is deliberately left unbound — a confirmation dialog acts
+/// only through the button that has the focus, which is Cancel.
+fn install_modal_seams(cx: &mut App) {
+    fn attach(backdrop: Stateful<Div>, handler: ModalKeyHandler) -> Stateful<Div> {
+        on_modal_key::<DialogCancel>(backdrop, ModalKey::Cancel, &handler)
+    }
+    cx.set_global(ModalSeams {
+        attach_keys: attach,
+        defer_to_owner: |_, _, _| {},
+        escape_label: |_| Some("Esc".into()),
+        close_icon: crate::explorer::icon(gpui_kit_assets::IconName::X),
+        close_label: || "Close".into(),
+    });
 }
 
 /// Reads one location off the UI thread: a plain directory scan, or the
@@ -143,6 +211,11 @@ fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<L
 
 /// How long one blocking watcher wait lasts on the background executor.
 const WATCH_STEP: Duration = Duration::from_millis(100);
+
+/// Where the toast stack starts, below the toolbar and the subbar.
+const TOAST_TOP: f32 = 150.0;
+/// The width the toast stack lays out in, in CSS pixels.
+const TOAST_STACK_WIDTH: f32 = 480.0;
 
 /// Sidebar width of the reference design, in CSS pixels.
 pub(crate) const SIDEBAR_WIDTH: f32 = 290.0;
@@ -235,6 +308,28 @@ pub(crate) struct Explorer {
     watched: Option<PathBuf>,
     /// The retained watch loop; replacing or dropping it ends the watcher.
     watch_task: Option<Task<()>>,
+    /// The operations running off the UI thread, behind the progress cards.
+    pub(crate) progress: Registry,
+    /// The session's undo history; survives navigation.
+    pub(crate) undo: UndoStack,
+    /// The inline rename in progress, if any.
+    pub(crate) renaming: Option<Renaming>,
+    /// The open context menu, if any.
+    pub(crate) menu: Option<MenuState>,
+    /// The focus of the open context menu.
+    pub(crate) menu_focus: FocusHandle,
+    /// The open confirmation dialog, if any.
+    pub(crate) dialog: Option<DialogState>,
+    /// The focus of the dialog's backdrop (the focus trap).
+    pub(crate) dialog_focus: FocusHandle,
+    /// The dialog's default button: Cancel.
+    pub(crate) dialog_cancel_focus: FocusHandle,
+    /// What to select (and whether to rename) once the next listing shows it.
+    pub(crate) pending: Option<PendingSelect>,
+    /// Bolt's toast stack: operation summaries, with Undo.
+    pub(crate) toast_host: Entity<ToastHost>,
+    /// The terminal "Open terminal here" runs, when one exists.
+    pub(crate) terminal: Option<PathBuf>,
 }
 
 impl Focusable for Explorer {
@@ -270,6 +365,15 @@ impl Explorer {
             input.set_placeholder("Search this folder…", window, cx);
             input
         });
+
+        let toast_host = cx.new(|_cx| ToastHost::new());
+        cx.set_global(ToastGlobal {
+            host: toast_host.clone(),
+        });
+        let terminal = pick_terminal(
+            std::env::var_os("TERMINAL").as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        );
 
         let weak_this = cx.entity().downgrade();
         // The details table's state: one entity per explorer, with the
@@ -320,6 +424,17 @@ impl Explorer {
             counts_task: None,
             watched: None,
             watch_task: None,
+            progress: Registry::default(),
+            undo: UndoStack::default(),
+            renaming: None,
+            menu: None,
+            menu_focus: cx.focus_handle(),
+            dialog: None,
+            dialog_focus: cx.focus_handle(),
+            dialog_cancel_focus: cx.focus_handle(),
+            pending: None,
+            toast_host,
+            terminal,
             _path_events: None,
             _search_events: None,
             _table_events: None,
@@ -446,7 +561,12 @@ impl Explorer {
     /// background executor, the completion re-enters the view through
     /// [`Self::finish_scan`], and the task is retained so a newer scan
     /// replaces it.
-    fn start_scan(&mut self, scan: Option<Scan>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn start_scan(
+        &mut self,
+        scan: Option<Scan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(scan) = scan else {
             return;
         };
@@ -488,6 +608,7 @@ impl Explorer {
                     self.refresh_snapshot();
                     self.start_child_counts(cx);
                     self.permissions = None;
+                    self.after_listing_changed(window, cx);
                     cx.notify();
                     return;
                 }
@@ -515,6 +636,7 @@ impl Explorer {
                     self.entries_focus.focus(window, cx);
                 }
                 self.sync_search_input(window, cx);
+                self.after_listing_changed(window, cx);
                 cx.notify();
             }
             Err(_) if scan.live => {
@@ -698,7 +820,7 @@ impl Explorer {
     /// Synchronizes the search field with the committed query after a
     /// commit, so the field, the listing and the match count agree again.
     /// `set_value` emits no Change; no query-subscription feedback.
-    fn sync_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let committed = self.state.query().to_owned();
         self.search_input.update(cx, |input, cx| {
             let shown = input.value().to_string();
@@ -882,7 +1004,7 @@ impl Explorer {
         cx.notify();
     }
 
-    fn scroll_selected_row(&mut self, position: usize, cx: &mut Context<Self>) {
+    pub(crate) fn scroll_selected_row(&mut self, position: usize, cx: &mut Context<Self>) {
         match self.state.view() {
             View::List => {
                 // Reveal only the nearest edge, preserving visible context
@@ -930,11 +1052,15 @@ impl Explorer {
     }
 
     /// Enter (or double click) on the selected entry: directories navigate,
-    /// everything else answers honestly read-only. Only **visible**
+    /// everything else opens with the default application. Only **visible**
     /// selected entries activate: a selection the current filter has
     /// hidden is never silently opened (see
     /// [`ExplorerState::activation_candidate`]).
     pub(crate) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter belongs to the rename editor while it is open.
+        if self.renaming.is_some() {
+            return;
+        }
         let Some(path) = self.state.activation_candidate() else {
             return;
         };
@@ -942,9 +1068,9 @@ impl Explorer {
     }
 
     /// Opens one entry: a real directory navigates; a file, symlink or
-    /// broken link sets the honest read-only notice and keeps everything.
-    /// A symlinked directory is not followed either: the MVP navigates
-    /// entry paths as scanned, and Trash rows never lead out of the Trash.
+    /// broken link opens with the default application (`xdg-open`, see
+    /// [`Explorer::open_file`]). A symlinked directory is not followed
+    /// either: the explorer navigates entry paths as scanned.
     pub(crate) fn open_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.snapshot.iter().find(|entry| entry.path == path) else {
             return;
@@ -957,9 +1083,8 @@ impl Explorer {
             );
             return;
         }
-        let name = entry.display_name().into_owned();
-        self.state.set_open_notice(&name);
-        cx.notify();
+        let entry_path = entry.path.clone();
+        self.open_file(&entry_path, cx);
     }
 
     /// Toggles the favorites membership of the current directory.
@@ -1069,9 +1194,13 @@ impl Render for Explorer {
             None => middle = middle.child(document),
         }
 
+        let weak = cx.entity().downgrade();
+        let cards = progress::render_cards(&self.progress, Instant::now(), &weak, cx);
+        let overlays = overlay::render(self, window, cx);
         div()
             .key_context(EXPLORER_CONTEXT)
             .track_focus(&self.shell_focus)
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1159,8 +1288,58 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
                 this.open_selected(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
+                this.create_new(crate::explorer::ops::NewKind::Folder, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenameSelected, window, cx| {
+                this.start_rename(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TrashSelected, window, cx| {
+                this.trash_selected(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, window, cx| {
+                this.delete_selected(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &UndoLast, window, cx| {
+                this.undo_last(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyPathSelected, _window, cx| {
+                this.copy_selected_paths(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenContextMenu, window, cx| {
+                let position = window.mouse_position();
+                let on = this.state.activation_candidate();
+                this.open_context_menu(position, on.as_deref(), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuUp, _window, cx| {
+                this.move_menu(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuDown, _window, cx| {
+                this.move_menu(true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuConfirm, window, cx| {
+                this.confirm_menu(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuCancel, window, cx| {
+                this.close_menu(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DialogCancel, window, cx| {
+                this.cancel_dialog(window, cx);
+            }))
             .child(middle)
             .child(self.render_statusbar(cx))
+            .children(overlays)
+            .children(cards)
+            .child(deferred(
+                // Below the toolbar and the subbar actions, which a toast
+                // would otherwise cover while it is up.
+                div()
+                    .absolute()
+                    .top(px(TOAST_TOP))
+                    .right_0()
+                    .w(px(TOAST_STACK_WIDTH))
+                    .child(self.toast_host.clone()),
+            ))
     }
 }
 
@@ -1213,7 +1392,10 @@ impl Explorer {
     fn render_scope_line(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let colors = bolt::colors(cx);
         let text = if self.state.current() == &Location::Trash {
-            Some("Home Trash — read-only: no restore, delete or empty here.".to_owned())
+            Some(
+                "Home Trash \u{2014} Restore puts items back; Delete permanently and Empty Trash cannot be undone."
+                    .to_owned(),
+            )
         } else {
             let query = self.state.query();
             (!query.is_empty()).then(|| {
@@ -1272,6 +1454,27 @@ impl Explorer {
                     .text_color(colors.muted)
                     .child(meta),
             )
+            .child(div().flex_1())
+            .child(if self.state.current() == &Location::Trash {
+                Button::new("explorer-empty-trash", "Empty Trash")
+                    .danger()
+                    .icon(crate::explorer::icon(gpui_kit_assets::IconName::Trash))
+                    .disabled(self.state.listing().entries.is_empty())
+                    .tooltip("Delete everything in the Trash for good")
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.request_empty_trash(window, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                Button::new("explorer-new-folder", "New folder")
+                    .primary()
+                    .icon(crate::explorer::icon(gpui_kit_assets::IconName::FolderPlus))
+                    .tooltip("New folder (Ctrl+Shift+N)")
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.create_new(crate::explorer::ops::NewKind::Folder, window, cx);
+                    }))
+                    .into_any_element()
+            })
     }
 
     /// The volume usage line of the volume holding the current folder
@@ -1321,6 +1524,17 @@ impl Explorer {
                     .id("explorer-status-loading")
                     .text_color(colors.foreground)
                     .child("Loading…"),
+            );
+        } else if let Some(error) = self.renaming.as_ref().and_then(|r| r.error.as_deref()) {
+            status = status.child(
+                div()
+                    .id("explorer-status-rename-error")
+                    .flex_none()
+                    .border_1()
+                    .border_color(colors.danger)
+                    .px(Spacing::SM)
+                    .text_color(colors.danger)
+                    .child(error.to_owned()),
             );
         } else if let Some(error) = self.state.load_error() {
             status = status.child(
@@ -1377,6 +1591,17 @@ impl Explorer {
                     .child(count_text),
             )
             .child(status)
+            .children(self.progress.status_text(Instant::now()).map(|text| {
+                div()
+                    .id("explorer-status-progress")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_color(colors.foreground)
+                    .child(div().size(px(6.0)).bg(colors.info))
+                    .child(text)
+            }))
             .child(
                 div()
                     .ml_auto()
