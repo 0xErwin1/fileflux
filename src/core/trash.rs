@@ -3,11 +3,15 @@
 //! never creates directories, writes configuration, restores, deletes or
 //! follows the recorded original paths.
 
+use super::ops::{numbered_name, rename_noreplace, unique_name, validate_name};
 use super::{Entry, EntryKind, Listing};
+use chrono::NaiveDateTime;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// Parses freedesktop `.trashinfo` content. Only the `[Trash Info]` header
@@ -193,6 +197,417 @@ pub fn read_trash(root: &Path) -> io::Result<Listing> {
         entries: entries.into_iter().map(|(_, entry)| entry).collect(),
         warnings,
     })
+}
+
+/// Where trashed files go and how their original paths are recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrashKind {
+    /// `$XDG_DATA_HOME/Trash`: absolute original paths.
+    Home,
+    /// `$topdir/.Trash-$uid` on another mount: original paths are recorded
+    /// relative to this topdir.
+    Topdir(PathBuf),
+}
+
+/// A trash directory (`files/` + `info/`) chosen for a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashTarget {
+    pub root: PathBuf,
+    pub kind: TrashKind,
+}
+
+impl TrashTarget {
+    pub fn home(root: PathBuf) -> TrashTarget {
+        TrashTarget {
+            root,
+            kind: TrashKind::Home,
+        }
+    }
+}
+
+/// Why a trash operation failed.
+#[derive(Debug)]
+pub enum TrashError {
+    /// No usable trash for the file: the UI may offer permanent deletion,
+    /// but only behind an explicit confirmation. Nothing was deleted.
+    NoTrash(String),
+    /// Malformed or hostile trash metadata, or a bad argument.
+    Invalid(String),
+    Io(io::Error),
+}
+
+impl TrashError {
+    /// True when restoring found the original path taken.
+    pub fn is_already_exists(&self) -> bool {
+        matches!(self, TrashError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists)
+    }
+}
+
+impl fmt::Display for TrashError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrashError::NoTrash(reason) => write!(f, "no usable trash: {reason}"),
+            TrashError::Invalid(reason) => write!(f, "invalid trash data: {reason}"),
+            TrashError::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TrashError {}
+
+impl From<io::Error> for TrashError {
+    fn from(error: io::Error) -> Self {
+        TrashError::Io(error)
+    }
+}
+
+/// What undo, restore and delete need to know about one trashed item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashedItem {
+    pub root: PathBuf,
+    /// The name under `files/` (and `info/<name>.trashinfo`).
+    pub name: OsString,
+    /// Absolute original path.
+    pub original: PathBuf,
+}
+
+impl TrashedItem {
+    pub fn files_path(&self) -> PathBuf {
+        self.root.join("files").join(&self.name)
+    }
+
+    pub fn info_path(&self) -> PathBuf {
+        info_path_for(&self.root, &self.name)
+    }
+
+    /// Reads the item `name` of `target` from its `.trashinfo`, resolving
+    /// topdir-relative paths. Relative paths with `..` are rejected.
+    pub fn load(target: &TrashTarget, name: &OsStr) -> Result<TrashedItem, TrashError> {
+        validate_item_name(name)?;
+        let bytes = fs::read(info_path_for(&target.root, name))?;
+        let recorded =
+            parse_trashinfo(&String::from_utf8_lossy(&bytes)).map_err(TrashError::Invalid)?;
+        let original = if recorded.is_absolute() {
+            recorded
+        } else {
+            match &target.kind {
+                TrashKind::Topdir(topdir)
+                    if recorded
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))) =>
+                {
+                    topdir.join(recorded)
+                }
+                _ => {
+                    return Err(TrashError::Invalid(format!(
+                        "unusable relative original path {}",
+                        recorded.display()
+                    )));
+                }
+            }
+        };
+        Ok(TrashedItem {
+            root: target.root.clone(),
+            name: name.to_owned(),
+            original,
+        })
+    }
+}
+
+/// How `restore` treats an original path that is taken again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreConflict {
+    /// Restore under a unique "name (2)" next to the original.
+    KeepBoth,
+    /// Fail with `AlreadyExists`, changing nothing.
+    Fail,
+}
+
+/// Result of emptying a trash: failed items stay in the trash.
+#[derive(Debug, Default)]
+pub struct EmptyReport {
+    pub removed: usize,
+    pub failures: Vec<(PathBuf, io::Error)>,
+}
+
+/// Percent-encodes bytes for a `.trashinfo` `Path`: RFC 3986 unreserved
+/// characters and `/` stay, everything else becomes `%XX`.
+pub fn encode_percent(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn info_path_for(root: &Path, name: &OsStr) -> PathBuf {
+    let mut file = name.as_bytes().to_vec();
+    file.extend_from_slice(b".trashinfo");
+    root.join("info").join(OsStr::from_bytes(&file))
+}
+
+/// An item name must be one plain path component: restore and delete act
+/// on `files/<name>` and must never be steered outside the trash.
+fn validate_item_name(name: &OsStr) -> Result<(), TrashError> {
+    validate_name(name).map_err(|error| TrashError::Invalid(format!("item name: {error}")))
+}
+
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Chooses the trash for `path` (freedesktop Trash spec 1.0): the home
+/// trash when `path` lives on `home_dev`, else `$topdir/.Trash-$uid` for the
+/// mount `mount_topdir_of` names, created with mode 0700. The shared
+/// `$topdir/.Trash` sticky-directory variant is not used. When no trash is
+/// usable the result is `TrashError::NoTrash`: the caller may then offer
+/// permanent deletion behind an explicit confirmation; nothing is deleted
+/// here.
+pub fn trash_dir_for(
+    path: &Path,
+    home_trash: &Path,
+    home_dev: u64,
+    uid: u32,
+    mount_topdir_of: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<TrashTarget, TrashError> {
+    // The link itself lives where it is, whatever it points to.
+    let device = fs::symlink_metadata(path)?.dev();
+    if device == home_dev {
+        return Ok(TrashTarget::home(home_trash.to_path_buf()));
+    }
+    let topdir = mount_topdir_of(path).ok_or_else(|| {
+        TrashError::NoTrash(format!("no mount point found for {}", path.display()))
+    })?;
+    if !path.starts_with(&topdir) {
+        return Err(TrashError::NoTrash(format!(
+            "{} is not under its mount point {}",
+            path.display(),
+            topdir.display()
+        )));
+    }
+    let top_meta = fs::metadata(&topdir)
+        .map_err(|error| TrashError::NoTrash(format!("{}: {error}", topdir.display())))?;
+    if top_meta.dev() != device {
+        return Err(TrashError::NoTrash(format!(
+            "{} is not the mount point of {}",
+            topdir.display(),
+            path.display()
+        )));
+    }
+    let root = topdir.join(format!(".Trash-{uid}"));
+    match fs::symlink_metadata(&root) {
+        // A symlink reports as non-directory here, so it is refused: a
+        // trash that redirects elsewhere is not trusted.
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(TrashError::NoTrash(format!(
+                "{} exists and is not a directory",
+                root.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .map_err(|error| {
+                    TrashError::NoTrash(format!("cannot create {}: {error}", root.display()))
+                })?;
+        }
+        Err(error) => {
+            return Err(TrashError::NoTrash(format!("{}: {error}", root.display())));
+        }
+    }
+    Ok(TrashTarget {
+        root,
+        kind: TrashKind::Topdir(topdir),
+    })
+}
+
+/// Moves `path` (a link is moved as a link) into `target`, recording where
+/// it came from and when (`now` is local time). The `.trashinfo` is created
+/// first with `O_EXCL`, under a unique name on collision, and is removed
+/// again when the move into `files/` fails. `path` must be absolute.
+pub fn put(
+    path: &Path,
+    target: &TrashTarget,
+    now: NaiveDateTime,
+) -> Result<TrashedItem, TrashError> {
+    if !path.is_absolute() {
+        return Err(TrashError::Invalid(format!(
+            "{} is not an absolute path",
+            path.display()
+        )));
+    }
+    let base = path
+        .file_name()
+        .ok_or_else(|| TrashError::Invalid(format!("{} has no file name", path.display())))?;
+    let recorded = match &target.kind {
+        TrashKind::Home => path,
+        TrashKind::Topdir(topdir) => path.strip_prefix(topdir).map_err(|_| {
+            TrashError::Invalid(format!(
+                "{} is not under {}",
+                path.display(),
+                topdir.display()
+            ))
+        })?,
+    };
+    let content = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        encode_percent(recorded.as_os_str().as_bytes()),
+        now.format("%Y-%m-%dT%H:%M:%S")
+    );
+    let files_dir = target.root.join("files");
+    create_private_dir_all(&files_dir)?;
+    create_private_dir_all(&target.root.join("info"))?;
+
+    let is_dir = fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
+    for attempt in 1..=10_000u32 {
+        let name = if attempt == 1 {
+            base.to_owned()
+        } else {
+            numbered_name(base, attempt, is_dir)
+        };
+        let info_path = info_path_for(&target.root, &name);
+        let mut info = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&info_path)
+        {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let written = io::Write::write_all(&mut info, content.as_bytes());
+        drop(info);
+        let moved = written.and_then(|()| rename_noreplace(path, &files_dir.join(&name)));
+        match moved {
+            Ok(()) => {
+                return Ok(TrashedItem {
+                    root: target.root.clone(),
+                    name,
+                    original: path.to_path_buf(),
+                });
+            }
+            Err(error) => {
+                fs::remove_file(&info_path).ok();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    // `files/<name>` is taken (e.g. by an item without
+                    // info): try the next name.
+                    continue;
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    Err(TrashError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free name in the trash",
+    )))
+}
+
+/// Moves a trashed item back to its original path, creating missing parent
+/// directories (left in place if the move then fails), and removes its
+/// `.trashinfo` only after the move succeeded. If the original path is
+/// taken, `KeepBoth` restores under a unique name and `Fail` returns
+/// `AlreadyExists`; nothing is ever replaced. The move is a rename, so a
+/// restore across devices fails with `EXDEV` and changes nothing.
+pub fn restore(item: &TrashedItem, conflict: RestoreConflict) -> Result<PathBuf, TrashError> {
+    validate_item_name(&item.name)?;
+    let name = item
+        .original
+        .file_name()
+        .ok_or_else(|| TrashError::Invalid("original path has no file name".to_owned()))?;
+    let parent = item
+        .original
+        .parent()
+        .ok_or_else(|| TrashError::Invalid("original path has no parent".to_owned()))?;
+    fs::create_dir_all(parent)?;
+    let destination = match conflict {
+        RestoreConflict::Fail => item.original.clone(),
+        RestoreConflict::KeepBoth => parent.join(unique_name(parent, name)),
+    };
+    // NOREPLACE keeps `Fail` honest even if the path appears meanwhile.
+    rename_noreplace(&item.files_path(), &destination)?;
+    // The item is back; a leftover info file is only stale metadata.
+    fs::remove_file(item.info_path()).ok();
+    Ok(destination)
+}
+
+/// Removes one trashed item for good: its `files/` entry (directories
+/// recursively, symlinks never followed) and then its `.trashinfo`. When the
+/// content cannot be removed the info is kept so the item stays listed.
+pub fn delete_permanently(item: &TrashedItem) -> Result<(), TrashError> {
+    validate_item_name(&item.name)?;
+    remove_item(&item.root, &item.name)?;
+    Ok(())
+}
+
+fn remove_item(root: &Path, name: &OsStr) -> io::Result<()> {
+    let content = root.join("files").join(name);
+    match fs::symlink_metadata(&content) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&content)?,
+        Ok(_) => fs::remove_file(&content)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::remove_file(info_path_for(root, name)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Permanently removes everything in the trash at `trash_root`, item by
+/// item. Items that cannot be removed are reported and stay (with their
+/// info); orphan `.trashinfo` files without content are removed too.
+pub fn empty(trash_root: &Path) -> Result<EmptyReport, TrashError> {
+    let files_dir = trash_root.join("files");
+    let mut report = EmptyReport::default();
+    match fs::symlink_metadata(&files_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
+        Err(error) => return Err(error.into()),
+        Ok(meta) if !meta.is_dir() => {
+            return Err(TrashError::Invalid(format!(
+                "{} is not a directory",
+                files_dir.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    for found in fs::read_dir(&files_dir)? {
+        let name = match found {
+            Ok(found) => found.file_name(),
+            Err(error) => {
+                report.failures.push((files_dir.clone(), error));
+                continue;
+            }
+        };
+        match remove_item(trash_root, &name) {
+            Ok(()) => report.removed += 1,
+            Err(error) => report.failures.push((files_dir.join(&name), error)),
+        }
+    }
+    // Info files whose content is gone.
+    if let Ok(infos) = fs::read_dir(trash_root.join("info")) {
+        for info in infos.flatten() {
+            let file_name = info.file_name();
+            let Some(stem) = file_name.as_bytes().strip_suffix(b".trashinfo") else {
+                continue;
+            };
+            let content = files_dir.join(OsStr::from_bytes(stem));
+            if fs::symlink_metadata(&content).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+                fs::remove_file(info.path()).ok();
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -430,6 +845,558 @@ mod tests {
                 b"/home/fixture/caf\xe9-report.tar.gz".to_vec()
             )))
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Scratch directory holding a fake home, trash and mount; removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(prefix: &str) -> io::Result<Scratch> {
+            let tick = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let dir = std::env::temp_dir().join(format!(
+                "fileflux-trashw-{prefix}-{}-{tick}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir)?;
+            Ok(Scratch(dir))
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        fn target(&self) -> TrashTarget {
+            TrashTarget::home(self.path("Trash"))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn when() -> Result<NaiveDateTime, Box<dyn std::error::Error>> {
+        NaiveDate::from_ymd_opt(2024, 3, 9)
+            .and_then(|date| date.and_hms_opt(7, 5, 3))
+            .ok_or_else(|| "bad fixture date".into())
+    }
+
+    fn names(dir: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            found.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    fn trash_file(
+        scratch: &Scratch,
+        rel: &str,
+        body: &[u8],
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = scratch.path(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn encode_percent_round_trips_and_keeps_slashes() {
+        let raw: &[u8] = b"/home/u/My Docs/caf\xc3\xa9 100%#.txt";
+        let encoded = encode_percent(raw);
+        assert_eq!(encoded, "/home/u/My%20Docs/caf%C3%A9%20100%25%23.txt");
+        assert_eq!(decode_percent(encoded.as_bytes()).as_deref(), Some(raw));
+        let odd = b"a\xe9b";
+        assert_eq!(
+            decode_percent(encode_percent(odd).as_bytes()).as_deref(),
+            Some(odd.as_slice())
+        );
+        assert_eq!(encode_percent(b"safe-_.~/Name9"), "safe-_.~/Name9");
+    }
+
+    #[test]
+    fn put_writes_files_and_info_with_spec_content() -> TestResult {
+        let scratch = Scratch::new("put")?;
+        let file = trash_file(&scratch, "home/My Docs/report v1.txt", b"data")?;
+        let target = scratch.target();
+
+        let item = put(&file, &target, when()?)?;
+
+        assert!(!file.exists(), "the file left its place");
+        assert_eq!(item.name, "report v1.txt");
+        assert_eq!(item.original, file);
+        assert_eq!(item.files_path(), target.root.join("files/report v1.txt"));
+        assert_eq!(fs::read(item.files_path())?, b"data");
+        let info = fs::read_to_string(target.root.join("info/report v1.txt.trashinfo"))?;
+        let expected = format!(
+            "[Trash Info]\nPath={}\nDeletionDate=2024-03-09T07:05:03\n",
+            file.to_string_lossy().replace(' ', "%20")
+        );
+        assert_eq!(info, expected);
+        assert_eq!(
+            item.info_path(),
+            target.root.join("info/report v1.txt.trashinfo")
+        );
+        // The existing read side sees it, with the original path.
+        let listing = read_trash(&target.root)?;
+        assert!(listing.warnings.is_empty());
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(
+            listing.entries.first().and_then(|e| e.origin.clone()),
+            Some(file)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn put_creates_private_trash_directories() -> TestResult {
+        let scratch = Scratch::new("put-modes")?;
+        let file = trash_file(&scratch, "home/a.txt", b"x")?;
+        let target = scratch.target();
+        put(&file, &target, when()?)?;
+        for dir in ["files", "info"] {
+            let mode = fs::metadata(target.root.join(dir))?.mode() & 0o777;
+            assert_eq!(mode, 0o700, "{dir}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn put_same_name_twice_keeps_both() -> TestResult {
+        let scratch = Scratch::new("put-collide")?;
+        let first = trash_file(&scratch, "home/a/note.txt", b"one")?;
+        let second = trash_file(&scratch, "home/b/note.txt", b"two")?;
+        let target = scratch.target();
+
+        let one = put(&first, &target, when()?)?;
+        let two = put(&second, &target, when()?)?;
+
+        assert_ne!(one.name, two.name);
+        assert_eq!(two.name, "note (2).txt");
+        assert_eq!(fs::read(one.files_path())?, b"one");
+        assert_eq!(fs::read(two.files_path())?, b"two");
+        let info = fs::read_to_string(two.info_path())?;
+        assert!(info.contains(&second.to_string_lossy().into_owned()));
+        assert_eq!(names(&target.root.join("info"))?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn put_skips_a_name_already_taken_in_files() -> TestResult {
+        let scratch = Scratch::new("put-orphan")?;
+        let target = scratch.target();
+        fs::create_dir_all(target.root.join("files"))?;
+        fs::write(target.root.join("files/a.txt"), b"orphan")?;
+        let file = trash_file(&scratch, "home/a.txt", b"new")?;
+
+        let item = put(&file, &target, when()?)?;
+
+        assert_eq!(item.name, "a (2).txt");
+        assert_eq!(fs::read(target.root.join("files/a.txt"))?, b"orphan");
+        assert_eq!(names(&target.root.join("info"))?, ["a (2).txt.trashinfo"]);
+        Ok(())
+    }
+
+    #[test]
+    fn put_failure_removes_the_info_file() -> TestResult {
+        let scratch = Scratch::new("put-fail")?;
+        let target = scratch.target();
+        let missing = scratch.path("home/ghost.txt");
+        fs::create_dir_all(scratch.path("home"))?;
+
+        let result = put(&missing, &target, when()?);
+
+        assert!(result.is_err());
+        assert!(names(&target.root.join("info"))?.is_empty());
+        assert!(names(&target.root.join("files"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn put_rejects_relative_paths() -> TestResult {
+        let scratch = Scratch::new("put-relative")?;
+        let result = put(Path::new("relative.txt"), &scratch.target(), when()?);
+        assert!(matches!(result, Err(TrashError::Invalid(_))));
+        assert!(!scratch.path("Trash").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn put_on_a_symlink_trashes_the_link_not_the_target() -> TestResult {
+        let scratch = Scratch::new("put-link")?;
+        let real = trash_file(&scratch, "home/real.txt", b"real")?;
+        let dir = scratch.path("home/realdir");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("inner"), b"inner")?;
+        let link = scratch.path("home/link.txt");
+        let dirlink = scratch.path("home/dirlink");
+        symlink(&real, &link)?;
+        symlink(&dir, &dirlink)?;
+        let target = scratch.target();
+
+        let one = put(&link, &target, when()?)?;
+        let two = put(&dirlink, &target, when()?)?;
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(&real)?, b"real");
+        assert_eq!(fs::read(dir.join("inner"))?, b"inner");
+        assert!(fs::symlink_metadata(one.files_path())?.is_symlink());
+        assert!(fs::symlink_metadata(two.files_path())?.is_symlink());
+        assert_eq!(fs::read_link(one.files_path())?, real);
+        Ok(())
+    }
+
+    #[test]
+    fn put_on_a_directory_moves_the_whole_tree() -> TestResult {
+        let scratch = Scratch::new("put-dir")?;
+        let file = trash_file(&scratch, "home/Photos/a.jpg", b"jpg")?;
+        let dir = scratch.path("home/Photos");
+        let item = put(&dir, &scratch.target(), when()?)?;
+        assert!(!dir.exists());
+        assert_eq!(fs::read(item.files_path().join("a.jpg"))?, b"jpg");
+        assert!(!file.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn trash_dir_for_picks_home_on_the_same_device() -> TestResult {
+        let scratch = Scratch::new("dir-home")?;
+        let file = trash_file(&scratch, "home/a.txt", b"x")?;
+        let home_dev = fs::symlink_metadata(&file)?.dev();
+        let home_trash = scratch.path("Trash");
+
+        let target = trash_dir_for(&file, &home_trash, home_dev, 1000, |_| None)?;
+
+        assert_eq!(target, TrashTarget::home(home_trash));
+        Ok(())
+    }
+
+    #[test]
+    fn trash_dir_for_uses_topdir_trash_on_another_device() -> TestResult {
+        let scratch = Scratch::new("dir-top")?;
+        let topdir = scratch.path("mnt");
+        let file = trash_file(&scratch, "mnt/stuff/a.txt", b"x")?;
+        let other_dev = fs::symlink_metadata(&file)?.dev().wrapping_add(1);
+        let seen = std::cell::RefCell::new(None);
+
+        let target = trash_dir_for(&file, &scratch.path("Trash"), other_dev, 1234, |path| {
+            *seen.borrow_mut() = Some(path.to_path_buf());
+            Some(topdir.clone())
+        })?;
+
+        assert_eq!(seen.take(), Some(file.clone()));
+        assert_eq!(target.root, topdir.join(".Trash-1234"));
+        assert_eq!(target.kind, TrashKind::Topdir(topdir.clone()));
+        let meta = fs::symlink_metadata(&target.root)?;
+        assert!(meta.is_dir());
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        assert!(!scratch.path("Trash").exists(), "home trash untouched");
+
+        // Reusing the existing directory works too.
+        let again = trash_dir_for(&file, &scratch.path("Trash"), other_dev, 1234, |_| {
+            Some(topdir.clone())
+        })?;
+        assert_eq!(again, target);
+        Ok(())
+    }
+
+    #[test]
+    fn topdir_trash_records_topdir_relative_paths_and_round_trips() -> TestResult {
+        let scratch = Scratch::new("top-roundtrip")?;
+        let topdir = scratch.path("mnt");
+        let file = trash_file(&scratch, "mnt/stuff/My File.txt", b"usb")?;
+        let other_dev = fs::symlink_metadata(&file)?.dev().wrapping_add(1);
+        let target = trash_dir_for(&file, &scratch.path("Trash"), other_dev, 77, |_| {
+            Some(topdir.clone())
+        })?;
+
+        let item = put(&file, &target, when()?)?;
+
+        let info = fs::read_to_string(item.info_path())?;
+        assert!(info.contains("Path=stuff/My%20File.txt\n"), "{info}");
+        assert_eq!(item.original, file, "item carries the absolute path");
+        let loaded = TrashedItem::load(&target, &item.name)?;
+        assert_eq!(loaded, item);
+        assert_eq!(restore(&loaded, RestoreConflict::Fail)?, file);
+        assert_eq!(fs::read(&file)?, b"usb");
+        Ok(())
+    }
+
+    #[test]
+    fn trash_dir_for_without_a_usable_trash_is_an_error_not_a_delete() -> TestResult {
+        let scratch = Scratch::new("dir-none")?;
+        let file = trash_file(&scratch, "mnt/a.txt", b"x")?;
+        let other_dev = fs::symlink_metadata(&file)?.dev().wrapping_add(1);
+
+        let none = trash_dir_for(&file, &scratch.path("Trash"), other_dev, 1, |_| None);
+        assert!(matches!(none, Err(TrashError::NoTrash(_))));
+
+        // A topdir trash path occupied by a file or a symlink is unusable.
+        fs::write(scratch.path("mnt/.Trash-1"), b"squatter")?;
+        let squatted = trash_dir_for(&file, &scratch.path("Trash"), other_dev, 1, |_| {
+            Some(scratch.path("mnt"))
+        });
+        assert!(matches!(squatted, Err(TrashError::NoTrash(_))));
+        assert!(file.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn load_rejects_hostile_relative_paths() -> TestResult {
+        let scratch = Scratch::new("load-hostile")?;
+        let target = TrashTarget {
+            root: scratch.path("mnt/.Trash-1"),
+            kind: TrashKind::Topdir(scratch.path("mnt")),
+        };
+        fs::create_dir_all(target.root.join("info"))?;
+        fs::write(
+            target.root.join("info/x.trashinfo"),
+            "[Trash Info]\nPath=../../etc/passwd\n",
+        )?;
+        assert!(matches!(
+            TrashedItem::load(&target, OsStr::new("x")),
+            Err(TrashError::Invalid(_))
+        ));
+        let home = scratch.target();
+        fs::create_dir_all(home.root.join("info"))?;
+        fs::write(
+            home.root.join("info/y.trashinfo"),
+            "[Trash Info]\nPath=rel/y\n",
+        )?;
+        assert!(matches!(
+            TrashedItem::load(&home, OsStr::new("y")),
+            Err(TrashError::Invalid(_))
+        ));
+        assert!(matches!(
+            TrashedItem::load(&home, OsStr::new("../y")),
+            Err(TrashError::Invalid(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn restore_round_trip_returns_the_file_and_drops_the_info() -> TestResult {
+        let scratch = Scratch::new("restore")?;
+        let file = trash_file(&scratch, "home/a b.txt", b"data")?;
+        let target = scratch.target();
+        let item = put(&file, &target, when()?)?;
+
+        let restored = restore(&item, RestoreConflict::Fail)?;
+
+        assert_eq!(restored, file);
+        assert_eq!(fs::read(&file)?, b"data");
+        assert!(names(&target.root.join("files"))?.is_empty());
+        assert!(names(&target.root.join("info"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_recreates_missing_parent_directories() -> TestResult {
+        let scratch = Scratch::new("restore-parents")?;
+        let file = trash_file(&scratch, "home/deep/er/a.txt", b"data")?;
+        let item = put(&file, &scratch.target(), when()?)?;
+        fs::remove_dir_all(scratch.path("home/deep"))?;
+
+        let restored = restore(&item, RestoreConflict::Fail)?;
+
+        assert_eq!(fs::read(restored)?, b"data");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_conflict_fail_changes_nothing() -> TestResult {
+        let scratch = Scratch::new("restore-fail")?;
+        let file = trash_file(&scratch, "home/a.txt", b"old")?;
+        let target = scratch.target();
+        let item = put(&file, &target, when()?)?;
+        fs::write(&file, b"newer")?;
+
+        let error = restore(&item, RestoreConflict::Fail)
+            .err()
+            .ok_or("restored over")?;
+
+        assert!(error.is_already_exists());
+        assert_eq!(fs::read(&file)?, b"newer");
+        assert_eq!(fs::read(item.files_path())?, b"old");
+        assert!(item.info_path().exists(), "info kept until success");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_conflict_keep_both_uses_a_unique_name() -> TestResult {
+        let scratch = Scratch::new("restore-keep")?;
+        let file = trash_file(&scratch, "home/a.txt", b"old")?;
+        let target = scratch.target();
+        let item = put(&file, &target, when()?)?;
+        fs::write(&file, b"newer")?;
+
+        let restored = restore(&item, RestoreConflict::KeepBoth)?;
+
+        assert_eq!(restored, scratch.path("home/a (2).txt"));
+        assert_eq!(fs::read(&restored)?, b"old");
+        assert_eq!(fs::read(&file)?, b"newer");
+        assert!(!item.info_path().exists());
+        assert!(!item.files_path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_a_trashed_symlink_restores_the_link() -> TestResult {
+        let scratch = Scratch::new("restore-link")?;
+        let real = trash_file(&scratch, "home/real.txt", b"real")?;
+        let link = scratch.path("home/link");
+        symlink(&real, &link)?;
+        let item = put(&link, &scratch.target(), when()?)?;
+
+        restore(&item, RestoreConflict::Fail)?;
+
+        assert_eq!(fs::read_link(&link)?, real);
+        assert_eq!(fs::read(&real)?, b"real");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_a_forged_item_name() -> TestResult {
+        let scratch = Scratch::new("restore-forged")?;
+        let victim = trash_file(&scratch, "victim.txt", b"keep")?;
+        let item = TrashedItem {
+            root: scratch.path("Trash"),
+            name: OsString::from("../../victim.txt"),
+            original: scratch.path("elsewhere.txt"),
+        };
+        assert!(restore(&item, RestoreConflict::Fail).is_err());
+        assert!(delete_permanently(&item).is_err());
+        assert_eq!(fs::read(&victim)?, b"keep");
+        Ok(())
+    }
+
+    #[test]
+    fn delete_permanently_removes_content_and_info_only_for_that_item() -> TestResult {
+        let scratch = Scratch::new("delete")?;
+        let outside = trash_file(&scratch, "outside.txt", b"outside")?;
+        let dir = scratch.path("home/tree");
+        fs::create_dir_all(dir.join("sub"))?;
+        fs::write(dir.join("sub/f"), b"f")?;
+        symlink(&outside, dir.join("sub/link"))?;
+        symlink(scratch.path("home"), dir.join("sub/dirlink"))?;
+        let keep = trash_file(&scratch, "home/keep.txt", b"keep")?;
+        let target = scratch.target();
+        let gone = put(&dir, &target, when()?)?;
+        let kept = put(&keep, &target, when()?)?;
+
+        delete_permanently(&gone)?;
+
+        assert!(!gone.files_path().exists());
+        assert!(!gone.info_path().exists());
+        assert_eq!(fs::read(kept.files_path())?, b"keep");
+        assert!(kept.info_path().exists());
+        assert_eq!(fs::read(&outside)?, b"outside", "links were not followed");
+        assert!(scratch.path("home").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_permanently_of_a_symlink_removes_only_the_link() -> TestResult {
+        let scratch = Scratch::new("delete-link")?;
+        let real = trash_file(&scratch, "home/real.txt", b"real")?;
+        let link = scratch.path("home/link");
+        symlink(&real, &link)?;
+        let item = put(&link, &scratch.target(), when()?)?;
+        delete_permanently(&item)?;
+        assert!(fs::symlink_metadata(item.files_path()).is_err());
+        assert_eq!(fs::read(&real)?, b"real");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_removes_everything_and_reports_per_item() -> TestResult {
+        let scratch = Scratch::new("empty")?;
+        let outside = trash_file(&scratch, "outside.txt", b"outside")?;
+        let target = scratch.target();
+        let a = trash_file(&scratch, "home/a.txt", b"a")?;
+        let dir = scratch.path("home/tree");
+        fs::create_dir_all(&dir)?;
+        symlink(&outside, dir.join("link"))?;
+        let link = scratch.path("home/link");
+        symlink(&outside, &link)?;
+        put(&a, &target, when()?)?;
+        put(&dir, &target, when()?)?;
+        put(&link, &target, when()?)?;
+        // An orphan info file with no content is cleaned up too.
+        fs::write(
+            target.root.join("info/orphan.trashinfo"),
+            "[Trash Info]\nPath=/x\n",
+        )?;
+
+        let report = empty(&target.root)?;
+
+        assert_eq!(report.removed, 3);
+        assert!(report.failures.is_empty());
+        assert!(names(&target.root.join("files"))?.is_empty());
+        assert!(names(&target.root.join("info"))?.is_empty());
+        assert_eq!(fs::read(&outside)?, b"outside");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_reports_items_it_could_not_remove_and_keeps_their_info() -> TestResult {
+        let scratch = Scratch::new("empty-fail")?;
+        let target = scratch.target();
+        let ok = trash_file(&scratch, "home/ok.txt", b"ok")?;
+        let stuck_dir = scratch.path("home/stuck");
+        fs::create_dir_all(stuck_dir.join("locked"))?;
+        fs::write(stuck_dir.join("locked/f"), b"f")?;
+        put(&ok, &target, when()?)?;
+        let stuck = put(&stuck_dir, &target, when()?)?;
+        let locked = stuck.files_path().join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))?;
+
+        let report = empty(&target.root)?;
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
+        // Running as root bypasses permission bits; only assert when blocked.
+        if report.failures.is_empty() {
+            return Ok(());
+        }
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures.first().map(|f| f.0.clone()),
+            Some(stuck.files_path())
+        );
+        assert!(stuck.info_path().exists(), "info stays with its item");
+        assert!(names(&target.root.join("files"))? == ["stuck"]);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_of_a_missing_trash_is_a_noop() -> TestResult {
+        let scratch = Scratch::new("empty-missing")?;
+        let report = empty(&scratch.path("Trash"))?;
+        assert_eq!(report.removed, 0);
+        assert!(!scratch.path("Trash").exists());
         Ok(())
     }
 }
