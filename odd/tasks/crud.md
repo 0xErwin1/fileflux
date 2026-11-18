@@ -1,0 +1,21 @@
+# Fileflux file operations (CRUD)
+Goal: turn the read-only explorer into a working file manager: create, rename, trash/restore, delete, copy/move/paste, open, with undo where safe. Branch: main (local commits, no push). Risk: item 1 (irreversible data effects) for every task touching the filesystem — independent verification required before close.
+Safety defaults (not optional): Del moves to the freedesktop Trash; permanent deletion only via Shift+Del or the Trash view, always behind a confirmation dialog; nothing ever overwrites silently; symlinks are never followed for delete/move/copy (they are copied/moved as links); operations run off the UI thread; tests and native checks use scratch directories under /tmp only (`fileflux /tmp/<fixture>` with HOME pointed at a fixture).
+
+## Specs
+- S1: "Tambien de paso dame una lista de feature a agregar, falta todo lo que es CRUD, preview y demas"
+- S2: "continua no estoy para validar yo, validas vos" — continue with the next proposed feature (CRUD, recommended right after the visual pass) and validate it without the user.
+- S3 (accepted proposal, verbatim): "Nueva carpeta y nuevo archivo." / "Renombrar inline con `F2`." / "Mover a la Papelera (spec freedesktop) y, desde la Papelera, restaurar y vaciar." / "Borrado permanente con confirmación (`Shift+Del`)." / "Copiar, cortar y pegar con progreso y manejo de conflictos (reemplazar, saltar o renombrar)." / "Drag & drop para mover o copiar." / "Deshacer para renombrar, mover y mandar a la papelera." / "Menú contextual (click derecho)." / "Abrir con la app por defecto (`xdg-open`), \"Abrir con…\", abrir terminal aquí y copiar ruta."
+- S4 (accepted risk notes, verbatim): "Mover entre particiones no funciona con un simple rename: el sistema devuelve `EXDEV` y hay que copiar y luego borrar. Si esa copia falla a medias, quedan archivos duplicados o perdidos. Los symlinks y los permisos también tienen que estar cubiertos por tests contra directorios aislados." / "Sin refresco en vivo, cualquier operación deja la vista desactualizada. Por eso el watcher tiene que ir junto con CRUD, no después."
+- S5 (UI reference): design/file-explorer/04-refined-shell.html context menu (`openMenu`), F2 inline rename, trash toast with Undo, New folder chip.
+
+## Tasks
+- T1 | S3,S4 | route: writer (core, parallel with refined-shell follow-ups) | pending | `src/core/ops.rs` + trash write side: create dir/file, validated rename (no-replace), copy/move with conflict policy, EXDEV copy+verify+delete, cancel/progress, freedesktop trash put/restore/delete/empty, all tested on tmp | commit: -
+- T2 | S4 | route: writer after T1 | pending | Live refresh: watch the current directory (inotify via rustix, no new dependency) and rescan on change, debounced; own operations also rescan | commit: -
+- T3 | S3,S5 | route: writer after T1 | pending | UI: context menu, F2 rename, New folder/file, Del → Trash with undo toast, Shift+Del confirm, Ctrl+C/X/V with progress + conflict dialog, Ctrl+Z undo (rename/move/trash/new), Enter/double-click opens files with xdg-open, Open with…, open terminal here, copy path; Trash view Restore / Delete permanently / Empty with confirm | commit: -
+- T4 | S3 | route: writer after T3 | pending | Drag & drop inside the window (move; Ctrl = copy) onto folders and sidebar places | commit: -
+- T5 | S2,S4 | route: independent gentle-ai-verify (Risk item 1) | pending | Verify on isolated fixtures: no data loss on conflicts, EXDEV, symlinks, permissions, cancel mid-copy, trash round-trip, undo | commit: -
+
+## Log
+- L1: "Tambien de paso dame una lista de feature a agregar, falta todo lo que es CRUD, preview y demas"
+- L2: "continua no estoy para validar yo, validas vos" → start CRUD after the refined shell; the agent validates (native Xvfb checks + independent verifier).

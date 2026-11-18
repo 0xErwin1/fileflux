@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 pub mod fs;
 pub mod navigation;
+pub mod ops;
 pub mod places;
 pub mod trash;
 
