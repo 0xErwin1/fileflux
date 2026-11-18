@@ -1,6 +1,7 @@
 //! The Fileflux explorer: the native Bolt shell for the read-only MVP.
 
 pub(crate) mod entries;
+pub(crate) mod inspector;
 pub(crate) mod sidebar;
 pub(crate) mod state;
 pub(crate) mod table;

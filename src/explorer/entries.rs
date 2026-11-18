@@ -83,10 +83,6 @@ const PHOTO_HEIGHT: f32 = 46.0;
 /// folder glyph is stroke-only, so the two tones are composed natively.
 const FOLDER_VIEW_WIDTH: f32 = 59.0;
 const FOLDER_VIEW_HEIGHT: f32 = 50.0;
-/// Scale from artboard viewBox units to pixels.
-const FOLDER_SCALE: f32 = THUMB_HEIGHT / FOLDER_VIEW_HEIGHT;
-/// Silhouette width in pixels; fits [`THUMB_WIDTH`].
-const FOLDER_WIDTH: f32 = FOLDER_VIEW_WIDTH * FOLDER_SCALE;
 
 /// Whether a file gets a real thumbnail: decided from the extension alone,
 /// never by reading the file. Only formats GPUI's image loader decodes
@@ -135,30 +131,40 @@ pub(crate) fn file_glyph(name: &OsStr) -> gpui_kit_assets::IconName {
     }
 }
 
-/// One rectangle of the folder silhouette, given in artboard viewBox units.
-fn folder_part(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Div {
+/// One rectangle of the folder silhouette, given in artboard viewBox units
+/// and drawn at `scale` pixels per unit.
+fn folder_part(scale: f32, x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Div {
     div()
         .absolute()
-        .left(px(x * FOLDER_SCALE))
-        .top(px(y * FOLDER_SCALE))
-        .w(px(width * FOLDER_SCALE))
-        .h(px(height * FOLDER_SCALE))
+        .left(px(x * scale))
+        .top(px(y * scale))
+        .w(px(width * scale))
+        .h(px(height * scale))
         .bg(color)
 }
 
-/// The two-tone folder of the artboard's `folderArt`: the back layer (tab
-/// plus back panel) in info at reduced opacity, the front body in full
-/// info, and a faint lighter top edge in strong.
-fn folder_silhouette(info: Hsla, strong: Hsla) -> impl IntoElement {
+/// The two-tone folder of the artboard's `folderArt`, `height` pixels tall:
+/// the back layer (tab plus back panel) in info at reduced opacity, the
+/// front body in full info, and a faint lighter top edge in strong. The
+/// grid draws it [`THUMB_HEIGHT`] tall, the details panel larger.
+pub(crate) fn folder_silhouette(info: Hsla, strong: Hsla, height: f32) -> impl IntoElement {
     let back = info.opacity(0.55);
+    let scale = height / FOLDER_VIEW_HEIGHT;
     div()
         .relative()
-        .w(px(FOLDER_WIDTH))
-        .h(px(THUMB_HEIGHT))
-        .child(folder_part(2.0, 6.0, 20.0, 5.0, back))
-        .child(folder_part(2.0, 11.0, 55.0, 4.0, back))
-        .child(folder_part(2.0, 15.0, 55.0, 31.0, info))
-        .child(folder_part(2.0, 15.0, 55.0, 3.0, strong.opacity(0.18)))
+        .w(px(FOLDER_VIEW_WIDTH * scale))
+        .h(px(height))
+        .child(folder_part(scale, 2.0, 6.0, 20.0, 5.0, back))
+        .child(folder_part(scale, 2.0, 11.0, 55.0, 4.0, back))
+        .child(folder_part(scale, 2.0, 15.0, 55.0, 31.0, info))
+        .child(folder_part(
+            scale,
+            2.0,
+            15.0,
+            55.0,
+            3.0,
+            strong.opacity(0.18),
+        ))
 }
 
 /// A file glyph centered in the thumbnail slot.
@@ -426,7 +432,7 @@ fn render_grid_row(
         } else if tile.is_symlink {
             file_glyph_element(gpui_kit_assets::IconName::FileSymlink, colors.muted)
         } else if is_folder {
-            folder_silhouette(colors.info, colors.strong).into_any_element()
+            folder_silhouette(colors.info, colors.strong, THUMB_HEIGHT).into_any_element()
         } else if has_thumbnail(&tile.name) {
             photo_thumbnail(path.clone(), &tile.name, &colors)
         } else {
@@ -659,7 +665,8 @@ mod tests {
         );
         assert_eq!(TILE_WIDTH, 112.0);
         assert_eq!(THUMB_HEIGHT, 52.0);
-        let (folder_width, thumb_width) = (FOLDER_WIDTH, THUMB_WIDTH);
+        let folder_width = FOLDER_VIEW_WIDTH * THUMB_HEIGHT / FOLDER_VIEW_HEIGHT;
+        let thumb_width = THUMB_WIDTH;
         assert!(
             folder_width <= thumb_width,
             "silhouette fits the slot width"

@@ -81,6 +81,21 @@ pub fn filtered_indices(entries: &[Entry], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The unix permission bits (`st_mode`) of `path`, following symlinks, or
+/// `None` on platforms without them. One `stat`: callers run it off the UI
+/// thread, only for the entry the details panel shows.
+pub fn read_mode(path: &Path) -> io::Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Some(fs::metadata(path)?.mode()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(path).map(|_| None)
+    }
+}
+
 /// Builds one listing entry; `Err` carries a ready-to-push warning string.
 fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
     let name: OsString = dir_entry.file_name();
@@ -156,7 +171,7 @@ mod tests {
     use std::time::SystemTime;
 
     use super::super::{Entry, EntryKind, Listing};
-    use super::{filtered_indices, read_directory};
+    use super::{filtered_indices, read_directory, read_mode};
 
     /// RAII scratch directory under the system temp dir; removed on drop.
     struct Scratch {
@@ -255,6 +270,28 @@ mod tests {
             zeta.path,
             scratch.path().join("zeta.txt"),
             "paths keep raw filesystem form"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_mode_reports_permission_bits_and_missing_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = scratch("mode")?;
+        let file = scratch.path().join("f.txt");
+        fs::write(&file, "x")?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640))?;
+
+        let mode = read_mode(&file)?.ok_or("unix reports a mode")?;
+        assert_eq!(mode & 0o7777, 0o640);
+
+        let missing = read_mode(&scratch.path().join("nope"));
+        assert_eq!(
+            missing.err().map(|err| err.kind()),
+            Some(std::io::ErrorKind::NotFound)
         );
         Ok(())
     }

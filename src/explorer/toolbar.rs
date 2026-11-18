@@ -2,7 +2,7 @@
 //! states, the breadcrumb path (Ctrl+L or a click on its empty space edits
 //! it), the current-folder filename
 //! search (Ctrl+F, with its live match count), the segmented grid/list toggle,
-//! and the session-favorites star.
+//! the details-panel toggle and the session-favorites star.
 //!
 //! The controls keep their sizes from `bolt`'s tokens; on narrow windows
 //! they shrink with flex instead of disappearing, and the sidebar toggle
@@ -148,6 +148,20 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     "List view",
                     View::List,
                 )),
+        )
+        // The details panel toggle: tinted while the panel is open.
+        .child(
+            Button::new("explorer-inspector-toggle", "Details panel")
+                .ghost()
+                .icon_only()
+                .icon(icon(gpui_kit_assets::IconName::PanelRight))
+                .tooltip("Show or hide the details panel (Ctrl+I)")
+                .selected(this.inspector_open)
+                .toggled(this.inspector_open)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.inspector_open = !this.inspector_open;
+                    cx.notify();
+                })),
         )
         // The session favorites toggle for the current directory.
         .child(

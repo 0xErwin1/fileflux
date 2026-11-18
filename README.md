@@ -41,6 +41,7 @@ Use `--` before a directory whose name starts with `-`. Pointing the explorer at
 | Search | Ctrl+F filters file names in the current folder only — case-insensitive, nonrecursive, with a live "n of m" count; no matches is distinct from an empty folder; Escape clears. |
 | Selection | Click selects, Ctrl+click toggles, Shift+click selects a range in the displayed order, Escape clears; arrow keys and Home/End move through the visible entries in the order the list is sorted and scroll them into view; a filtered-out selection stays selected. The table's internal selection is off, so pointer and keyboard selection stay one source of truth. |
 | Open | Double click or Enter navigates into folders. Files, symlinks, and broken links are never opened and answer honestly in the status bar that Fileflux is read-only. |
+| Details panel | A 300 px read-only panel on the right of the document island, toggled by the toolbar panel button or Ctrl+I (open by default; hidden automatically when the window is too narrow to leave the entries 520 px). Nothing selected: the folder glyph, name, item count and full location. One entry: a preview (image files draw the image, contain-fit; others the folder/file glyph), name, kind ("Image · JPG"), size, local modified time, permissions (`rw-r--r--`, read off the UI thread with one `stat`) and path (Trash entries show their original location). Several: the count and the total size of the selected files. No Open/Rename/Trash actions. |
 | Status bar | Left: "N items" or "N selected · <total size of the selected files>", plus loading, error and read-only notices. Right: the free space of the volume that holds the current folder (longest mount-path prefix) with a small success-colored square. Shortcuts live in the toolbar tooltips. |
 | Favorites | Session-only: the toolbar star adds/removes the current directory. Nothing is written to configuration; the Trash cannot be favorited. |
 | Loading | Directory scans, Trash reads and places discovery run off the UI thread with a generation guard: stale completions (including a newer failed request's) never overwrite newer results. |
@@ -57,7 +58,7 @@ The Trash is the freedesktop home Trash only, labeled as such, read-only — no 
 | `cargo clippy --all-targets -- -D warnings` | Lints with the family lint set |
 | `cargo build --locked` | Builds the binary |
 
-Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R reload · Enter open(selected) · Escape cancel/clear. Escape while the path field or the search field is focused restores the committed path or clears the query and returns the keyboard to the folder contents; Escape elsewhere clears the selection.
+Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R reload · Ctrl+I details panel · Enter open(selected) · Escape cancel/clear. Escape while the path field or the search field is focused restores the committed path or clears the query and returns the keyboard to the folder contents; Escape elsewhere clears the selection.
 
 ## Native smoke helper
 
@@ -65,7 +66,7 @@ Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R relo
 
 ## Current scope
 
-Read-only by design (S3): no destructive operations, no copy/move, no tabs, no previews. The window title shows the current folder plus Fileflux; the empty top gutter matches the 8 px side gutters (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable. The app always starts in Bolt's dark palette, whatever the operating system's appearance; there is no theme toggle.
+Read-only by design (S3): no destructive operations, no copy/move, no tabs; the details panel previews image files only. The window title shows the current folder plus Fileflux; the empty top gutter matches the 8 px side gutters (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable. The app always starts in Bolt's dark palette, whatever the operating system's appearance; there is no theme toggle.
 
 ## Design
 

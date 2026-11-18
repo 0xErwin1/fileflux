@@ -28,6 +28,7 @@ use gpui::{
 };
 use gpui_component::table::{TableEvent, TableState};
 
+use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::{entries, sidebar, toolbar, util};
@@ -55,6 +56,8 @@ actions!(
         NavigateUp,
         /// Re-reads the current location from the filesystem.
         Reload,
+        /// Shows or hides the details panel.
+        ToggleInspector,
     ]
 );
 
@@ -91,6 +94,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-right", NavigateForward, shell),
         KeyBinding::new("alt-up", NavigateUp, shell),
         KeyBinding::new("ctrl-r", Reload, shell),
+        KeyBinding::new("ctrl-i", ToggleInspector, shell),
         KeyBinding::new("up", SelectUp, entries),
         KeyBinding::new("down", SelectDown, entries),
         KeyBinding::new("left", SelectLeft, entries),
@@ -186,6 +190,14 @@ pub(crate) struct Explorer {
     /// The grid column count of the last render, so keyboard row steps use
     /// the same geometry the list draws with.
     pub(crate) rendered_columns: usize,
+    /// Whether the user wants the details panel (Ctrl+I, toolbar button).
+    pub(crate) inspector_open: bool,
+    /// Whether the panel drew in the last render: wanted and wide enough.
+    pub(crate) inspector_shown: bool,
+    /// The mode of the single inspected entry, probed off the UI thread.
+    pub(crate) permissions: Option<PermissionProbe>,
+    /// The permission probe in flight, replaced by the next one.
+    pub(crate) permission_task: Option<Task<()>>,
 }
 
 impl Focusable for Explorer {
@@ -262,6 +274,10 @@ impl Explorer {
             scan_task: None,
             sidebar_open: true,
             rendered_columns: 1,
+            inspector_open: true,
+            inspector_shown: false,
+            permissions: None,
+            permission_task: None,
             _path_events: None,
             _search_events: None,
             _table_events: None,
@@ -430,6 +446,8 @@ impl Explorer {
                     self.scroll_active_to_top(cx);
                 }
                 self.refresh_snapshot();
+                // A reload may have changed the modes: probe again.
+                self.permissions = None;
                 // Consume the submitted edit only when this completion is
                 // its own scan with no newer edit after it; stale or failed
                 // completions never reseed either field.
@@ -754,13 +772,33 @@ impl Explorer {
     /// inter-island gap and the island's 16 px content padding.
     fn content_width(&self, window: &Window) -> f32 {
         let total = f32::from(window.viewport_size().width);
-        let narrow = total < NARROW_WIDTH;
+        let panel = if self.inspector_wanted(window) {
+            inspector::INSPECTOR_WIDTH
+        } else {
+            0.0
+        };
+        (total - self.shell_width(window) - panel - 2.0 * 16.0).max(0.0)
+    }
+
+    /// Everything in the window that is not the document island: the outer
+    /// gutters and the docked sidebar with its gap.
+    fn shell_width(&self, window: &Window) -> f32 {
+        let narrow = f32::from(window.viewport_size().width) < NARROW_WIDTH;
         let sidebar = if self.sidebar_open && !narrow {
             SIDEBAR_WIDTH + IslandMetrics::GAP.as_f32()
         } else {
             0.0
         };
-        (total - 2.0 * IslandMetrics::GAP.as_f32() - sidebar - 2.0 * 16.0).max(0.0)
+        2.0 * IslandMetrics::GAP.as_f32() + sidebar
+    }
+
+    /// Whether the details panel draws at this window width.
+    fn inspector_wanted(&self, window: &Window) -> bool {
+        inspector::panel_visible(
+            self.inspector_open,
+            f32::from(window.viewport_size().width),
+            self.shell_width(window),
+        )
     }
 }
 
@@ -800,7 +838,7 @@ impl Render for Explorer {
                 .unwrap_or_else(|| self.content_width(window)),
         );
 
-        let document = self.render_document_island(cx);
+        let document = self.render_document_island(window, cx);
         let side = sidebar::render(self, narrow, cx);
 
         // The sidebar reads on the LEFT of the content island (artboard
@@ -860,6 +898,10 @@ impl Render for Explorer {
                 let current = this.state.current().clone();
                 this.navigate(Transition::Visit(current), window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, _window, cx| {
+                this.inspector_open = !this.inspector_open;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
                 let columns = this.grid_step();
                 this.move_selection(-columns, cx);
@@ -914,9 +956,13 @@ impl Explorer {
         }
     }
 
-    /// The document island: toolbar, scope line, folder subbar, entries, all cut 14 px at
-    /// the opposing corners by [`Island`].
-    fn render_document_island(&mut self, cx: &mut Context<Self>) -> Island {
+    /// The document island: toolbar, scope line, folder subbar, then the
+    /// entries beside the details panel, all cut 14 px at the opposing
+    /// corners by [`Island`].
+    fn render_document_island(&mut self, window: &Window, cx: &mut Context<Self>) -> Island {
+        self.inspector_shown = self.inspector_wanted(window);
+        self.sync_permissions(cx);
+        let panel = self.inspector_shown.then(|| inspector::render(self, cx));
         Island::new()
             .flex_1()
             .min_w_0()
@@ -924,7 +970,15 @@ impl Explorer {
             .child(toolbar::render(self, cx))
             .child(self.render_subbar(cx))
             .children(self.render_scope_line(cx))
-            .child(entries::render(self, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .child(entries::render(self, cx))
+                    .children(panel),
+            )
     }
 
     /// The scope line under the toolbar: the Trash scope, the live filter,
