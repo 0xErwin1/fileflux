@@ -1,6 +1,6 @@
-//! GUI startup: logging, the Bolt theme and the explorer window inside
-//! `gpui_component`'s [`Root`], reusing the startup lifecycle the setup
-//! screen proved.
+//! GUI startup: logging, the Bolt theme (Bolt's existing dark palette) and
+//! the explorer window inside `gpui_component`'s [`Root`], reusing the
+//! startup lifecycle the setup screen proved.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -61,7 +61,7 @@ fn assets() -> impl gpui::AssetSource {
 /// Installs the theme, binds the explorer's keys and opens the explorer
 /// window wrapped in gpui-component's [`Root`].
 fn open_explorer_window(cx: &mut App) -> Result<()> {
-    theme::install(bolt::palette::PaletteMode::System, cx);
+    theme::install(theme::STARTUP_PALETTE, cx);
     bind_keys(cx);
 
     let bounds = Bounds::centered(

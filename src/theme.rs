@@ -4,6 +4,11 @@ use bolt::brand::Brand;
 use bolt::theme::rgb_to_hsla as hex;
 use gpui::App;
 
+/// The palette Fileflux starts with. The chosen design is dark, so the
+/// explorer always opens with Bolt's existing dark palette, regardless of
+/// the platform appearance.
+pub(crate) const STARTUP_PALETTE: bolt::palette::PaletteMode = bolt::palette::PaletteMode::Dark;
+
 /// The brand Fileflux installs into `bolt`: ReqFlux's cobalt accent, renamed
 /// until the family settles on Fileflux's own colors.
 pub(crate) fn brand() -> Brand {
@@ -19,8 +24,7 @@ pub(crate) fn brand() -> Brand {
 
 /// Initializes `gpui-component`, loads Bolt's bundled fonts at the default
 /// interface size, the default density, and installs the Bolt theme for
-/// `mode` with Fileflux's brand. [`PaletteMode::System`] resolves against the
-/// platform appearance when the theme applies.
+/// `mode` with Fileflux's brand.
 pub(crate) fn install(mode: bolt::palette::PaletteMode, cx: &mut App) {
     if !cx.has_global::<gpui_component::theme::Theme>() {
         gpui_component::init(cx);
@@ -29,4 +33,20 @@ pub(crate) fn install(mode: bolt::palette::PaletteMode, cx: &mut App) {
     bolt::fonts::init(cx, bolt::fonts::FontSettings::default());
     bolt::density::init(cx, bolt::density::Density::Default);
     bolt::theme::install(brand(), mode, bolt::density::Density::Default, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The explorer must start dark no matter how the OS appears, so the
+    /// startup selection can never drift back to `System` (or `Light`).
+    #[test]
+    fn startup_palette_is_dark() {
+        assert_eq!(
+            STARTUP_PALETTE,
+            bolt::palette::PaletteMode::Dark,
+            "Fileflux must start with Bolt's dark palette, independent of the OS appearance"
+        );
+    }
 }

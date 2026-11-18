@@ -47,7 +47,7 @@ Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R relo
 
 ## Current scope
 
-Read-only by design (S3): no destructive operations, no copy/move, no tabs, no previews. The window title shows the current folder plus Fileflux; the empty top gutter matches the 8 px side gutters (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable.
+Read-only by design (S3): no destructive operations, no copy/move, no tabs, no previews. The window title shows the current folder plus Fileflux; the empty top gutter matches the 8 px side gutters (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable. The app always starts in Bolt's dark palette, whatever the operating system's appearance; there is no theme toggle.
 
 ## Design
 
