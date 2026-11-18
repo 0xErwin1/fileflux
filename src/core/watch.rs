@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -67,6 +68,19 @@ struct Entry {
     /// Tells a handle apart from the handles of an earlier watch of the same
     /// path that was released (the folder vanished and came back).
     serial: u64,
+    /// Device and inode of the folder when it was watched: tells the folder
+    /// apart from one that replaced it at the same path.
+    identity: Identity,
+}
+
+/// Device and inode of a directory.
+type Identity = (u64, u64);
+
+/// The identity of the directory at `path` (following symlinks, as the
+/// inotify watch does).
+fn identity_of(path: &Path) -> io::Result<Identity> {
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 /// The watched folders: pure bookkeeping, no file descriptors.
@@ -74,15 +88,31 @@ struct Entry {
 struct Registry {
     paths: HashMap<PathBuf, Entry>,
     next_serial: u64,
+    /// Folders whose entry `attach` found replaced and dropped: their
+    /// holders still have to be told [`FolderEvent::Gone`].
+    evicted: Vec<PathBuf>,
+    /// Kernel watches nobody refers to any more, to be removed.
+    dead_watches: Vec<i32>,
 }
 
 impl Registry {
     /// Registers one more handle on `path`, adding the inotify watch through
-    /// `add` only when the path is not watched yet. Returns the serial.
-    fn attach(&mut self, path: &Path, add: impl FnOnce() -> io::Result<i32>) -> io::Result<u64> {
+    /// `add` only when the path is not watched yet. `identity` is the
+    /// folder at `path` now: an entry recorded for another folder is dead
+    /// (replaced behind the hub's back), so it is evicted rather than shared,
+    /// and a fresh watch is added. Returns the serial.
+    fn attach(
+        &mut self,
+        path: &Path,
+        identity: Identity,
+        add: impl FnOnce() -> io::Result<i32>,
+    ) -> io::Result<u64> {
         if let Some(entry) = self.paths.get_mut(path) {
-            entry.refs += 1;
-            return Ok(entry.serial);
+            if entry.identity == identity {
+                entry.refs += 1;
+                return Ok(entry.serial);
+            }
+            self.evict(path);
         }
         let wd = add()?;
         self.next_serial += 1;
@@ -93,9 +123,69 @@ impl Registry {
                 wd,
                 refs: 1,
                 serial,
+                identity,
             },
         );
         Ok(serial)
+    }
+
+    /// Removes the entry of `path`, remembering its holders still have to be
+    /// told and its kernel watch (unless another path shares it) removed.
+    fn evict(&mut self, path: &Path) -> Option<i32> {
+        let entry = self.paths.remove(path)?;
+        self.evicted.push(path.to_path_buf());
+        let unshared = !self.paths.values().any(|other| other.wd == entry.wd);
+        if unshared {
+            self.dead_watches.push(entry.wd);
+        }
+        unshared.then_some(entry.wd)
+    }
+
+    /// The folders `attach` evicted since the last call.
+    fn take_evicted(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.evicted)
+    }
+
+    /// The kernel watches to remove since the last call.
+    fn take_dead_watches(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.dead_watches)
+    }
+
+    /// Every watched folder with its watch serial and recorded identity.
+    fn snapshot(&self) -> Vec<(PathBuf, u64, Identity)> {
+        self.paths
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.serial, entry.identity))
+            .collect()
+    }
+
+    /// Releases the listed `(path, serial)` watches (those still current):
+    /// each reports [`FolderEvent::Gone`]. Also returns the kernel watches
+    /// to remove.
+    fn release_stale(
+        &mut self,
+        stale: &[(PathBuf, u64)],
+    ) -> (Vec<(PathBuf, FolderEvent)>, Vec<i32>) {
+        let mut events = Vec::new();
+        let mut removals = Vec::new();
+        for (path, serial) in stale {
+            if self
+                .paths
+                .get(path)
+                .is_none_or(|entry| entry.serial != *serial)
+            {
+                continue;
+            }
+            if let Some(wd) = self.evict(path) {
+                removals.push(wd);
+            }
+            events.push((path.clone(), FolderEvent::Gone));
+        }
+        // These holders are told right here, not through the queue.
+        self.evicted
+            .retain(|path| !events.iter().any(|(done, _)| done == path));
+        self.dead_watches.retain(|wd| !removals.contains(wd));
+        (events, removals)
     }
 
     /// Drops one handle of the watch `serial` on `path`. Returns the inotify
@@ -219,9 +309,22 @@ impl WatchHub {
             | WatchFlags::DELETE_SELF
             | WatchFlags::MOVE_SELF
             | WatchFlags::ONLYDIR;
-        let serial = self.shared.registry().attach(path, || {
-            Ok(inotify::add_watch(&self.shared.inotify, path, mask)?)
-        })?;
+        let identity = identity_of(path)?;
+        let serial = {
+            let mut registry = self.shared.registry();
+            let attached = registry.attach(path, identity, || {
+                Ok(inotify::add_watch(&self.shared.inotify, path, mask)?)
+            });
+            let evicted = !registry.evicted.is_empty();
+            for wd in registry.take_dead_watches() {
+                inotify::remove_watch(&self.shared.inotify, wd).ok();
+            }
+            if evicted {
+                // The thread tells the holders of the replaced folder.
+                rustix::io::write(&self.shared.wake, &1u64.to_ne_bytes()).ok();
+            }
+            attached?
+        };
         Ok(WatchHandle {
             shared: Arc::clone(&self.shared),
             path: path.to_path_buf(),
@@ -257,6 +360,17 @@ impl WatchHandle {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether the watch this handle holds still exists. It does not once
+    /// the folder was deleted, moved or replaced: the hub released it, and
+    /// only a new [`WatchHub::watch`] watches the path again.
+    pub fn is_live(&self) -> bool {
+        self.shared
+            .registry()
+            .paths
+            .get(&self.path)
+            .is_some_and(|entry| entry.serial == self.serial)
+    }
 }
 
 impl Drop for WatchHandle {
@@ -287,6 +401,11 @@ fn run(shared: &Shared, sender: &Sender<(PathBuf, FolderEvent)>) {
                 return;
             }
         }
+        // Resets the wake counter (a watch evicted a replaced folder). The
+        // shutdown flag is read only after it: a shutdown wake consumed here
+        // must not be missed, or the join in `Drop` would wait forever.
+        let mut counter = [0u8; 8];
+        rustix::io::read(&shared.wake, &mut counter).ok();
         if shared.shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -319,7 +438,12 @@ fn drain(shared: &Shared, sender: &Sender<(PathBuf, FolderEvent)>) -> bool {
                     }
                     routed
                 };
-                for (path, folder_event) in routed {
+                let revalidated = if signal == Signal::Overflow {
+                    revalidate(shared)
+                } else {
+                    Vec::new()
+                };
+                for (path, folder_event) in routed.into_iter().chain(revalidated) {
                     batch
                         .entry(path)
                         .and_modify(|seen| *seen = (*seen).max(folder_event))
@@ -334,11 +458,43 @@ fn drain(shared: &Shared, sender: &Sender<(PathBuf, FolderEvent)>) -> bool {
             }
         }
     }
+    let evicted = shared.registry().take_evicted();
+    for path in evicted {
+        batch.insert(path, FolderEvent::Gone);
+    }
     for entry in batch {
         // The receiver is gone when the explorer is; shutdown follows.
         sender.send(entry).ok();
     }
     healthy
+}
+
+/// After a queue overflow the kernel may have dropped the `Gone` of any
+/// folder: checks every watched folder is still the one watched, and
+/// releases (with a `Gone`) those deleted or replaced. The stat calls run
+/// outside the registry lock.
+fn revalidate(shared: &Shared) -> Vec<(PathBuf, FolderEvent)> {
+    let snapshot = shared.registry().snapshot();
+    let stale: Vec<(PathBuf, u64)> = snapshot
+        .into_iter()
+        .filter(|(path, _, identity)| identity_of(path).ok().as_ref() != Some(identity))
+        .map(|(path, serial, _)| (path, serial))
+        .collect();
+    if stale.is_empty() {
+        return Vec::new();
+    }
+    let (events, removals) = shared.registry().release_stale(&stale);
+    for wd in removals {
+        inotify::remove_watch(&shared.inotify, wd).ok();
+    }
+    events
+}
+
+/// The status notice for a watcher channel that reported `error`, or `None`
+/// when it is not a stop or was already announced.
+pub fn stop_notice(error: mpsc::TryRecvError, already_announced: bool) -> Option<&'static str> {
+    (error == mpsc::TryRecvError::Disconnected && !already_announced)
+        .then_some("Live updates stopped; press Ctrl+R to reload")
 }
 
 /// The closest existing directory above `path`, or `path` itself when it
@@ -566,8 +722,8 @@ mod tests {
     #[test]
     fn an_overflow_reports_every_watched_folder_changed() -> TestResult {
         let mut registry = Registry::default();
-        registry.attach(Path::new("/a"), || Ok(1))?;
-        registry.attach(Path::new("/b"), || Ok(2))?;
+        registry.attach(Path::new("/a"), (1, 1), || Ok(1))?;
+        registry.attach(Path::new("/b"), (1, 2), || Ok(2))?;
         let mut events = registry.route(Signal::Overflow, -1);
         events.sort();
         assert_eq!(
@@ -584,8 +740,8 @@ mod tests {
     #[test]
     fn paths_that_share_an_inode_share_the_descriptor() -> TestResult {
         let mut registry = Registry::default();
-        let real = registry.attach(Path::new("/real"), || Ok(7))?;
-        let link = registry.attach(Path::new("/link"), || Ok(7))?;
+        let real = registry.attach(Path::new("/real"), (1, 7), || Ok(7))?;
+        let link = registry.attach(Path::new("/link"), (1, 7), || Ok(7))?;
         assert_eq!(
             registry.detach(Path::new("/real"), real),
             None,
@@ -593,12 +749,158 @@ mod tests {
         );
         assert_eq!(registry.detach(Path::new("/link"), link), Some(7));
         let mut again = Registry::default();
-        again.attach(Path::new("/real"), || Ok(7))?;
-        again.attach(Path::new("/link"), || Ok(7))?;
+        again.attach(Path::new("/real"), (1, 7), || Ok(7))?;
+        again.attach(Path::new("/link"), (1, 7), || Ok(7))?;
         let gone = again.route(Signal::Gone, 7);
         assert_eq!(gone.len(), 2, "both names of the folder are gone");
         assert!(again.paths.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn a_handle_knows_whether_its_watch_is_still_live() -> TestResult {
+        let scratch = Scratch::new("live")?;
+        let victim = scratch.0.join("victim");
+        fs::create_dir(&victim)?;
+        let (hub, rx) = hub()?;
+        let handle = hub.watch(&victim)?;
+        assert!(handle.is_live());
+        fs::remove_dir(&victim)?;
+        assert_eq!(next(&rx, LONG), Some((victim.clone(), FolderEvent::Gone)));
+        assert!(!handle.is_live(), "released by the Gone");
+        fs::create_dir(&victim)?;
+        let fresh = hub.watch(&victim)?;
+        assert!(fresh.is_live());
+        assert!(!handle.is_live(), "a newer watch does not revive the old");
+        Ok(())
+    }
+
+    #[test]
+    fn attach_never_bumps_an_entry_of_a_replaced_folder() -> TestResult {
+        let mut registry = Registry::default();
+        let old = registry.attach(Path::new("/p"), (1, 10), || Ok(3))?;
+        let fresh = registry.attach(Path::new("/p"), (1, 11), || Ok(4))?;
+        assert_ne!(old, fresh, "a new watch, not a bumped one");
+        let entry = registry.paths.get(Path::new("/p")).ok_or("entry")?;
+        assert_eq!(entry.refs, 1);
+        assert_eq!(entry.wd, 4);
+        assert_eq!(registry.take_dead_watches(), [3], "the old kernel watch");
+        assert_eq!(registry.take_evicted(), [PathBuf::from("/p")]);
+        assert_eq!(registry.detach(Path::new("/p"), old), None);
+        assert_eq!(registry.paths.len(), 1, "the old handle cannot drop it");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_entries_are_released_with_a_gone() -> TestResult {
+        let mut registry = Registry::default();
+        let keep = registry.attach(Path::new("/keep"), (1, 1), || Ok(1))?;
+        let lost = registry.attach(Path::new("/lost"), (1, 2), || Ok(2))?;
+        let mut snapshot = registry.snapshot();
+        snapshot.sort();
+        assert_eq!(snapshot.len(), 2);
+        let (events, removals) = registry.release_stale(&[(PathBuf::from("/lost"), lost)]);
+        assert_eq!(events, [(PathBuf::from("/lost"), FolderEvent::Gone)]);
+        assert_eq!(removals, [2]);
+        assert!(registry.paths.contains_key(Path::new("/keep")));
+        assert_eq!(
+            registry
+                .paths
+                .get(Path::new("/keep"))
+                .map(|entry| entry.serial),
+            Some(keep)
+        );
+        // A newer watch of the same path is not the stale one.
+        let again = registry.release_stale(&[(PathBuf::from("/lost"), lost)]);
+        assert!(again.0.is_empty() && again.1.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_overflow_releases_deleted_folders_and_a_new_watch_is_fresh() -> TestResult {
+        let scratch = Scratch::new("overflow")?;
+        let busy = scratch.0.join("busy");
+        let victim = scratch.0.join("victim");
+        fs::create_dir(&busy)?;
+        fs::create_dir(&victim)?;
+        let (hub, rx) = hub()?;
+        let _busy = hub.watch(&busy)?;
+        let _victim = hub.watch(&victim)?;
+        {
+            // Stall the hub thread so the kernel queue fills up.
+            let _stall = hub.shared.registry();
+            for index in 0..10_000 {
+                fs::write(busy.join(format!("f{index}")), b"x")?;
+            }
+            fs::remove_dir_all(&victim)?;
+        }
+        let mut seen = Vec::new();
+        while let Some(event) = next(&rx, LONG) {
+            let done = event == (victim.clone(), FolderEvent::Gone);
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            seen.contains(&(victim.clone(), FolderEvent::Gone)),
+            "the lost Gone is recovered: {seen:?}"
+        );
+        assert_eq!(hub.watch_count(), 1, "only the busy folder stays watched");
+
+        fs::create_dir(&victim)?;
+        let fresh = hub.watch(&victim)?;
+        assert!(fresh.is_live());
+        while next(&rx, SHORT).is_some() {}
+        fs::write(victim.join("x"), b"x")?;
+        assert_eq!(
+            next(&rx, LONG),
+            Some((victim.clone(), FolderEvent::Changed))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_replaced_behind_the_hub_gets_a_gone_and_a_fresh_watch() -> TestResult {
+        let scratch = Scratch::new("replaced")?;
+        let victim = scratch.0.join("victim");
+        fs::create_dir(&victim)?;
+        let (hub, rx) = hub()?;
+        let old = hub.watch(&victim)?;
+        {
+            let _stall = hub.shared.registry();
+            fs::remove_dir(&victim)?;
+            fs::create_dir(&victim)?;
+        }
+        // Held again before the Gone is processed or after: either way the
+        // watch must end up fresh and the old holders told.
+        let fresh = hub.watch(&victim)?;
+        assert!(fresh.is_live());
+        let mut gone = false;
+        while let Some(event) = next(&rx, SHORT) {
+            gone |= event == (victim.clone(), FolderEvent::Gone);
+        }
+        assert!(gone, "holders of the replaced folder are told");
+        assert!(!old.is_live());
+        assert!(fresh.is_live(), "the fresh watch survives the late Gone");
+        fs::write(victim.join("x"), b"x")?;
+        assert_eq!(
+            next(&rx, LONG),
+            Some((victim.clone(), FolderEvent::Changed))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_closed_channel_announces_the_stop_once() {
+        use std::sync::mpsc::TryRecvError;
+        assert!(stop_notice(TryRecvError::Disconnected, false).is_some());
+        assert_eq!(
+            stop_notice(TryRecvError::Disconnected, false),
+            Some("Live updates stopped; press Ctrl+R to reload")
+        );
+        assert_eq!(stop_notice(TryRecvError::Disconnected, true), None);
+        assert_eq!(stop_notice(TryRecvError::Empty, false), None);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::watch::{
-    Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor,
+    Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
 use fileflux::core::{Listing, Location};
 use gpui::{
@@ -481,9 +481,14 @@ struct TabWatch {
 
 impl TabWatch {
     /// Moves `slot` to watch `wanted`. The new hold is taken before the old
-    /// one is released, so a folder both name never loses its watch.
+    /// one is released, so a folder both name never loses its watch. A hold
+    /// whose watch died (the folder was deleted or replaced) is not kept even
+    /// for the same path: that folder is watched anew.
     fn retarget(slot: &mut Option<WatchHandle>, wanted: Option<PathBuf>, hub: &WatchHub) {
-        if slot.as_ref().map(WatchHandle::path) == wanted.as_deref() {
+        let kept = slot
+            .as_ref()
+            .is_some_and(|handle| Some(handle.path()) == wanted.as_deref() && handle.is_live());
+        if kept || (slot.is_none() && wanted.is_none()) {
             return;
         }
         *slot = wanted.and_then(|path| match hub.watch(&path) {
@@ -1026,13 +1031,23 @@ impl Explorer {
     fn pump_watch_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         let mut gone = Vec::new();
+        let mut stopped = None;
         if let Some(events) = &self.watch_events {
-            while let Ok((path, event)) = events.try_recv() {
-                match event {
-                    FolderEvent::Changed => self.folder_debounce.entry(path).or_default().note(now),
-                    FolderEvent::Gone => gone.push(path),
+            loop {
+                match events.try_recv() {
+                    Ok((path, FolderEvent::Changed)) => {
+                        self.folder_debounce.entry(path).or_default().note(now);
+                    }
+                    Ok((path, FolderEvent::Gone)) => gone.push(path),
+                    Err(error) => {
+                        stopped = Some(error);
+                        break;
+                    }
                 }
             }
+        }
+        if let Some(notice) = stopped.and_then(|error| stop_notice(error, false)) {
+            self.watcher_stopped(notice, cx);
         }
         for path in gone {
             self.folder_debounce.remove(&path);
@@ -1071,6 +1086,20 @@ impl Explorer {
                 self.start_scan_in(id, scan, window, cx);
             }
         }
+    }
+
+    /// The watcher thread died: drop the hub and every hold, so tabs go back
+    /// to re-reading on activation, and tell the user once.
+    fn watcher_stopped(&mut self, notice: &str, cx: &mut Context<Self>) {
+        log::warn!("the watcher thread stopped; live updates are off");
+        self.hub = None;
+        self.watch_events = None;
+        self.folder_debounce.clear();
+        for tab in self.tabs.iter_mut() {
+            tab.watch = TabWatch::default();
+        }
+        self.tab_mut().state.set_notice(notice.to_owned());
+        cx.notify();
     }
 
     /// The folder tab `id` shows was deleted or moved away: fall back to the
@@ -2309,5 +2338,38 @@ mod tests {
         let restored = search_field_resync("alpha", "");
         assert_eq!(restored, Some("alpha"), "lost query is restored");
         assert_eq!(search_field_resync("", ""), None, "already in sync: no set");
+    }
+
+    /// Verifier F1: a folder deleted and recreated at the same path leaves a
+    /// dead hold; a tab that commits the same path again (the fallback of a
+    /// vanished folder lands on it) must end with a live watch.
+    #[test]
+    fn retarget_rewatches_the_same_path_after_its_watch_died()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+        let base = std::env::temp_dir().join(format!("fileflux-retarget-{}", std::process::id()));
+        let folder = base.join("p");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&folder)?;
+        let (hub, events) = WatchHub::new()?;
+        let mut slot = None;
+        TabWatch::retarget(&mut slot, Some(folder.clone()), &hub);
+        assert!(slot.is_some(), "watching the folder");
+
+        std::fs::remove_dir_all(&folder)?;
+        std::fs::create_dir(&folder)?;
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(3)).ok(),
+            Some((folder.clone(), FolderEvent::Gone))
+        );
+        TabWatch::retarget(&mut slot, Some(folder.clone()), &hub);
+        assert_eq!(hub.watch_count(), 1, "the path is watched again");
+        std::fs::write(folder.join("x"), b"x")?;
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(3)).ok(),
+            Some((folder.clone(), FolderEvent::Changed))
+        );
+        std::fs::remove_dir_all(&base).ok();
+        Ok(())
     }
 }
