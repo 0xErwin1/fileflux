@@ -7,6 +7,7 @@ use std::time::SystemTime;
 pub mod apps;
 pub mod fs;
 pub mod images;
+pub mod kinds;
 pub mod navigation;
 pub mod ops;
 pub mod places;

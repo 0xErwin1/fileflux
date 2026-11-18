@@ -325,16 +325,21 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .items_center()
                 .gap(Spacing::SM)
                 .text_color(colors.muted)
-                .child(
-                    div()
-                        .text_color(colors.strong)
-                        .text_size(px(18.0))
-                        .child(format!(
+                .child(div().text_color(colors.strong).text_size(px(18.0)).child(
+                    if this.tab().state.query().is_empty() {
+                        "Nothing matches the filters".to_owned()
+                    } else {
+                        format!(
                             "No matches for \u{201c}{}\u{201d}",
                             this.tab().state.query()
-                        )),
-                )
-                .child("Search checks names in the current folder only, not its subfolders."),
+                        )
+                    },
+                ))
+                .child(if this.tab().state.query().is_empty() {
+                    "Remove a filter chip, or use Filter \u{203a} Clear all filters."
+                } else {
+                    "Search and filters check names in the current folder only, not its subfolders."
+                }),
         );
     }
 
@@ -348,7 +353,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         count.div_ceil(columns)
     };
     let snapshot = Arc::clone(&this.tab().snapshot);
-    let counts_for_rows = Arc::clone(&this.tab().child_counts);
+    let counts_for_rows = Arc::clone(this.tab().state.child_counts());
     let weak_for_rows = weak.clone();
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);

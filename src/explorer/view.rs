@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use bolt::composites::Island;
+use bolt::composites::{Island, StatusChip};
 use bolt::controls::{Button, InputEvent, InputState};
 use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
@@ -34,13 +34,16 @@ use gpui::{
     KeyBinding, ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
     UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px,
 };
+use gpui_component::ActiveTheme as _;
 use gpui_component::table::{TableEvent, TableState};
+use gpui_component::tooltip::Tooltip;
 
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
+use crate::explorer::arrange::ArrangeCommand;
 use crate::explorer::clipboard::PasteHandle;
 use crate::explorer::inspector::{self, PermissionProbe};
-use crate::explorer::ops::DialogQueue;
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
+use crate::explorer::ops::{DialogQueue, MenuPage};
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::progress::Registry;
 use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
@@ -73,6 +76,8 @@ actions!(
         Reload,
         /// Shows or hides the details panel.
         ToggleInspector,
+        /// Shows or hides the hidden (dot) files of the tab (Ctrl+H).
+        ToggleHidden,
         /// Creates a folder in the shown folder and renames it in place.
         NewFolder,
         /// Renames the selected entry in place (F2).
@@ -188,6 +193,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-up", NavigateUp, shell),
         KeyBinding::new("ctrl-r", Reload, shell),
         KeyBinding::new("ctrl-i", ToggleInspector, shell),
+        KeyBinding::new("ctrl-h", ToggleHidden, shell),
         KeyBinding::new("up", SelectUp, entries),
         KeyBinding::new("down", SelectDown, entries),
         KeyBinding::new("left", SelectLeft, entries),
@@ -346,10 +352,6 @@ pub(crate) struct Tab {
     pub(crate) permission_in_flight: Option<PathBuf>,
     /// The retained permission probe task.
     pub(crate) permission_task: Option<Task<()>>,
-    /// The item count of each folder of the committed listing, filled off
-    /// the UI thread after the listing is shown; a folder missing from the
-    /// map has not been counted yet, `None` could not be read.
-    pub(crate) child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
     /// The holds on the folders this tab live-refreshes from.
@@ -459,7 +461,6 @@ impl Tab {
             permissions: None,
             permission_in_flight: None,
             permission_task: None,
-            child_counts: Arc::new(HashMap::new()),
             counts_task: None,
             watch: TabWatch::default(),
             pending: None,
@@ -1143,7 +1144,7 @@ impl Explorer {
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
-        tab.child_counts = Arc::new(HashMap::new());
+        tab.state.set_child_counts(Arc::new(HashMap::new()));
         let entries = Arc::clone(&tab.snapshot);
         if !entries.iter().any(fileflux::core::Entry::is_directory) {
             tab.counts_task = None;
@@ -1156,7 +1157,7 @@ impl Explorer {
             let counts = counting.await;
             if let Err(error) = this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.by_id_mut(id) {
-                    tab.child_counts = Arc::new(counts);
+                    tab.state.set_child_counts(Arc::new(counts));
                 }
                 cx.notify();
             }) {
@@ -1812,6 +1813,9 @@ impl Render for Explorer {
                 this.inspector_open = !this.inspector_open;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleHidden, _window, cx| {
+                this.arrange(ArrangeCommand::ToggleHidden, cx);
+            }))
             .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
                 let columns = this.grid_step();
                 this.move_selection(-columns, cx);
@@ -2062,6 +2066,11 @@ impl Explorer {
         let colors = bolt::colors(cx);
         let meta = if self.tab().state.is_loading() {
             String::new()
+        } else if self.tab().state.is_filtering() {
+            util::filtered_counts_label(
+                self.tab().state.visible_indices().len(),
+                self.tab().state.listing().entries.len(),
+            )
         } else {
             util::folder_counts_label(&self.tab().state.listing().entries)
         };
@@ -2092,7 +2101,29 @@ impl Explorer {
                     .text_color(colors.muted)
                     .child(meta),
             )
-            .child(div().flex_1())
+            .child(self.render_filter_chips(cx))
+            .child(
+                Button::new("explorer-sort", "Sort")
+                    .secondary()
+                    .icon(crate::explorer::icon(
+                        gpui_kit_assets::IconName::ArrowUpDown,
+                    ))
+                    .tooltip("Sort by name, size, date or type")
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        let position = overlay::under_button(event.position());
+                        this.open_arrange_menu(MenuPage::Sort, position, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("explorer-filter", "Filter")
+                    .secondary()
+                    .icon(crate::explorer::icon(gpui_kit_assets::IconName::ListFilter))
+                    .tooltip("Filter by type, date, size or hidden files")
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        let position = overlay::under_button(event.position());
+                        this.open_arrange_menu(MenuPage::Filter, position, window, cx);
+                    })),
+            )
             .child(if self.tab().state.current() == &Location::Trash {
                 Button::new("explorer-empty-trash", "Empty Trash")
                     .danger()
@@ -2115,6 +2146,53 @@ impl Explorer {
             })
     }
 
+    /// The active filters as removable chips, then "Clear all"; this is
+    /// also the subbar's flexible gap, so it fills the row when empty.
+    fn render_filter_chips(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let colors = bolt::colors(cx);
+        let tint = bolt::tokens::ChromeColors::tint(cx.theme());
+        let chips = self.tab().state.arrangement().filters.chips();
+        let clear = (chips.len() > 1).then(|| {
+            div()
+                .id("explorer-chips-clear")
+                .flex_none()
+                .cursor_pointer()
+                .text_size(px(12.0))
+                .text_color(colors.muted)
+                .hover(|this| this.text_color(colors.foreground))
+                .child("Clear all")
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.arrange(ArrangeCommand::ClearFilters, cx);
+                }))
+        });
+        div()
+            .id("explorer-chips")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .children(chips.into_iter().enumerate().map(|(index, chip)| {
+                StatusChip::new(("explorer-chip", index))
+                    .clickable(true)
+                    .tone(tint)
+                    .wash(true)
+                    .build(cx)
+                    .text_size(px(12.0))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(format!("Remove the {} filter", chip.label()))
+                            .build(window, cx)
+                    })
+                    .child(chip.label())
+                    .child(div().text_color(colors.muted).child("\u{d7}"))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.arrange(ArrangeCommand::RemoveChip(chip), cx);
+                    }))
+            }))
+            .children(clear)
+    }
+
     /// The volume usage line of the volume holding the current folder
     /// (longest mount-path prefix); nothing when it is unknown.
     fn free_space_label(&self) -> Option<String> {
@@ -2134,7 +2212,10 @@ impl Explorer {
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = bolt::colors(cx);
         let entries_count = self.tab().state.listing().entries.len();
-        let shown = (!self.tab().state.query().is_empty())
+        let shown = self
+            .tab()
+            .state
+            .is_filtering()
             .then(|| self.tab().state.visible_indices().len());
         let selection = self.tab().state.selection();
         let mut count_text = util::status_label(

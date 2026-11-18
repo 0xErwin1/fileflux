@@ -10,13 +10,16 @@
 //! query: every scan carries the generation it was started under, and only a
 //! completion matching the newest generation is accepted.
 
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use fileflux::core::fs::filtered_indices;
+use chrono::{DateTime, Local, TimeZone};
+
 use fileflux::core::navigation::Navigation;
 use fileflux::core::{Entry, Listing, Location};
+
+pub(crate) use super::arrange::{ArrangeCommand, Arrangement, FolderCounts, SortKey, SortSpec};
 
 /// The two presentations of the folder contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,128 +28,6 @@ pub(crate) enum View {
     Grid,
     /// Details list: Name, Type, Size, Modified.
     List,
-}
-
-/// What the list is sorted by.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum SortKey {
-    Name,
-    Size,
-    Modified,
-}
-
-impl SortKey {
-    /// The sort key of column `column`, or `None` past the columns.
-    pub(crate) fn of_column(column: usize) -> Option<Self> {
-        match column {
-            0 => Some(Self::Name),
-            1 => Some(Self::Size),
-            2 => Some(Self::Modified),
-            _ => None,
-        }
-    }
-}
-
-/// The direction of the sort.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum SortDir {
-    Ascending,
-    Descending,
-}
-
-impl SortDir {
-    /// The arrow drawn beside the sorted header.
-    pub(crate) fn arrow(self) -> &'static str {
-        match self {
-            Self::Ascending => "\u{2191}",
-            Self::Descending => "\u{2193}",
-        }
-    }
-
-    fn flipped(self) -> Self {
-        match self {
-            Self::Ascending => Self::Descending,
-            Self::Descending => Self::Ascending,
-        }
-    }
-}
-
-/// The list's sort: a key and a direction. Starts at name ascending, the
-/// order the scan already delivers.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct SortSpec {
-    pub(crate) key: SortKey,
-    pub(crate) dir: SortDir,
-}
-
-impl Default for SortSpec {
-    fn default() -> Self {
-        Self {
-            key: SortKey::Name,
-            dir: SortDir::Ascending,
-        }
-    }
-}
-
-impl SortSpec {
-    /// The sort after a click on `key`'s header: the active key flips its
-    /// direction, any other key starts ascending.
-    pub(crate) fn clicked(self, key: SortKey) -> Self {
-        if self.key == key {
-            Self {
-                key,
-                dir: self.dir.flipped(),
-            }
-        } else {
-            Self {
-                key,
-                dir: SortDir::Ascending,
-            }
-        }
-    }
-}
-
-/// Orders two entries under `spec`. Folders always come first, whatever the
-/// key or direction; within a group the key decides (a missing size or time
-/// sorts lowest) and the direction reverses only that; ties fall back to
-/// the case-insensitive name and then the raw path, ascending, so the order
-/// is total and stable.
-pub(crate) fn compare_entries(a: &Entry, b: &Entry, spec: SortSpec) -> Ordering {
-    let by_key = match spec.key {
-        SortKey::Name => Ordering::Equal,
-        SortKey::Size => a.size.cmp(&b.size),
-        SortKey::Modified => a.modified.cmp(&b.modified),
-    };
-    let by_key = match spec.dir {
-        SortDir::Ascending => by_key,
-        SortDir::Descending => by_key.reverse(),
-    };
-    let by_name = a
-        .name
-        .to_string_lossy()
-        .to_lowercase()
-        .cmp(&b.name.to_string_lossy().to_lowercase());
-    // Name is its own key, so the direction applies to the name comparison.
-    let by_name = if spec.key == SortKey::Name && spec.dir == SortDir::Descending {
-        by_name.reverse()
-    } else {
-        by_name
-    };
-    b.is_directory()
-        .cmp(&a.is_directory())
-        .then(by_key)
-        .then(by_name)
-        .then_with(|| a.path.cmp(&b.path))
-}
-
-/// The `visible` snapshot indices reordered under `spec`.
-pub(crate) fn sorted_indices(entries: &[Entry], visible: &[usize], spec: SortSpec) -> Vec<usize> {
-    let mut order = visible.to_vec();
-    order.sort_by(|&a, &b| match (entries.get(a), entries.get(b)) {
-        (Some(a), Some(b)) => compare_entries(a, b, spec),
-        (a, b) => a.is_some().cmp(&b.is_some()).reverse(),
-    });
-    order
 }
 
 /// A navigation transition the user asked for, resolved against the
@@ -257,9 +138,13 @@ pub(crate) struct ExplorerState {
     listing: Listing,
     /// Grid or list presentation.
     view: View,
-    /// The list's sort: the single source of truth for the displayed order
-    /// the keyboard, range selection and the table all follow.
-    sort: SortSpec,
+    /// The sort and the filters: the single source of truth for the
+    /// displayed order the keyboard, range selection, grid and table all
+    /// follow. Plain data, so a new tab can inherit it as it is.
+    arrangement: Arrangement,
+    /// The item count of each folder of the listing, counted off the UI
+    /// thread after the scan; what a folder sorts by under "Size".
+    child_counts: Arc<FolderCounts>,
     /// The entry a Shift-range selection extends from.
     anchor: Option<PathBuf>,
     /// The moving end of the selection: the entry the last click, arrow or
@@ -295,7 +180,8 @@ impl ExplorerState {
             nav: Navigation::new(initial),
             listing: Listing::default(),
             view: View::Grid,
-            sort: SortSpec::default(),
+            arrangement: Arrangement::default(),
+            child_counts: Arc::new(FolderCounts::new()),
             anchor: None,
             cursor: None,
             query: String::new(),
@@ -585,16 +471,18 @@ impl ExplorerState {
         self.query.clear();
     }
 
-    /// Indices into [`Self::listing`] that pass the current query, in the
-    /// **displayed** order: the list follows its sort, the grid keeps the
-    /// scan's name order, folders first. Keyboard navigation, range
-    /// selection and the table all read this one order.
+    /// Indices into [`Self::listing`] that pass the query and the filters,
+    /// in the **displayed** order: grid and list both follow the sort.
+    /// Keyboard navigation, range selection and the table all read this one
+    /// order.
     pub(crate) fn visible_indices(&self) -> Vec<usize> {
-        let visible = filtered_indices(&self.listing.entries, &self.query);
-        match self.view {
-            View::List => sorted_indices(&self.listing.entries, &visible, self.sort),
-            View::Grid => visible,
-        }
+        self.visible_indices_at(&Local::now())
+    }
+
+    /// [`Self::visible_indices`] at an explicit `now`, for the date filters.
+    pub(crate) fn visible_indices_at<Tz: TimeZone>(&self, now: &DateTime<Tz>) -> Vec<usize> {
+        self.arrangement
+            .arranged(&self.listing.entries, &self.query, &self.child_counts, now)
     }
 
     /// The visible entries in displayed order; used by the UI per frame and
@@ -611,10 +499,15 @@ impl ExplorerState {
         self.listing.entries.is_empty()
     }
 
-    /// The query is set and filters everything out; the UI shows a "no
-    /// matches" state instead of "empty folder".
+    /// The name search or a filter is narrowing the listing.
+    pub(crate) fn is_filtering(&self) -> bool {
+        !self.query.is_empty() || !self.arrangement.filters.is_default()
+    }
+
+    /// The search or the filters hide every entry of a folder that has
+    /// some; the UI shows a "no matches" state instead of "empty folder".
     pub(crate) fn is_no_result(&self) -> bool {
-        !self.query.is_empty() && self.visible_indices().is_empty()
+        self.is_filtering() && self.visible_indices().is_empty()
     }
 
     // --- selection ----------------------------------------------------------
@@ -797,26 +690,47 @@ impl ExplorerState {
         self.view = view;
     }
 
-    /// The list's sort.
+    /// The sort.
     pub(crate) fn sort(&self) -> SortSpec {
-        self.sort
+        self.arrangement.sort
+    }
+
+    /// The sort and the filters.
+    pub(crate) fn arrangement(&self) -> &Arrangement {
+        &self.arrangement
     }
 
     /// Applies a header click: sets or flips the sort. The selection and
     /// anchor are paths, so they survive the reorder.
     pub(crate) fn click_sort(&mut self, key: SortKey) {
-        self.sort = self.sort.clicked(key);
+        self.arrangement.sort = self.arrangement.sort.clicked(key);
+    }
+
+    /// Applies a sort or filter change from a menu, chip or shortcut. The
+    /// selection is untouched: a filtered-out entry stays selected.
+    pub(crate) fn arrange(&mut self, command: ArrangeCommand) {
+        self.arrangement.apply(command);
+    }
+
+    /// The folder item counts the size sort reads.
+    pub(crate) fn child_counts(&self) -> &Arc<FolderCounts> {
+        &self.child_counts
+    }
+
+    /// Publishes new folder counts; the order may change under "Size".
+    pub(crate) fn set_child_counts(&mut self, counts: Arc<FolderCounts>) {
+        self.child_counts = counts;
     }
 
     // --- tabs ---------------------------------------------------------------
 
     /// The state of a new tab opened on `location`: a fresh history,
-    /// selection and filter, and the presentation (view and sort) of this
-    /// tab.
+    /// selection and name search, and the presentation (view, sort and
+    /// filters) of this tab.
     pub(crate) fn for_new_tab(&self, location: Location) -> Self {
         Self {
             view: self.view,
-            sort: self.sort,
+            arrangement: self.arrangement.clone(),
             ..Self::new(location, self.home.clone())
         }
     }
@@ -975,7 +889,10 @@ mod tests {
         let mut state = sized_state()?;
         state.click_sort(SortKey::Size);
         state.click_sort(SortKey::Size);
-        assert_eq!(state.sort().dir, SortDir::Descending);
+        assert_eq!(
+            state.sort().dir,
+            crate::explorer::arrange::SortDir::Descending
+        );
         assert_eq!(displayed(&state), ["d", "c", "b", "a"]);
 
         // Home/Down/End select by displayed position.
@@ -1027,16 +944,187 @@ mod tests {
     }
 
     #[test]
-    fn the_grid_keeps_the_scan_order_whatever_the_list_sort() -> TestResult {
+    fn the_grid_follows_the_same_sort_as_the_list() -> TestResult {
         let mut state = sized_state()?;
         state.click_sort(SortKey::Size);
         state.click_sort(SortKey::Size);
         state.set_view(View::Grid);
-        assert_eq!(displayed(&state), ["a", "b", "c", "d"]);
+        assert_eq!(displayed(&state), ["d", "c", "b", "a"]);
         assert_eq!(state.selected_size(), 0);
         state.select_only(Path::new("/fixture/b"));
         state.toggle(Path::new("/fixture/c"));
         assert_eq!(state.selected_size(), 50, "sizes of the selected files");
+        Ok(())
+    }
+
+    /// A listing of images and a note, with a dotfile and a folder, for the
+    /// filter tests: `IMG_10.png`, `IMG_2.png`, `.secret.png`, `todo.txt`,
+    /// `pics/`.
+    fn mixed_state() -> Result<ExplorerState, Box<dyn std::error::Error>> {
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("begin must return a scan")?;
+        let entries = [
+            ("IMG_10.png", EntryKind::File),
+            ("IMG_2.png", EntryKind::File),
+            (".secret.png", EntryKind::File),
+            ("todo.txt", EntryKind::File),
+            ("pics", EntryKind::Directory),
+        ]
+        .iter()
+        .map(|(name, kind)| entry(name, *kind))
+        .collect();
+        assert!(state.commit(
+            scan,
+            Listing {
+                entries,
+                warnings: Vec::new()
+            }
+        ));
+        Ok(state)
+    }
+
+    #[test]
+    fn grid_and_list_show_the_same_natural_order_and_filters() -> TestResult {
+        use crate::explorer::arrange::ArrangeCommand;
+        use fileflux::core::kinds::FileCategory;
+        let mut state = mixed_state()?;
+        for view in [View::Grid, View::List] {
+            state.set_view(view);
+            assert_eq!(
+                displayed(&state),
+                ["pics", ".secret.png", "IMG_2.png", "IMG_10.png", "todo.txt"],
+                "{view:?}"
+            );
+        }
+        state.arrange(ArrangeCommand::ToggleCategory(FileCategory::Images));
+        state.arrange(ArrangeCommand::ToggleHidden);
+        for view in [View::Grid, View::List] {
+            state.set_view(view);
+            assert_eq!(displayed(&state), ["IMG_2.png", "IMG_10.png"], "{view:?}");
+        }
+        assert!(state.is_filtering());
+        assert!(!state.is_no_result());
+        Ok(())
+    }
+
+    #[test]
+    fn selection_navigation_and_activation_follow_the_filtered_result() -> TestResult {
+        use crate::explorer::arrange::ArrangeCommand;
+        let mut state = mixed_state()?;
+        state.select_only(Path::new("/fixture/todo.txt"));
+        state.arrange(ArrangeCommand::ToggleHidden);
+        assert_eq!(
+            displayed(&state),
+            ["pics", "IMG_2.png", "IMG_10.png", "todo.txt"]
+        );
+        // Shift-range and Ctrl+A cover what is shown and never the hidden file.
+        state.select_only(Path::new("/fixture/pics"));
+        state.select_range_to(Path::new("/fixture/IMG_10.png"));
+        let range: Vec<_> = state.selection().iter().cloned().collect();
+        assert_eq!(
+            range,
+            [
+                PathBuf::from("/fixture/IMG_10.png"),
+                PathBuf::from("/fixture/IMG_2.png"),
+                PathBuf::from("/fixture/pics"),
+            ]
+        );
+        state.select_all_visible();
+        assert_eq!(state.selection().len(), 4);
+        assert!(
+            !state
+                .selection()
+                .contains(Path::new("/fixture/.secret.png"))
+        );
+        // A selected entry the filter hides is kept but never activated.
+        state.select_only(Path::new("/fixture/todo.txt"));
+        state.arrange(ArrangeCommand::ToggleCategory(
+            fileflux::core::kinds::FileCategory::Images,
+        ));
+        assert_eq!(state.selection().len(), 1, "filtering does not deselect");
+        assert_eq!(state.activation_candidate(), None);
+        // Keyboard steps and the viewer's image list use the same order.
+        state.select_visible(0);
+        assert_eq!(
+            state.selection().iter().next(),
+            Some(&PathBuf::from("/fixture/IMG_2.png"))
+        );
+        let shown = state.visible_entries();
+        let target = crate::explorer::ops::open_target(Path::new("/fixture/IMG_10.png"), &shown);
+        assert_eq!(
+            target,
+            crate::explorer::ops::OpenTarget::Viewer {
+                list: vec![
+                    PathBuf::from("/fixture/IMG_2.png"),
+                    PathBuf::from("/fixture/IMG_10.png")
+                ],
+                index: 1
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn filters_that_hide_everything_are_a_no_result_not_an_empty_folder() -> TestResult {
+        use crate::explorer::arrange::{ArrangeCommand, SizeRange};
+        let mut state = mixed_state()?;
+        assert!(!state.is_filtering());
+        state.arrange(ArrangeCommand::ToggleSize(SizeRange::Over1Gb));
+        assert_eq!(displayed(&state), ["pics"], "folders ignore byte sizes");
+        state.arrange(ArrangeCommand::ToggleCategory(
+            fileflux::core::kinds::FileCategory::Audio,
+        ));
+        assert!(state.visible_indices().is_empty());
+        assert!(state.is_no_result());
+        assert!(!state.folder_is_empty());
+        state.arrange(ArrangeCommand::ClearFilters);
+        assert!(!state.is_filtering());
+        assert_eq!(state.visible_indices().len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_counts_arriving_later_reorder_the_size_sort() -> TestResult {
+        let mut state = mixed_state()?;
+        state.click_sort(SortKey::Size);
+        let before = displayed(&state);
+        assert_eq!(before.first().map(String::as_str), Some("pics"));
+        let mut counts = FolderCounts::new();
+        counts.insert(PathBuf::from("/fixture/pics"), Some(99));
+        state.set_child_counts(Arc::new(counts));
+        assert_eq!(
+            displayed(&state).first().map(String::as_str),
+            Some("pics"),
+            "folders stay first"
+        );
+        state.arrange(ArrangeCommand::ToggleFoldersFirst);
+        assert_eq!(
+            displayed(&state).last().map(String::as_str),
+            Some("pics"),
+            "99 items outsize the 10-byte files once folders are mixed in"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_tab_inherits_sort_and_filters_then_diverges() -> TestResult {
+        use crate::explorer::arrange::{ArrangeCommand, DateRange};
+        let mut source = mixed_state()?;
+        source.click_sort(SortKey::Modified);
+        source.arrange(ArrangeCommand::ToggleHidden);
+        source.arrange(ArrangeCommand::ToggleDate(DateRange::Older));
+        let mut fresh = source.for_new_tab(dir("/fixture/a"));
+        assert_eq!(fresh.arrangement(), source.arrangement());
+        fresh.arrange(ArrangeCommand::ClearFilters);
+        fresh.click_sort(SortKey::Size);
+        assert_ne!(fresh.arrangement(), source.arrangement());
+        assert!(
+            source.arrangement().filters.hide_hidden,
+            "the source keeps its own"
+        );
+        assert_eq!(source.sort().key, SortKey::Modified);
         Ok(())
     }
 

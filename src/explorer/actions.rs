@@ -25,11 +25,13 @@ use gpui::{
 use fileflux::core::apps::{self, App, OpenWith};
 use fileflux::core::images::is_image_path;
 
+use super::arrange::ArrangeCommand;
+use super::arrange_menu::page_rows;
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
-    MenuRow, MenuTarget, NewKind, Notice, OpenTarget, RenameCheck, RenameStep, Report, Severity,
-    UndoAction, UndoEntry, add_viewer_row, check_rename, dismissed_notice, menu_rows,
+    MenuPage, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, RenameCheck, RenameStep, Report,
+    Severity, UndoAction, UndoEntry, add_viewer_row, check_rename, dismissed_notice, menu_rows,
     move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command, rename_seed,
     rename_step, stem_range,
 };
@@ -80,6 +82,11 @@ pub(crate) struct MenuState {
     pub(crate) rows: Vec<MenuRow>,
     /// The highlighted row (keyboard or hover).
     pub(crate) selected: Option<usize>,
+    /// Which page the rows are.
+    pub(crate) page: MenuPage,
+    /// The context menu's rows while a Sort or Filter page drilled into it,
+    /// restored by "Back".
+    pub(crate) parent: Option<Vec<MenuRow>>,
 }
 
 /// What to select (and whether to start renaming) once the listing that
@@ -446,8 +453,9 @@ impl Explorer {
         };
         // A filter could hide the new entry; the new item must be visible
         // to be renamed.
-        if !self.tab().state.query().is_empty() {
+        if self.tab().state.is_filtering() {
             self.tab_mut().state.clear_query();
+            self.tab_mut().state.arrange(ArrangeCommand::ClearFilters);
             self.tab()
                 .search_input
                 .update(cx, |input, cx| input.set_value(String::new(), window, cx));
@@ -971,16 +979,85 @@ impl Explorer {
             cx.notify();
             return;
         }
+        self.show_menu(position, rows, MenuPage::Context, window, cx);
+    }
+
+    /// Opens the menu with `rows` and gives it the keyboard.
+    fn show_menu(
+        &mut self,
+        position: Point<Pixels>,
+        rows: Vec<MenuRow>,
+        page: MenuPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.menu = Some(MenuState {
             position,
             rows,
             selected: None,
+            page,
+            parent: None,
         });
         cx.defer_in(window, |this, window, cx| {
             if this.menu.is_some() {
                 this.menu_focus.focus(window, cx);
             }
         });
+        cx.notify();
+    }
+
+    /// The Sort or Filter menu a subbar button opens, on this tab's
+    /// arrangement.
+    pub(crate) fn open_arrange_menu(
+        &mut self,
+        page: MenuPage,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_rename(window, cx);
+        let rows = page_rows(page, self.tab().state.arrangement(), false);
+        self.show_menu(position, rows, page, window, cx);
+    }
+
+    /// Changes the active tab's sort or filters (menus, chips, Ctrl+H).
+    /// Selection stays; the grid, list, keyboard and viewer follow the new
+    /// order on the next frame.
+    pub(crate) fn arrange(&mut self, command: ArrangeCommand, cx: &mut Context<Self>) {
+        self.tab_mut().state.arrange(command);
+        // The open Sort/Filter menu redraws its check marks.
+        let arrangement = self.tab().state.arrangement().clone();
+        if let Some(menu) = self.menu.as_mut()
+            && menu.page != MenuPage::Context
+        {
+            menu.rows = page_rows(menu.page, &arrangement, menu.parent.is_some());
+        }
+        cx.notify();
+    }
+
+    /// Shows `page` in the open menu: drilling into Sort/Filter from the
+    /// context menu, or "Back" out of it.
+    fn show_menu_page(&mut self, page: MenuPage, cx: &mut Context<Self>) {
+        let arrangement = self.tab().state.arrangement().clone();
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match page {
+            MenuPage::Context => {
+                let Some(rows) = menu.parent.take() else {
+                    return;
+                };
+                menu.rows = rows;
+            }
+            MenuPage::Sort | MenuPage::Filter => {
+                if menu.page == MenuPage::Context {
+                    menu.parent = Some(std::mem::take(&mut menu.rows));
+                }
+                menu.rows = page_rows(page, &arrangement, menu.parent.is_some());
+            }
+        }
+        menu.page = page;
+        menu.selected = None;
         cx.notify();
     }
 
@@ -1007,7 +1084,7 @@ impl Explorer {
             .and_then(|menu| menu.selected.and_then(|at| menu.rows.get(at)))
             .and_then(|row| match row {
                 MenuRow::Item(item) if item.enabled => Some(item.command),
-                MenuRow::Item(_) | MenuRow::Separator => None,
+                MenuRow::Item(_) | MenuRow::Header(_) | MenuRow::Separator => None,
             });
         if let Some(command) = command {
             self.run_menu_command(command, window, cx);
@@ -1021,8 +1098,16 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Sort and filter rows keep the menu open: several categories can
+        // be ticked in a row, and the checks redraw.
+        match command {
+            MenuCommand::Arrange(change) => return self.arrange(change, cx),
+            MenuCommand::Page(page) => return self.show_menu_page(page, cx),
+            _ => {}
+        }
         self.close_menu(window, cx);
         match command {
+            MenuCommand::Arrange(_) | MenuCommand::Page(_) => {}
             MenuCommand::Open => self.open_selected(window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
             MenuCommand::OpenInNewTab => self.open_selected_in_new_tab(window, cx),

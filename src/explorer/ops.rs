@@ -34,6 +34,7 @@ use fileflux::core::trash::{
 };
 use fileflux::core::watch::nearest_existing_ancestor;
 
+use super::arrange::ArrangeCommand;
 use super::progress::Sink;
 
 #[path = "paste.rs"]
@@ -1156,6 +1157,20 @@ pub(crate) enum MenuCommand {
     Paste,
     /// Paste into the single selected folder ("Paste into folder").
     PasteIntoFolder,
+    /// A sort or filter change; the menu stays open and redraws its checks.
+    Arrange(ArrangeCommand),
+    /// Shows another page of the open menu ("Sort by", "Filter").
+    Page(MenuPage),
+}
+
+/// Which page of the one menu is showing. The empty-space menu opens on
+/// [`MenuPage::Context`] and drills into the other two; the subbar buttons
+/// open them directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuPage {
+    Context,
+    Sort,
+    Filter,
 }
 
 /// One drawn menu item.
@@ -1168,12 +1183,33 @@ pub(crate) struct MenuItemSpec {
     /// A disabled item is drawn dimmed, skipped by the arrow keys and does
     /// nothing when activated.
     pub(crate) enabled: bool,
+    /// `Some` for a checkable row: `true` draws the check mark.
+    pub(crate) checked: Option<bool>,
+    /// The row opens another page of the menu: drawn with a chevron.
+    pub(crate) submenu: bool,
+}
+
+impl MenuItemSpec {
+    /// An enabled, plain row.
+    pub(crate) fn new(command: MenuCommand, label: &'static str) -> Self {
+        Self {
+            command,
+            label,
+            shortcut: None,
+            danger: false,
+            enabled: true,
+            checked: None,
+            submenu: false,
+        }
+    }
 }
 
 /// A row of the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuRow {
     Item(MenuItemSpec),
+    /// A caption naming the group of rows under it; never selectable.
+    Header(&'static str),
     Separator,
 }
 
@@ -1236,13 +1272,10 @@ pub(crate) fn add_viewer_row(rows: &mut Vec<MenuRow>) {
     if let Some(at) = after_open {
         rows.insert(
             at + 1,
-            MenuRow::Item(MenuItemSpec {
-                command: MenuCommand::OpenInViewer,
-                label: "Open in viewer",
-                shortcut: None,
-                danger: false,
-                enabled: true,
-            }),
+            MenuRow::Item(MenuItemSpec::new(
+                MenuCommand::OpenInViewer,
+                "Open in viewer",
+            )),
         );
     }
 }
@@ -1252,22 +1285,18 @@ pub(crate) fn add_viewer_row(rows: &mut Vec<MenuRow>) {
 pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
     let item = |command, label, shortcut, danger| {
         MenuRow::Item(MenuItemSpec {
-            command,
-            label,
             shortcut,
             danger,
-            enabled: true,
+            ..MenuItemSpec::new(command, label)
         })
     };
     // Paste needs something on the clipboard; Cut and Copy are only ever
     // offered on a selection.
     let paste = |command, label| {
         MenuRow::Item(MenuItemSpec {
-            command,
-            label,
             shortcut: Some("Ctrl+V"),
-            danger: false,
             enabled: target.can_paste,
+            ..MenuItemSpec::new(command, label)
         })
     };
     let properties = || item(MenuCommand::Properties, "Properties", Some("Ctrl+I"), false);
@@ -1350,6 +1379,9 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         MenuRow::Separator,
         paste(MenuCommand::Paste, "Paste"),
         MenuRow::Separator,
+        page_row(MenuPage::Sort, "Sort by"),
+        page_row(MenuPage::Filter, "Filter"),
+        MenuRow::Separator,
     ];
     if target.terminal {
         rows.push(item(
@@ -1366,6 +1398,14 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         false,
     ));
     rows
+}
+
+/// A row that opens another page of the menu.
+pub(crate) fn page_row(page: MenuPage, label: &'static str) -> MenuRow {
+    MenuRow::Item(MenuItemSpec {
+        submenu: true,
+        ..MenuItemSpec::new(MenuCommand::Page(page), label)
+    })
 }
 
 /// The row the arrow keys move to from `current` (`None`: nothing

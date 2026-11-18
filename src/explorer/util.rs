@@ -192,6 +192,15 @@ pub(crate) fn folder_counts_label(entries: &[fileflux::core::Entry]) -> String {
     }
 }
 
+/// The subbar meta while the search or a filter narrows the folder:
+/// `"12 of 40 items"`.
+pub(crate) fn filtered_counts_label(shown: usize, total: usize) -> String {
+    format!(
+        "{shown} of {total} {}",
+        if total == 1 { "item" } else { "items" }
+    )
+}
+
 /// The status bar's left text: `"N items"` (or `"n of N shown"` while a
 /// query filters), and `"N selected · <size>"` once something is selected.
 pub(crate) fn status_label(
@@ -507,5 +516,12 @@ mod tests {
         assert_eq!(items_label(12, Some(3)), "3 of 12");
         assert_eq!(items_label(0, None), "0");
         assert_eq!(items_label(5, Some(0)), "0 of 5");
+    }
+
+    #[test]
+    fn the_subbar_reads_n_of_m_items_while_filtering() {
+        assert_eq!(filtered_counts_label(12, 40), "12 of 40 items");
+        assert_eq!(filtered_counts_label(0, 40), "0 of 40 items");
+        assert_eq!(filtered_counts_label(1, 1), "1 of 1 item");
     }
 }

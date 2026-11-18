@@ -46,9 +46,10 @@ use gpui_component::{
 };
 
 use super::actions::RenameView;
+use super::arrange::SortKey;
 use super::dnd::{self, DropTarget};
 use super::entries;
-use super::state::{SortKey, SortSpec};
+use super::state::SortSpec;
 use super::util;
 use super::view::Explorer;
 
@@ -658,7 +659,8 @@ pub(crate) fn render_list(
         let data_changed =
             delegate.set_data(Arc::clone(&explorer.tab().snapshot), Arc::clone(&visible));
         let sort_changed = delegate.set_sort(explorer.tab().state.sort());
-        let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.tab().child_counts));
+        let counts_changed =
+            delegate.set_child_counts(Arc::clone(explorer.tab().state.child_counts()));
         delegate.set_selection(Arc::clone(&selected));
         delegate.set_dragged(dragged);
         let cut_changed = delegate.set_cut(explorer.clipboard.cut_paths());
@@ -701,7 +703,7 @@ pub(crate) fn render_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::explorer::state::{SortDir, sorted_indices};
+    use crate::explorer::arrange::{FolderCounts, SortDir, compare_entries};
     use fileflux::core::EntryKind;
     use fileflux::core::fs::filtered_indices;
     use std::ffi::OsString;
@@ -935,7 +937,22 @@ mod tests {
     }
 
     fn spec(key: SortKey, dir: SortDir) -> SortSpec {
-        SortSpec { key, dir }
+        SortSpec {
+            key,
+            dir,
+            ..SortSpec::default()
+        }
+    }
+
+    /// The `visible` indices reordered under `spec`, the way the state does.
+    fn sorted_indices(entries: &[Entry], visible: &[usize], spec: SortSpec) -> Vec<usize> {
+        let counts = FolderCounts::new();
+        let mut order = visible.to_vec();
+        order.sort_by(|&a, &b| match (entries.get(a), entries.get(b)) {
+            (Some(a), Some(b)) => compare_entries(a, b, spec, &counts),
+            (a, b) => a.is_some().cmp(&b.is_some()).reverse(),
+        });
+        order
     }
 
     /// Folders stay grouped before files under every key and direction;

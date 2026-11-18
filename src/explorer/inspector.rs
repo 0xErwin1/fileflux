@@ -452,8 +452,11 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     let colors = bolt::colors(cx);
     // The folder's total; "N of M" while a filter hides some of it.
     let total = this.tab().state.listing().entries.len();
-    let shown =
-        (!this.tab().state.query().is_empty()).then(|| this.tab().state.visible_indices().len());
+    let shown = this
+        .tab()
+        .state
+        .is_filtering()
+        .then(|| this.tab().state.visible_indices().len());
     let items = util::items_label(total, shown);
     vec![
         preview_box(folder_glyph(cx), cx).into_any_element(),
@@ -502,7 +505,14 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
 
     let mut rows = Vec::new();
     if entry.is_directory() {
-        if let Some(count) = this.tab().child_counts.get(&entry.path).copied().flatten() {
+        if let Some(count) = this
+            .tab()
+            .state
+            .child_counts()
+            .get(&entry.path)
+            .copied()
+            .flatten()
+        {
             rows.push(Fact::new("Contains", util::format_item_count(count)));
         }
     } else {

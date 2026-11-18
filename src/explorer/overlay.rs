@@ -6,7 +6,8 @@
 //! `bolt::modals::Modal` with `Button`s, and the editor is Bolt's `Input`.
 
 use bolt::composites::{
-    MenuItem, render_menu_container, render_menu_item, render_menu_overlay, render_separator,
+    MenuItem, render_menu_container, render_menu_header, render_menu_item, render_menu_overlay,
+    render_separator,
 };
 use bolt::controls::{Button, Checkbox, Input, InputEnter, InputEscape};
 use bolt::modals::Modal;
@@ -19,7 +20,7 @@ use gpui::{
 
 use super::actions::RenameView;
 use super::icon;
-use super::ops::{DialogAction, DialogChoice, MenuCommand, MenuRow};
+use super::ops::{DialogAction, DialogChoice, MenuCommand, MenuPage, MenuRow};
 use super::view::{Explorer, MENU_CONTEXT};
 
 /// The menu and the dialog, when open. Also hands the keyboard back to the
@@ -42,9 +43,14 @@ pub(crate) fn render(
     layers
 }
 
-fn command_icon(command: MenuCommand) -> gpui_kit_assets::IconName {
+fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
     use gpui_kit_assets::IconName;
-    match command {
+    Some(match command {
+        // Sort and filter choices show their check mark instead.
+        MenuCommand::Arrange(_) => return None,
+        MenuCommand::Page(MenuPage::Sort) => IconName::ArrowUpDown,
+        MenuCommand::Page(MenuPage::Filter) => IconName::ListFilter,
+        MenuCommand::Page(MenuPage::Context) => IconName::ChevronLeft,
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
         MenuCommand::OpenInViewer => IconName::Image,
         MenuCommand::OpenInNewTab => IconName::ExternalLink,
@@ -61,7 +67,7 @@ fn command_icon(command: MenuCommand) -> gpui_kit_assets::IconName {
         MenuCommand::Cut => IconName::Scissors,
         MenuCommand::Copy => IconName::Copy,
         MenuCommand::Paste | MenuCommand::PasteIntoFolder => IconName::ClipboardPaste,
-    }
+    })
 }
 
 fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
@@ -75,8 +81,20 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
         .enumerate()
         .map(|(index, row)| match row {
             MenuRow::Separator => render_separator(cx).into_any_element(),
+            MenuRow::Header(label) => {
+                render_menu_header(&MenuItem::header(*label), cx).into_any_element()
+            }
             MenuRow::Item(spec) => {
-                let mut item = MenuItem::new(spec.label).icon(icon(command_icon(spec.command)));
+                let mut item = MenuItem::new(spec.label);
+                if let Some(name) = command_icon(spec.command) {
+                    item = item.icon(icon(name));
+                }
+                if let Some(checked) = spec.checked {
+                    item = item.checked(checked);
+                }
+                if spec.submenu {
+                    item = item.submenu();
+                }
                 if let Some(shortcut) = spec.shortcut {
                     item = item.shortcut(shortcut);
                 }
@@ -121,7 +139,16 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
         .collect();
 
     let dismiss = weak.clone();
-    let panel = render_menu_container(children, cx).min_w(px(250.0));
+    // The Filter page is taller than a short window: the rows scroll inside
+    // the frame, which stays put.
+    let rows = div()
+        .id("explorer-menu-rows")
+        .flex()
+        .flex_col()
+        .max_h(px(700.0))
+        .overflow_y_scroll()
+        .children(children);
+    let panel = render_menu_container(vec![rows], cx).min_w(px(250.0));
     vec![
         // Under the menu: any click elsewhere closes it.
         deferred(div().absolute().size_full().child(render_menu_overlay(
@@ -373,6 +400,11 @@ pub(crate) fn renamer(
                 .error(view.error.clone().filter(|_| caption)),
         )
         .into_any_element()
+}
+
+/// The point a subbar button's menu anchors to: just under the click.
+pub(crate) fn under_button(position: gpui::Point<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
+    point(position.x - px(24.0), position.y + px(16.0))
 }
 
 /// The point menus anchor to when the toolbar button opens one.

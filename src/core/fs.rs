@@ -4,8 +4,9 @@
 //! resolves entry kinds through metadata only, and reports partial failures as
 //! explicit [`Listing::warnings`] instead of hiding entries.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,23 +49,71 @@ pub fn read_directory(path: &Path) -> io::Result<Listing> {
     Ok(listing)
 }
 
-/// Sorts entries folders-first, then case-insensitive by name, raw path tie.
-///
-/// Comparisons use the lossy lowercase display name, so the order is stable
-/// and independent of locale; equal names fall back to the raw [`PathBuf`]
-/// bytes so non-UTF8 names keep a deterministic position.
+/// Sorts entries folders-first, then by natural name order
+/// ([`natural_cmp`]), raw path tie. The order is independent of locale and
+/// deterministic for non-UTF8 names.
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         b.is_directory()
             .cmp(&a.is_directory())
-            .then_with(|| {
-                a.name
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .cmp(&b.name.to_string_lossy().to_lowercase())
-            })
+            .then_with(|| natural_cmp(&a.name, &b.name))
             .then_with(|| a.path.cmp(&b.path))
     });
+}
+
+/// Compares two names for display: case-insensitively, with runs of ASCII
+/// digits ordered by their number (`IMG_2` before `IMG_10`, however long
+/// the run). Names are compared through their lossy text, so non-UTF-8 names
+/// are safe; a number with leading zeros follows the same number without
+/// them, and names that are still equal fall back to their raw bytes, so the
+/// order is total and deterministic.
+pub fn natural_cmp(a: &OsStr, b: &OsStr) -> Ordering {
+    natural_text_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
+}
+
+fn natural_text_cmp(a: &str, b: &str) -> Ordering {
+    let (mut left, mut right) = (a.chars().peekable(), b.chars().peekable());
+    // The first difference in leading zeros between numerically equal runs.
+    let mut zeros = Ordering::Equal;
+    loop {
+        match (left.peek().copied(), right.peek().copied()) {
+            (None, None) => return zeros,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let run_a = take_digits(&mut left);
+                let run_b = take_digits(&mut right);
+                let (number_a, number_b) =
+                    (run_a.trim_start_matches('0'), run_b.trim_start_matches('0'));
+                let by_number = number_a
+                    .len()
+                    .cmp(&number_b.len())
+                    .then_with(|| number_a.cmp(number_b));
+                if by_number != Ordering::Equal {
+                    return by_number;
+                }
+                if zeros == Ordering::Equal {
+                    zeros = run_a.len().cmp(&run_b.len());
+                }
+            }
+            (Some(x), Some(y)) => {
+                let by_char = x.to_lowercase().cmp(y.to_lowercase());
+                if by_char != Ordering::Equal {
+                    return by_char;
+                }
+                left.next();
+                right.next();
+            }
+        }
+    }
+}
+
+fn take_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut run = String::new();
+    while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+        run.push(digit);
+    }
+    run
 }
 
 /// Returns the indices of entries whose local name contains `query`
@@ -490,5 +539,109 @@ mod tests {
             "files are never counted"
         );
         Ok(())
+    }
+
+    mod natural {
+        use super::super::natural_cmp;
+        use std::cmp::Ordering;
+        use std::ffi::OsStr;
+
+        fn sorted(names: &[&str]) -> Vec<String> {
+            let mut list: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
+            list.sort_by(|a, b| natural_cmp(a, b));
+            list.iter()
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        #[test]
+        fn digit_runs_order_by_number() {
+            assert_eq!(
+                sorted(&["IMG_10", "IMG_2", "IMG_1", "IMG_100"]),
+                ["IMG_1", "IMG_2", "IMG_10", "IMG_100"]
+            );
+            assert_eq!(
+                sorted(&["a10b2", "a10b10", "a9b99"]),
+                ["a9b99", "a10b2", "a10b10"]
+            );
+        }
+
+        #[test]
+        fn case_is_ignored_before_the_tie_break() {
+            assert_eq!(sorted(&["b", "A", "a", "B"]), ["A", "a", "B", "b"]);
+            assert_eq!(
+                natural_cmp(OsStr::new("img_2"), OsStr::new("IMG_10")),
+                Ordering::Less
+            );
+        }
+
+        #[test]
+        fn leading_zeros_do_not_change_the_number_but_break_ties() {
+            assert_eq!(
+                sorted(&["f02", "f1", "f001", "f2"]),
+                ["f1", "f001", "f2", "f02"]
+            );
+            assert_eq!(
+                natural_cmp(OsStr::new("a007"), OsStr::new("a8")),
+                Ordering::Less
+            );
+        }
+
+        #[test]
+        fn huge_numbers_never_overflow() {
+            let big = "n99999999999999999999999999";
+            let bigger = "n100000000000000000000000000";
+            assert_eq!(
+                natural_cmp(OsStr::new(big), OsStr::new(bigger)),
+                Ordering::Less
+            );
+        }
+
+        #[test]
+        fn mixed_digits_and_letters_compare_by_character() {
+            assert_eq!(sorted(&["a1", "ab", "a-"]), ["a-", "a1", "ab"]);
+            assert_eq!(sorted(&["file", "file1"]), ["file", "file1"]);
+        }
+
+        #[test]
+        fn unicode_names_fold_case() {
+            assert_eq!(
+                natural_cmp(OsStr::new("Éclair"), OsStr::new("éclair")),
+                Ordering::Less
+            );
+            assert_eq!(sorted(&["ñ2", "ñ10", "Ñ1"]), ["Ñ1", "ñ2", "ñ10"]);
+        }
+
+        #[test]
+        fn equal_names_tie_break_by_raw_bytes() {
+            assert_eq!(
+                natural_cmp(OsStr::new("a"), OsStr::new("a")),
+                Ordering::Equal
+            );
+            assert_eq!(
+                natural_cmp(OsStr::new("A"), OsStr::new("a")),
+                Ordering::Less
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_names_are_ordered_deterministically() {
+            use std::os::unix::ffi::OsStrExt as _;
+            let bad_a = OsStr::from_bytes(b"x\xff1");
+            let bad_b = OsStr::from_bytes(b"x\xfe1");
+            assert_ne!(natural_cmp(bad_a, bad_b), Ordering::Equal);
+            assert_eq!(natural_cmp(bad_a, bad_b), natural_cmp(bad_a, bad_b));
+            assert_eq!(
+                natural_cmp(bad_a, bad_b),
+                natural_cmp(bad_b, bad_a).reverse()
+            );
+            let mut names = [bad_a, OsStr::new("x2"), bad_b, OsStr::new("x10")];
+            names.sort_by(|a, b| natural_cmp(a, b));
+            let mut again = names;
+            again.reverse();
+            again.sort_by(|a, b| natural_cmp(a, b));
+            assert_eq!(names, again, "the order does not depend on the input order");
+        }
     }
 }

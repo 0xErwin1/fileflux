@@ -298,6 +298,7 @@ fn flat(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
             MenuRow::Separator => "-".to_owned(),
+            MenuRow::Header(label) => format!("# {label}"),
             MenuRow::Item(item) => item.label.to_owned(),
         })
         .collect()
@@ -373,6 +374,9 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "-",
             "Paste",
             "-",
+            "Sort by",
+            "Filter",
+            "-",
             "Open terminal here",
             "Copy folder path"
         ]
@@ -389,6 +393,9 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "New file",
             "-",
             "Paste",
+            "-",
+            "Sort by",
+            "Filter",
             "-",
             "Copy folder path"
         ],
