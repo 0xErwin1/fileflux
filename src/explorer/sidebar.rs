@@ -17,13 +17,15 @@ use fileflux::core::places::Volume;
 use std::path::Path;
 
 use gpui::{
-    App, Context, Div, ElementId, ParentElement, Stateful, Styled, div, prelude::*, px, relative,
+    App, Context, Div, ElementId, MouseButton, ParentElement, Stateful, Styled, div, prelude::*,
+    px, relative,
 };
 use gpui_component::{ActiveTheme, tooltip::Tooltip};
 
 use super::dnd::{self, DropTarget};
 use super::icon;
 use super::state::Transition;
+use super::tabs::Placement;
 use super::view::{Explorer, SIDEBAR_WIDTH};
 
 /// The sidebar island, or nothing while it is toggled closed — at either
@@ -156,7 +158,7 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
 fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let mut section = div().flex_none().flex().flex_col();
     section = section.child(section_label("favorites-label", "Favorites", cx));
-    if this.state.favorites().is_empty() {
+    if this.favorites.list().is_empty() {
         let colors = bolt::colors(cx);
         return section.child(
             div()
@@ -174,7 +176,7 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
                 .child("Star a folder to pin it here."),
         );
     }
-    for (index, path) in this.state.favorites().iter().enumerate() {
+    for (index, path) in this.favorites.list().iter().enumerate() {
         section = section.child(nav_row(
             format!("favorite-{index}"),
             &path.file_name().map_or_else(
@@ -218,7 +220,7 @@ fn volume_row(
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
     let location = Location::Directory(volume.path.clone());
-    let active = this.state.current() == &location;
+    let active = this.tab().state.current() == &location;
     let glyph = if volume.removable {
         gpui_kit_assets::IconName::Usb
     } else {
@@ -314,9 +316,18 @@ fn row_shell(
         } else {
             colors.foreground
         })
-        .on_click(cx.listener(move |this, _event, window, cx| {
-            this.navigate(Transition::Visit(location.clone()), window, cx);
-        }));
+        .on_click(cx.listener({
+            let location = location.clone();
+            move |this, _event, window, cx| {
+                this.navigate(Transition::Visit(location.clone()), window, cx);
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Middle,
+            cx.listener(move |this, _event, window, cx| {
+                this.open_tab(location.clone(), Placement::Background, window, cx);
+            }),
+        );
     let row = dnd::drop_target(row, target, &cx.entity().downgrade(), cx);
     if path.is_empty() {
         return row;
@@ -339,7 +350,7 @@ fn nav_row(
 ) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
-    let active = this.state.current() == location;
+    let active = this.tab().state.current() == location;
     let home_label = home.is_some_and(|home| location == &Location::Directory(home.to_path_buf()));
     let shown_label = if home_label {
         "Home".to_owned()

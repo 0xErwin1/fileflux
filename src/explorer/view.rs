@@ -40,9 +40,10 @@ use crate::explorer::ops::DialogQueue;
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::progress::Registry;
-use crate::explorer::state::{ExplorerState, PathArgument, Scan, Transition, View};
+use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
-use crate::explorer::{entries, overlay, progress, sidebar, toolbar, util};
+use crate::explorer::tabs::{Affected, Placement, TabList};
+use crate::explorer::{entries, overlay, progress, sidebar, tabstrip, toolbar, util};
 
 /// Key context of the whole explorer window.
 pub(crate) const EXPLORER_CONTEXT: &str = "FilefluxExplorer";
@@ -105,6 +106,33 @@ actions!(
         DialogUp,
         /// Moves down in the "Open with…" list.
         DialogDown,
+        /// Opens a new tab on the current folder (Ctrl+T).
+        NewTab,
+        /// Closes the current tab; the last tab stays (Ctrl+W).
+        CloseTab,
+        /// Activates the next tab, wrapping around (Ctrl+Tab, Ctrl+PageDown).
+        NextTab,
+        /// Activates the previous tab, wrapping around (Ctrl+Shift+Tab,
+        /// Ctrl+PageUp).
+        PreviousTab,
+        /// Activates the first tab (Alt+1).
+        JumpToTab1,
+        /// Activates the second tab (Alt+2).
+        JumpToTab2,
+        /// Activates the third tab (Alt+3).
+        JumpToTab3,
+        /// Activates the fourth tab (Alt+4).
+        JumpToTab4,
+        /// Activates the fifth tab (Alt+5).
+        JumpToTab5,
+        /// Activates the sixth tab (Alt+6).
+        JumpToTab6,
+        /// Activates the seventh tab (Alt+7).
+        JumpToTab7,
+        /// Activates the eighth tab (Alt+8).
+        JumpToTab8,
+        /// Activates the ninth tab (Alt+9).
+        JumpToTab9,
     ]
 );
 
@@ -196,6 +224,27 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", DialogUp, Some("Modal")),
         KeyBinding::new("down", DialogDown, Some("Modal")),
     ]);
+
+    // Tabs answer anywhere in the window except behind a dialog or the
+    // open menu, text fields included: none of these chords types text.
+    let tabs = Some("FilefluxExplorer && !Modal && !FilefluxMenu");
+    cx.bind_keys([
+        KeyBinding::new("ctrl-t", NewTab, tabs),
+        KeyBinding::new("ctrl-w", CloseTab, tabs),
+        KeyBinding::new("ctrl-tab", NextTab, tabs),
+        KeyBinding::new("ctrl-pagedown", NextTab, tabs),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, tabs),
+        KeyBinding::new("ctrl-pageup", PreviousTab, tabs),
+        KeyBinding::new("alt-1", JumpToTab1, tabs),
+        KeyBinding::new("alt-2", JumpToTab2, tabs),
+        KeyBinding::new("alt-3", JumpToTab3, tabs),
+        KeyBinding::new("alt-4", JumpToTab4, tabs),
+        KeyBinding::new("alt-5", JumpToTab5, tabs),
+        KeyBinding::new("alt-6", JumpToTab6, tabs),
+        KeyBinding::new("alt-7", JumpToTab7, tabs),
+        KeyBinding::new("alt-8", JumpToTab8, tabs),
+        KeyBinding::new("alt-9", JumpToTab9, tabs),
+    ]);
     install_modal_seams(cx);
 }
 
@@ -244,22 +293,24 @@ pub(crate) const SIDEBAR_WIDTH: f32 = 290.0;
 /// so path, search and view stay reachable.
 pub(crate) const NARROW_WIDTH: f32 = 760.0;
 
-/// The explorer view. All filesystem state lives in [`ExplorerState`]; this
-/// struct only adds the session UI: inputs, focus handles, the scroll
-/// anchor and the background tasks.
-pub(crate) struct Explorer {
+/// Identifies one tab for as long as it lives. Ids are never reused, so a
+/// task that outlives its tab finds nothing instead of another tab.
+pub(crate) type TabId = u64;
+
+/// Everything one tab keeps for itself: where it is and how it got there,
+/// what is selected, how it is presented, the filter and path fields, the
+/// scroll handles, and the background work for its folder. The window-wide
+/// things — places, favorites, clipboard, undo, dialogs, operations — live
+/// on [`Explorer`].
+pub(crate) struct Tab {
+    /// This tab's identity, for tasks that must find it again.
+    pub(crate) id: TabId,
     /// The committed explorer state, guarded by generations.
     pub(crate) state: ExplorerState,
     /// A clone of the committed listing for the virtualized rows, replaced
     /// on every commit; the render closures read this instead of scanning
     /// the directory again.
     pub(crate) snapshot: Arc<Vec<fileflux::core::Entry>>,
-    /// Sidebar discovery, arriving off the UI thread at startup.
-    pub(crate) places: Option<Places>,
-    /// Why the sidebar could not be discovered, when it could not.
-    pub(crate) sidebar_error: Option<String>,
-    /// The home Trash root once places are known.
-    pub(crate) trash_root: Option<PathBuf>,
     /// The editable path field.
     pub(crate) path_input: Entity<InputState>,
     /// The text the path field was last seeded with; an unedited submit
@@ -277,41 +328,13 @@ pub(crate) struct Explorer {
     submitted_edit: Option<SubmittedEdit>,
     /// The current-folder filename search field.
     pub(crate) search_input: Entity<InputState>,
-    /// The whole-window focus, so Escape has somewhere to give the focus
-    /// back and the shell keys work after a click on bare chrome.
-    pub(crate) shell_focus: FocusHandle,
-    /// The entries area focus, which carries the arrow keys.
-    pub(crate) entries_focus: FocusHandle,
-    /// The details table's state entity: one per explorer, so no row data
-    /// leaks across windows; the delegate answers the current snapshot.
+    /// The details table's state entity: one per tab, so each tab keeps its
+    /// own scroll offset; the delegate answers the tab's snapshot.
     pub(crate) table: Entity<TableState<EntryTableDelegate>>,
-    /// The column widths the user dragged on the details table, honored by
-    /// [`crate::explorer::table::distribute_widths`] on every render.
-    pub(crate) list_widths: ListWidths,
     /// The vertical scroll handle of the tile grid.
     pub(crate) grid_scroll: UniformListScrollHandle,
-    /// The entries area's measured inner width, recorded by the draw-nothing
-    /// measuring canvas every frame; `None` until the first layout reached
-    /// it, so the first frame draws with the estimate below.
-    pub(crate) entries_width: Option<f32>,
     /// The retained scan task, replaced by the next scan.
     scan_task: Option<Task<()>>,
-    /// The path field's Enter/Change/Blur subscription.
-    _path_events: Option<Subscription>,
-    /// The search field's Change subscription.
-    _search_events: Option<Subscription>,
-    /// The details table's width-drag events.
-    _table_events: Option<Subscription>,
-    /// Whether the sidebar is shown; narrow windows park it behind the
-    /// sidebar toggle.
-    pub(crate) sidebar_open: bool,
-    /// The grid column count of the last render, so keyboard row steps use
-    /// the same geometry the list draws with.
-    pub(crate) rendered_columns: usize,
-    /// Whether the user wants the details panel (Ctrl+I, toolbar button).
-    pub(crate) inspector_open: bool,
-    /// Whether the panel drew in the last render: wanted and wide enough.
-    pub(crate) inspector_shown: bool,
     /// The mode of the single inspected entry, probed off the UI thread.
     pub(crate) permissions: Option<PermissionProbe>,
     /// The path whose permission probe is waiting out its debounce or
@@ -325,21 +348,199 @@ pub(crate) struct Explorer {
     pub(crate) child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
-    /// The folder the live-refresh watcher observes, if any.
+    /// The folder the live-refresh watcher observes, if any. Only the
+    /// active tab is watched: see [`Explorer::after_tab_switch`].
     watched: Option<PathBuf>,
     /// The retained watch loop; replacing or dropping it ends the watcher.
     watch_task: Option<Task<()>>,
+    /// What to select (and whether to rename) once the next listing shows it.
+    pub(crate) pending: Option<PendingSelect>,
+    /// The path field's Enter/Change/Blur subscription.
+    _path_events: Subscription,
+    /// The search field's Change subscription.
+    _search_events: Subscription,
+    /// The details table's width-drag events.
+    _table_events: Subscription,
+}
+
+impl Tab {
+    /// A tab with its own fields and tables, committed to `state` but not
+    /// scanned yet.
+    fn new(
+        id: TabId,
+        state: ExplorerState,
+        window: &mut Window,
+        cx: &mut Context<Explorer>,
+    ) -> Self {
+        let path_input = cx.new(|cx| InputState::new(window, cx));
+        let search_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_placeholder("Search this folder…", window, cx);
+            input
+        });
+
+        // The details table's state: one entity per tab, with the table's
+        // internal selection off — the explorer's raw-path selection
+        // (single, Ctrl-toggle, keyboard) drives everything through the
+        // delegate's row clicks, so the table can never clobber it.
+        let weak_this = cx.entity().downgrade();
+        let table = cx.new(|cx| {
+            TableState::new(
+                EntryTableDelegate::new(weak_this, Arc::new(Vec::new()), Arc::new(Vec::new())),
+                window,
+                cx,
+            )
+            .row_selectable(false)
+            .col_selectable(false)
+            .cell_selectable(false)
+            .sortable(false)
+            .col_movable(false)
+        });
+
+        // The path field: Enter submits, typing clears the path error, and
+        // blur restores the committed path (the same as Escape).
+        let path_events = cx.subscribe_in(
+            &path_input,
+            window,
+            move |this, _input, event: &InputEvent, window, cx| {
+                this.path_event(id, event, window, cx);
+            },
+        );
+
+        // The search field filters its tab's folder on every keystroke.
+        let search_events = cx.subscribe_in(
+            &search_input,
+            window,
+            move |this, _input, event: &InputEvent, _window, cx| {
+                if let InputEvent::Change = event {
+                    let Some(tab) = this.tabs.by_id_mut(id) else {
+                        return;
+                    };
+                    let text = tab.search_input.read(cx).value().to_string();
+                    tab.state.set_query(text);
+                    cx.notify();
+                }
+            },
+        );
+
+        // The details table's column drags: only widths that actually moved
+        // against the delegate's applied widths are deliberate, so an
+        // undragged column keeps re-filling when the pane changes.
+        let table_events = cx.subscribe(&table, move |this, table, event: &TableEvent, cx| {
+            if let TableEvent::ColumnWidthsChanged(widths) = event {
+                let applied = *table.read(cx).delegate().widths();
+                for (column, width) in widths.iter().enumerate() {
+                    let Some(applied) = applied.get(column) else {
+                        continue;
+                    };
+                    if (width.as_f32() - applied).abs() > crate::explorer::table::DRAG_EPSILON {
+                        this.list_widths.record(column, width.as_f32());
+                    }
+                }
+                cx.notify();
+            }
+        });
+
+        Self {
+            id,
+            state,
+            snapshot: Arc::new(Vec::new()),
+            path_input,
+            path_seed: String::new(),
+            path_edited: false,
+            path_editing: false,
+            path_edit_revision: 0,
+            submitted_edit: None,
+            search_input,
+            table,
+            grid_scroll: UniformListScrollHandle::new(),
+            scan_task: None,
+            permissions: None,
+            permission_in_flight: None,
+            permission_task: None,
+            child_counts: Arc::new(HashMap::new()),
+            counts_task: None,
+            watched: None,
+            watch_task: None,
+            pending: None,
+            _path_events: path_events,
+            _search_events: search_events,
+            _table_events: table_events,
+        }
+    }
+}
+
+impl TabList<Tab> {
+    /// The tab with `id`, if it is still open.
+    pub(crate) fn by_id_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        self.iter_mut().find(|tab| tab.id == id)
+    }
+}
+
+/// The context an operation started in, kept until its result arrives.
+pub(crate) struct OpContext {
+    /// The tab the operation was started from: the one a "select the new
+    /// item" result belongs to.
+    pub(crate) origin: TabId,
+    /// The folders the operation changes.
+    pub(crate) affected: Affected,
+}
+
+/// The explorer view: the window's tabs plus everything the tabs share.
+/// All per-folder state lives in [`Tab`]; this struct adds the window's
+/// UI: focus handles, the sidebar, the operations and their dialogs.
+pub(crate) struct Explorer {
+    /// The open tabs, one of them active.
+    pub(crate) tabs: TabList<Tab>,
+    /// The id the next opened tab gets.
+    next_tab_id: TabId,
+    /// The home directory, when known: `~` in typed paths, new tabs.
+    pub(crate) home: Option<PathBuf>,
+    /// The session favorites, shared by every tab.
+    pub(crate) favorites: Favorites,
+    /// Sidebar discovery, arriving off the UI thread at startup.
+    pub(crate) places: Option<Places>,
+    /// Why the sidebar could not be discovered, when it could not.
+    pub(crate) sidebar_error: Option<String>,
+    /// The home Trash root once places are known.
+    pub(crate) trash_root: Option<PathBuf>,
+    /// The whole-window focus, so Escape has somewhere to give the focus
+    /// back and the shell keys work after a click on bare chrome.
+    pub(crate) shell_focus: FocusHandle,
+    /// The entries area focus, which carries the arrow keys.
+    pub(crate) entries_focus: FocusHandle,
+    /// The column widths the user dragged on the details table, honored by
+    /// [`crate::explorer::table::distribute_widths`] on every render.
+    pub(crate) list_widths: ListWidths,
+    /// The entries area's measured inner width, recorded by the draw-nothing
+    /// measuring canvas every frame; `None` until the first layout reached
+    /// it, so the first frame draws with the estimate below.
+    pub(crate) entries_width: Option<f32>,
+    /// Whether the sidebar is shown; narrow windows park it behind the
+    /// sidebar toggle.
+    pub(crate) sidebar_open: bool,
+    /// The grid column count of the last render, so keyboard row steps use
+    /// the same geometry the list draws with.
+    pub(crate) rendered_columns: usize,
+    /// Whether the user wants the details panel (Ctrl+I, toolbar button).
+    pub(crate) inspector_open: bool,
+    /// Whether the panel drew in the last render: wanted and wide enough.
+    pub(crate) inspector_shown: bool,
     /// The operations running off the UI thread, behind the progress cards.
     pub(crate) progress: Registry,
-    /// The session's undo history; survives navigation.
+    /// Where each running operation started and what it changes.
+    pub(crate) op_contexts: HashMap<u64, OpContext>,
+    /// The session's undo history; survives navigation and tab switches.
     pub(crate) undo: UndoStack,
-    /// The inline rename in progress, if any.
+    /// The inline rename in progress, if any: it belongs to the active tab
+    /// and is cancelled when the tab changes.
     pub(crate) renaming: Option<Renaming>,
     /// The open context menu, if any.
     pub(crate) menu: Option<MenuState>,
     /// The focus of the open context menu.
     pub(crate) menu_focus: FocusHandle,
-    /// The open confirmation dialog and those waiting behind it.
+    /// The open confirmation dialog and those waiting behind it: modal over
+    /// the whole window, whichever tab is active.
     pub(crate) dialogs: DialogQueue,
     /// The focus of the dialog's backdrop (the focus trap).
     pub(crate) dialog_focus: FocusHandle,
@@ -358,8 +559,6 @@ pub(crate) struct Explorer {
     pub(crate) clipboard_text: Option<String>,
     /// The pastes running now, by operation id, with their conflict channel.
     pub(crate) pastes: HashMap<u64, PasteHandle>,
-    /// What to select (and whether to rename) once the next listing shows it.
-    pub(crate) pending: Option<PendingSelect>,
     /// Bolt's toast stack: operation summaries, with Undo.
     pub(crate) toast_host: Entity<ToastHost>,
     /// The terminal "Open terminal here" runs, when one exists.
@@ -379,7 +578,22 @@ impl Explorer {
         self.entries_focus.clone()
     }
 
-    /// Builds the explorer: the first scan of `start` (the command-line
+    /// The active tab.
+    pub(crate) fn tab(&self) -> &Tab {
+        self.tabs.active()
+    }
+
+    /// The active tab, mutably.
+    pub(crate) fn tab_mut(&mut self) -> &mut Tab {
+        self.tabs.active_mut()
+    }
+
+    /// The id of the active tab.
+    pub(crate) fn active_id(&self) -> TabId {
+        self.tabs.active().id
+    }
+
+    /// Builds the explorer: the first tab scans `start` (the command-line
     /// path), else the home (or the honest root fallback when `$HOME` is
     /// missing), and the places discovery both start off the UI thread
     /// right away.
@@ -391,14 +605,8 @@ impl Explorer {
             .or_else(|| home.clone())
             .map(Location::Directory)
             .unwrap_or_else(|| Location::Directory(PathBuf::from("/")));
-        let state = ExplorerState::new(initial.clone(), home);
-
-        let path_input = cx.new(|cx| InputState::new(window, cx));
-        let search_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx);
-            input.set_placeholder("Search this folder…", window, cx);
-            input
-        });
+        let state = ExplorerState::new(initial.clone(), home.clone());
+        let first = Tab::new(0, state, window, cx);
 
         let toast_host = cx.new(|_cx| ToastHost::new());
         cx.set_global(ToastGlobal {
@@ -409,27 +617,11 @@ impl Explorer {
             std::env::var_os("PATH").as_deref(),
         );
 
-        let weak_this = cx.entity().downgrade();
-        // The details table's state: one entity per explorer, with the
-        // table's internal selection off — the explorer's raw-path selection
-        // (single, Ctrl-toggle, keyboard) drives everything through the
-        // delegate's row clicks, so the table can never clobber it.
-        let table = cx.new(|cx| {
-            TableState::new(
-                EntryTableDelegate::new(weak_this, Arc::new(Vec::new()), Arc::new(Vec::new())),
-                window,
-                cx,
-            )
-            .row_selectable(false)
-            .col_selectable(false)
-            .cell_selectable(false)
-            .sortable(false)
-            .col_movable(false)
-        });
-
         let mut this = Self {
-            state,
-            snapshot: Arc::new(Vec::new()),
+            tabs: TabList::new(first),
+            next_tab_id: 1,
+            home,
+            favorites: Favorites::default(),
             places: None,
             sidebar_error: None,
             // Known from the environment at once, so Del has a Trash even
@@ -438,32 +630,16 @@ impl Explorer {
                 std::env::var_os("HOME").as_deref(),
                 std::env::var_os("XDG_DATA_HOME").as_deref(),
             ),
-            path_input,
-            path_seed: String::new(),
-            path_edited: false,
-            path_editing: false,
-            path_edit_revision: 0,
-            submitted_edit: None,
-            search_input,
             shell_focus: cx.focus_handle(),
             entries_focus: cx.focus_handle(),
-            table,
             list_widths: ListWidths::default(),
-            grid_scroll: UniformListScrollHandle::new(),
             entries_width: None,
-            scan_task: None,
             sidebar_open: true,
             rendered_columns: 1,
             inspector_open: true,
             inspector_shown: false,
-            permissions: None,
-            permission_in_flight: None,
-            permission_task: None,
-            child_counts: Arc::new(HashMap::new()),
-            counts_task: None,
-            watched: None,
-            watch_task: None,
             progress: Registry::default(),
+            op_contexts: HashMap::new(),
             undo: UndoStack::default(),
             renaming: None,
             menu: None,
@@ -477,75 +653,9 @@ impl Explorer {
             clipboard: ClipboardState::default(),
             clipboard_text: None,
             pastes: HashMap::new(),
-            pending: None,
             toast_host,
             terminal,
-            _path_events: None,
-            _search_events: None,
-            _table_events: None,
         };
-
-        // The path field: Enter submits, typing clears the path error, and
-        // blur restores the committed path (the same as Escape).
-        let path_entity = this.path_input.clone();
-        this._path_events = Some(cx.subscribe_in(
-            &path_entity,
-            window,
-            |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => this.submit_path(window, cx),
-                InputEvent::Change => {
-                    let text = this.path_input.read(cx).value().to_string();
-                    this.path_edit_revision += 1;
-                    this.path_edited = text != this.path_seed;
-                    this.state.clear_path_error();
-                    cx.notify();
-                }
-                InputEvent::Blur => {
-                    if this.path_edited {
-                        this.seed_path_input(window, cx, false);
-                    }
-                    // Leaving the field returns to the breadcrumbs.
-                    this.path_editing = false;
-                    cx.notify();
-                }
-                InputEvent::Focus => {}
-            },
-        ));
-
-        // The search field filters the current folder on every keystroke.
-        let search_entity = this.search_input.clone();
-        this._search_events = Some(cx.subscribe_in(
-            &search_entity,
-            window,
-            |this, _input, event: &InputEvent, _window, cx| {
-                if let InputEvent::Change = event {
-                    let text = this.search_input.read(cx).value().to_string();
-                    this.state.set_query(text);
-                    cx.notify();
-                }
-            },
-        ));
-
-        // The details table's column drags: only widths that actually moved
-        // against the delegate's applied widths are deliberate, so an
-        // undragged column keeps re-filling when the pane changes.
-        this._table_events = Some(cx.subscribe(
-            &this.table,
-            |this, _table, event: &TableEvent, cx| {
-                if let TableEvent::ColumnWidthsChanged(widths) = event {
-                    let applied = *this.table.read(cx).delegate().widths();
-                    for (column, width) in widths.iter().enumerate() {
-                        let Some(applied) = applied.get(column) else {
-                            continue;
-                        };
-                        if (width.as_f32() - applied).abs() > crate::explorer::table::DRAG_EPSILON {
-                            this.list_widths.record(column, width.as_f32());
-                        }
-                    }
-                    cx.notify();
-                }
-            },
-        ));
 
         // The sidebar discovery reads the user-dirs configuration and the
         // mount table: blocking work that belongs off the UI thread.
@@ -565,11 +675,53 @@ impl Explorer {
         this
     }
 
+    /// Handles the path field of tab `id`: Enter, typing and blur.
+    fn path_event(
+        &mut self,
+        id: TabId,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = id == self.active_id();
+        match event {
+            InputEvent::PressEnter { .. } => {
+                if active {
+                    self.submit_path(window, cx);
+                }
+            }
+            InputEvent::Change => {
+                let Some(tab) = self.tabs.by_id_mut(id) else {
+                    return;
+                };
+                let text = tab.path_input.read(cx).value().to_string();
+                tab.path_edit_revision += 1;
+                tab.path_edited = text != tab.path_seed;
+                tab.state.clear_path_error();
+                cx.notify();
+            }
+            InputEvent::Blur => {
+                // A tab left in the background keeps its path edit: the
+                // field only loses the focus because another tab took over.
+                if !active {
+                    return;
+                }
+                if self.tab().path_edited {
+                    self.seed_path_input(id, window, cx, false);
+                }
+                // Leaving the field returns to the breadcrumbs.
+                self.tab_mut().path_editing = false;
+                cx.notify();
+            }
+            InputEvent::Focus => {}
+        }
+    }
+
     /// The current-location label, as the window title and the content head
     /// show it: `Home` for the home directory, `Home Trash` for the home
     /// Trash, else the folder name (or `/` for the filesystem root).
     pub(crate) fn current_label(&self) -> String {
-        match self.state.current() {
+        match self.tab().state.current() {
             Location::Trash => "Home Trash".to_owned(),
             Location::Directory(path) => {
                 if self
@@ -588,26 +740,38 @@ impl Explorer {
         }
     }
 
-    /// Navigates: turns the transition into a scan and starts it off the UI
-    /// thread. A transition that changes nothing produces no scan. Returns
-    /// the started scan, so a path submit can remember it.
+    /// Navigates the active tab: turns the transition into a scan and starts
+    /// it off the UI thread. A transition that changes nothing produces no
+    /// scan. Returns the started scan, so a path submit can remember it.
     pub(crate) fn navigate(
         &mut self,
         transition: Transition,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Scan> {
-        let scan = self.state.begin(transition);
+        let scan = self.tab_mut().state.begin(transition);
         self.start_scan(scan.clone(), window, cx);
         scan
     }
 
-    /// Starts the scan (risk item 4): the blocking read runs on the
-    /// background executor, the completion re-enters the view through
-    /// [`Self::finish_scan`], and the task is retained so a newer scan
-    /// replaces it.
+    /// Starts the active tab's scan (see [`Self::start_scan_in`]).
     pub(crate) fn start_scan(
         &mut self,
+        scan: Option<Scan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.active_id();
+        self.start_scan_in(id, scan, window, cx);
+    }
+
+    /// Starts tab `id`'s scan (risk item 4): the blocking read runs on the
+    /// background executor, the completion re-enters the view through
+    /// [`Self::finish_scan`], and the task is retained by the tab so a newer
+    /// scan replaces it.
+    pub(crate) fn start_scan_in(
+        &mut self,
+        id: TabId,
         scan: Option<Scan>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -620,40 +784,56 @@ impl Explorer {
         let load = cx
             .background_executor()
             .spawn(async move { load_location(&location, trash_root.as_deref()) });
-        self.scan_task = Some(cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let result = load.await;
             if let Err(error) = this.update_in(cx, |this, window, cx| {
-                this.finish_scan(scan, result, window, cx);
+                this.finish_scan(id, scan, result, window, cx);
             }) {
                 log::debug!("the explorer closed before its scan settled: {error}");
             }
-        }));
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.scan_task = Some(task);
+        }
         cx.notify();
     }
 
-    /// Settles a finished scan. A stale result (a newer scan has started,
-    /// including a newer failed one) changes nothing. A commit re-seeds the
-    /// path field and the window title; a failure only reports.
+    /// Settles a finished scan of tab `id`. A stale result (a newer scan
+    /// has started, including a newer failed one) and a result for a tab
+    /// that closed meanwhile change nothing. A commit re-seeds the path
+    /// field and, for the active tab, the window title; a failure only
+    /// reports.
     fn finish_scan(
         &mut self,
+        id: TabId,
         scan: Scan,
         result: io::Result<Listing>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let active = id == self.active_id();
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
         match result {
             Ok(listing) => {
-                if !self.state.commit(scan.clone(), listing) {
+                if !tab.state.commit(scan.clone(), listing) {
                     return;
                 }
-                self.sync_watcher(window, cx);
+                // Only the active tab is watched: a background tab is
+                // re-read when it becomes active again.
+                if active {
+                    self.sync_watcher(id, window, cx);
+                }
                 if scan.live {
                     // A background refresh only swaps the listing: focus,
                     // path editing, scroll position and the filter stay.
-                    self.refresh_snapshot();
-                    self.start_child_counts(cx);
-                    self.permissions = None;
-                    self.after_listing_changed(window, cx);
+                    self.refresh_snapshot(id);
+                    self.start_child_counts(id, cx);
+                    if let Some(tab) = self.tabs.by_id_mut(id) {
+                        tab.permissions = None;
+                    }
+                    self.after_listing_changed(id, window, cx);
                     cx.notify();
                     return;
                 }
@@ -661,70 +841,94 @@ impl Explorer {
                 // the presentation that is showing; a reload keeps the
                 // reader at the place they were reading.
                 if !scan.refresh {
-                    self.scroll_active_to_top(cx);
+                    self.scroll_to_top(id, cx);
                 }
-                self.refresh_snapshot();
-                self.start_child_counts(cx);
+                self.refresh_snapshot(id);
+                self.start_child_counts(id, cx);
+                let Some(tab) = self.tabs.by_id_mut(id) else {
+                    return;
+                };
                 // A reload may have changed the modes: probe again.
-                self.permissions = None;
+                tab.permissions = None;
                 // Consume the submitted edit only when this completion is
                 // its own scan with no newer edit after it; stale or failed
                 // completions never reseed either field.
-                let revision = self.path_edit_revision;
-                let settled = self
+                let revision = tab.path_edit_revision;
+                let settled = tab
                     .submitted_edit
                     .take()
                     .is_some_and(|edit| edit.settles(scan.generation, revision));
-                self.seed_path_input(window, cx, settled);
+                self.seed_path_input(id, window, cx, settled);
                 if settled {
-                    self.path_editing = false;
-                    self.entries_focus.focus(window, cx);
+                    if let Some(tab) = self.tabs.by_id_mut(id) {
+                        tab.path_editing = false;
+                    }
+                    if active {
+                        self.entries_focus.focus(window, cx);
+                    }
                 }
-                self.sync_search_input(window, cx);
-                self.after_listing_changed(window, cx);
+                self.sync_search_input(id, window, cx);
+                self.after_listing_changed(id, window, cx);
                 // An operation that finished while this navigation was
                 // pending refreshes the folder now shown.
-                let postponed = self.state.begin_deferred_op_refresh();
-                self.start_scan(postponed, window, cx);
+                let postponed = self
+                    .tabs
+                    .by_id_mut(id)
+                    .and_then(|tab| tab.state.begin_deferred_op_refresh());
+                self.start_scan_in(id, postponed, window, cx);
                 cx.notify();
             }
-            Err(_) if scan.live => {
-                // The folder became unreadable or vanished mid-scan; the
-                // watcher reports a vanished folder, so keep what is shown.
-                self.state
+            Err(error) if scan.live => {
+                // The folder became unreadable or vanished mid-scan. A
+                // watched folder's vanishing is reported by the watcher; a
+                // background tab has none, so a missing folder falls back
+                // here like the watcher would.
+                let location = scan.location.clone();
+                tab.state
                     .commit_failure(scan, "the folder could not be refreshed".to_owned());
+                if error.kind() == io::ErrorKind::NotFound
+                    && let Location::Directory(gone) = location
+                {
+                    self.watched_folder_gone(id, &gone, window, cx);
+                }
                 cx.notify();
             }
             Err(error) => {
-                self.submitted_edit = None;
-                if !self.state.commit_failure(scan, error.to_string()) {
+                tab.submitted_edit = None;
+                if !tab.state.commit_failure(scan, error.to_string()) {
                     return;
                 }
                 log::warn!("directory scan failed: {error}");
                 // The folder still shown is what the operation changed.
-                let postponed = self.state.begin_deferred_op_refresh();
-                self.start_scan(postponed, window, cx);
+                let postponed = tab.state.begin_deferred_op_refresh();
+                self.start_scan_in(id, postponed, window, cx);
                 cx.notify();
             }
         }
-        self.sync_window_title(window);
+        if active {
+            self.sync_window_title(window);
+        }
     }
 
-    /// Makes the watcher observe the committed folder: a new folder
-    /// replaces (and thereby stops) the previous watch, the Trash is not
-    /// watched. The loop blocks only on the background executor, debounces
-    /// bursts, and ends when the folder vanishes or the task is replaced.
-    fn sync_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Location::Directory(path) = self.state.current().clone() else {
-            self.watched = None;
-            self.watch_task = None;
+    /// Makes the watcher observe tab `id`'s committed folder (the active
+    /// tab's): a new folder replaces (and thereby stops) the previous watch,
+    /// the Trash is not watched. The loop blocks only on the background
+    /// executor, debounces bursts, and ends when the folder vanishes or the
+    /// task is replaced.
+    fn sync_watcher(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
-        if self.watched.as_ref() == Some(&path) && self.watch_task.is_some() {
+        let Location::Directory(path) = tab.state.current().clone() else {
+            tab.watched = None;
+            tab.watch_task = None;
+            return;
+        };
+        if tab.watched.as_ref() == Some(&path) && tab.watch_task.is_some() {
             return;
         }
-        self.watched = Some(path.clone());
-        self.watch_task = None;
+        tab.watched = Some(path.clone());
+        tab.watch_task = None;
         let watcher = match Watcher::new(&path) {
             Ok(watcher) => watcher,
             Err(error) => {
@@ -733,7 +937,7 @@ impl Explorer {
             }
         };
         let executor = cx.background_executor().clone();
-        self.watch_task = Some(cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let mut watcher = watcher;
             let mut debounce = Debounce::default();
             loop {
@@ -750,7 +954,7 @@ impl Explorer {
                     WatchEvent::Gone => {
                         let gone = path.clone();
                         if let Err(error) = this.update_in(cx, |this, window, cx| {
-                            this.watched_folder_gone(&gone, window, cx);
+                            this.watched_folder_gone(id, &gone, window, cx);
                         }) {
                             log::debug!("the explorer closed before the folder fallback: {error}");
                         }
@@ -760,25 +964,41 @@ impl Explorer {
                 if debounce.ready(now) {
                     debounce.reset();
                     let alive = this.update_in(cx, |this, window, cx| {
-                        let scan = this.state.begin_live_refresh();
-                        this.start_scan(scan, window, cx);
+                        let scan = this
+                            .tabs
+                            .by_id_mut(id)
+                            .and_then(|tab| tab.state.begin_live_refresh());
+                        this.start_scan_in(id, scan, window, cx);
                     });
                     if alive.is_err() {
                         return;
                     }
                 }
             }
-        }));
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.watch_task = Some(task);
+        }
     }
 
-    /// The shown folder was deleted or moved away: fall back to the nearest
-    /// existing ancestor with a status message, like a failed scan would.
-    fn watched_folder_gone(&mut self, gone: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if self.watched.as_deref() != Some(gone) {
+    /// The folder tab `id` shows was deleted or moved away: fall back to the
+    /// nearest existing ancestor with a status message, like a failed scan
+    /// would.
+    fn watched_folder_gone(
+        &mut self,
+        id: TabId,
+        gone: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        if tab.state.current() != &Location::Directory(gone.to_path_buf()) {
             return;
         }
         // The loop that reported this returns on its own; only forget the path.
-        self.watched = None;
+        tab.watched = None;
         let Some(ancestor) = nearest_existing_ancestor(gone) else {
             return;
         };
@@ -787,33 +1007,41 @@ impl Explorer {
             gone.display(),
             ancestor.display()
         );
-        let scan = self.state.begin_fallback(ancestor, notice);
-        self.start_scan(scan, window, cx);
+        let scan = tab.state.begin_fallback(ancestor, notice);
+        self.start_scan_in(id, scan, window, cx);
     }
 
-    /// Counts the entries of every folder of the committed listing on the
-    /// background executor, then publishes them in one step. A newer commit
-    /// replaces the task (dropping it), so counts never leak across
+    /// Counts the entries of every folder of tab `id`'s committed listing on
+    /// the background executor, then publishes them in one step. A newer
+    /// commit replaces the task (dropping it), so counts never leak across
     /// listings.
-    fn start_child_counts(&mut self, cx: &mut Context<Self>) {
-        self.child_counts = Arc::new(HashMap::new());
-        let entries = Arc::clone(&self.snapshot);
+    fn start_child_counts(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        tab.child_counts = Arc::new(HashMap::new());
+        let entries = Arc::clone(&tab.snapshot);
         if !entries.iter().any(fileflux::core::Entry::is_directory) {
-            self.counts_task = None;
+            tab.counts_task = None;
             return;
         }
         let counting = cx
             .background_executor()
             .spawn(async move { fileflux::core::fs::child_counts(&entries) });
-        self.counts_task = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let counts = counting.await;
             if let Err(error) = this.update(cx, |this, cx| {
-                this.child_counts = Arc::new(counts);
+                if let Some(tab) = this.tabs.by_id_mut(id) {
+                    tab.child_counts = Arc::new(counts);
+                }
                 cx.notify();
             }) {
                 log::debug!("the explorer closed before its folder counts settled: {error}");
             }
-        }));
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.counts_task = Some(task);
+        }
     }
 
     /// Applies the sidebar discovery. A discovery failure is honest and
@@ -833,26 +1061,37 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Rebuilds the entry snapshot the virtualized rows read.
-    fn refresh_snapshot(&mut self) {
-        self.snapshot = Arc::new(self.state.listing().entries.clone());
+    /// Rebuilds tab `id`'s entry snapshot the virtualized rows read.
+    fn refresh_snapshot(&mut self, id: TabId) {
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.snapshot = Arc::new(tab.state.listing().entries.clone());
+        }
     }
 
-    /// Seeds the path field with the committed location unless the user is
-    /// mid-edit. Unedited submits therefore retain the actual current path.
-    /// `force` reseeds even while focused, for a just-settled submission,
-    /// so a second Enter reloads the displayed location; post-submission
-    /// edits keep the guard.
-    fn seed_path_input(&mut self, window: &mut Window, cx: &mut Context<Self>, force: bool) {
-        let committed = self.committed_path_text();
-        let focused = self.path_input.read(cx).focus_handle(cx).is_focused(window);
-        if !force && focused && self.path_edited {
+    /// Seeds tab `id`'s path field with its committed location unless the
+    /// user is mid-edit. Unedited submits therefore retain the actual
+    /// current path. `force` reseeds even while focused, for a
+    /// just-settled submission, so a second Enter reloads the displayed
+    /// location; post-submission edits keep the guard.
+    fn seed_path_input(
+        &mut self,
+        id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        force: bool,
+    ) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let committed = committed_path_text(tab.state.current());
+        let focused = tab.path_input.read(cx).focus_handle(cx).is_focused(window);
+        if !force && focused && tab.path_edited {
             return;
         }
-        self.path_seed.clone_from(&committed);
-        self.path_edited = false;
+        tab.path_seed.clone_from(&committed);
+        tab.path_edited = false;
         let seed = committed;
-        self.path_input.update(cx, |input, cx| {
+        tab.path_input.update(cx, |input, cx| {
             let shown = input.value().to_string();
             if shown != seed {
                 input.set_value(seed, window, cx);
@@ -860,21 +1099,15 @@ impl Explorer {
         });
     }
 
-    /// The path text the committed location displays (lossy); typed edits
-    /// and submits go through the raw-state resolver instead.
-    fn committed_path_text(&self) -> String {
-        match self.state.current() {
-            Location::Directory(path) => path.to_string_lossy().into_owned(),
-            Location::Trash => "Trash".to_owned(),
-        }
-    }
-
-    /// Synchronizes the search field with the committed query after a
-    /// commit, so the field, the listing and the match count agree again.
+    /// Synchronizes tab `id`'s search field with its committed query after
+    /// a commit, so the field, the listing and the match count agree again.
     /// `set_value` emits no Change; no query-subscription feedback.
-    pub(crate) fn sync_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let committed = self.state.query().to_owned();
-        self.search_input.update(cx, |input, cx| {
+    fn sync_search_input(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let committed = tab.state.query().to_owned();
+        tab.search_input.update(cx, |input, cx| {
             let shown = input.value().to_string();
             if let Some(value) = search_field_resync(&committed, &shown) {
                 input.set_value(value.to_owned(), window, cx);
@@ -890,11 +1123,11 @@ impl Explorer {
     /// Switches the breadcrumbs to the editable path field (Ctrl+L, or a
     /// click on the bar's empty space) and focuses it once it is drawn.
     pub(crate) fn focus_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.path_edited = false;
-        self.path_editing = true;
+        self.tab_mut().path_edited = false;
+        self.tab_mut().path_editing = true;
         cx.notify();
         cx.defer_in(window, |this, window, cx| {
-            this.path_input.update(cx, |input, cx| {
+            this.tab().path_input.update(cx, |input, cx| {
                 input.focus(window, cx);
                 input.select_all(window, cx);
             });
@@ -903,7 +1136,7 @@ impl Explorer {
 
     /// Focuses the search field and selects its content.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_input.update(cx, |input, cx| {
+        self.tab().search_input.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
@@ -916,14 +1149,14 @@ impl Explorer {
     /// edit lands. Dismiss the failed edit's status without changing the
     /// committed location, listing or navigation history.
     pub(crate) fn restore_path_on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.path_edited = false;
-        self.path_editing = false;
-        self.path_seed = self.committed_path_text();
-        let seed = self.path_seed.clone();
-        self.path_input.update(cx, |input, cx| {
+        self.tab_mut().path_edited = false;
+        self.tab_mut().path_editing = false;
+        self.tab_mut().path_seed = committed_path_text(self.tab().state.current());
+        let seed = self.tab().path_seed.clone();
+        self.tab().path_input.update(cx, |input, cx| {
             input.set_value(seed, window, cx);
         });
-        self.state.cancel_path_edit();
+        self.tab_mut().state.cancel_path_edit();
         self.entries_focus.focus(window, cx);
         cx.notify();
     }
@@ -933,18 +1166,23 @@ impl Explorer {
     /// restoring the committed path, like Escape but without stealing a
     /// focus the press itself is about to give elsewhere.
     pub(crate) fn leave_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.path_editing {
+        if !self.tab().path_editing {
             return;
         }
-        let was_focused = self.path_input.read(cx).focus_handle(cx).is_focused(window);
-        self.path_edited = false;
-        self.path_editing = false;
-        self.path_seed = self.committed_path_text();
-        let seed = self.path_seed.clone();
-        self.path_input.update(cx, |input, cx| {
+        let was_focused = self
+            .tab()
+            .path_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        self.tab_mut().path_edited = false;
+        self.tab_mut().path_editing = false;
+        self.tab_mut().path_seed = committed_path_text(self.tab().state.current());
+        let seed = self.tab().path_seed.clone();
+        self.tab().path_input.update(cx, |input, cx| {
             input.set_value(seed, window, cx);
         });
-        self.state.cancel_path_edit();
+        self.tab_mut().state.cancel_path_edit();
         if was_focused {
             self.entries_focus.focus(window, cx);
         }
@@ -955,8 +1193,8 @@ impl Explorer {
     /// clears the query — the full listing returns, the no-result state
     /// goes away — and gives the keyboard back to the entries area.
     pub(crate) fn clear_search_on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.state.clear_query();
-        self.search_input.update(cx, |input, cx| {
+        self.tab_mut().state.clear_query();
+        self.tab().search_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
         self.entries_focus.focus(window, cx);
@@ -971,8 +1209,8 @@ impl Explorer {
         if cx.stop_active_drag(window) {
             return;
         }
-        if !self.state.selection().is_empty() {
-            self.state.clear_selection();
+        if !self.tab().state.selection().is_empty() {
+            self.tab_mut().state.clear_selection();
         }
         self.shell_focus.focus(window, cx);
         cx.notify();
@@ -983,32 +1221,32 @@ impl Explorer {
     /// [`ExplorerState::resolve_input`] — `~`, absolute and relative
     /// forms, no shell.
     pub(crate) fn submit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.path_input.read(cx).value().to_string();
-        if !self.path_edited || text == self.path_seed {
+        let text = self.tab().path_input.read(cx).value().to_string();
+        if !self.tab().path_edited || text == self.tab().path_seed {
             // Unedited: the submit retains the actual current path.
-            let current = self.state.current().clone();
-            self.state.clear_path_error();
-            self.path_editing = false;
+            let current = self.tab().state.current().clone();
+            self.tab_mut().state.clear_path_error();
+            self.tab_mut().path_editing = false;
             self.entries_focus.focus(window, cx);
             self.navigate(Transition::Visit(current), window, cx);
             return;
         }
-        match self.state.resolve_input(&text) {
+        match self.tab().state.resolve_input(&text) {
             Ok(location) => {
-                self.state.clear_path_error();
-                self.state.clear_notice();
-                let revision = self.path_edit_revision;
+                self.tab_mut().state.clear_path_error();
+                self.tab_mut().state.clear_notice();
+                let revision = self.tab().path_edit_revision;
                 let scan = self.navigate(Transition::Visit(location), window, cx);
                 if let Some(scan) = scan {
-                    self.submitted_edit = Some(SubmittedEdit {
+                    self.tab_mut().submitted_edit = Some(SubmittedEdit {
                         generation: scan.generation,
                         revision,
                     });
                 }
             }
             Err(argument) => {
-                self.state.clear_notice();
-                self.state.set_path_error(argument);
+                self.tab_mut().state.clear_notice();
+                self.tab_mut().state.set_path_error(argument);
                 cx.notify();
             }
         }
@@ -1017,25 +1255,25 @@ impl Explorer {
     /// Moves the keyboard selection by `delta` visible positions and
     /// scrolls the row it lands on into view.
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.state.visible_indices().len();
+        let count = self.tab().state.visible_indices().len();
         if count == 0 {
             return;
         }
         let last = count - 1;
-        let current = self.state.cursor_position();
+        let current = self.tab().state.cursor_position();
         let target = match current {
             Some(position) => (position as isize + delta).clamp(0, last as isize) as usize,
             None => 0,
         };
-        self.state.select_visible(target);
+        self.tab_mut().state.select_visible(target);
         self.scroll_selected_row(target, cx);
         cx.notify();
     }
 
     /// Shift+Arrow: extends the selection by `delta` visible positions.
     fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        self.state.extend_selection_by(delta);
-        if let Some(position) = self.state.cursor_position() {
+        self.tab_mut().state.extend_selection_by(delta);
+        if let Some(position) = self.tab().state.cursor_position() {
             self.scroll_selected_row(position, cx);
         }
         cx.notify();
@@ -1043,29 +1281,29 @@ impl Explorer {
 
     /// Shift+Home / Shift+End: extends the selection to `position`.
     fn extend_selection_to_extreme(&mut self, position: usize, cx: &mut Context<Self>) {
-        self.state.extend_selection_to(position);
-        if let Some(position) = self.state.cursor_position() {
+        self.tab_mut().state.extend_selection_to(position);
+        if let Some(position) = self.tab().state.cursor_position() {
             self.scroll_selected_row(position, cx);
         }
         cx.notify();
     }
 
     fn select_extreme(&mut self, position: usize, cx: &mut Context<Self>) {
-        let count = self.state.visible_indices().len();
+        let count = self.tab().state.visible_indices().len();
         if count == 0 {
             return;
         }
-        self.state.select_visible(position);
+        self.tab_mut().state.select_visible(position);
         self.scroll_selected_row(position, cx);
         cx.notify();
     }
 
     pub(crate) fn scroll_selected_row(&mut self, position: usize, cx: &mut Context<Self>) {
-        match self.state.view() {
+        match self.tab().state.view() {
             View::List => {
                 // Reveal only the nearest edge, preserving visible context
                 // when keyboard selection crosses the viewport boundary.
-                self.table.update(cx, |table, cx| {
+                self.tab().table.update(cx, |table, cx| {
                     table
                         .vertical_scroll_handle
                         .scroll_to_item(position, ScrollStrategy::Nearest);
@@ -1073,7 +1311,7 @@ impl Explorer {
                 });
             }
             View::Grid => {
-                self.grid_scroll.scroll_to_item(
+                self.tab().grid_scroll.scroll_to_item(
                     util::grid_row(position, self.rendered_columns.max(1)),
                     ScrollStrategy::Nearest,
                 );
@@ -1081,16 +1319,18 @@ impl Explorer {
         }
     }
 
-    /// Returns the presentation that is showing to its top: the details
-    /// table scrolls its own rows, the tile grid its own handle.
-    fn scroll_active_to_top(&mut self, cx: &mut Context<Self>) {
-        match self.state.view() {
+    /// Returns tab `id`'s presentation that is showing to its top: the
+    /// details table scrolls its own rows, the tile grid its own handle.
+    fn scroll_to_top(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        match tab.state.view() {
             View::List => {
-                self.table
-                    .update(cx, |table, cx| table.scroll_to_row(0, cx));
+                tab.table.update(cx, |table, cx| table.scroll_to_row(0, cx));
             }
             View::Grid => {
-                self.grid_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                tab.grid_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
         }
     }
@@ -1099,11 +1339,12 @@ impl Explorer {
     /// counted in the wrong row units, so the fresh view starts at its top;
     /// the selection lives in the state and survives untouched.
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
-        if self.state.view() == view {
+        if self.tab().state.view() == view {
             return;
         }
-        self.state.set_view(view);
-        self.scroll_active_to_top(cx);
+        self.tab_mut().state.set_view(view);
+        let id = self.active_id();
+        self.scroll_to_top(id, cx);
         cx.notify();
     }
 
@@ -1117,7 +1358,7 @@ impl Explorer {
         if self.renaming.is_some() {
             return;
         }
-        let Some(path) = self.state.activation_candidate() else {
+        let Some(path) = self.tab().state.activation_candidate() else {
             return;
         };
         self.open_path(&path, window, cx);
@@ -1128,7 +1369,7 @@ impl Explorer {
     /// [`Explorer::open_file`]). A symlinked directory is not followed
     /// either: the explorer navigates entry paths as scanned.
     pub(crate) fn open_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.snapshot.iter().find(|entry| entry.path == path) else {
+        let Some(entry) = self.tab().snapshot.iter().find(|entry| entry.path == path) else {
             return;
         };
         if entry.is_directory() && !entry.is_symlink {
@@ -1145,7 +1386,7 @@ impl Explorer {
 
     /// Toggles the favorites membership of the current directory.
     pub(crate) fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
-        self.state.toggle_favorite();
+        self.favorites.toggle(self.tabs.active().state.current());
         cx.notify();
     }
 
@@ -1185,6 +1426,168 @@ impl Explorer {
     }
 }
 
+// --- tabs ---------------------------------------------------------------------
+
+impl Explorer {
+    /// Opens `location` in a new tab to the right of the active one. A
+    /// foreground tab takes over at once; a background tab loads quietly
+    /// and the active tab keeps the keyboard. The new tab starts with the
+    /// presentation (view and sort) of the tab it was opened from.
+    pub(crate) fn open_tab(
+        &mut self,
+        location: Location,
+        placement: Placement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let state = self.tab().state.for_new_tab(location.clone());
+        let mut tab = Tab::new(id, state, window, cx);
+        let scan = tab.state.begin(Transition::Visit(location));
+        let previous = self.active_id();
+        self.tabs.open(tab, placement);
+        self.start_scan_in(id, scan, window, cx);
+        if placement == Placement::Foreground {
+            self.after_tab_switch(Some(previous), false, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+T: a new tab on the folder the active tab shows.
+    pub(crate) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.tab().state.current().clone();
+        self.open_tab(here, Placement::Foreground, window, cx);
+    }
+
+    /// Middle-click or the menu on an entry: a real directory opens in a
+    /// background tab; files and symlinks (which `open_path` does not
+    /// follow either) do nothing.
+    pub(crate) fn open_path_in_new_tab(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.tab().snapshot.iter().find(|entry| entry.path == path) else {
+            return;
+        };
+        if entry.is_directory() && !entry.is_symlink {
+            let location = Location::Directory(entry.path.clone());
+            self.open_tab(location, Placement::Background, window, cx);
+        }
+    }
+
+    /// The context menu's "Open in new tab" on the selected folder.
+    pub(crate) fn open_selected_in_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.tab().state.activation_candidate() {
+            self.open_path_in_new_tab(&path, window, cx);
+        }
+    }
+
+    /// Closes the tab at `index`. The last tab stays. Closing the active tab
+    /// activates its right neighbour, else the left one.
+    pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.active_id();
+        let Some(closed) = self.tabs.close(index) else {
+            return;
+        };
+        // Dropping the tab ends its scan, watcher and probe tasks.
+        let closed_active = closed.id == previous;
+        drop(closed);
+        if closed_active {
+            self.after_tab_switch(None, true, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+W: closes the active tab.
+    pub(crate) fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.tabs.active_index();
+        self.close_tab(index, window, cx);
+    }
+
+    /// Makes the tab at `index` the active one.
+    pub(crate) fn activate_tab(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.active_id();
+        if self.tabs.activate(index) && self.active_id() != previous {
+            self.after_tab_switch(Some(previous), true, window, cx);
+        }
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+PageDown / Ctrl+PageUp.
+    pub(crate) fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.active_id();
+        self.tabs.cycle(step);
+        if self.active_id() != previous {
+            self.after_tab_switch(Some(previous), true, window, cx);
+        }
+    }
+
+    /// Alt+1..9: the tab with that number.
+    pub(crate) fn jump_to_tab(
+        &mut self,
+        number: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.active_id();
+        if self.tabs.jump(number) && self.active_id() != previous {
+            self.after_tab_switch(Some(previous), true, window, cx);
+        }
+    }
+
+    /// What a change of the active tab does around the tabs themselves:
+    ///
+    /// - the tab left behind drops its watcher (a watcher parks one thread
+    ///   of the shared background executor, so only the active tab owns
+    ///   one) — it is re-read when it becomes active again, so a tab never
+    ///   shows stale data once it is back;
+    /// - the inline rename and the context menu belong to the tab they
+    ///   started in and are dropped; dialogs are modal over the window and
+    ///   stay;
+    /// - the new tab starts watching *before* its re-read, so a change
+    ///   between the two is never missed (`refresh` is off for a tab that
+    ///   is being loaded for the first time anyway);
+    /// - the window title follows the tab and the keyboard goes to its
+    ///   entries — or to its path field when it was mid path edit.
+    fn after_tab_switch(
+        &mut self,
+        previous: Option<TabId>,
+        refresh: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(old) = previous.and_then(|id| self.tabs.by_id_mut(id)) {
+            old.watched = None;
+            old.watch_task = None;
+        }
+        self.renaming = None;
+        self.menu = None;
+        let id = self.active_id();
+        self.sync_watcher(id, window, cx);
+        if refresh {
+            let scan = self.tab_mut().state.begin_op_refresh();
+            self.start_scan_in(id, scan, window, cx);
+        }
+        self.sync_window_title(window);
+        if self.tab().path_editing {
+            let input = self.tab().path_input.clone();
+            cx.defer_in(window, move |_this, window, cx| {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            });
+        } else {
+            self.entries_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+}
+
 /// The path-field edit a successful edited-path submit started: the scan
 /// generation it began under, and the field's edit revision at submit time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1199,6 +1602,15 @@ impl SubmittedEdit {
     /// the text, decides: edits away and back are still newer edits.
     fn settles(self, scan_generation: u64, current_revision: u64) -> bool {
         self.generation == scan_generation && self.revision == current_revision
+    }
+}
+
+/// The path text a committed location displays (lossy); typed edits and
+/// submits go through the raw-state resolver instead.
+fn committed_path_text(location: &Location) -> String {
+    match location {
+        Location::Directory(path) => path.to_string_lossy().into_owned(),
+        Location::Trash => "Trash".to_owned(),
     }
 }
 
@@ -1282,7 +1694,7 @@ impl Render for Explorer {
                 this.navigate(Transition::Up, window, cx);
             }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| {
-                let current = this.state.current().clone();
+                let current = this.tab().state.current().clone();
                 this.navigate(Transition::Visit(current), window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _window, cx| {
@@ -1298,13 +1710,13 @@ impl Render for Explorer {
                 this.move_selection(columns, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, _window, cx| {
-                if this.state.view() == View::List {
+                if this.tab().state.view() == View::List {
                     return;
                 }
                 this.move_selection(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectRight, _window, cx| {
-                if this.state.view() == View::List {
+                if this.tab().state.view() == View::List {
                     return;
                 }
                 this.move_selection(1, cx);
@@ -1313,7 +1725,7 @@ impl Render for Explorer {
                 this.select_extreme(0, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLastEntry, _window, cx| {
-                let count = this.state.visible_indices().len();
+                let count = this.tab().state.visible_indices().len();
                 this.select_extreme(count.saturating_sub(1), cx);
             }))
             .on_action(cx.listener(|this, _: &ExtendUp, _window, cx| {
@@ -1325,12 +1737,12 @@ impl Render for Explorer {
                 this.extend_selection(columns, cx);
             }))
             .on_action(cx.listener(|this, _: &ExtendLeft, _window, cx| {
-                if this.state.view() != View::List {
+                if this.tab().state.view() != View::List {
                     this.extend_selection(-1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendRight, _window, cx| {
-                if this.state.view() != View::List {
+                if this.tab().state.view() != View::List {
                     this.extend_selection(1, cx);
                 }
             }))
@@ -1338,11 +1750,11 @@ impl Render for Explorer {
                 this.extend_selection_to_extreme(0, cx);
             }))
             .on_action(cx.listener(|this, _: &ExtendToLast, _window, cx| {
-                let count = this.state.visible_indices().len();
+                let count = this.tab().state.visible_indices().len();
                 this.extend_selection_to_extreme(count.saturating_sub(1), cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
-                this.state.select_all_visible();
+                this.tab_mut().state.select_all_visible();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
@@ -1377,7 +1789,7 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &OpenContextMenu, window, cx| {
                 let position = window.mouse_position();
-                let on = this.state.activation_candidate();
+                let on = this.tab().state.activation_candidate();
                 this.open_context_menu(position, on.as_deref(), window, cx);
             }))
             .on_action(cx.listener(|this, _: &MenuUp, _window, cx| {
@@ -1400,6 +1812,45 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &DialogDown, _window, cx| {
                 this.move_open_with(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                this.new_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                this.close_active_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                this.cycle_tab(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+                this.cycle_tab(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab1, window, cx| {
+                this.jump_to_tab(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab2, window, cx| {
+                this.jump_to_tab(2, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab3, window, cx| {
+                this.jump_to_tab(3, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab4, window, cx| {
+                this.jump_to_tab(4, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab5, window, cx| {
+                this.jump_to_tab(5, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab6, window, cx| {
+                this.jump_to_tab(6, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab7, window, cx| {
+                this.jump_to_tab(7, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab8, window, cx| {
+                this.jump_to_tab(8, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToTab9, window, cx| {
+                this.jump_to_tab(9, window, cx);
             }))
             .child(middle)
             .child(self.render_statusbar(cx))
@@ -1431,7 +1882,7 @@ impl Explorer {
     /// In the grid, up and down move one row of tiles; in the list they
     /// move one entry.
     fn grid_step(&self) -> isize {
-        match self.state.view() {
+        match self.tab().state.view() {
             View::List => 1,
             View::Grid => self.rendered_columns.max(1) as isize,
         }
@@ -1448,6 +1899,7 @@ impl Explorer {
             .flex_1()
             .min_w_0()
             .h_full()
+            .children(tabstrip::render(self, cx))
             .child(toolbar::render(self, cx))
             .child(self.render_subbar(cx))
             .children(self.render_scope_line(cx))
@@ -1466,18 +1918,18 @@ impl Explorer {
     /// or nothing.
     fn render_scope_line(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let colors = bolt::colors(cx);
-        let text = if self.state.current() == &Location::Trash {
+        let text = if self.tab().state.current() == &Location::Trash {
             Some(
                 "Home Trash \u{2014} Restore puts items back; Delete permanently and Empty Trash cannot be undone."
                     .to_owned(),
             )
         } else {
-            let query = self.state.query();
+            let query = self.tab().state.query();
             (!query.is_empty()).then(|| {
                 format!(
                     "Filtering \u{201c}{query}\u{201d} — {} of {} items. Current folder only, no subfolders.",
-                    self.state.visible_indices().len(),
-                    self.state.listing().entries.len()
+                    self.tab().state.visible_indices().len(),
+                    self.tab().state.listing().entries.len()
                 )
             })
         }?;
@@ -1497,10 +1949,10 @@ impl Explorer {
     /// its mono "4 folders · 7 files" meta.
     fn render_subbar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let colors = bolt::colors(cx);
-        let meta = if self.state.is_loading() {
+        let meta = if self.tab().state.is_loading() {
             String::new()
         } else {
-            util::folder_counts_label(&self.state.listing().entries)
+            util::folder_counts_label(&self.tab().state.listing().entries)
         };
         div()
             .id("explorer-subbar")
@@ -1530,11 +1982,11 @@ impl Explorer {
                     .child(meta),
             )
             .child(div().flex_1())
-            .child(if self.state.current() == &Location::Trash {
+            .child(if self.tab().state.current() == &Location::Trash {
                 Button::new("explorer-empty-trash", "Empty Trash")
                     .danger()
                     .icon(crate::explorer::icon(gpui_kit_assets::IconName::Trash))
-                    .disabled(self.state.listing().entries.is_empty())
+                    .disabled(self.tab().state.listing().entries.is_empty())
                     .tooltip("Delete everything in the Trash for good")
                     .on_click(cx.listener(|this, _event, window, cx| {
                         this.request_empty_trash(window, cx);
@@ -1556,7 +2008,7 @@ impl Explorer {
     /// (longest mount-path prefix); nothing when it is unknown.
     fn free_space_label(&self) -> Option<String> {
         let places = self.places.as_ref()?;
-        let path = match self.state.current() {
+        let path = match self.tab().state.current() {
             Location::Directory(path) => path.as_path(),
             Location::Trash => places.trash_root.as_path(),
         };
@@ -1570,18 +2022,20 @@ impl Explorer {
     /// toolbar tooltips.
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = bolt::colors(cx);
-        let entries_count = self.state.listing().entries.len();
-        let shown = (!self.state.query().is_empty()).then(|| self.state.visible_indices().len());
-        let selection = self.state.selection();
+        let entries_count = self.tab().state.listing().entries.len();
+        let shown = (!self.tab().state.query().is_empty())
+            .then(|| self.tab().state.visible_indices().len());
+        let selection = self.tab().state.selection();
         let mut count_text = util::status_label(
             entries_count,
             shown,
             selection.len(),
-            self.state.selected_size(),
+            self.tab().state.selected_size(),
         );
         // A single selected Trash entry keeps its recorded origin.
         if let Some(path) = selection.iter().next().filter(|_| selection.len() == 1)
             && let Some(origin) = self
+                .tab()
                 .state
                 .listing()
                 .entries
@@ -1601,7 +2055,7 @@ impl Explorer {
             .flex_1()
             .min_w_0()
             .overflow_hidden();
-        if self.state.is_loading() {
+        if self.tab().state.is_loading() {
             status = status.child(
                 div()
                     .id("explorer-status-loading")
@@ -1622,7 +2076,7 @@ impl Explorer {
                     .text_color(colors.danger)
                     .child(error.to_owned()),
             );
-        } else if let Some(error) = self.state.load_error() {
+        } else if let Some(error) = self.tab().state.load_error() {
             status = status.child(
                 div()
                     .id("explorer-status-error")
@@ -1636,7 +2090,7 @@ impl Explorer {
                     .text_color(colors.danger)
                     .child(format!("Could not open folder: {error}")),
             );
-        } else if let Some(error) = self.state.path_error() {
+        } else if let Some(error) = self.tab().state.path_error() {
             status = status.child(
                 div()
                     .id("explorer-status-error")
@@ -1650,7 +2104,7 @@ impl Explorer {
                     .text_color(colors.danger)
                     .child(path_argument_message(error)),
             );
-        } else if let Some(notice) = self.state.notice() {
+        } else if let Some(notice) = self.tab().state.notice() {
             status = status.child(
                 div()
                     .id("explorer-status-notice")
@@ -1663,7 +2117,7 @@ impl Explorer {
             );
         }
 
-        let warnings = self.state.warnings().len();
+        let warnings = self.tab().state.warnings().len();
         let selection_active = !selection.is_empty();
         div()
             .id("explorer-status")

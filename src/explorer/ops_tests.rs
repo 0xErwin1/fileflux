@@ -861,6 +861,41 @@ fn open_with_is_offered_for_one_selected_file_only() {
 }
 
 #[test]
+fn open_in_new_tab_is_offered_for_one_selected_folder_only() {
+    let offers = |target: MenuTarget| {
+        menu_rows(&target).iter().any(
+            |row| matches!(row, MenuRow::Item(spec) if spec.command == MenuCommand::OpenInNewTab),
+        )
+    };
+    let one_folder = MenuTarget {
+        folder_selected: true,
+        ..target(false, 1, false, false)
+    };
+    assert!(offers(one_folder));
+    let rows = menu_rows(&one_folder);
+    let spec = item(&rows, MenuCommand::OpenInNewTab);
+    assert_eq!(spec.map(|spec| spec.label), Some("Open in new tab"));
+    assert_eq!(spec.and_then(|spec| spec.shortcut), None);
+    assert_eq!(
+        flat(&rows).first().map(String::as_str),
+        Some("Open"),
+        "Open stays first"
+    );
+    assert!(
+        !offers(target(false, 1, false, false)),
+        "a file or link target"
+    );
+    assert!(!offers(target(false, 0, false, false)), "empty space");
+    assert!(
+        !offers(MenuTarget {
+            in_trash: true,
+            ..one_folder
+        }),
+        "the Trash view"
+    );
+}
+
+#[test]
 fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
     let found = OpenWith {
         mime: "text/plain".to_owned(),

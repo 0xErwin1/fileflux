@@ -12,13 +12,14 @@ use bolt::controls::{Button, InputEscape, SearchCount, SearchField};
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, Spacing};
 use fileflux::core::Location;
-use gpui::{Context, Div, Stateful, Styled, div, prelude::*, px};
+use gpui::{Context, Div, MouseButton, Stateful, Styled, div, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 use gpui_component::tooltip::Tooltip;
 
 use super::dnd::{self, DropTarget};
 use super::icon;
 use super::state::{Transition, View};
+use super::tabs::Placement;
 use super::util::{self, CrumbKind};
 use super::view::Explorer;
 
@@ -63,7 +64,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         .icon_only()
                         .icon(icon(gpui_kit_assets::IconName::ChevronLeft))
                         .tooltip("Go back (Alt+Left)")
-                        .disabled(!this.state.navigation().can_back())
+                        .disabled(!this.tab().state.navigation().can_back())
                         .on_click(cx.listener(|this, _event, window, cx| {
                             this.navigate(Transition::Back, window, cx);
                         })),
@@ -74,7 +75,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         .icon_only()
                         .icon(icon(gpui_kit_assets::IconName::ChevronRight))
                         .tooltip("Go forward (Alt+Right)")
-                        .disabled(!this.state.navigation().can_forward())
+                        .disabled(!this.tab().state.navigation().can_forward())
                         .on_click(cx.listener(|this, _event, window, cx| {
                             this.navigate(Transition::Forward, window, cx);
                         })),
@@ -85,7 +86,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         .icon_only()
                         .icon(icon(gpui_kit_assets::IconName::ChevronUp))
                         .tooltip("Parent folder (Alt+Up)")
-                        .disabled(!this.state.navigation().can_up())
+                        .disabled(!this.tab().state.navigation().can_up())
                         .on_click(cx.listener(|this, _event, window, cx| {
                             this.navigate(Transition::Up, window, cx);
                         })),
@@ -97,7 +98,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         // consumes before it would ever bubble: here Escape restores the
         // committed path, returns to the breadcrumbs and gives the focus
         // back to the entries area (reqflux sidebar filter pattern).
-        .child(if this.path_editing {
+        .child(if this.tab().path_editing {
             path_editor(this, cx).into_any_element()
         } else {
             crumb_bar(this, cx).into_any_element()
@@ -115,7 +116,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     cx.stop_propagation();
                 }))
                 .child(
-                    SearchField::new("explorer-search", &this.search_input)
+                    SearchField::new("explorer-search", &this.tab().search_input)
                         .aria_label("Search names in current folder")
                         .width(gpui::rems(13.125))
                         .count(search_count(this, cx)),
@@ -169,13 +170,15 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             Button::new("explorer-favorite", "Favorite")
                 .ghost()
                 .icon_only()
-                .icon(icon(if this.state.is_favorite() {
-                    gpui_kit_assets::IconName::StarFill
-                } else {
-                    gpui_kit_assets::IconName::Star
-                }))
+                .icon(icon(
+                    if this.favorites.contains(this.tab().state.current()) {
+                        gpui_kit_assets::IconName::StarFill
+                    } else {
+                        gpui_kit_assets::IconName::Star
+                    },
+                ))
                 .tooltip("Add or remove the current folder as a session-only favorite")
-                .disabled(this.state.current() == &Location::Trash)
+                .disabled(this.tab().state.current() == &Location::Trash)
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_favorite(cx);
                 })),
@@ -188,7 +191,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .icon(icon(gpui_kit_assets::IconName::RefreshCw))
                 .tooltip("Reload current folder (Ctrl+R)")
                 .on_click(cx.listener(|this, _event, window, cx| {
-                    let current = this.state.current().clone();
+                    let current = this.tab().state.current().clone();
                     this.navigate(Transition::Visit(current), window, cx);
                 })),
         )
@@ -202,7 +205,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .tooltip("More actions (right click, Menu key or Shift+F10)")
                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                     let position = super::overlay::below(event.position());
-                    let on = this.state.activation_candidate();
+                    let on = this.tab().state.activation_candidate();
                     this.open_context_menu(position, on.as_deref(), window, cx);
                 })),
         )
@@ -223,13 +226,14 @@ fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
             this.leave_path_edit(window, cx);
         }))
         .child(
-            bolt::controls::Input::new(&this.path_input)
+            bolt::controls::Input::new(&this.tab().path_input)
                 .id("explorer-path-input")
                 .w_full()
                 .aria_label("Current folder path")
                 .prefix(Icon::new(icon(gpui_kit_assets::IconName::Folder)))
                 .error(
-                    this.state
+                    this.tab()
+                        .state
                         .path_error()
                         .map(super::view::path_argument_message),
                 ),
@@ -243,7 +247,7 @@ fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
 fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let home = this.places.as_ref().map(|places| places.home.as_path());
-    let crumbs = util::breadcrumbs(this.state.current(), home);
+    let crumbs = util::breadcrumbs(this.tab().state.current(), home);
     let last = crumbs.len().saturating_sub(1);
 
     let mut bar = div()
@@ -293,14 +297,24 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
             .gap(px(6.0))
             .text_size(px(13.0))
             .text_color(if is_last { colors.strong } else { colors.muted })
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                // The segment is a target of its own: never the bar's edit
-                // click behind it.
-                cx.stop_propagation();
-                if !is_last {
-                    this.navigate(Transition::Visit(target.clone()), window, cx);
+            .on_click(cx.listener({
+                let target = target.clone();
+                move |this, _event, window, cx| {
+                    // The segment is a target of its own: never the bar's edit
+                    // click behind it.
+                    cx.stop_propagation();
+                    if !is_last {
+                        this.navigate(Transition::Visit(target.clone()), window, cx);
+                    }
                 }
-            }));
+            }))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.open_tab(target.clone(), Placement::Background, window, cx);
+                }),
+            );
         segment = if is_last {
             // The current folder keeps its room and clips last.
             segment.flex_shrink_0().max_w_full().truncate()
@@ -337,7 +351,7 @@ fn view_segment(
     view: View,
 ) -> Stateful<Div> {
     let colors = bolt::colors(cx);
-    let pressed = this.state.view() == view;
+    let pressed = this.tab().state.view() == view;
     let tint = ChromeColors::tint(cx.theme());
     div()
         .id(id)
@@ -362,12 +376,12 @@ fn view_segment(
 /// The live search count: "n of m", "no matches", or nothing without a
 /// query.
 fn search_count(this: &Explorer, _cx: &mut Context<Explorer>) -> Option<SearchCount> {
-    let query = this.state.query();
+    let query = this.tab().state.query();
     if query.is_empty() {
         return None;
     }
-    let total = this.state.listing().entries.len();
-    let shown = this.state.visible_indices().len();
+    let total = this.tab().state.listing().entries.len();
+    let shown = this.tab().state.visible_indices().len();
     if shown == 0 {
         return Some(SearchCount::new("no matches"));
     }

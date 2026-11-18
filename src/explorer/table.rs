@@ -456,7 +456,7 @@ impl TableDelegate for EntryTableDelegate {
                     return;
                 };
                 if let Err(error) = weak.update(cx, |explorer, cx| {
-                    explorer.state.click_sort(key);
+                    explorer.tab_mut().state.click_sort(key);
                     cx.notify();
                 }) {
                     log::debug!("the list header outlived its explorer: {error}");
@@ -598,6 +598,10 @@ impl TableDelegate for EntryTableDelegate {
                 gpui::MouseButton::Right,
                 entries::entry_context_menu(&weak, path.clone()),
             );
+            row = row.on_mouse_up(
+                gpui::MouseButton::Middle,
+                entries::entry_middle_click(&weak, path.clone()),
+            );
             row = row.on_click(
                 move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
                     // The actual event's modifiers decide: Ctrl toggles the
@@ -649,11 +653,12 @@ pub(crate) fn render_list(
     cx: &mut Context<Explorer>,
 ) -> impl IntoElement {
     let desired = distribute_widths(explorer.entries_width, explorer.list_widths.dragged());
-    explorer.table.update(cx, |table, cx| {
+    explorer.tab().table.update(cx, |table, cx| {
         let delegate = table.delegate_mut();
-        let data_changed = delegate.set_data(Arc::clone(&explorer.snapshot), Arc::clone(&visible));
-        let sort_changed = delegate.set_sort(explorer.state.sort());
-        let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.child_counts));
+        let data_changed =
+            delegate.set_data(Arc::clone(&explorer.tab().snapshot), Arc::clone(&visible));
+        let sort_changed = delegate.set_sort(explorer.tab().state.sort());
+        let counts_changed = delegate.set_child_counts(Arc::clone(&explorer.tab().child_counts));
         delegate.set_selection(Arc::clone(&selected));
         delegate.set_dragged(dragged);
         let cut_changed = delegate.set_cut(explorer.clipboard.cut_paths());
@@ -686,7 +691,7 @@ pub(crate) fn render_list(
         .w_full()
         .font_family(fonts::ui_family(cx))
         .child(
-            DataTable::new(&explorer.table)
+            DataTable::new(&explorer.tab().table)
                 .bordered(false)
                 .with_size(Size::Small)
                 .header_row_height(header_height),

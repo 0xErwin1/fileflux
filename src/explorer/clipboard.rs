@@ -21,6 +21,7 @@ use super::ops::paste::{
 };
 use super::ops::{DialogState, Job, Report, Severity};
 use super::progress::Unit;
+use super::tabs::Affected;
 use super::view::Explorer;
 
 /// How often the UI looks for a question from a running paste.
@@ -42,7 +43,8 @@ impl Explorer {
     /// link to one is not: pasting "into" it would be a surprise).
     pub(crate) fn selected_with_kind(&self) -> Vec<(std::path::PathBuf, bool)> {
         let selected = self.selected_visible_paths();
-        self.snapshot
+        self.tab()
+            .snapshot
             .iter()
             .filter(|entry| selected.contains(&entry.path))
             .map(|entry| {
@@ -66,7 +68,7 @@ impl Explorer {
         }
         let text = clipboard_text(&paths);
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-        self.state.set_notice(clip_notice(mode, &paths));
+        self.tab_mut().state.set_notice(clip_notice(mode, &paths));
         self.clipboard.set(mode, paths);
         self.clipboard_text = Some(text);
         cx.notify();
@@ -99,7 +101,7 @@ impl Explorer {
             self.say(Severity::Info, "Nothing to paste", window, cx);
             return;
         };
-        let Location::Directory(current) = self.state.current().clone() else {
+        let Location::Directory(current) = self.tab().state.current().clone() else {
             self.say(
                 Severity::Info,
                 "Can't paste into the Trash. Restore items instead",
@@ -177,6 +179,7 @@ impl Explorer {
                     title,
                     Unit::Bytes,
                     true,
+                    Affected::Everything,
                     move |sink| super::ops::run_job(Job::Paste(job), &ctx, &sink),
                     window,
                     cx,

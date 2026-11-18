@@ -19,7 +19,7 @@ use gpui::{
 };
 
 use super::state::ExplorerState;
-use super::view::Explorer;
+use super::view::{Explorer, TabId};
 use super::{entries, icon, util};
 
 /// Width of the details panel.
@@ -207,38 +207,44 @@ pub(crate) fn probe_row(outcome: &ProbeOutcome) -> Option<(String, bool)> {
 }
 
 impl Explorer {
-    /// Drives the permission probe for the single selected entry while the
-    /// panel shows. At most one probe is in flight; a selection change
-    /// while one runs waits for it and then probes only the latest
-    /// selection, after a short debounce. The one `metadata` call runs on
-    /// the background executor; the UI thread never touches the filesystem
-    /// for it. Called from every render, so each settled probe re-decides.
+    /// Drives the permission probe for the active tab's single selected
+    /// entry while the panel shows. At most one probe is in flight per tab;
+    /// a selection change while one runs waits for it and then probes only
+    /// the latest selection, after a short debounce. The one `metadata` call
+    /// runs on the background executor; the UI thread never touches the
+    /// filesystem for it. Called from every render, so each settled probe
+    /// re-decides.
     pub(crate) fn sync_permissions(&mut self, cx: &mut Context<Self>) {
-        let wanted = self.inspected_path();
+        let id = self.active_id();
+        let wanted = self.inspected_path(id);
+        let tab = self.tab_mut();
         let decision = probe_decision(
             wanted.as_deref(),
-            self.permissions.as_ref().map(|probe| probe.path.as_path()),
-            self.permission_in_flight.as_deref(),
+            tab.permissions.as_ref().map(|probe| probe.path.as_path()),
+            tab.permission_in_flight.as_deref(),
         );
         match decision {
             ProbeDecision::Idle | ProbeDecision::Wait => {}
-            ProbeDecision::Clear => self.permissions = None,
-            ProbeDecision::Start(path) => self.start_probe(path, cx),
+            ProbeDecision::Clear => tab.permissions = None,
+            ProbeDecision::Start(path) => self.start_probe(id, path, cx),
         }
     }
 
-    fn start_probe(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.permissions = Some(PermissionProbe {
+    fn start_probe(&mut self, id: TabId, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        tab.permissions = Some(PermissionProbe {
             path: path.clone(),
             outcome: ProbeOutcome::Pending,
         });
-        self.permission_in_flight = Some(path.clone());
-        self.permission_task = Some(cx.spawn(async move |this, cx| {
+        tab.permission_in_flight = Some(path.clone());
+        let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PROBE_DEBOUNCE).await;
             // Selections made during the debounce have settled: probe the
             // latest one, or none when the wish moved away from this path.
             let still_wanted = this.update(cx, |this, _| {
-                accepts_probe_result(&path, this.inspected_path().as_deref())
+                accepts_probe_result(&path, this.inspected_path(id).as_deref())
             });
             let outcome = match still_wanted {
                 Ok(true) => {
@@ -259,12 +265,15 @@ impl Explorer {
                 }
             };
             if let Err(error) = this.update(cx, |this, cx| {
-                this.permission_in_flight = None;
-                let wanted = this.inspected_path();
+                let wanted = this.inspected_path(id);
+                let Some(tab) = this.tabs.by_id_mut(id) else {
+                    return;
+                };
+                tab.permission_in_flight = None;
                 match outcome {
                     Some(outcome) if accepts_probe_result(&path, wanted.as_deref()) => {
                         if let Some(probe) =
-                            this.permissions.as_mut().filter(|probe| probe.path == path)
+                            tab.permissions.as_mut().filter(|probe| probe.path == path)
                         {
                             probe.outcome = outcome;
                         }
@@ -272,12 +281,12 @@ impl Explorer {
                     _ => {
                         // Superseded: drop the cache so the next render
                         // probes the latest selection.
-                        if this
+                        if tab
                             .permissions
                             .as_ref()
                             .is_some_and(|probe| probe.path == path)
                         {
-                            this.permissions = None;
+                            tab.permissions = None;
                         }
                     }
                 }
@@ -285,12 +294,17 @@ impl Explorer {
             }) {
                 log::debug!("the explorer closed before the permission probe settled: {error}");
             }
-        }));
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.permission_task = Some(task);
+        }
     }
 
-    /// The path the panel inspects: the only selected entry, if one.
-    fn inspected_path(&self) -> Option<PathBuf> {
-        let selection = self.state.selection();
+    /// The path the panel inspects for tab `id`: its only selected entry,
+    /// if one, while the panel shows.
+    fn inspected_path(&self, id: TabId) -> Option<PathBuf> {
+        let tab = self.tabs.iter().find(|tab| tab.id == id)?;
+        let selection = tab.state.selection();
         if selection.len() != 1 || !self.inspector_shown {
             return None;
         }
@@ -325,7 +339,7 @@ fn wrappable(text: &str) -> String {
 /// The panel: `.inspector` — 300 px, left line border, scrollable.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
-    let selected = selected_entries(&this.state);
+    let selected = selected_entries(&this.tab().state);
     let body = match selected.as_slice() {
         [] => none_selected(this, cx),
         [entry] => one_selected(this, entry, cx),
@@ -437,8 +451,9 @@ fn facts(rows: Vec<Fact>, cx: &Context<Explorer>) -> Div {
 fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
     let colors = bolt::colors(cx);
     // The folder's total; "N of M" while a filter hides some of it.
-    let total = this.state.listing().entries.len();
-    let shown = (!this.state.query().is_empty()).then(|| this.state.visible_indices().len());
+    let total = this.tab().state.listing().entries.len();
+    let shown =
+        (!this.tab().state.query().is_empty()).then(|| this.tab().state.visible_indices().len());
     let items = util::items_label(total, shown);
     vec![
         preview_box(folder_glyph(cx), cx).into_any_element(),
@@ -449,7 +464,10 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         facts(
             vec![
                 Fact::new("Items", items),
-                Fact::new("Location", wrappable(&location_text(this.state.current()))),
+                Fact::new(
+                    "Location",
+                    wrappable(&location_text(this.tab().state.current())),
+                ),
             ],
             cx,
         )
@@ -484,7 +502,7 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
 
     let mut rows = Vec::new();
     if entry.is_directory() {
-        if let Some(count) = this.child_counts.get(&entry.path).copied().flatten() {
+        if let Some(count) = this.tab().child_counts.get(&entry.path).copied().flatten() {
             rows.push(Fact::new("Contains", util::format_item_count(count)));
         }
     } else {
@@ -500,6 +518,7 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
         util::format_modified(entry.modified, &chrono::Local::now()),
     ));
     if let Some((text, muted)) = this
+        .tab()
         .permissions
         .as_ref()
         .filter(|probe| probe.path == entry.path)

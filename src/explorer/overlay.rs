@@ -46,6 +46,7 @@ fn command_icon(command: MenuCommand) -> gpui_kit_assets::IconName {
     use gpui_kit_assets::IconName;
     match command {
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
+        MenuCommand::OpenInNewTab => IconName::ExternalLink,
         MenuCommand::Rename => IconName::Pencil,
         MenuCommand::CopyPath | MenuCommand::CopyFolderPath => IconName::Link,
         MenuCommand::Properties => IconName::Info,

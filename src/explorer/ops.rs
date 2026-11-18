@@ -1131,6 +1131,8 @@ pub(crate) fn rename_step(check: RenameCheck, from_blur: bool) -> RenameStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuCommand {
     Open,
+    /// Open the single selected folder in a new background tab.
+    OpenInNewTab,
     /// Choose the application to open the single selected file with.
     OpenWith,
     Rename,
@@ -1238,6 +1240,14 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
     }
     if target.selected > 0 {
         let mut rows = vec![item(MenuCommand::Open, "Open", Some("Enter"), false)];
+        if target.folder_selected {
+            rows.push(item(
+                MenuCommand::OpenInNewTab,
+                "Open in new tab",
+                None,
+                false,
+            ));
+        }
         if target.single_file {
             rows.push(item(
                 MenuCommand::OpenWith,

@@ -32,7 +32,8 @@ use super::ops::{
     no_trash_dialog, open_with_command, rename_seed, rename_step, stem_range,
 };
 use super::progress::{Sink, Unit};
-use super::view::Explorer;
+use super::tabs::{Affected, tabs_to_refresh};
+use super::view::{Explorer, OpContext, TabId};
 
 /// How long a toast with an Undo button waits before it goes away.
 const UNDO_TOAST: Duration = Duration::from_secs(8);
@@ -103,15 +104,16 @@ fn count_label(count: usize) -> String {
 
 impl Explorer {
     pub(crate) fn in_trash(&self) -> bool {
-        *self.state.current() == Location::Trash
+        *self.tab().state.current() == Location::Trash
     }
 
     /// The selected entries that are on screen under the current filter.
     /// Operations act on these only: a selection the filter hides is never
     /// trashed or deleted behind the user's back.
     pub(crate) fn selected_visible_paths(&self) -> Vec<PathBuf> {
-        let selection = self.state.selection();
-        self.state
+        let selection = self.tab().state.selection();
+        self.tab()
+            .state
             .visible_entries()
             .into_iter()
             .filter(|entry| selection.contains(&entry.path))
@@ -146,10 +148,12 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         let ctx = self.job_ctx();
+        let affected = Affected::of_job(&job);
         self.start_work(
             title,
             Unit::Items,
             cancellable,
+            affected,
             move |sink| super::ops::run_job(job, &ctx, &sink),
             window,
             cx,
@@ -159,16 +163,27 @@ impl Explorer {
     /// Runs `work` on the background executor with the progress sink of a
     /// new registered operation, and applies its [`Report`] when it ends.
     /// Returns the operation's id.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_work(
         &mut self,
         title: impl Into<String>,
         unit: Unit,
         cancellable: bool,
+        affected: Affected,
         work: impl FnOnce(Sink) -> Report + Send + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> u64 {
         let (id, sink) = self.progress.start(title, unit, cancellable);
+        // The result belongs to the tab it was started from, and refreshes
+        // every tab showing a folder it changed, wherever the user is by then.
+        self.op_contexts.insert(
+            id,
+            OpContext {
+                origin: self.active_id(),
+                affected,
+            },
+        );
         let work = cx.background_executor().spawn(async move { work(sink) });
 
         // Repaints the card while the operation runs; dropped with it.
@@ -246,17 +261,49 @@ impl Explorer {
             let dialog = no_trash_dialog(std::mem::take(&mut report.needs_permanent));
             self.offer_dialog(dialog, window, cx);
         }
-        if !report.select.is_empty() {
-            self.pending = Some(PendingSelect {
+        let context = self.op_contexts.remove(&id);
+        let origin = context.as_ref().map(|context| context.origin);
+        if !report.select.is_empty()
+            && let Some(tab) = origin.and_then(|origin| self.tabs.by_id_mut(origin))
+        {
+            tab.pending = Some(PendingSelect {
                 paths: std::mem::take(&mut report.select),
                 rename: report.begin_rename,
             });
         }
         // The watcher would catch up within a moment; this makes our own
-        // result show right away, and covers the unwatched Trash.
-        let scan = self.state.begin_op_refresh();
-        self.start_scan(scan, window, cx);
+        // result show right away, and covers the unwatched Trash and the
+        // tabs in the background, which have no watcher.
+        self.refresh_after_operation(context, window, cx);
         cx.notify();
+    }
+
+    /// Re-reads every tab showing a folder the finished operation changed,
+    /// and always the tab it was started from, which waits for its result.
+    fn refresh_after_operation(
+        &mut self,
+        context: Option<OpContext>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let affected = context
+            .as_ref()
+            .map_or(Affected::Everything, |c| c.affected.clone());
+        let origin = context.and_then(|context| self.tabs.position(|tab| tab.id == context.origin));
+        let shown: Vec<&Location> = self.tabs.iter().map(|tab| tab.state.current()).collect();
+        let targets = tabs_to_refresh(&shown, &affected, origin);
+        let ids: Vec<TabId> = targets
+            .into_iter()
+            .filter_map(|index| self.tabs.get(index).map(|tab| tab.id))
+            .collect();
+        log::debug!("operation finished: re-reading tabs {ids:?} ({affected:?})");
+        for id in ids {
+            let scan = self
+                .tabs
+                .by_id_mut(id)
+                .and_then(|tab| tab.state.begin_op_refresh());
+            self.start_scan_in(id, scan, window, cx);
+        }
     }
 
     /// Shows a result as a toast: severity-toned, with the failures as
@@ -329,11 +376,22 @@ impl Explorer {
         self.push_toast(notice, &[], None, window, cx);
     }
 
-    /// After the listing changed: drop a rename whose entry vanished, then
-    /// select what the last operation produced (and start renaming it).
-    pub(crate) fn after_listing_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(renaming) = &self.renaming
+    /// After tab `id`'s listing changed: drop a rename whose entry vanished
+    /// (the rename belongs to the active tab), then select what the last
+    /// operation produced there (and start renaming it, when the tab is the
+    /// one in front).
+    pub(crate) fn after_listing_changed(
+        &mut self,
+        id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = id == self.active_id();
+        if active
+            && let Some(renaming) = &self.renaming
             && !self
+                .tabs
+                .active()
                 .state
                 .listing()
                 .entries
@@ -342,22 +400,29 @@ impl Explorer {
         {
             self.renaming = None;
         }
-        let Some(pending) = self.pending.take() else {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let Some(pending) = tab.pending.take() else {
             return;
         };
         let present: Vec<PathBuf> = pending
             .paths
             .into_iter()
-            .filter(|path| self.state.visible_position_of(path).is_some())
+            .filter(|path| tab.state.visible_position_of(path).is_some())
             .collect();
         let Some((first, rest)) = present.split_first() else {
             return;
         };
-        self.state.select_only(first);
+        tab.state.select_only(first);
         for path in rest {
-            self.state.toggle(path);
+            tab.state.toggle(path);
         }
-        if let Some(position) = self.state.visible_position_of(first) {
+        let position = tab.state.visible_position_of(first);
+        if !active {
+            return;
+        }
+        if let Some(position) = position {
             self.scroll_selected_row(position, cx);
         }
         if pending.rename {
@@ -374,14 +439,15 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Location::Directory(dir) = self.state.current().clone() else {
+        let Location::Directory(dir) = self.tab().state.current().clone() else {
             return;
         };
         // A filter could hide the new entry; the new item must be visible
         // to be renamed.
-        if !self.state.query().is_empty() {
-            self.state.clear_query();
-            self.search_input
+        if !self.tab().state.query().is_empty() {
+            self.tab_mut().state.clear_query();
+            self.tab()
+                .search_input
                 .update(cx, |input, cx| input.set_value(String::new(), window, cx));
         }
         let title = match kind {
@@ -403,6 +469,7 @@ impl Explorer {
             return;
         };
         let Some(entry) = self
+            .tab()
             .snapshot
             .iter()
             .find(|entry| entry.path == *path)
@@ -485,7 +552,8 @@ impl Explorer {
             check_rename(
                 &renaming.original,
                 &typed,
-                self.state
+                self.tab()
+                    .state
                     .listing()
                     .entries
                     .iter()
@@ -567,6 +635,7 @@ impl Explorer {
         }
         if self.in_trash() {
             let names: Vec<String> = self
+                .tab()
                 .snapshot
                 .iter()
                 .filter(|entry| paths.contains(&entry.path))
@@ -619,6 +688,7 @@ impl Explorer {
             return;
         }
         let names: Vec<OsString> = self
+            .tab()
             .state
             .listing()
             .entries
@@ -873,15 +943,17 @@ impl Explorer {
     ) {
         self.cancel_rename(window, cx);
         match on {
-            Some(path) if !self.state.selection().contains(path) => self.state.select_only(path),
+            Some(path) if !self.tab().state.selection().contains(path) => {
+                self.tab_mut().state.select_only(path)
+            }
             Some(_) => {}
-            None => self.state.clear_selection(),
+            None => self.tab_mut().state.clear_selection(),
         }
         let selected = self.selected_with_kind();
         let target = MenuTarget {
             in_trash: self.in_trash(),
             selected: selected.len(),
-            folder_is_empty: self.state.listing().entries.is_empty(),
+            folder_is_empty: self.tab().state.listing().entries.is_empty(),
             terminal: self.terminal.is_some(),
             can_paste: self.can_paste(cx),
             folder_selected: matches!(selected.as_slice(), [(_, true)]),
@@ -945,6 +1017,7 @@ impl Explorer {
         self.close_menu(window, cx);
         match command {
             MenuCommand::Open => self.open_selected(window, cx),
+            MenuCommand::OpenInNewTab => self.open_selected_in_new_tab(window, cx),
             MenuCommand::OpenWith => self.open_with(window, cx),
             MenuCommand::Rename => self.start_rename(window, cx),
             MenuCommand::CopyPath => self.copy_selected_paths(cx),
@@ -1056,7 +1129,7 @@ impl Explorer {
                 );
             }
             Err(message) => {
-                self.state.set_notice(message);
+                self.tab_mut().state.set_notice(message);
                 cx.notify();
             }
         }
@@ -1077,7 +1150,7 @@ impl Explorer {
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.state.set_notice(match paths.as_slice() {
+        self.tab_mut().state.set_notice(match paths.as_slice() {
             [_] => "Copied the path".to_owned(),
             many => format!("Copied {} paths", many.len()),
         });
@@ -1085,13 +1158,15 @@ impl Explorer {
     }
 
     fn copy_folder_path(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Location::Directory(dir) = self.state.current() else {
+        let Location::Directory(dir) = self.tab().state.current() else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(
             dir.to_string_lossy().into_owned(),
         ));
-        self.state.set_notice("Copied the folder path".to_owned());
+        self.tab_mut()
+            .state
+            .set_notice("Copied the folder path".to_owned());
         cx.notify();
     }
 
@@ -1099,7 +1174,8 @@ impl Explorer {
     /// detached, no shell. A trashed file opens only after it is restored.
     pub(crate) fn open_file(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.in_trash() {
-            self.state
+            self.tab_mut()
+                .state
                 .set_notice(format!("Restore {} to open it.", quoted(path)));
             cx.notify();
             return;
@@ -1118,7 +1194,7 @@ impl Explorer {
     /// the shown folder.
     fn open_terminal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let (Some(program), Location::Directory(dir)) =
-            (self.terminal.clone(), self.state.current().clone())
+            (self.terminal.clone(), self.tab().state.current().clone())
         else {
             return;
         };
@@ -1167,7 +1243,9 @@ impl Explorer {
         cx.spawn(async move |this, cx| {
             if let Err(error) = started.await
                 && let Err(closed) = this.update(cx, |this, cx| {
-                    this.state.set_notice(format!("{failure}: {error}"));
+                    this.tab_mut()
+                        .state
+                        .set_notice(format!("{failure}: {error}"));
                     cx.notify();
                 })
             {

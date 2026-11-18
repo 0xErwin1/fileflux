@@ -212,7 +212,41 @@ pub(crate) fn retain_existing(
         .collect()
 }
 
-/// Selection, view, query and history for one explorer window, plus the
+/// The session favorites, shared by every tab of the window: in the order
+/// they were added, never persisted, unique, never the virtual Trash.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Favorites(Vec<PathBuf>);
+
+impl Favorites {
+    /// The favorites, in the order they were added.
+    pub(crate) fn list(&self) -> &[PathBuf] {
+        &self.0
+    }
+
+    /// Whether `location` is a favorite directory.
+    pub(crate) fn contains(&self, location: &Location) -> bool {
+        match location {
+            Location::Directory(path) => self.0.contains(path),
+            Location::Trash => false,
+        }
+    }
+
+    /// Adds the directory `location` or removes it again. The virtual Trash
+    /// is never favorited. Favorites live in memory only: nothing is
+    /// written anywhere.
+    pub(crate) fn toggle(&mut self, location: &Location) {
+        let Location::Directory(path) = location else {
+            return;
+        };
+        if self.0.contains(path) {
+            self.0.retain(|favorite| favorite != path);
+        } else {
+            self.0.push(path.clone());
+        }
+    }
+}
+
+/// Selection, view, query and history for one tab, plus the
 /// scan-in-progress guard. All locations and entry paths are kept raw; only
 /// display strings are lossy.
 #[derive(Clone, Debug)]
@@ -236,9 +270,6 @@ pub(crate) struct ExplorerState {
     query: String,
     /// Selected entry paths of the current location, raw.
     selected: BTreeSet<PathBuf>,
-    /// Session favorites, in the order they were added; never persisted,
-    /// unique, never the virtual Trash.
-    favorites: Vec<PathBuf>,
     /// The scan waiting for its listing, if any.
     pending: Option<Scan>,
     /// An operation finished while a navigation was pending: its refresh
@@ -269,7 +300,6 @@ impl ExplorerState {
             cursor: None,
             query: String::new(),
             selected: BTreeSet::new(),
-            favorites: Vec::new(),
             pending: None,
             op_refresh_deferred: false,
             generation: 1,
@@ -750,33 +780,16 @@ impl ExplorerState {
         self.sort = self.sort.clicked(key);
     }
 
-    // --- favorites (session only) -------------------------------------------
+    // --- tabs ---------------------------------------------------------------
 
-    /// The session favorites, in the order they were added.
-    pub(crate) fn favorites(&self) -> &[PathBuf] {
-        &self.favorites
-    }
-
-    /// Whether the committed current directory is a favorite.
-    pub(crate) fn is_favorite(&self) -> bool {
-        match self.nav.current() {
-            Location::Directory(path) => self.favorites.contains(path),
-            Location::Trash => false,
-        }
-    }
-
-    /// Adds the current directory to the favorites or removes it again.
-    /// The virtual Trash is never favorited. Favorites live in this state
-    /// only: nothing is written anywhere.
-    pub(crate) fn toggle_favorite(&mut self) {
-        let Location::Directory(path) = self.nav.current() else {
-            return;
-        };
-        let path = path.clone();
-        if self.favorites.contains(&path) {
-            self.favorites.retain(|favorite| *favorite != path);
-        } else {
-            self.favorites.push(path);
+    /// The state of a new tab opened on `location`: a fresh history,
+    /// selection and filter, and the presentation (view and sort) of this
+    /// tab.
+    pub(crate) fn for_new_tab(&self, location: Location) -> Self {
+        Self {
+            view: self.view,
+            sort: self.sort,
+            ..Self::new(location, self.home.clone())
         }
     }
 
@@ -1316,41 +1329,60 @@ mod tests {
     }
 
     #[test]
-    fn favorites_are_session_only_unique_and_never_the_trash() -> TestResult {
-        let mut state = committed()?;
-        assert!(state.favorites().is_empty());
-        assert!(!state.is_favorite());
+    fn favorites_are_session_only_unique_and_never_the_trash() {
+        let mut favorites = Favorites::default();
+        assert!(favorites.list().is_empty());
+        assert!(!favorites.contains(&dir("/fixture/a")));
 
-        state.toggle_favorite();
-        assert_eq!(state.favorites(), [PathBuf::from("/fixture/a")]);
-        assert!(state.is_favorite());
+        favorites.toggle(&dir("/fixture/a"));
+        assert_eq!(favorites.list(), [PathBuf::from("/fixture/a")]);
+        assert!(favorites.contains(&dir("/fixture/a")));
 
         // Re-adding is a remove: the toggle is one button.
-        state.toggle_favorite();
-        assert!(state.favorites().is_empty());
+        favorites.toggle(&dir("/fixture/a"));
+        assert!(favorites.list().is_empty());
 
-        // Navigating elsewhere and favoriting the new directory, then
-        // toggling again, keeps exactly one entry per directory.
-        let scan = visit_scan(&mut state, "/fixture/b")?;
-        state.commit(scan, listing(&[]));
-        state.toggle_favorite();
-        assert_eq!(state.favorites(), [PathBuf::from("/fixture/b")]);
-        state.toggle_favorite();
-        assert!(state.favorites().is_empty());
-        state.toggle_favorite();
-        assert_eq!(state.favorites(), [PathBuf::from("/fixture/b")]);
+        // Toggling another directory keeps exactly one entry per directory.
+        favorites.toggle(&dir("/fixture/b"));
+        assert_eq!(favorites.list(), [PathBuf::from("/fixture/b")]);
+        favorites.toggle(&dir("/fixture/b"));
+        assert!(favorites.list().is_empty());
+        favorites.toggle(&dir("/fixture/b"));
+        assert_eq!(favorites.list(), [PathBuf::from("/fixture/b")]);
 
         // The virtual Trash is never favorited.
-        let scan = state
-            .begin(Transition::Visit(Location::Trash))
-            .ok_or("a visit to the Trash produces a scan")?;
-        state.commit(scan, listing(&[]));
-        state.toggle_favorite();
+        favorites.toggle(&Location::Trash);
         assert_eq!(
-            state.favorites(),
+            favorites.list(),
             [PathBuf::from("/fixture/b")],
             "the Trash toggle is a no-op and keeps prior favorites"
         );
+        assert!(!favorites.contains(&Location::Trash));
+    }
+
+    #[test]
+    fn a_new_tab_starts_on_the_current_folder_with_a_fresh_history() -> TestResult {
+        let mut state = committed()?;
+        let scan = visit_scan(&mut state, "/fixture/b")?;
+        state.commit(scan, listing(&[("x", EntryKind::File)]));
+        state.set_view(View::List);
+        state.click_sort(SortKey::Size);
+        state.select_only(Path::new("/fixture/x"));
+        state.set_query("x".to_owned());
+
+        let fresh = state.for_new_tab(dir("/fixture/b"));
+        assert_eq!(fresh.current(), &dir("/fixture/b"));
+        assert!(!fresh.navigation().can_back(), "no inherited history");
+        assert!(!fresh.navigation().can_forward());
+        assert!(fresh.selection().is_empty());
+        assert_eq!(fresh.query(), "");
+        assert_eq!(fresh.view(), View::List, "the presentation carries over");
+        assert_eq!(fresh.sort(), state.sort());
+
+        // The source tab keeps what it had.
+        assert!(state.navigation().can_back());
+        assert_eq!(state.selection().len(), 1);
+        assert_eq!(state.query(), "x");
         Ok(())
     }
 

@@ -24,8 +24,8 @@ use fileflux::core::places::format_bytes;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
-    MouseButton, MouseDownEvent, ParentElement, Stateful, Styled, WeakEntity, Window, canvas, div,
-    prelude::*, px,
+    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Stateful, Styled, WeakEntity, Window,
+    canvas, div, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 
@@ -237,7 +237,7 @@ pub(crate) fn grid_tile_range(row: usize, count: usize, columns: usize) -> std::
 /// count follows that measurement instead of a viewport estimate.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
-    let visible: Arc<Vec<usize>> = Arc::new(this.state.visible_indices());
+    let visible: Arc<Vec<usize>> = Arc::new(this.tab().state.visible_indices());
     let count = visible.len();
 
     let container = div()
@@ -249,7 +249,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .min_w_0()
         .flex()
         .flex_col()
-        .when(this.state.view() != View::List, |container| {
+        .when(this.tab().state.view() != View::List, |container| {
             container
                 .px(px(ENTRIES_PADDING))
                 .pt(px(GRID_TOP_PADDING))
@@ -271,7 +271,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     // entry that is no target covers it while dragging, see
     // `dnd::block_while_dragging`). The Trash view takes none.
     let weak_for_drops = cx.entity().downgrade();
-    let container = match this.state.current() {
+    let container = match this.tab().state.current() {
         Location::Directory(dir) => dnd::drop_target(
             container,
             DropTarget::Folder(dir.clone()),
@@ -281,7 +281,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         Location::Trash => container,
     };
 
-    if this.state.is_loading() && count == 0 {
+    if this.tab().state.is_loading() && count == 0 {
         return container.justify_center().child(
             div()
                 .id("explorer-entries-loading")
@@ -290,8 +290,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         );
     }
 
-    if this.state.folder_is_empty() {
-        let empty_note = if this.state.current() == &Location::Trash {
+    if this.tab().state.folder_is_empty() {
+        let empty_note = if this.tab().state.current() == &Location::Trash {
             "Trash is empty. Deleted items would appear here."
         } else {
             "Favorites can point to an empty folder. Nothing to show yet."
@@ -314,7 +314,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         );
     }
 
-    if this.state.is_no_result() {
+    if this.tab().state.is_no_result() {
         // The folder has entries; the query filters everything out. This is
         // distinct from an empty folder.
         return container.justify_center().child(
@@ -331,7 +331,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         .text_size(px(18.0))
                         .child(format!(
                             "No matches for \u{201c}{}\u{201d}",
-                            this.state.query()
+                            this.tab().state.query()
                         )),
                 )
                 .child("Search checks names in the current folder only, not its subfolders."),
@@ -339,16 +339,16 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     }
 
     let weak = cx.entity().downgrade();
-    let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.state.selection().clone());
-    let list_view = this.state.view() == View::List;
+    let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.tab().state.selection().clone());
+    let list_view = this.tab().state.view() == View::List;
     let columns = this.rendered_columns.max(1);
     let item_count = if list_view {
         count
     } else {
         count.div_ceil(columns)
     };
-    let snapshot = Arc::clone(&this.snapshot);
-    let counts_for_rows = Arc::clone(&this.child_counts);
+    let snapshot = Arc::clone(&this.tab().snapshot);
+    let counts_for_rows = Arc::clone(&this.tab().child_counts);
     let weak_for_rows = weak.clone();
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);
@@ -358,7 +358,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     // Entries drag from the folder views, never from the Trash view.
     let drag: Option<Arc<Vec<PathBuf>>> = (!this.in_trash()).then(|| {
         Arc::new(
-            this.state
+            this.tab()
+                .state
                 .visible_entries()
                 .into_iter()
                 .filter(|entry| selected.contains(&entry.path))
@@ -396,7 +397,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         )
         .flex_1()
         .min_h_0()
-        .track_scroll(&this.grid_scroll.clone())
+        .track_scroll(&this.tab().grid_scroll.clone())
         .into_any_element()
     };
 
@@ -543,6 +544,7 @@ fn render_grid_row(
         })
         .when(tile_cut, |tile| tile.opacity(CUT_OPACITY))
         .on_click(entry_click(weak, path.clone()))
+        .on_mouse_up(MouseButton::Middle, entry_middle_click(weak, path.clone()))
         .on_mouse_down(MouseButton::Right, entry_context_menu(weak, path.clone()));
         let renaming_this = renaming.is_some_and(|view| view.path == path);
         if let Some(selection) = drag.filter(|_| !renaming_this) {
@@ -647,16 +649,16 @@ pub(crate) fn handle_entry_click(
         if click_count >= 2 {
             this.open_path(&path, window, cx);
         } else if modifiers.shift {
-            this.state.clear_notice();
-            this.state.select_range_to(&path);
+            this.tab_mut().state.clear_notice();
+            this.tab_mut().state.select_range_to(&path);
             cx.notify();
         } else if modifiers.control {
-            this.state.clear_notice();
-            this.state.toggle(&path);
+            this.tab_mut().state.clear_notice();
+            this.tab_mut().state.toggle(&path);
             cx.notify();
         } else {
-            this.state.clear_notice();
-            this.state.select_only(&path);
+            this.tab_mut().state.clear_notice();
+            this.tab_mut().state.select_only(&path);
             cx.notify();
         }
     }) {
@@ -677,6 +679,23 @@ pub(crate) fn entry_context_menu(
         if let Err(error) = weak.update(cx, |this, cx| {
             this.entries_focus.focus(window, cx);
             this.open_context_menu(event.position, Some(&path), window, cx);
+        }) {
+            log::debug!("the row outlived its explorer: {error}");
+        }
+    }
+}
+
+/// The middle-click handler of one entry: a folder opens in a new
+/// background tab; anything else does nothing.
+pub(crate) fn entry_middle_click(
+    weak: &WeakEntity<Explorer>,
+    path: PathBuf,
+) -> impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static {
+    let weak = weak.clone();
+    move |_event: &MouseUpEvent, window, cx| {
+        cx.stop_propagation();
+        if let Err(error) = weak.update(cx, |this, cx| {
+            this.open_path_in_new_tab(&path, window, cx);
         }) {
             log::debug!("the row outlived its explorer: {error}");
         }

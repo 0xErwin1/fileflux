@@ -246,7 +246,7 @@ pub(crate) fn drag_source<E: StatefulInteractiveElement>(
         move |dragged, grab, _window, cx| {
             if !selected
                 && let Err(error) = weak.update(cx, |this, cx| {
-                    this.state.select_only(&path);
+                    this.tab_mut().state.select_only(&path);
                     cx.notify();
                 })
             {

@@ -43,11 +43,28 @@ Use `--` before a directory whose name starts with `-`. Pointing the explorer at
 | Open | Double click or Enter navigates into folders and opens files, symlinks and broken links with the default application (`xdg-open <path>`, detached, no shell; a failure to start it is reported in the status bar). Entries in the Trash are not opened: restore them first. |
 | Details panel | A 300 px read-only panel on the right of the document island, toggled by the toolbar panel button or Ctrl+I (open by default; hidden automatically when the window is too narrow to leave the entries 520 px after the island's own padding). Nothing selected: the folder glyph, name, item total ("N of M" while a filter is active) and full location. One entry: a preview (image files draw the image, contain-fit; others the folder/file glyph), name, kind ("Image · JPG"), size, local modified time, permissions (`rw-r--r--`, read off the UI thread with one `stat`, at most one probe at a time and debounced; `unavailable` in muted text when it fails), the item count for folders and path (Trash entries show their original location). Several: the count and the total size of the selected files. The panel is read-only; the actions live in the context menu and the keyboard. |
 | Status bar | Left: "N items" or "N selected · <total size of the selected files>", plus loading, error and status notices (long names and paths end in an ellipsis instead of running under the right-hand side), the rename editor's refusal reason, and a compact indicator ("Moving 20000 items to Trash · 9655 of 20000 items") while an operation that takes more than ~400 ms runs. Right: the free space of the volume that holds the current folder (longest mount-path prefix) with a small success-colored square. Shortcuts live in the toolbar tooltips. |
-| Live refresh | The current folder is watched (inotify); creates, deletes, moves and edits made elsewhere show up within about a second, keeping the selection of entries that still exist, the filter and the scroll position. If the folder itself is deleted, the explorer falls back to the nearest existing parent with a notice. |
+| Live refresh | The folder of the active tab is watched (inotify); creates, deletes, moves and edits made elsewhere show up within about a second, keeping the selection of entries that still exist, the filter and the scroll position. If the folder itself is deleted, the explorer falls back to the nearest existing parent with a notice. Background tabs are not watched (see [Tabs](#tabs)): they are re-read the moment they become active. |
 | Favorites | Session-only: the toolbar star adds/removes the current directory. Nothing is written to configuration; the Trash cannot be favorited. |
 | Loading | Directory scans, Trash reads and places discovery run off the UI thread with a generation guard: stale completions (including a newer failed request's) never overwrite newer results. |
 
 Non-UTF8 file names keep their exact raw bytes for navigation; lossy text appears only in display strings.
+
+## Tabs
+
+Several folders open at once in one window. The tab strip sits at the top of the document island, above the toolbar, and appears only while two or more tabs are open: square Bolt tabs 30 px tall, the active one on the raised fill with strong text and a 2 px tint bar along its bottom edge. A tab shows the folder name (`Home` for the home directory, `Trash` for the Trash view) and carries the full path as its tooltip; the close button shows on the active tab and on hover. Tabs are session-only (nothing is written), and the command-line path opens as the first tab. The window title follows the active tab.
+
+| Action | How |
+|---|---|
+| New tab | Ctrl+T opens a tab on the current folder, to the right of the active one, and switches to it. It starts with the view mode and sort of the tab it came from, and a fresh history. |
+| Close tab | Ctrl+W, the close button or a middle click on the tab. **The last tab is never closed.** Closing the active tab activates its right neighbour (the left one when it was the rightmost). |
+| Switch | Ctrl+Tab / Ctrl+Shift+Tab or Ctrl+PageDown / Ctrl+PageUp cycle (wrapping around); Alt+1 … Alt+9 jump to that tab (nothing happens when there is no such tab); click a tab. |
+| Open in a new tab | Middle-click a folder in the grid, the list, a sidebar row (Places, Favorites, Devices, Home Trash) or a breadcrumb segment, or use **Open in new tab** in the context menu of a selected folder. The tab opens in the background, to the right of the active tab; several in a row keep their click order. Files and symlinks do nothing. |
+
+Each tab keeps its own location, back/forward history, selection, view mode, sort, filter text, scroll position and path-edit state: navigating in one tab never moves another one's selection or filter. Window-wide on purpose: the places sidebar and favorites, the clipboard (copy in one tab, paste in another), the undo stack, the progress cards, dialogs (modal over the whole window) and toasts.
+
+- **Focus.** Switching tabs puts the keyboard on the new tab's entries (or on its path field when that tab was mid path edit). An inline rename and an open context menu belong to the tab they started in and are cancelled when the tab changes.
+- **Operations.** A file operation keeps running when you switch tabs; its toast is global. When it finishes, every tab showing a folder it changed is re-read (a trash refreshes the folder, and the Trash view), and the tab it was started from always is; operations whose reach is not known up front (restore, undo, paste) re-read every tab.
+- **Background tabs are never stale.** Only the active tab owns a watcher: each watch parks one thread of the shared background executor, which scans, copies and thumbnails also use, so one per tab would starve them. The tab you leave drops its watcher, and the tab you enter starts watching and re-reads its folder right away, keeping its selection, filter and scroll position (a folder that vanished meanwhile falls back to its nearest existing parent, like a watched one).
 
 ## File operations
 
@@ -81,7 +98,7 @@ Safety defaults: Del never deletes — it moves to the Trash; permanent deletion
 | `cargo clippy --all-targets -- -D warnings` | Lints with the family lint set |
 | `cargo build --locked` | Builds the binary |
 
-Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R reload · Ctrl+I details panel · Enter open(selected) · F2 rename · Del move to Trash · Shift+Del delete permanently · Ctrl+Shift+N new folder · Ctrl+C copy · Ctrl+X cut · Ctrl+V paste · Ctrl+Z undo · Ctrl+A select all · Ctrl+Shift+C copy path · Menu / Shift+F10 context menu · Escape cancel/clear. Escape while the path field or the search field is focused restores the committed path or clears the query and returns the keyboard to the folder contents; Escape while dragging cancels the drag; Escape elsewhere clears the selection.
+Keyboard: Ctrl+T new tab · Ctrl+W close tab · Ctrl+Tab / Ctrl+Shift+Tab or Ctrl+PageDown / Ctrl+PageUp switch tabs · Alt+1…9 jump to a tab · Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R reload · Ctrl+I details panel · Enter open(selected) · F2 rename · Del move to Trash · Shift+Del delete permanently · Ctrl+Shift+N new folder · Ctrl+C copy · Ctrl+X cut · Ctrl+V paste · Ctrl+Z undo · Ctrl+A select all · Ctrl+Shift+C copy path · Menu / Shift+F10 context menu · Escape cancel/clear. Escape while the path field or the search field is focused restores the committed path or clears the query and returns the keyboard to the folder contents; Escape while dragging cancels the drag; Escape elsewhere clears the selection.
 
 ## Native smoke helper
 
@@ -89,7 +106,7 @@ Keyboard: Ctrl+L path · Ctrl+F search · Alt+←/→/↑ history · Ctrl+R relo
 
 ## Current scope
 
-No tabs; the details panel previews image files only. The window title shows the current folder plus Fileflux; the empty top gutter matches the 8 px side gutters (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable. The app always starts in Bolt's dark palette, whatever the operating system's appearance; there is no theme toggle.
+There is no dual-pane view and tabs cannot be reordered or dragged between windows; the details panel previews image files only. The window title shows the current folder plus Fileflux; the empty top gutter matches the 8 px side gutters (no brand text or icon). Modification dates are displayed in UTC without a timezone database. The sidebar toggle hides or shows the sidebar at any window width, and narrow windows park it as an overlay; path, search and view controls always stay reachable. The app always starts in Bolt's dark palette, whatever the operating system's appearance; there is no theme toggle.
 
 ## Design
 
