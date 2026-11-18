@@ -12,7 +12,7 @@ use bolt::icon::IconSource;
 use bolt::primitives::Icon;
 use bolt::tokens::Spacing;
 use gpui::{
-    AnyElement, Context, Div, FocusHandle, Focusable, ImageFormat, ImageSource, ImgResourceLoader,
+    AnyElement, Context, Div, FocusHandle, Focusable, ImageSource, ImgResourceLoader,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     NavigationDirection, ObjectFit, ParentElement as _, Pixels, Render, RenderImage, Resource,
     ScrollWheelEvent, Styled as _, StyledImage as _, Window, div, img, px,
@@ -25,7 +25,7 @@ use super::actions::{
 use super::facts;
 use super::header;
 use super::nav::{self, Step};
-use super::rotation::{Rotation, encode_png, rotate_pixels};
+use super::rotation::{Rotation, render_image, rotate_pixels};
 use super::zoom::{Pt, ViewState, percent_label};
 
 /// Height of the top bar.
@@ -85,9 +85,9 @@ fn density_of(path: &Path) -> f32 {
     }
 }
 
-/// A rotated copy of the current image, as PNG data GPUI decodes.
+/// A rotated copy of the current image, as pixels GPUI draws directly.
 struct Rotated {
-    image: Arc<gpui::Image>,
+    image: Arc<RenderImage>,
     /// The rotated size in logical pixels.
     size: Pt,
 }
@@ -336,7 +336,7 @@ impl Viewer {
         cx.spawn(async move |this, cx| {
             let produced = cx
                 .background_executor()
-                .spawn(async move { rotated_png(&image, rotation) })
+                .spawn(async move { rotated_image(&image, rotation) })
                 .await;
             if let Err(error) = this.update(cx, |this, cx| {
                 if this.rotation_job != job {
@@ -344,10 +344,10 @@ impl Viewer {
                 }
                 this.rotating = false;
                 match produced {
-                    Some((png, width, height)) => {
+                    Some((image, width, height)) => {
                         this.drop_rotated(cx);
                         this.rotated = Some(Rotated {
-                            image: Arc::new(gpui::Image::from_bytes(ImageFormat::Png, png)),
+                            image,
                             size: Pt::new(width as f32 / density, height as f32 / density),
                         });
                     }
@@ -692,14 +692,14 @@ impl Viewer {
     }
 }
 
-/// Rotated copy of frame 0 as PNG bytes with its size.
-fn rotated_png(image: &RenderImage, rotation: Rotation) -> Option<(Vec<u8>, u32, u32)> {
+/// Rotated copy of frame 0 as a GPUI image with its size.
+fn rotated_image(image: &RenderImage, rotation: Rotation) -> Option<(Arc<RenderImage>, u32, u32)> {
     let size = image.size(0);
     let width = u32::try_from(i32::from(size.width)).ok()?;
     let height = u32::try_from(i32::from(size.height)).ok()?;
     let turned = rotate_pixels(image.as_bytes(0)?, width, height, rotation)?;
-    let png = encode_png(&turned.bytes, turned.width, turned.height)?;
-    Some((png, turned.width, turned.height))
+    let (turned_width, turned_height) = turned.dimensions();
+    Some((render_image(turned), turned_width, turned_height))
 }
 
 impl Focusable for Viewer {
