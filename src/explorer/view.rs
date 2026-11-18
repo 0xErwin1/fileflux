@@ -820,12 +820,13 @@ impl Render for Explorer {
 }
 
 impl Explorer {
-    /// The 44 px empty top strip of the desk. It shows nothing: the user
-    /// asked for no brand text or icon (S10). The OS window title keeps the
-    /// `current folder — Fileflux` identity; the strip only preserves the
-    /// reference design's header geometry.
+    /// The empty top gutter matches the side gutters, without branding.
+    /// The OS window title retains the current folder and application identity.
     fn render_header(&self) -> impl IntoElement {
-        div().id("explorer-header").flex_none().h(px(44.0))
+        div()
+            .id("explorer-header")
+            .flex_none()
+            .h(IslandMetrics::GAP)
     }
 
     /// In the grid, up and down move one row of tiles; in the list they
