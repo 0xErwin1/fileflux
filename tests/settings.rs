@@ -933,12 +933,8 @@ fn legacy_favorites_load_from_a_version_1_file_and_are_not_written_when_empty() 
 }
 
 #[test]
-fn a_version_1_arrangement_with_out_of_domain_sort_values_is_invalid_and_set_aside() {
+fn a_version_1_arrangement_with_unknown_sort_names_is_invalid_and_set_aside() {
     let cases = [
-        ("sort_key = 5\nsort_dir = \"ascending\"", "number-key"),
-        ("sort_key = \"name\"\nsort_dir = true", "bool-dir"),
-        ("sort_key = [\"name\"]", "array-key"),
-        ("sort_dir = 3", "lone-number-dir"),
         (
             "sort_key = \"bogus\"\nsort_dir = \"ascending\"",
             "unknown-key",
@@ -983,10 +979,82 @@ fn a_version_1_arrangement_with_out_of_domain_sort_values_is_invalid_and_set_asi
     let path = scratch.path().join("session.toml");
     std::fs::write(
         &path,
-        "version = 1\n[[tabs]]\nkind = \"directory\"\npath = \"/a\"\n[tabs.arrangement]\nsort_key = 7\n",
+        "version = 1\n[[tabs]]\nkind = \"directory\"\npath = \"/a\"\n[tabs.arrangement]\nsort_key = \"bogus\"\n",
     )
     .expect("fixture writes");
     let loaded = load_session(&path, now());
     assert_eq!(loaded.value, Session::default());
     assert!(loaded.heal);
+}
+
+#[test]
+fn a_non_string_sort_value_in_a_version_1_file_resets_only_the_arrangement() {
+    let cases = [
+        ("sort_key = 5\nsort_dir = \"descending\"", "number-key"),
+        ("sort_key = \"size\"\nsort_dir = true", "bool-dir"),
+        ("sort_key = [\"name\"]", "array-key"),
+        ("sort_dir = 3", "lone-number-dir"),
+    ];
+    for (sort, tag) in cases {
+        let text = format!(
+            "version = 1\nfavorites = [\"/srv/a\"]\n[preferences]\nsidebar_width = 333\n\
+             default_view = \"list\"\n[preferences.arrangement]\n{sort}\nfolders_first = false\n"
+        );
+        let scratch = Scratch::new(&format!("migrate-nonstring-{tag}"));
+        let path = scratch.path().join("settings.toml");
+        std::fs::write(&path, &text).expect("fixture writes");
+
+        let loaded = load_settings(&path, now());
+
+        let preferences = &loaded.value.preferences;
+        let defaults = ArrangementPrefs::default();
+        assert_eq!(preferences.arrangement.sort_key, defaults.sort_key, "{tag}");
+        assert_eq!(preferences.arrangement.sort_dir, defaults.sort_dir, "{tag}");
+        assert!(!preferences.arrangement.folders_first, "{tag}: kept");
+        assert_eq!(preferences.sidebar_width, 333, "{tag}: other choices kept");
+        assert_eq!(preferences.view, ViewMode::List, "{tag}");
+        assert_eq!(loaded.value.favorites, [PathBuf::from("/srv/a")], "{tag}");
+        assert!(loaded.writable, "{tag}");
+        assert!(loaded.migrated, "{tag}: rewritten on the next save");
+        assert!(!loaded.heal, "{tag}: the file is not set aside");
+        let notice = loaded.notice.expect("the invalid-settings notice shows");
+        assert!(
+            notice.starts_with("Settings file was invalid"),
+            "{tag}: {notice}"
+        );
+        let aside = entries(scratch.path())
+            .into_iter()
+            .filter(|name| name.contains(".bad-"))
+            .count();
+        assert_eq!(aside, 0, "{tag}: nothing is set aside");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            text,
+            "{tag}"
+        );
+    }
+
+    // A session tab: only that tab's arrangement is reset.
+    let scratch = Scratch::new("migrate-nonstring-session");
+    let path = scratch.path().join("session.toml");
+    std::fs::write(
+        &path,
+        "version = 1\nactive = 1\n[[tabs]]\nkind = \"directory\"\npath = \"/a\"\n\
+         [tabs.arrangement]\nsort_key = 7\n[[tabs]]\nkind = \"directory\"\npath = \"/b\"\n",
+    )
+    .expect("fixture writes");
+    let loaded = load_session(&path, now());
+    assert_eq!(loaded.value.tabs.len(), 2);
+    assert_eq!(loaded.value.active, 1);
+    assert_eq!(
+        loaded.value.tabs[0].arrangement.sort_key,
+        ArrangementPrefs::default().sort_key
+    );
+    assert!(!loaded.heal);
+    assert!(
+        loaded
+            .notice
+            .expect("a notice")
+            .starts_with("Session file was invalid")
+    );
 }

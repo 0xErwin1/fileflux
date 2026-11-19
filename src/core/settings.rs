@@ -421,23 +421,23 @@ trait Stored: Serialize + DeserializeOwned + Default {
     const VERSION: u32;
 
     /// Brings a table written by an older version up to [`Self::VERSION`],
-    /// touching only what the older meaning requires.
-    fn migrate(table: &mut toml::Table);
+    /// touching only what the older meaning requires. Returns whether a part
+    /// of the table was not a choice this version ever wrote and was reset to
+    /// its defaults.
+    fn migrate(table: &mut toml::Table) -> bool;
 }
 
 impl Stored for Settings {
     const LABEL: &'static str = "Settings";
     const VERSION: u32 = SETTINGS_VERSION;
 
-    fn migrate(table: &mut toml::Table) {
-        if let Some(arrangement) = table
+    fn migrate(table: &mut toml::Table) -> bool {
+        table
             .get_mut("preferences")
             .and_then(toml::Value::as_table_mut)
             .and_then(|preferences| preferences.get_mut("arrangement"))
             .and_then(toml::Value::as_table_mut)
-        {
-            migrate_arrangement(arrangement);
-        }
+            .is_some_and(migrate_arrangement)
     }
 }
 
@@ -445,17 +445,19 @@ impl Stored for Session {
     const LABEL: &'static str = "Session";
     const VERSION: u32 = SESSION_VERSION;
 
-    fn migrate(table: &mut toml::Table) {
+    fn migrate(table: &mut toml::Table) -> bool {
         let tabs = table.get_mut("tabs").and_then(toml::Value::as_array_mut);
+        let mut reset = false;
         for tab in tabs.into_iter().flatten() {
             if let Some(arrangement) = tab
                 .as_table_mut()
                 .and_then(|tab| tab.get_mut("arrangement"))
                 .and_then(toml::Value::as_table_mut)
             {
-                migrate_arrangement(arrangement);
+                reset |= migrate_arrangement(arrangement);
             }
         }
+        reset
     }
 }
 
@@ -466,10 +468,11 @@ impl Stored for Session {
 /// partner key was a choice.
 ///
 /// A sort value that is not a string is not a choice this version ever wrote:
-/// the arrangement is left as it is, so loading it fails and the file is
-/// kept aside like any other invalid one (an unknown string fails the same
-/// way), instead of silently becoming a default.
-fn migrate_arrangement(arrangement: &mut toml::Table) {
+/// the sort of that arrangement goes back to the defaults (every other
+/// preference is kept) and `true` is returned so the user is told. An
+/// unknown string is not repaired here: loading it fails and the file is
+/// kept aside like any other invalid one.
+fn migrate_arrangement(arrangement: &mut toml::Table) -> bool {
     let sort_value = |key: &str, old_default: &str| match arrangement.get(key) {
         None => Some(old_default.to_owned()),
         Some(value) => value.as_str().map(str::to_owned),
@@ -478,7 +481,9 @@ fn migrate_arrangement(arrangement: &mut toml::Table) {
         sort_value("sort_key", "name"),
         sort_value("sort_dir", "ascending"),
     ) else {
-        return;
+        arrangement.remove("sort_key");
+        arrangement.remove("sort_dir");
+        return true;
     };
     if key == "name" && dir == "ascending" {
         arrangement.insert("sort_key".to_owned(), "modified".into());
@@ -494,6 +499,7 @@ fn migrate_arrangement(arrangement: &mut toml::Table) {
     {
         arrangement.insert("hide_hidden".to_owned(), true.into());
     }
+    false
 }
 
 // --- loading ------------------------------------------------------------------
@@ -529,7 +535,9 @@ pub fn load_session(path: &Path, now: SystemTime) -> Loaded<Session> {
 
 /// How a file's bytes read.
 enum Parsed<T> {
-    Value(T, bool),
+    /// The value, whether the file was migrated, whether migration reset a
+    /// part that was not a choice this version wrote.
+    Value(T, bool, bool),
     /// Written by a newer Fileflux: its `version`.
     Newer(i64),
     /// Not UTF-8, not TOML, or not the expected shape.
@@ -558,12 +566,13 @@ fn parse<T: Stored>(bytes: &[u8]) -> Parsed<T> {
         .get("version")
         .and_then(toml::Value::as_integer)
         .is_some_and(|version| version < i64::from(T::VERSION));
+    let mut reset = false;
     if older {
-        T::migrate(&mut table);
+        reset = T::migrate(&mut table);
         table.insert("version".to_owned(), i64::from(T::VERSION).into());
     }
     match table.try_into::<T>() {
-        Ok(value) => Parsed::Value(value, older),
+        Ok(value) => Parsed::Value(value, older, reset),
         Err(error) => Parsed::Invalid(error.to_string()),
     }
 }
@@ -598,9 +607,15 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
     };
 
     match parse::<T>(&bytes) {
-        Parsed::Value(value, migrated) => Loaded {
+        Parsed::Value(value, migrated, reset) => Loaded {
             value,
-            notice: None,
+            notice: reset.then(|| {
+                format!(
+                    "{} file was invalid; using defaults for the sort \
+                     (the other preferences were kept)",
+                    T::LABEL
+                )
+            }),
             writable: true,
             migrated,
             heal: false,
@@ -801,7 +816,7 @@ fn merge_with_disk(path: &Path, base: &Settings, ours: &Settings) -> io::Result<
         Err(error) => return Err(error),
     };
     match parse::<Settings>(&bytes) {
-        Parsed::Value(disk, _) => Ok(merge_settings(base, ours, &disk)),
+        Parsed::Value(disk, ..) => Ok(merge_settings(base, ours, &disk)),
         Parsed::Newer(version) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

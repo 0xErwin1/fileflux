@@ -13,8 +13,10 @@
 //! atomically (see [`super::settings`]: a temporary file beside the target,
 //! renamed over it, through a symlink, keeping the file's mode). Right
 //! before the rename the file is read once more: an edit another program made
-//! meanwhile is merged with (the change is applied again to its content),
-//! never overwritten. Changes of this process are serialized by one lock.
+//! meanwhile is re-applied (the change is made again on its content). The
+//! window that remains between that last re-read and the rename is narrowed,
+//! not closed: a write landing inside it is still lost. Changes of this
+//! process are serialized by one lock.
 
 use std::ffi::{OsStr, OsString};
 use std::io;

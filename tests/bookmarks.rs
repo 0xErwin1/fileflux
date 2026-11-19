@@ -430,4 +430,16 @@ fn relative_folders_are_rejected_by_add_and_merge_and_nothing_is_written() {
     let missing = scratch.0.join("absent/bookmarks");
     assert!(add(&missing, Path::new("")).is_err());
     assert!(!scratch.0.join("absent").exists(), "nothing is created");
+
+    // An absolute folder whose parent is missing is a real change: only the
+    // relative one must leave the missing directory alone.
+    let nested = scratch.0.join("deeper/absent/bookmarks");
+    assert!(add(&nested, Path::new("relative/dir")).is_err());
+    assert!(merge(&nested, &[PathBuf::from("/ok"), PathBuf::from("rel")]).is_err());
+    assert!(!scratch.0.join("deeper").exists(), "no parent is created");
+    assert!(
+        add(&nested, Path::new("/abs/dir")).is_ok(),
+        "control: creates"
+    );
+    assert!(nested.exists());
 }

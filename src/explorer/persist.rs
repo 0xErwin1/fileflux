@@ -562,9 +562,25 @@ impl Startup {
             settings_writable,
             legacy_favorites.is_empty(),
         ) {
-            match bookmarks::merge(path, &legacy_favorites) {
+            // A relative entry names no folder a bookmarks file could hold:
+            // it is dropped, with one notice, rather than failing the batch.
+            let (absolute, relative): (Vec<PathBuf>, Vec<PathBuf>) = legacy_favorites
+                .iter()
+                .cloned()
+                .partition(|folder| folder.is_absolute());
+            match bookmarks::merge(path, &absolute) {
                 Ok(_) => {
                     legacy_favorites.clear();
+                    if !relative.is_empty() {
+                        let listed = relative
+                            .iter()
+                            .map(|folder| folder.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        notices.push(format!(
+                            "Left out of the GTK bookmarks, because they are not absolute paths: {listed}"
+                        ));
+                    }
                     // Only now, with the bookmarks written, do the favorites
                     // leave `settings.toml`, in this same step: were they left
                     // for the first tick, a launch that dies before it would
@@ -1253,6 +1269,43 @@ mod tests {
             std::fs::read_to_string(&bookmarks).expect("reads"),
             format!("{original}file:///srv/a\nfile:///srv/c%20d\n")
         );
+    }
+
+    #[test]
+    fn relative_legacy_favorites_are_dropped_with_one_notice_and_the_rest_still_move() {
+        let scratch = Scratch::new("bookmarks-relative");
+        let bookmarks = scratch.0.join("config/gtk-3.0/bookmarks");
+        write(
+            &scratch.0.join("config/settings.toml"),
+            "version = 1\nfavorites = [\"/srv/a\", \"rel/dir\", \"/srv/b\", \"other\"]\n",
+        );
+
+        let mut first = load(&scratch.0, None);
+
+        assert_eq!(
+            std::fs::read_to_string(&bookmarks).expect("reads"),
+            "file:///srv/a\nfile:///srv/b\n",
+            "the absolute ones moved, in order"
+        );
+        assert_eq!(
+            favorite_paths(&first),
+            [PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]
+        );
+        assert!(first.legacy_favorites.is_empty());
+        assert_eq!(first.notices.len(), 1, "{:?}", first.notices);
+        assert!(
+            first.notices[0].contains("rel/dir") && first.notices[0].contains("other"),
+            "the notice lists what was dropped: {:?}",
+            first.notices
+        );
+
+        first_tick(&mut first);
+        let text = std::fs::read_to_string(scratch.0.join("config/settings.toml")).expect("reads");
+        assert!(!text.contains("favorites"), "{text}");
+
+        let second = load(&scratch.0, None);
+        assert!(second.notices.is_empty(), "one time: {:?}", second.notices);
+        assert_eq!(favorite_paths(&second), favorite_paths(&first));
     }
 
     #[test]
