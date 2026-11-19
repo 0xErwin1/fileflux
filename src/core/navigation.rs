@@ -21,7 +21,10 @@ use super::Location;
 ///   target stack is empty, leaving state unchanged.
 /// - `up` is a regular `visit` of the parent directory, so it joins history;
 ///   it is a no-op at the filesystem root and in the virtual
-///   [`Location::Trash`] and [`Location::Recent`].
+///   [`Location::Trash`] and [`Location::Recent`]; from a
+///   [`Location::Search`] it goes to the folder searched.
+/// - `replace_current` changes what is shown without touching the history:
+///   a search that is refined stays one history entry.
 #[derive(Clone, Debug)]
 pub struct Navigation {
     current: Location,
@@ -56,6 +59,13 @@ impl Navigation {
         self.current = location;
     }
 
+    /// Replaces the current location in place: the back and forward stacks
+    /// stay as they are. A search refined by typing is one history entry,
+    /// not one per keystroke.
+    pub fn replace_current(&mut self, location: Location) {
+        self.current = location;
+    }
+
     /// Steps one entry back; returns `false` (state unchanged) if none exist.
     pub fn back(&mut self) -> bool {
         let Some(previous) = self.back.pop() else {
@@ -81,9 +91,11 @@ impl Navigation {
     /// Returns `false` without changing state in [`Location::Trash`] or
     /// [`Location::Recent`], at the
     /// filesystem root, or when the parent resolves to the current location.
+    /// A [`Location::Search`] goes up to the folder it searches.
     pub fn up(&mut self) -> bool {
         let parent = match &self.current {
             Location::Directory(path) => path.parent().map(Path::to_path_buf),
+            Location::Search { root, .. } => Some(root.clone()),
             Location::Trash | Location::Recent => None,
         };
         let Some(parent) = parent else {
@@ -112,6 +124,7 @@ impl Navigation {
             Location::Directory(path) => path
                 .parent()
                 .is_some_and(|parent| Location::Directory(parent.to_path_buf()) != self.current),
+            Location::Search { .. } => true,
             Location::Trash | Location::Recent => false,
         }
     }
@@ -236,5 +249,47 @@ mod tests {
         assert!(!recent_nav.up(), "Recent Up is a no-op");
         assert_eq!(recent_nav.current(), &Location::Recent);
         assert!(!recent_nav.can_back());
+    }
+
+    fn search(root: &str, query: &str) -> Location {
+        Location::Search {
+            root: PathBuf::from(root),
+            query: query.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_search_goes_up_to_its_folder_and_back_returns_to_it() {
+        let mut nav = Navigation::new(dir("/srv/data"));
+        nav.visit(search("/srv/data", "re"));
+        assert!(nav.can_up());
+        assert!(nav.up());
+        assert_eq!(nav.current(), &dir("/srv/data"));
+        assert!(nav.back());
+        assert_eq!(nav.current(), &search("/srv/data", "re"));
+        assert!(nav.back());
+        assert_eq!(nav.current(), &dir("/srv/data"));
+    }
+
+    #[test]
+    fn replacing_the_current_location_keeps_the_history() {
+        let mut nav = Navigation::new(dir("/a"));
+        nav.visit(search("/a", "r"));
+        nav.replace_current(search("/a", "re"));
+        nav.replace_current(search("/a", "rep"));
+        assert_eq!(nav.current(), &search("/a", "rep"));
+        assert!(nav.back(), "one step back, not one per keystroke");
+        assert_eq!(nav.current(), &dir("/a"));
+        assert!(!nav.can_back());
+        assert!(nav.forward());
+        assert_eq!(nav.current(), &search("/a", "rep"));
+    }
+
+    #[test]
+    fn only_recent_and_search_list_files_from_elsewhere() {
+        assert!(Location::Recent.lists_files_from_elsewhere());
+        assert!(search("/a", "x").lists_files_from_elsewhere());
+        assert!(!Location::Trash.lists_files_from_elsewhere());
+        assert!(!dir("/a").lists_files_from_elsewhere());
     }
 }

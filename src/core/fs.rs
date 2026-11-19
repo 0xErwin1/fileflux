@@ -62,7 +62,7 @@ const HIDDEN_FILE_LIMIT: u64 = 1 << 20;
 /// Anyone who can write the folder controls `.hidden`, so it is only opened
 /// when it is a regular file, and opened non-blocking: a FIFO or device node
 /// planted there (or swapped in after the check) never stalls the listing.
-fn read_hidden_names(dir: &Path) -> BTreeSet<OsString> {
+pub(crate) fn read_hidden_names(dir: &Path) -> BTreeSet<OsString> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = dir.join(".hidden");
@@ -354,7 +354,7 @@ pub fn child_counts(entries: &[Entry]) -> HashMap<PathBuf, Option<usize>> {
 }
 
 /// Builds one listing entry; `Err` carries a ready-to-push warning string.
-fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
+pub(crate) fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
     let name: OsString = dir_entry.file_name();
     let path: PathBuf = dir_entry.path();
     let file_type: FileType = dir_entry

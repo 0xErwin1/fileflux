@@ -15,19 +15,37 @@ pub mod navigation;
 pub mod ops;
 pub mod places;
 pub mod recent;
+pub mod search;
 pub mod settings;
 pub mod terminal;
 pub mod thumbnails;
 pub mod trash;
 pub mod watch;
 
-/// A navigable directory, the virtual read-only home Trash or the virtual
-/// read-only list of recently used files.
+/// A navigable directory, the virtual read-only home Trash, the virtual
+/// read-only list of recently used files or the virtual read-only results of
+/// a recursive name search.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Location {
     Directory(PathBuf),
     Trash,
     Recent,
+    /// The files under `root` (and its subfolders) whose name contains
+    /// `query`, streamed in by [`search`]. A view of files that live in other
+    /// folders: nothing is created or pasted into it.
+    Search {
+        root: PathBuf,
+        query: String,
+    },
+}
+
+impl Location {
+    /// A list of files that live in other folders (Recent, search results):
+    /// each entry shows its folder, and nothing is created or pasted here.
+    #[must_use]
+    pub fn lists_files_from_elsewhere(&self) -> bool {
+        matches!(self, Self::Recent | Self::Search { .. })
+    }
 }
 
 /// The kind observed when the directory was scanned.
