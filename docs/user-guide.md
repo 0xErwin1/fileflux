@@ -166,6 +166,12 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | Shift + those keys | Extend the selection from the anchor |
 | Ctrl+A | Select every entry visible under the filter |
 | Escape | Clear the selection |
+| Click on empty space | Clear the selection (Ctrl or Shift held: leave it) |
+| Drag on empty space | Draw a selection rectangle; the entries it touches are selected live |
+| Ctrl+drag on empty space | Toggle the entries the rectangle touches, against the selection from before the drag |
+| Shift+drag on empty space | Add the entries the rectangle touches to the selection from before the drag |
+
+**Rubber-band selection** works in the grid and the list, in both panes. Press on empty space (the gaps between tiles, the space right of the last tile or below the last row; never on an entry, a column header or the scrollbar), then drag. Without a modifier the rectangle replaces the selection; with Ctrl it toggles, and with Shift it adds, always relative to the selection you had when you pressed, so shrinking the rectangle gives entries back. Holding the pointer near, or beyond, the top or bottom edge scrolls the pane, faster the further out it is. Escape during the drag cancels it and restores the selection from before the press. Dragging from an entry still drags files, not a rectangle.
 
 A selected entry that the filter hides stays selected, but operations act only on the entries that are visible.
 

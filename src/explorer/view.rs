@@ -69,7 +69,7 @@ use crate::explorer::state::{
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::tabs::{Affected, Placement};
 use crate::explorer::toasts;
-use crate::explorer::{entries, overlay, progress, sidebar, tabstrip, toolbar, util};
+use crate::explorer::{entries, overlay, progress, rubber, sidebar, tabstrip, toolbar, util};
 
 /// How many images one background thumbnail lookup covers before the tiles
 /// it found are shown.
@@ -673,6 +673,9 @@ pub(crate) struct OpContext {
 #[derive(Clone, Copy, Debug)]
 struct PaneGeometry {
     width: Option<f32>,
+    /// The entries content's window rectangle as of the last frame, for the
+    /// rubber band's hit testing.
+    bounds: Option<gpui::Bounds<gpui::Pixels>>,
     /// The grid column count of the last render, so keyboard row steps use
     /// the same geometry the list draws with.
     columns: usize,
@@ -682,6 +685,7 @@ impl Default for PaneGeometry {
     fn default() -> Self {
         Self {
             width: None,
+            bounds: None,
             columns: 1,
         }
     }
@@ -812,6 +816,8 @@ pub(crate) struct Explorer {
     _watch_pump: Option<Task<()>>,
     /// The machine's devices and the actions on them: the Devices section.
     pub(crate) devices: DeviceHub,
+    /// The rubber-band press in flight, if any (see [`rubber`]).
+    pub(crate) rubber_band: Option<rubber::Band>,
 }
 
 impl Focusable for Explorer {
@@ -845,6 +851,16 @@ impl Explorer {
         let changed = geometry.width != Some(width);
         geometry.width = Some(width);
         changed
+    }
+
+    /// The window rectangle of the focused pane's entries content.
+    pub(crate) fn entries_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.pane_geometry.get(self.tabs.focus()).bounds
+    }
+
+    /// Records the window rectangle of `side`'s entries content.
+    pub(crate) fn record_entries_bounds(&mut self, side: Side, bounds: gpui::Bounds<gpui::Pixels>) {
+        self.pane_geometry.get_mut(side).bounds = Some(bounds);
     }
 
     /// The grid column count the focused pane drew with last.
@@ -1007,6 +1023,7 @@ impl Explorer {
             folder_debounce: HashMap::new(),
             _watch_pump: None,
             devices: DeviceHub::from_env(),
+            rubber_band: None,
         };
         this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -2374,6 +2391,10 @@ impl Explorer {
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Escape while dragging cancels the drag and nothing else.
         if cx.stop_active_drag(window) {
+            return;
+        }
+        // Escape during a rubber band restores the selection it started from.
+        if self.cancel_rubber_band(cx) {
             return;
         }
         // Escape closes the parked sidebar overlay first and nothing else.

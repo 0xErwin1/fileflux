@@ -40,7 +40,7 @@ use super::{icon, util};
 /// Tile width of the reference grid (the artboard's 112 px minimum); every
 /// tile draws at exactly this width, so a partial last row matches a full
 /// one.
-const TILE_WIDTH: f32 = 112.0;
+pub(crate) const TILE_WIDTH: f32 = 112.0;
 /// Tile top padding above the thumbnail slot.
 const TILE_TOP_PADDING: f32 = 12.0;
 /// Width of the thumbnail slot every glyph, folder and photo draws in.
@@ -63,7 +63,7 @@ const SUB_LINE: f32 = 14.0;
 const TILE_BOTTOM_PADDING: f32 = 4.0;
 /// Tile height: top padding, the thumbnail slot, the name gap, two clamped
 /// filename lines, the subline gap and subline, and bottom padding.
-const TILE_HEIGHT: f32 = TILE_TOP_PADDING
+pub(crate) const TILE_HEIGHT: f32 = TILE_TOP_PADDING
     + THUMB_HEIGHT
     + NAME_GAP
     + 2.0 * NAME_LINE
@@ -71,7 +71,7 @@ const TILE_HEIGHT: f32 = TILE_TOP_PADDING
     + SUB_LINE
     + TILE_BOTTOM_PADDING;
 /// Gap between tiles.
-const TILE_GAP: f32 = 6.0;
+pub(crate) const TILE_GAP: f32 = 6.0;
 /// Opacity of an entry that was cut and waits for Paste.
 pub(crate) const CUT_OPACITY: f32 = 0.45;
 /// Alpha of the tint border around a selected tile (artboard `.35`).
@@ -554,7 +554,14 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             .flex()
             .flex_col()
             .child(measure_width(&weak, this.tabs.focus()))
-            .child(rows),
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.rubber_press(event, window, cx);
+                }),
+            )
+            .child(rows)
+            .children(this.rubber_overlay(this.tabs.focus(), cx)),
     )
 }
 
@@ -565,10 +572,12 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
 /// when it changed, so the measurement never becomes a paint loop.
 fn measure_width(weak: &WeakEntity<Explorer>, side: Side) -> impl IntoElement {
     let weak = weak.clone();
+    let listener = weak.clone();
     canvas(
         move |bounds, window, cx| {
             let width = f32::from(bounds.size.width);
             if let Err(error) = weak.update(cx, |this, cx| {
+                this.record_entries_bounds(side, bounds);
                 if this.record_entries_width(side, width) {
                     cx.notify();
                     window.request_animation_frame();
@@ -577,7 +586,7 @@ fn measure_width(weak: &WeakEntity<Explorer>, side: Side) -> impl IntoElement {
                 log::debug!("the entries area outlived its explorer: {error}");
             }
         },
-        |_, _, _, _| {},
+        move |_, (), window, _| super::rubber::listen(&listener, side, window),
     )
     .absolute()
     .size_full()

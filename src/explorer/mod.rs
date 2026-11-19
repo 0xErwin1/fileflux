@@ -15,6 +15,7 @@ pub(crate) mod overlay;
 pub(crate) mod panes;
 pub(crate) mod persist;
 pub(crate) mod progress;
+pub(crate) mod rubber;
 pub(crate) mod sidebar;
 pub(crate) mod state;
 pub(crate) mod table;

@@ -205,6 +205,21 @@ impl Clone for ArrangeSlot {
     }
 }
 
+/// A copy of the selection and its keyboard anchor and cursor.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectionSnapshot {
+    selected: BTreeSet<PathBuf>,
+    anchor: Option<PathBuf>,
+    cursor: Option<PathBuf>,
+}
+
+impl SelectionSnapshot {
+    /// The selected paths of the snapshot.
+    pub(crate) fn selected(&self) -> &BTreeSet<PathBuf> {
+        &self.selected
+    }
+}
+
 /// Selection, view, query and history for one tab, plus the
 /// scan-in-progress guard. All locations and entry paths are kept raw; only
 /// display strings are lossy.
@@ -1185,6 +1200,40 @@ impl ExplorerState {
         self.cursor = Some(last);
     }
 
+    /// The selection with its anchor and cursor, to put back later (a
+    /// cancelled rubber band).
+    pub(crate) fn selection_snapshot(&self) -> SelectionSnapshot {
+        SelectionSnapshot {
+            selected: self.selected.clone(),
+            anchor: self.anchor.clone(),
+            cursor: self.cursor.clone(),
+        }
+    }
+
+    /// Puts a [`Self::selection_snapshot`] back.
+    pub(crate) fn restore_selection(&mut self, snapshot: SelectionSnapshot) {
+        self.selected = snapshot.selected;
+        self.anchor = snapshot.anchor;
+        self.cursor = snapshot.cursor;
+    }
+
+    /// Replaces the selection (the live rubber band). The cursor and anchor
+    /// stay where they were while they are still selected; otherwise they
+    /// move to the last selected path, or are dropped when nothing is.
+    pub(crate) fn replace_selection(&mut self, selected: BTreeSet<PathBuf>) {
+        self.selected = selected;
+        let still = |path: &Option<PathBuf>| {
+            path.as_ref()
+                .is_some_and(|path| self.selected.contains(path))
+        };
+        if !still(&self.cursor) {
+            self.cursor = self.selected.last().cloned();
+        }
+        if !still(&self.anchor) {
+            self.anchor = self.cursor.clone();
+        }
+    }
+
     /// Empties the selection (Escape over the entries, folder change).
     pub(crate) fn clear_selection(&mut self) {
         self.selected.clear();
@@ -1979,6 +2028,48 @@ mod tests {
             [PathBuf::from("/fixture/a/beta")].into(),
             "clearing the query restores its visibility"
         );
+        Ok(())
+    }
+
+    /// The rubber band replaces the selection live and Escape puts the
+    /// press-time one back, cursor and anchor included.
+    #[test]
+    fn replacing_the_selection_and_restoring_the_snapshot_round_trip() -> TestResult {
+        let mut state = state();
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        state.commit(
+            scan,
+            listing(&[
+                ("one", EntryKind::File),
+                ("two", EntryKind::File),
+                ("three", EntryKind::File),
+            ]),
+        );
+        state.select_only(Path::new("/fixture/one"));
+        let before = state.selection_snapshot();
+
+        state.replace_selection(
+            [
+                PathBuf::from("/fixture/two"),
+                PathBuf::from("/fixture/three"),
+            ]
+            .into(),
+        );
+        assert_eq!(state.selection().len(), 2);
+        assert!(state.selection().contains(Path::new("/fixture/two")));
+
+        state.replace_selection(BTreeSet::new());
+        assert!(state.selection().is_empty());
+
+        state.restore_selection(before);
+        assert_eq!(
+            state.selection().clone(),
+            [PathBuf::from("/fixture/one")].into()
+        );
+        // The anchor came back too: the range runs one..two in displayed
+        // order, which has three between them.
+        state.select_range_to(Path::new("/fixture/two"));
+        assert_eq!(state.selection().len(), 3);
         Ok(())
     }
 
