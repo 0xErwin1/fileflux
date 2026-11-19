@@ -34,9 +34,11 @@ log = "0.4.34"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rustix = { version = "1.1.6", features = ["event", "fs"] }
 # The viewer rotates decoded pixels with `imageops` and hands them to GPUI as
-# a frame; no codec is needed, so no feature is enabled. The version is the
-# one GPUI already links, so both share one `image::Frame` type.
-image = { version = "=0.25.10", default-features = false }
+# a frame; the thumbnail generator decodes the formats the grid lists (jpeg,
+# png, webp, gif, bmp) to downscale them. The version is the one GPUI already
+# links, so both share one `image::Frame` type, and these codecs are already
+# compiled through GPUI.
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 # Settings persistence: the TOML files under the XDG config and state
 # directories. Both versions are already in the lock through the GPUI stack;
 # only the features the files need are enabled.

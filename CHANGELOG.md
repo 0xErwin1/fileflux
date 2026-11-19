@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Missing image thumbnails are generated into the freedesktop cache (256 px, EXIF-upright, two at a time).
+- Open with: Other application with a filter, and Remember for <type> writing mimeapps.list.
+
 - Search in subfolders: a toggle by the search box and Ctrl+Shift+F search file names in the folder and everything under it. Results stream into a read-only view that shows each match's folder; the walk is breadth-first, off the UI thread, cancellable with Escape, never follows symlinked folders, stays on one filesystem, follows the hidden-files rule, and stops at 10,000 matches ("N found · searching…", "stopped at 10,000"). Enter, Open containing folder and the file operations work on results. A search tab is not saved in the session.
 - Recent view in Places from the freedesktop `recently-used.xbel` (read-only, live, Open containing folder, restorable tab).
 - Grid thumbnails reuse current entries from the freedesktop thumbnail cache.

@@ -261,7 +261,7 @@ Only image files are previewed.
 
 ## Thumbnails
 
-Image tiles in the grid use the freedesktop thumbnail cache (`$XDG_CACHE_HOME/thumbnails/{normal,large,x-large}`) when it holds a current thumbnail: the file name is the MD5 of the image's canonical `file://` URI, and the PNG's `Thumb::URI` must match and `Thumb::MTime` must equal the file's modification time. Otherwise the image itself is loaded. Fileflux only reads the cache and never creates thumbnails.
+Thumbnails follow the freedesktop Thumbnail Managing Standard. Fileflux reuses thumbnails other applications already made in `$XDG_CACHE_HOME/thumbnails` (default `~/.cache/thumbnails`) when their `Thumb::URI` and `Thumb::MTime` match the file. When there is none it generates a 256 px `large` PNG there, upright per the photo's EXIF orientation, off the UI thread and at most two at a time. Images that fail to decode are recorded under `fail/fileflux-<version>/` and not retried until they change. Fileflux never generates thumbnails for files inside the cache, on gvfs/FUSE/network mounts, or for images over 50 megapixels or 100 MB; those show the file-type icon.
 
 ## Image viewer
 

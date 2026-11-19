@@ -34,15 +34,16 @@ use fileflux::core::settings::{
     self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
 };
 use fileflux::core::terminal::{self, Terminal, TerminalEnv};
+use fileflux::core::thumbnails::{Outcome, Skip};
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
 use fileflux::core::{Listing, Location};
 use gpui::{
-    App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollStrategy,
-    Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, actions, deferred, div,
-    prelude::*, px,
+    App, AppContext as _, AsyncApp, Context, Div, Entity, FocusHandle, Focusable,
+    InteractiveElement, KeyBinding, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement,
+    Render, ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle,
+    WeakEntity, Window, actions, deferred, div, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::table::{TableEvent, TableState};
@@ -74,6 +75,8 @@ use crate::explorer::{entries, overlay, progress, sidebar, tabstrip, toolbar, ut
 /// How many images one background thumbnail lookup covers before the tiles
 /// it found are shown.
 const THUMBNAIL_BATCH: usize = 32;
+/// How many images are decoded at once to make missing thumbnails.
+const THUMBNAIL_JOBS: usize = 2;
 
 /// Key context of the whole explorer window.
 pub(crate) const EXPLORER_CONTEXT: &str = "FilefluxExplorer";
@@ -1682,7 +1685,7 @@ impl Explorer {
     }
 
     /// Looks up the cached thumbnails of tab `id`'s images on the background
-    /// executor, a batch at a time so the first tiles do not wait for a long
+    /// executor, then generates the missing ones (freedesktop `large`), a batch at a time so the first tiles do not wait for a long
     /// folder. The answers that still apply stay on screen meanwhile; a newer
     /// commit replaces the task (dropping it).
     fn start_thumbnails(&mut self, id: TabId, cx: &mut Context<Self>) {
@@ -1699,6 +1702,9 @@ impl Explorer {
             return;
         }
         let task = cx.spawn(async move |this, cx| {
+            // Cache lookups first, so every cached thumbnail shows before any
+            // image is decoded.
+            let mut missing = Vec::new();
             for batch in todo.chunks(THUMBNAIL_BATCH) {
                 let batch = batch.to_vec();
                 let answers = cx
@@ -1708,26 +1714,78 @@ impl Explorer {
                             .into_iter()
                             .map(|(path, modified)| {
                                 let found = fileflux::core::thumbnails::lookup(&path);
-                                (path, entries::Thumb { modified, found })
+                                (path, modified, found)
                             })
                             .collect::<Vec<_>>()
                     })
                     .await;
-                let published = this.update(cx, |this, cx| {
-                    if let Some(tab) = this.tabs.by_id_mut(id) {
-                        Arc::make_mut(&mut tab.thumbs).extend(answers);
+                let mut hits = Vec::new();
+                for (path, modified, found) in answers {
+                    if found.is_some() {
+                        hits.push((path, entries::Thumb { modified, found }));
+                    } else {
+                        missing.push((path, modified));
                     }
-                    cx.notify();
-                });
-                if let Err(error) = published {
-                    log::debug!("the explorer closed before its thumbnails settled: {error}");
-                    break;
+                }
+                if hits.is_empty() {
+                    continue;
+                }
+                if !Self::publish_thumbnails(&this, id, hits, cx) {
+                    return;
+                }
+            }
+            // Then generate the missing ones, a few decodes at a time.
+            for jobs in missing.chunks(THUMBNAIL_JOBS) {
+                let running = jobs
+                    .iter()
+                    .map(|(path, modified)| {
+                        let (path, modified) = (path.clone(), *modified);
+                        cx.background_executor().spawn(async move {
+                            let found = match fileflux::core::thumbnails::generate(&path) {
+                                Outcome::Ready(thumbnail) => Some(thumbnail),
+                                // A file of the cache is a thumbnail already.
+                                Outcome::Skipped(Skip::InsideCache) => Some(path.clone()),
+                                Outcome::Failed | Outcome::Skipped(_) => None,
+                            };
+                            (path, entries::Thumb { modified, found })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut made = Vec::new();
+                for job in running {
+                    let (path, thumb) = job.await;
+                    if thumb.found.is_some() {
+                        made.push((path, thumb));
+                    }
+                }
+                if !made.is_empty() && !Self::publish_thumbnails(&this, id, made, cx) {
+                    return;
                 }
             }
         });
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.thumbs_task = Some(task);
         }
+    }
+
+    /// Shows `answers` on tab `id`. `false` when the explorer is gone and the
+    /// thumbnail task should stop.
+    fn publish_thumbnails(
+        this: &WeakEntity<Self>,
+        id: TabId,
+        answers: Vec<(PathBuf, entries::Thumb)>,
+        cx: &mut AsyncApp,
+    ) -> bool {
+        let published = this.update(cx, |this, cx| {
+            if let Some(tab) = this.tabs.by_id_mut(id) {
+                Arc::make_mut(&mut tab.thumbs).extend(answers);
+            }
+            cx.notify();
+        });
+        if let Err(error) = &published {
+            log::debug!("the explorer closed before its thumbnails settled: {error}");
+        }
+        published.is_ok()
     }
 
     /// Applies the sidebar discovery. A discovery failure is honest and
