@@ -389,28 +389,37 @@ jobs:
           git tag -f nightly HEAD
           git push origin refs/tags/nightly --force
 
-      # After the new pin is on the remote: drop per-build assets older than
-      # the retention window. Anything pinned by a nightly-ref commit newer
-      # than that keeps resolving. The current build is never deleted, and a
-      # failure here leaves extra assets rather than a broken nightly.
+      # After the new pin is on the remote: keep the most recent KEEP_BUILDS
+      # per-build assets (by upload time) and drop older ones. Retention is by
+      # count, not by the date in the name, so a nightly superseded after a
+      # long idle period on main still stays fetchable for the next
+      # KEEP_BUILDS builds. The current build is never deleted, and a failure
+      # here leaves extra assets rather than a broken nightly.
       - name: Prune old per-build assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_NAME: fileflux-linux-amd64-${{ needs.compute-version.outputs.date }}-${{ needs.compute-version.outputs.short_sha }}
-          RETENTION_DAYS: '14'
+          KEEP_BUILDS: '14'
         run: |
           set -euo pipefail
-          CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" '+%Y-%m-%d')
           RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/nightly")
+          # Per-build stems (name without .sha256), newest upload first.
+          mapfile -t KEEP < <(
+            jq -r '.assets | sort_by(.created_at) | reverse | .[].name' <<<"$RELEASE_JSON" |
+            grep -E '^fileflux-linux-amd64-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9a-f]+\.tar\.gz$' |
+            head -n "$KEEP_BUILDS"
+          )
+          KEEP+=("${BUILD_NAME}.tar.gz")
           jq -r '.assets[] | "\(.id) \(.name)"' <<<"$RELEASE_JSON" |
           while read -r ID NAME; do
             # Only per-build names (…-YYYY-MM-DD-<sha>.tar.gz[.sha256]); the
             # rolling names and anything else are left alone.
-            if [[ "$NAME" =~ ^fileflux-linux-amd64-([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9a-f]+\.tar\.gz(\.sha256)?$ ]]; then
-              [[ "$NAME" == "${BUILD_NAME}".* ]] && continue
-              if [[ "${BASH_REMATCH[1]}" < "$CUTOFF" ]]; then
-                echo "Deleting $NAME (older than $CUTOFF)"
-                gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${ID}"
-              fi
+            [[ "$NAME" =~ ^fileflux-linux-amd64-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9a-f]+\.tar\.gz(\.sha256)?$ ]] || continue
+            STEM="${NAME%.sha256}"
+            KEPT=false
+            for K in "${KEEP[@]}"; do [[ "$STEM" == "$K" ]] && KEPT=true && break; done
+            if [[ "$KEPT" == false ]]; then
+              echo "Deleting $NAME (beyond the newest ${KEEP_BUILDS} builds)"
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${ID}"
             fi
           done

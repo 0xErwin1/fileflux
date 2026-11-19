@@ -13,7 +13,7 @@
 # hashes that match the artifacts published in the rolling nightly release.
 #
 # `url` names a per-build immutable asset (fileflux-linux-amd64-<date>-<sha>.tar.gz)
-# that the workflow keeps for 14 days after it is superseded, so a pin of an
+# that the workflow keeps for the 14 most recent builds, so a pin of an
 # older `nightly` commit keeps working for that long. The rolling
 # fileflux-linux-amd64.tar.gz asset is for humans and is never pinned.
 #
