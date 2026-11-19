@@ -224,7 +224,7 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     };
 
     let open_with = match &dialog.action {
-        DialogAction::OpenWith { selected, .. } => Some(*selected),
+        DialogAction::OpenWith(state) => Some(state),
         _ => None,
     };
     // Waiting for a device to be free destroys nothing: not a danger button.
@@ -235,7 +235,20 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         .gap(Spacing::MD)
         .child(div().text_color(colors.foreground).child(text.body.clone()))
         // "Open with…": one clickable row per application.
-        .children(open_with.map(|selected| {
+        // The list of every application is narrowed by a filter box.
+        .children(
+            open_with
+                .and_then(|state| state.filter_input.as_ref())
+                .map(|input| {
+                    Input::new(input)
+                        .id("explorer-open-with-filter")
+                        .aria_label("Filter applications")
+                        .w_full()
+                        .small()
+                }),
+        )
+        .children(open_with.map(|state| {
+            let selected = state.selected;
             div()
                 .id("explorer-open-with-list")
                 .flex()
@@ -283,6 +296,20 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                         .text_color(colors.muted)
                         .child(name.clone())
                 }))
+        }))
+        .children(open_with.is_some().then(|| {
+            let toggle_weak = weak.clone();
+            Checkbox::new("explorer-open-with-remember")
+                .checked(dialog.open_with_remember())
+                .label(dialog.remember_label().unwrap_or_default())
+                .on_click(move |checked, _window, cx| {
+                    let checked = *checked;
+                    if let Err(error) = toggle_weak.update(cx, |this, cx| {
+                        this.set_open_with_remember(checked, cx);
+                    }) {
+                        log::debug!("the dialog outlived its explorer: {error}");
+                    }
+                })
         }))
         .children(apply_all.map(|checked| {
             let toggle_weak = weak.clone();

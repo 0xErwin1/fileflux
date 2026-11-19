@@ -432,14 +432,20 @@ pub fn desktop_entries(dirs: &[PathBuf]) -> Vec<(String, DesktopEntry)> {
     entries
 }
 
-/// The applications under `dirs` that can open `mime`. A file in an earlier
-/// directory hides one with the same id in a later one (even when it is
-/// itself hidden). Entries that are `NoDisplay`, `Hidden`, run in a
-/// terminal, or take no file argument are left out. `default_id` (from
-/// `xdg-mime query default`) is listed first, the rest by name.
-pub fn find_apps(dirs: &[PathBuf], mime: &str, default_id: Option<&str>) -> Vec<App> {
+/// An application that can open a file, with the MIME types it declares.
+struct Candidate {
+    app: App,
+    mime_types: Vec<String>,
+}
+
+/// Every application under `dirs` that a file manager may offer: one that
+/// is not `NoDisplay`, `Hidden` or run in a terminal, and whose `Exec=`
+/// takes a file in a form that can be run (see [`takes_file`]). A file in
+/// an earlier directory hides one with the same id in a later one (even
+/// when it is itself hidden).
+fn candidates(dirs: &[PathBuf]) -> Vec<Candidate> {
     let mut seen: Vec<String> = Vec::new();
-    let mut apps: Vec<App> = Vec::new();
+    let mut found: Vec<Candidate> = Vec::new();
     for root in dirs {
         let mut files = Vec::new();
         desktop_files(root, root, 0, &mut files);
@@ -454,30 +460,82 @@ pub fn find_apps(dirs: &[PathBuf], mime: &str, default_id: Option<&str>) -> Vec<
             let Some(entry) = parse_desktop_entry(&String::from_utf8_lossy(&bytes)) else {
                 continue;
             };
-            if entry.hidden
-                || entry.no_display
-                || entry.terminal
-                || !takes_file(&entry.exec)
-                || !mime_matches(&entry.mime_types, mime)
-            {
+            if entry.hidden || entry.no_display || entry.terminal || !takes_file(&entry.exec) {
                 continue;
             }
-            apps.push(App {
-                id,
-                name: entry.name,
-                exec: entry.exec,
+            found.push(Candidate {
+                app: App {
+                    id,
+                    name: entry.name,
+                    exec: entry.exec,
+                },
+                mime_types: entry.mime_types,
             });
         }
     }
+    found
+}
+
+/// Name order, ignoring case; the id breaks ties.
+fn by_name(a: &App, b: &App) -> std::cmp::Ordering {
+    a.name
+        .to_lowercase()
+        .cmp(&b.name.to_lowercase())
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn sorted_apps(mut apps: Vec<App>, default_id: Option<&str>) -> Vec<App> {
     apps.sort_by(|a, b| {
         let a_default = default_id == Some(a.id.as_str());
         let b_default = default_id == Some(b.id.as_str());
-        b_default
-            .cmp(&a_default)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.id.cmp(&b.id))
+        b_default.cmp(&a_default).then_with(|| by_name(a, b))
     });
     apps
+}
+
+fn matching_apps(found: &[Candidate], mime: &str, default_id: Option<&str>) -> Vec<App> {
+    let apps = found
+        .iter()
+        .filter(|candidate| {
+            // A default the user chose is offered for the type even when
+            // the application does not declare it ("Other application…").
+            default_id == Some(candidate.app.id.as_str())
+                || mime_matches(&candidate.mime_types, mime)
+        })
+        .map(|candidate| candidate.app.clone())
+        .collect();
+    sorted_apps(apps, default_id)
+}
+
+fn all_apps(found: &[Candidate]) -> Vec<App> {
+    sorted_apps(found.iter().map(|c| c.app.clone()).collect(), None)
+}
+
+/// The applications under `dirs` that can open `mime`. A file in an earlier
+/// directory hides one with the same id in a later one (even when it is
+/// itself hidden). Entries that are `NoDisplay`, `Hidden`, run in a
+/// terminal, or take no file argument are left out. `default_id` (the
+/// remembered or `xdg-mime query default` choice) is listed first, even
+/// when it does not declare `mime`; the rest by name.
+pub fn find_apps(dirs: &[PathBuf], mime: &str, default_id: Option<&str>) -> Vec<App> {
+    matching_apps(&candidates(dirs), mime, default_id)
+}
+
+/// Every application under `dirs` that can open a file, whatever types it
+/// declares ("Other application…"), by name. The same entries are left out
+/// as in [`find_apps`].
+pub fn find_all_apps(dirs: &[PathBuf]) -> Vec<App> {
+    all_apps(&candidates(dirs))
+}
+
+/// The applications whose name contains `query`, ignoring case and
+/// surrounding blanks, in the order given. An empty query keeps them all.
+pub fn filter_apps(apps: &[App], query: &str) -> Vec<App> {
+    let query = query.trim().to_lowercase();
+    apps.iter()
+        .filter(|app| app.name.to_lowercase().contains(&query))
+        .cloned()
+        .collect()
 }
 
 /// The MIME type of `path` by `xdg-mime query filetype` (no shell), else
@@ -516,12 +574,201 @@ pub fn query_default(mime: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenWith {
     pub mime: String,
+    /// The applications that handle `mime`, the default first.
     pub apps: Vec<App>,
+    /// Every application that takes a file, by name ("Other application…").
+    pub all_apps: Vec<App>,
+}
+
+/// `$XDG_CONFIG_HOME/mimeapps.list` (else `$HOME/.config/mimeapps.list`);
+/// a relative `XDG_CONFIG_HOME` is ignored, as the spec says.
+pub fn mimeapps_path(home: Option<&OsStr>, config_home: Option<&OsStr>) -> Option<PathBuf> {
+    let base = config_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|home| !home.is_empty())
+                .map(|home| Path::new(home).join(".config"))
+        })?;
+    Some(base.join("mimeapps.list"))
+}
+
+fn mimeapps_path_from_env() -> Option<PathBuf> {
+    mimeapps_path(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+    )
+}
+
+const DEFAULT_GROUP: &str = "[Default Applications]";
+
+/// The line without its `\n` or `\r\n` ending.
+fn line_body(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map_or(line, |rest| rest.strip_suffix('\r').unwrap_or(rest))
+}
+
+/// The first desktop id `file` lists for `mime` in its
+/// `[Default Applications]` group.
+pub fn default_application(file: &Path, mime: &str) -> Option<String> {
+    let content = std::fs::read(file).ok()?;
+    let content = String::from_utf8_lossy(&content);
+    let mut in_defaults = false;
+    for line in content.split_inclusive('\n').map(line_body) {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_defaults = line == DEFAULT_GROUP;
+        } else if in_defaults
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == mime
+        {
+            return value
+                .split(';')
+                .map(str::trim)
+                .find(|id| !id.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// `content` with `mime=id;` as the default for `mime`: the first line of
+/// the `[Default Applications]` group for that key is replaced, else the
+/// line is added at the end of the group, else the group is appended. Every
+/// other byte stays, and new lines use the file's own line ending.
+fn with_default(content: &str, mime: &str, id: &str) -> String {
+    let eol = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let new_line = format!("{mime}={id};");
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+
+    let mut in_defaults = false;
+    let mut group_seen = false;
+    // Index just after the last key line of the group.
+    let mut insert_at = 0;
+    let mut replace: Option<usize> = None;
+    for (index, raw) in lines.iter().enumerate() {
+        let line = line_body(raw).trim();
+        if line.starts_with('[') {
+            in_defaults = line == DEFAULT_GROUP;
+            if in_defaults {
+                group_seen = true;
+                insert_at = index + 1;
+            }
+        } else if in_defaults && !line.is_empty() && !line.starts_with('#') {
+            insert_at = index + 1;
+            if replace.is_none()
+                && line
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.trim() == mime)
+            {
+                replace = Some(index);
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(content.len() + new_line.len() + 2 * eol.len());
+    if group_seen {
+        for (index, raw) in lines.iter().enumerate() {
+            if replace == Some(index) {
+                let ending = &raw[line_body(raw).len()..];
+                out.push_str(&new_line);
+                out.push_str(ending);
+            } else {
+                out.push_str(raw);
+            }
+            if replace.is_none() && index + 1 == insert_at {
+                if !raw.ends_with('\n') {
+                    out.push_str(eol);
+                }
+                out.push_str(&new_line);
+                out.push_str(eol);
+            }
+        }
+    } else {
+        out.push_str(content);
+        if !content.is_empty() {
+            if !content.ends_with('\n') {
+                out.push_str(eol);
+            }
+            if lines
+                .last()
+                .is_some_and(|last| !line_body(last).trim().is_empty())
+            {
+                out.push_str(eol);
+            }
+        }
+        out.push_str(DEFAULT_GROUP);
+        out.push_str(eol);
+        out.push_str(&new_line);
+        out.push_str(eol);
+    }
+    out
+}
+
+/// Makes `id` the default application for `mime` in the
+/// `[Default Applications]` group of the `mimeapps.list` at `file`,
+/// creating the file, its folder and the group when missing. The new
+/// content goes to a temporary file in the same folder that then replaces
+/// `file`, so a reader never sees a half-written list.
+pub fn set_default_application(file: &Path, mime: &str, id: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let valid = |text: &str, forbidden: &[char]| {
+        !text.is_empty()
+            && !text
+                .chars()
+                .any(|c| c.is_control() || forbidden.contains(&c))
+    };
+    if !valid(mime, &['=', ';', '[', ']']) || !valid(id, &['=', ';']) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "the MIME type or the desktop id cannot be written to mimeapps.list",
+        ));
+    }
+    let current = match std::fs::read(file) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let text = current.as_deref().map(String::from_utf8_lossy);
+    let updated = with_default(text.as_deref().unwrap_or(""), mime, id);
+    // Lossy decoding must not rewrite bytes the user had: a list that is
+    // not UTF-8 is left alone.
+    if text
+        .as_ref()
+        .is_some_and(|text| matches!(text, std::borrow::Cow::Owned(_)))
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "mimeapps.list is not valid UTF-8",
+        ));
+    }
+    // The shared atomic writer: a unique temporary name created with
+    // O_EXCL and O_NOFOLLOW, fsync and rename, written through a symlinked
+    // file (home-manager) instead of replacing the link. An existing file
+    // keeps its mode; a new one is 0644 like the desktop tools write it.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(file).map_or(0o644, |meta| meta.permissions().mode() & 0o7777);
+    crate::core::settings::write_atomic_with_mode(file, updated.as_bytes(), mode)
+}
+
+/// Remembers `id` as the default for `mime` in the user's `mimeapps.list`
+/// (see [`set_default_application`]).
+pub fn remember_default(mime: &str, id: &str) -> std::io::Result<()> {
+    let file = mimeapps_path_from_env().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no HOME or XDG_CONFIG_HOME")
+    })?;
+    set_default_application(&file, mime, id)
 }
 
 /// The MIME type of `path` and the applications that handle it, from the
 /// process environment. Blocking: it runs `xdg-mime` and reads `.desktop`
-/// files, so call it off the UI thread.
+/// files, so call it off the UI thread. The default is the one remembered in
+/// the user's `mimeapps.list`, else the one `xdg-mime` reports.
 pub fn open_with_candidates(path: &Path) -> OpenWith {
     let mime = query_mime(path);
     let dirs = application_dirs(
@@ -529,9 +776,15 @@ pub fn open_with_candidates(path: &Path) -> OpenWith {
         std::env::var_os("XDG_DATA_HOME").as_deref(),
         std::env::var_os("XDG_DATA_DIRS").as_deref(),
     );
-    let default = query_default(&mime);
-    let apps = find_apps(&dirs, &mime, default.as_deref());
-    OpenWith { mime, apps }
+    let default = mimeapps_path_from_env()
+        .and_then(|file| default_application(&file, &mime))
+        .or_else(|| query_default(&mime));
+    let found = candidates(&dirs);
+    OpenWith {
+        apps: matching_apps(&found, &mime, default.as_deref()),
+        all_apps: all_apps(&found),
+        mime,
+    }
 }
 
 #[cfg(test)]
@@ -902,6 +1155,263 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn find_all_apps_lists_every_visible_file_app_by_name_whatever_its_mime() -> TestResult {
+        let first = Scratch::new("all-first")?;
+        let second = Scratch::new("all-second")?;
+        first.write("zed.desktop", &entry("Zed", "text/plain;", ""))?;
+        first.write("img.desktop", &entry("Gimp", "image/png;", ""))?;
+        first.write("nomime.desktop", &entry("beta", "", ""))?;
+        first.write("sub/nested.desktop", &entry("Nested", "video/mp4;", ""))?;
+        first.write("a.desktop", &entry("Secret", "", "NoDisplay=true\n"))?;
+        first.write("b.desktop", &entry("Gone", "", "Hidden=true\n"))?;
+        first.write("c.desktop", &entry("Term", "", "Terminal=true\n"))?;
+        first.write(
+            "d.desktop",
+            "[Desktop Entry]\nName=NoFile\nExec=nofile\nMimeType=text/plain;\n",
+        )?;
+        first.write(
+            "e.desktop",
+            "[Desktop Entry]\nName=Quoted\nExec=sh -c \"echo %f\"\n",
+        )?;
+        first.write("shadow.desktop", &entry("Shadow", "", "Hidden=true\n"))?;
+        second.write("shadow.desktop", &entry("Shadow", "", ""))?;
+        second.write("zed.desktop", &entry("Zed Old", "", ""))?;
+        second.write("alpha.desktop", &entry("alpha", "", ""))?;
+
+        let dirs = [first.0.clone(), second.0.clone()];
+        let names: Vec<String> = find_all_apps(&dirs)
+            .into_iter()
+            .map(|app| app.name)
+            .collect();
+        assert_eq!(names, ["alpha", "beta", "Gimp", "Nested", "Zed"]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_filter_matches_names_case_insensitively_and_keeps_the_order() {
+        let app = |id: &str, name: &str| App {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            exec: "x %f".to_owned(),
+        };
+        let apps = [
+            app("a.desktop", "Alpha Editor"),
+            app("b.desktop", "Beta"),
+            app("c.desktop", "Text EDITOR"),
+        ];
+        let ids = |query: &str| {
+            filter_apps(&apps, query)
+                .into_iter()
+                .map(|app| app.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(""), ["a.desktop", "b.desktop", "c.desktop"]);
+        assert_eq!(ids("  "), ["a.desktop", "b.desktop", "c.desktop"]);
+        assert_eq!(ids("editor"), ["a.desktop", "c.desktop"]);
+        assert_eq!(ids(" BETA "), ["b.desktop"]);
+        assert!(ids("zzz").is_empty());
+    }
+
+    #[test]
+    fn a_remembered_default_is_listed_first_even_when_it_does_not_declare_the_type() -> TestResult {
+        let scratch = Scratch::new("default-any")?;
+        scratch.write("alpha.desktop", &entry("Alpha", "text/plain;", ""))?;
+        scratch.write("other.desktop", &entry("Other", "image/png;", ""))?;
+        let dirs = [scratch.0.clone()];
+        let names: Vec<String> = find_apps(&dirs, "text/plain", Some("other.desktop"))
+            .into_iter()
+            .map(|app| app.name)
+            .collect();
+        assert_eq!(names, ["Other", "Alpha"]);
+        let unset: Vec<String> = find_apps(&dirs, "text/plain", None)
+            .into_iter()
+            .map(|app| app.name)
+            .collect();
+        assert_eq!(unset, ["Alpha"]);
+        Ok(())
+    }
+
+    fn mimeapps(scratch: &Scratch) -> PathBuf {
+        scratch.0.join("config/mimeapps.list")
+    }
+
+    fn only_file_in_config(scratch: &Scratch) -> std::io::Result<Vec<String>> {
+        let mut names: Vec<String> = fs::read_dir(scratch.0.join("config"))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    #[test]
+    fn remembering_creates_the_file_and_the_group_when_missing() -> TestResult {
+        let scratch = Scratch::new("mime-create")?;
+        let file = mimeapps(&scratch);
+        set_default_application(&file, "text/plain", "gedit.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&file)?,
+            "[Default Applications]\ntext/plain=gedit.desktop;\n"
+        );
+        assert_eq!(only_file_in_config(&scratch)?, ["mimeapps.list"]);
+
+        let second = Scratch::new("mime-create-2")?;
+        let other = mimeapps(&second);
+        fs::create_dir_all(other.parent().ok_or("no parent")?)?;
+        fs::write(&other, "[Added Associations]\nimage/png=a.desktop;\n")?;
+        set_default_application(&other, "text/plain", "gedit.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&other)?,
+            "[Added Associations]\nimage/png=a.desktop;\n\n\
+             [Default Applications]\ntext/plain=gedit.desktop;\n",
+            "a new group is appended after a blank line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remembering_changes_one_line_and_keeps_every_other_byte() -> TestResult {
+        let scratch = Scratch::new("mime-keep")?;
+        let file = mimeapps(&scratch);
+        fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        let before = "# my apps\n[Added Associations]\ntext/plain=old.desktop;\n\n\
+                      [Default Applications]\n# keep me\nimage/png=viewer.desktop;\n\
+                      text/plain=old.desktop;gedit.desktop;\n  \nvideo/mp4=mpv.desktop;\n\n\
+                      [Removed Associations]\ntext/plain=bad.desktop;";
+        fs::write(&file, before)?;
+        set_default_application(&file, "text/plain", "new app.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&file)?,
+            before.replace(
+                "text/plain=old.desktop;gedit.desktop;",
+                "text/plain=new app.desktop;"
+            ),
+            "only the existing default line changed (no trailing newline stays absent)"
+        );
+
+        // A key that is missing is added at the end of its group.
+        set_default_application(&file, "audio/ogg", "player.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&file)?,
+            before
+                .replace(
+                    "text/plain=old.desktop;gedit.desktop;",
+                    "text/plain=new app.desktop;"
+                )
+                .replace(
+                    "video/mp4=mpv.desktop;\n",
+                    "video/mp4=mpv.desktop;\naudio/ogg=player.desktop;\n"
+                )
+        );
+        assert_eq!(only_file_in_config(&scratch)?, ["mimeapps.list"]);
+        Ok(())
+    }
+
+    #[test]
+    fn remembering_keeps_a_file_without_a_final_newline_valid() -> TestResult {
+        let scratch = Scratch::new("mime-eof")?;
+        let file = mimeapps(&scratch);
+        fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        fs::write(&file, "[Default Applications]\nimage/png=v.desktop;")?;
+        set_default_application(&file, "text/plain", "g.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&file)?,
+            "[Default Applications]\nimage/png=v.desktop;\ntext/plain=g.desktop;\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remembering_tolerates_crlf_files_and_keeps_their_line_ends() -> TestResult {
+        let scratch = Scratch::new("mime-crlf")?;
+        let file = mimeapps(&scratch);
+        fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        fs::write(
+            &file,
+            "[Default Applications]\r\ntext/plain=old.desktop;\r\nimage/png=v.desktop;\r\n\r\n[Other]\r\nk=v\r\n",
+        )?;
+        set_default_application(&file, "text/plain", "g.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&file)?,
+            "[Default Applications]\r\ntext/plain=g.desktop;\r\nimage/png=v.desktop;\r\n\r\n[Other]\r\nk=v\r\n"
+        );
+        set_default_application(&file, "audio/ogg", "p.desktop")?;
+        assert_eq!(
+            fs::read_to_string(&file)?,
+            "[Default Applications]\r\ntext/plain=g.desktop;\r\nimage/png=v.desktop;\r\naudio/ogg=p.desktop;\r\n\r\n[Other]\r\nk=v\r\n"
+        );
+        assert_eq!(
+            default_application(&file, "text/plain").as_deref(),
+            Some("g.desktop")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remembering_refuses_values_that_would_corrupt_the_file() -> TestResult {
+        let scratch = Scratch::new("mime-invalid")?;
+        let file = mimeapps(&scratch);
+        for (mime, id) in [
+            ("text/plain", "a\nb.desktop"),
+            ("text/plain", "a;b.desktop"),
+            ("text/plain", ""),
+            ("text/p=lain", "a.desktop"),
+            ("text/plain\n[X]", "a.desktop"),
+            ("", "a.desktop"),
+        ] {
+            let result = set_default_application(&file, mime, id);
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidInput),
+                "{mime:?} {id:?}: {result:?}"
+            );
+        }
+        assert!(!file.exists(), "a refusal writes nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn the_remembered_default_is_read_back_from_the_default_group_only() -> TestResult {
+        let scratch = Scratch::new("mime-read")?;
+        let file = mimeapps(&scratch);
+        fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        fs::write(
+            &file,
+            "[Added Associations]\ntext/plain=added.desktop;\n[Default Applications]\n\
+             text/plain=first.desktop;second.desktop;\n",
+        )?;
+        assert_eq!(
+            default_application(&file, "text/plain").as_deref(),
+            Some("first.desktop")
+        );
+        assert_eq!(default_application(&file, "image/png"), None);
+        assert_eq!(
+            default_application(&scratch.0.join("missing"), "text/plain"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_config_file_follows_the_xdg_config_home_rules() {
+        let os = OsStr::new;
+        assert_eq!(
+            mimeapps_path(Some(os("/h")), None),
+            Some(PathBuf::from("/h/.config/mimeapps.list"))
+        );
+        assert_eq!(
+            mimeapps_path(Some(os("/h")), Some(os("/cfg"))),
+            Some(PathBuf::from("/cfg/mimeapps.list"))
+        );
+        assert_eq!(
+            mimeapps_path(Some(os("/h")), Some(os("relative"))),
+            Some(PathBuf::from("/h/.config/mimeapps.list")),
+            "a relative XDG_CONFIG_HOME is ignored"
+        );
+        assert_eq!(mimeapps_path(None, None), None);
+    }
+
     fn entry_with(extra: &str) -> Option<DesktopEntry> {
         parse_desktop_entry(&format!("[Desktop Entry]\nName=T\nExec=t\n{extra}\n"))
     }
@@ -945,5 +1455,28 @@ mod tests {
         assert_eq!(arg_dir("X-TerminalArgDir="), None);
         assert_eq!(arg_dir("X-TerminalArgDir=    "), None);
         assert_eq!(arg_dir(""), None);
+    }
+
+    #[test]
+    fn remembering_a_default_writes_through_a_symlinked_mimeapps_list()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = Scratch::new("mimeapps-symlink")?;
+        let real = scratch.0.join("dotfiles/mimeapps.list");
+        std::fs::create_dir_all(scratch.0.join("dotfiles"))?;
+        std::fs::write(&real, "[Default Applications]\nimage/png=a.desktop;\n")?;
+        let link = scratch.0.join("config/mimeapps.list");
+        std::fs::create_dir_all(scratch.0.join("config"))?;
+        std::os::unix::fs::symlink(&real, &link)?;
+
+        set_default_application(&link, "text/plain", "zed.desktop")?;
+
+        assert!(
+            std::fs::symlink_metadata(&link)?.file_type().is_symlink(),
+            "the link is kept"
+        );
+        let written = std::fs::read_to_string(&real)?;
+        assert!(written.contains("text/plain=zed.desktop;"), "{written}");
+        assert!(written.contains("image/png=a.desktop;"), "{written}");
+        Ok(())
     }
 }

@@ -1249,13 +1249,18 @@ fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
             app("a.desktop", "Alpha", "alpha %f"),
             app("b.desktop", "Beta", "beta %f"),
         ],
+        all_apps: Vec::new(),
     };
     let dialog = DialogState::open_with(Path::new("/d/notes.txt"), &found);
     assert_eq!(
         dialog.text.title,
         "Open \u{201c}notes.txt\u{201d} with\u{2026}"
     );
-    assert_eq!(dialog.text.names, ["Alpha", "Beta"]);
+    assert_eq!(
+        dialog.text.names,
+        ["Alpha", "Beta", "Other application\u{2026}"],
+        "the Other application row is last"
+    );
     assert_eq!(dialog.text.confirm, "Open");
     assert_eq!(
         dialog.initial_focus(),
@@ -1264,11 +1269,17 @@ fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
     );
     assert_eq!(
         dialog.action,
-        DialogAction::OpenWith {
+        DialogAction::OpenWith(OpenWithState {
             path: PathBuf::from("/d/notes.txt"),
+            mime: "text/plain".to_owned(),
             apps: found.apps.clone(),
+            all_apps: Vec::new(),
             selected: 0,
-        }
+            other: false,
+            filter: String::new(),
+            remember: false,
+            filter_input: None,
+        })
     );
     // A delete confirmation still defaults to the safe button.
     let delete = DialogState::new(
@@ -1277,6 +1288,141 @@ fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
         DialogAction::DeletePermanently(vec![PathBuf::from("/d/a")]),
     );
     assert_eq!(delete.initial_focus(), DialogChoice::Cancel);
+}
+
+fn chooser(matching: &[(&str, &str)], all: &[(&str, &str)]) -> DialogState {
+    let make = |list: &[(&str, &str)]| {
+        list.iter()
+            .map(|(id, name)| app(id, name, "run %f"))
+            .collect::<Vec<_>>()
+    };
+    DialogState::open_with(
+        Path::new("/d/notes.txt"),
+        &OpenWith {
+            mime: "text/plain".to_owned(),
+            apps: make(matching),
+            all_apps: make(all),
+        },
+    )
+}
+
+const EVERY_APP: &[(&str, &str)] = &[
+    ("a.desktop", "Alpha"),
+    ("b.desktop", "Beta"),
+    ("g.desktop", "Gimp"),
+    ("z.desktop", "Zed Editor"),
+];
+
+#[test]
+fn a_type_nobody_handles_still_offers_other_application() {
+    let dialog = chooser(&[], EVERY_APP);
+    assert_eq!(dialog.text.names, ["Other application\u{2026}"]);
+    assert_eq!(dialog.open_with_pick(), Some(OpenWithPick::Other));
+}
+
+#[test]
+fn choosing_the_other_row_lists_every_application_by_name() {
+    let mut dialog = chooser(&[("b.desktop", "Beta")], EVERY_APP);
+    assert_eq!(dialog.text.names, ["Beta", "Other application\u{2026}"]);
+    assert_eq!(
+        dialog.open_with_pick(),
+        Some(OpenWithPick::Launch {
+            path: PathBuf::from("/d/notes.txt"),
+            app: app("b.desktop", "Beta", "run %f"),
+            remember: None,
+        })
+    );
+    dialog.move_open_with(1);
+    assert_eq!(dialog.open_with_pick(), Some(OpenWithPick::Other));
+    dialog.move_open_with(1);
+    assert_eq!(
+        dialog.open_with_pick(),
+        Some(OpenWithPick::Other),
+        "stops at the Other row"
+    );
+
+    dialog.show_other_apps();
+    assert_eq!(dialog.text.names, ["Alpha", "Beta", "Gimp", "Zed Editor"]);
+    assert_eq!(
+        dialog.text.body,
+        "Every application. Type to filter, Up and Down choose, Enter opens."
+    );
+    assert_eq!(
+        dialog.open_with_pick(),
+        Some(OpenWithPick::Launch {
+            path: PathBuf::from("/d/notes.txt"),
+            app: app("a.desktop", "Alpha", "run %f"),
+            remember: None,
+        }),
+        "the first application is selected"
+    );
+    dialog.move_open_with(2);
+    assert_eq!(
+        dialog.open_with_pick().map(|pick| match pick {
+            OpenWithPick::Launch { app, .. } => app.name,
+            OpenWithPick::Other => "other".to_owned(),
+        }),
+        Some("Gimp".to_owned())
+    );
+}
+
+#[test]
+fn the_filter_narrows_the_other_applications_and_resets_the_selection() {
+    let mut dialog = chooser(&[], EVERY_APP);
+    dialog.show_other_apps();
+    dialog.move_open_with(3);
+    dialog.set_open_with_filter("ED");
+    assert_eq!(dialog.text.names, ["Zed Editor"]);
+    assert_eq!(
+        dialog.open_with_pick().map(|pick| match pick {
+            OpenWithPick::Launch { app, .. } => app.id,
+            OpenWithPick::Other => "other".to_owned(),
+        }),
+        Some("z.desktop".to_owned())
+    );
+    dialog.set_open_with_filter("nothing like this");
+    assert!(dialog.text.names.is_empty());
+    assert_eq!(dialog.open_with_pick(), None, "no row, nothing to launch");
+    dialog.set_open_with_filter("");
+    assert_eq!(dialog.text.names.len(), 4, "clearing shows every one");
+    // The filter does nothing before the list of every application shows.
+    let mut mime_list = chooser(&[("b.desktop", "Beta")], EVERY_APP);
+    mime_list.set_open_with_filter("gimp");
+    assert_eq!(mime_list.text.names, ["Beta", "Other application\u{2026}"]);
+}
+
+#[test]
+fn remember_is_off_by_default_and_names_the_type_when_chosen() {
+    let mut dialog = chooser(&[("b.desktop", "Beta")], EVERY_APP);
+    assert_eq!(
+        dialog.remember_label().as_deref(),
+        Some("Remember for text/plain")
+    );
+    assert!(!dialog.open_with_remember());
+    dialog.set_open_with_remember(true);
+    assert!(dialog.open_with_remember());
+    assert_eq!(
+        dialog.open_with_pick(),
+        Some(OpenWithPick::Launch {
+            path: PathBuf::from("/d/notes.txt"),
+            app: app("b.desktop", "Beta", "run %f"),
+            remember: Some("text/plain".to_owned()),
+        })
+    );
+    dialog.set_open_with_remember(false);
+    assert!(matches!(
+        dialog.open_with_pick(),
+        Some(OpenWithPick::Launch { remember: None, .. })
+    ));
+    // Other dialogs have no such checkbox and ignore the call.
+    let mut delete = DialogState::new(
+        DialogKind::DeletePermanently,
+        &["a".to_owned()],
+        DialogAction::DeletePermanently(vec![PathBuf::from("/d/a")]),
+    );
+    delete.set_open_with_remember(true);
+    assert_eq!(delete.remember_label(), None);
+    assert_eq!(delete.open_with_pick(), None);
 }
 
 #[test]

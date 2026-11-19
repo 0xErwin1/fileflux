@@ -31,9 +31,9 @@ use super::devices::{device_menu_rows, job_paths, with_device_rows};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
-    MenuPage, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, RenameCheck, RenameStep, Report,
-    Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row, check_rename, dismissed_notice,
-    menu_rows, move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command,
+    MenuPage, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick, RenameCheck,
+    RenameStep, Report, Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row, check_rename,
+    dismissed_notice, menu_rows, next_menu_index, no_trash_dialog, open_target, open_with_command,
     rename_seed, rename_step, stem_range,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
@@ -881,6 +881,14 @@ impl Explorer {
         if !self.dialogs.accepts(DialogChoice::Confirm, Instant::now()) {
             return;
         }
+        if self
+            .dialogs
+            .current()
+            .is_some_and(|dialog| matches!(dialog.action, DialogAction::OpenWith(_)))
+        {
+            self.confirm_open_with(window, cx);
+            return;
+        }
         let Some(dialog) = self.dialogs.close() else {
             return;
         };
@@ -900,16 +908,7 @@ impl Explorer {
             DialogAction::EmptyTrash(names) => {
                 ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
             }
-            DialogAction::OpenWith {
-                path,
-                apps,
-                selected,
-            } => {
-                if let Some(app) = apps.get(selected) {
-                    self.run_open_with(&path, app, cx);
-                }
-                return;
-            }
+            DialogAction::OpenWith(_) => return,
             DialogAction::DeviceWhenIdle(plan) => {
                 self.queue_device_plan(plan, window, cx);
                 return;
@@ -1469,7 +1468,7 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if found.apps.is_empty() {
+        if found.all_apps.is_empty() && found.apps.is_empty() {
             let text = format!("No application found for {} ({})", quoted(path), found.mime);
             self.say(Severity::Info, text, window, cx);
             return;
@@ -1479,33 +1478,105 @@ impl Explorer {
 
     /// Up / Down in the "Open with…" list.
     pub(crate) fn move_open_with(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if let Some(DialogState {
-            action: DialogAction::OpenWith { apps, selected, .. },
-            ..
-        }) = self.dialogs.current_mut()
-        {
-            *selected = move_selection(*selected, apps.len(), delta);
+        if let Some(dialog) = self.dialogs.current_mut() {
+            dialog.move_open_with(delta);
             cx.notify();
         }
     }
 
-    /// A click on one application of the "Open with…" list: choose it and
-    /// run it.
+    /// A click on one row of the "Open with…" list: choose it and confirm.
     pub(crate) fn choose_open_with(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(DialogState {
-            action: DialogAction::OpenWith { apps, selected, .. },
-            ..
-        }) = self.dialogs.current_mut()
-            && index < apps.len()
-        {
-            *selected = index;
+        if let Some(dialog) = self.dialogs.current_mut() {
+            dialog.select_open_with(index);
         }
         self.confirm_dialog(window, cx);
+    }
+
+    /// The checkbox "Remember for <type>" of the "Open with…" chooser.
+    pub(crate) fn set_open_with_remember(&mut self, remember: bool, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.dialogs.current_mut() {
+            dialog.set_open_with_remember(remember);
+            cx.notify();
+        }
+    }
+
+    /// Confirming the "Open with…" chooser: the "Other application…" row
+    /// swaps the list for every application (and a filter box); an
+    /// application closes the dialog, becomes the default of the type when
+    /// asked, and runs.
+    fn confirm_open_with(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.dialogs.current().and_then(DialogState::open_with_pick) {
+            None => {}
+            Some(OpenWithPick::Other) => self.show_other_apps(window, cx),
+            Some(OpenWithPick::Launch {
+                path,
+                app,
+                remember,
+            }) => {
+                self.dialogs.close();
+                self.dialog_closed(window, cx);
+                if let Some(mime) = remember {
+                    match apps::remember_default(&mime, &app.id) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let text =
+                                format!("Could not remember {} for {mime}: {error}", app.name);
+                            self.say(Severity::Warning, text, window, cx);
+                        }
+                    }
+                }
+                self.run_open_with(&path, &app, cx);
+            }
+        }
+    }
+
+    /// Lists every application in the open chooser and moves the keyboard to
+    /// its filter box, made here because it needs a window.
+    fn show_other_apps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_placeholder("Filter applications\u{2026}", window, cx);
+            input
+        });
+        cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                // Only the live chooser's own box may act.
+                let live = this.dialogs.current().is_some_and(|dialog| {
+                    matches!(&dialog.action, DialogAction::OpenWith(state)
+                        if state.filter_input.as_ref() == Some(input))
+                });
+                if !live {
+                    return;
+                }
+                match event {
+                    InputEvent::PressEnter { .. } => this.confirm_dialog(window, cx),
+                    InputEvent::Change => {
+                        let text = input.read(cx).value().to_string();
+                        if let Some(dialog) = this.dialogs.current_mut() {
+                            dialog.set_open_with_filter(&text);
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::Focus | InputEvent::Blur => {}
+                }
+            },
+        )
+        .detach();
+        if let Some(dialog) = self.dialogs.current_mut() {
+            dialog.show_other_apps();
+            dialog.set_open_with_filter_input(input.clone());
+        }
+        cx.defer_in(window, move |_this, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.notify();
     }
 
     /// Runs the chosen application of a closed "Open with…" dialog.

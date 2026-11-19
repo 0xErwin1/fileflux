@@ -25,8 +25,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bolt::controls::InputState;
 use fileflux::core::Entry;
-use fileflux::core::apps::{App, OpenWith, expand_exec};
+use fileflux::core::apps::{App, OpenWith, expand_exec, filter_apps};
 use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
@@ -35,6 +36,7 @@ use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
 };
 use fileflux::core::watch::nearest_existing_ancestor;
+use gpui::Entity;
 
 use super::arrange::ArrangeCommand;
 use super::progress::Sink;
@@ -1697,7 +1699,12 @@ pub(crate) enum DialogKind {
     /// Empty the Trash.
     EmptyTrash { count: usize },
     /// Choose the application to open `file` (of type `mime`) with.
-    OpenWith { file: String, mime: String },
+    OpenWith {
+        file: String,
+        mime: String,
+        /// The list of every application shows instead of the ones for `mime`.
+        other: bool,
+    },
     /// A paste found `name` already in `folder`; the two lines describe the
     /// item there and the one arriving.
     Conflict {
@@ -1723,12 +1730,8 @@ pub(crate) enum DialogAction {
     DeleteFromTrash(Vec<OsString>),
     /// The Trash names the dialog counted; nothing else is deleted.
     EmptyTrash(Vec<OsString>),
-    /// Run `apps[selected]` on `path`.
-    OpenWith {
-        path: PathBuf,
-        apps: Vec<App>,
-        selected: usize,
-    },
+    /// Run the selected application on the file.
+    OpenWith(OpenWithState),
     /// A running paste waits for the answer. `apply_all` is the checkbox
     /// "Apply to all remaining conflicts".
     Conflict {
@@ -1737,6 +1740,64 @@ pub(crate) enum DialogAction {
     },
     /// "Wait and eject": queue the plan until nothing uses the device.
     DeviceWhenIdle(DevicePlan),
+}
+
+/// The "Open with…" chooser. Its rows are the applications for `mime` and
+/// a last "Other application…" row; once that is chosen they are every
+/// application that takes a file, narrowed by `filter`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenWithState {
+    pub(crate) path: PathBuf,
+    pub(crate) mime: String,
+    /// The applications that handle `mime`, the default first.
+    pub(crate) apps: Vec<App>,
+    /// Every application that takes a file, by name.
+    pub(crate) all_apps: Vec<App>,
+    pub(crate) selected: usize,
+    /// The list of every application shows.
+    pub(crate) other: bool,
+    pub(crate) filter: String,
+    /// "Remember for <mime>": the chosen application becomes the default.
+    pub(crate) remember: bool,
+    /// The filter box, once the dialog has a window to make it in.
+    pub(crate) filter_input: Option<Entity<InputState>>,
+}
+
+/// The label of the last row of the list for the file's type.
+const OTHER_ROW: &str = "Other application\u{2026}";
+
+impl OpenWithState {
+    /// The applications the rows list now.
+    fn rows(&self) -> Vec<App> {
+        if self.other {
+            filter_apps(&self.all_apps, &self.filter)
+        } else {
+            self.apps.clone()
+        }
+    }
+
+    /// How many rows there are: the typed list has the extra last row.
+    fn row_count(&self) -> usize {
+        if self.other {
+            filter_apps(&self.all_apps, &self.filter).len()
+        } else {
+            self.apps.len() + 1
+        }
+    }
+}
+
+/// What confirming the "Open with…" chooser does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenWithPick {
+    /// The "Other application…" row: show every application instead.
+    Other,
+    /// Run `app` on `path`; `remember` is the MIME type to make `app` the
+    /// default for.
+    Launch {
+        path: PathBuf,
+        app: App,
+        remember: Option<String>,
+    },
 }
 
 /// One confirmation: its words and the action its danger button runs.
@@ -1768,22 +1829,140 @@ impl DialogState {
         }
     }
 
-    /// The "Open with…" chooser for `path`: the applications are listed in
-    /// the order found, the first (the default application) selected.
+    /// The "Open with…" chooser for `path`: the applications for its type
+    /// in the order found (the default first, selected), then the
+    /// "Other application…" row.
     pub(crate) fn open_with(path: &Path, found: &OpenWith) -> DialogState {
-        let names: Vec<String> = found.apps.iter().map(|app| app.name.clone()).collect();
-        DialogState::new(
-            DialogKind::OpenWith {
-                file: display_name(path),
-                mime: found.mime.clone(),
-            },
-            &names,
-            DialogAction::OpenWith {
-                path: path.to_path_buf(),
-                apps: found.apps.clone(),
-                selected: 0,
-            },
-        )
+        let state = OpenWithState {
+            path: path.to_path_buf(),
+            mime: found.mime.clone(),
+            apps: found.apps.clone(),
+            all_apps: found.all_apps.clone(),
+            selected: 0,
+            other: false,
+            filter: String::new(),
+            remember: false,
+            filter_input: None,
+        };
+        let kind = DialogKind::OpenWith {
+            file: display_name(path),
+            mime: found.mime.clone(),
+            other: false,
+        };
+        let mut dialog = DialogState {
+            text: dialog_text(&kind, &[]),
+            kind,
+            action: DialogAction::OpenWith(state),
+        };
+        dialog.refresh_open_with();
+        dialog
+    }
+
+    fn open_with_state(&self) -> Option<&OpenWithState> {
+        match &self.action {
+            DialogAction::OpenWith(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn open_with_state_mut(&mut self) -> Option<&mut OpenWithState> {
+        match &mut self.action {
+            DialogAction::OpenWith(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Rebuilds the words and rows from the chooser's state.
+    fn refresh_open_with(&mut self) {
+        let Some(state) = self.open_with_state() else {
+            return;
+        };
+        let mut names: Vec<String> = state.rows().into_iter().map(|app| app.name).collect();
+        if !state.other {
+            names.push(OTHER_ROW.to_owned());
+        }
+        let other = state.other;
+        if let DialogKind::OpenWith { other: kind, .. } = &mut self.kind {
+            *kind = other;
+        }
+        self.text = dialog_text(&self.kind, &names);
+    }
+
+    /// "Other application…" was chosen: list every application.
+    pub(crate) fn show_other_apps(&mut self) {
+        if let Some(state) = self.open_with_state_mut() {
+            state.other = true;
+            state.selected = 0;
+            state.filter.clear();
+        }
+        self.refresh_open_with();
+    }
+
+    /// The text of the filter box changed: narrows the list of every
+    /// application and selects its first row.
+    pub(crate) fn set_open_with_filter(&mut self, text: &str) {
+        let Some(state) = self.open_with_state_mut() else {
+            return;
+        };
+        if !state.other {
+            return;
+        }
+        state.filter = text.to_owned();
+        state.selected = 0;
+        self.refresh_open_with();
+    }
+
+    /// Up / Down: moves the selected row, stopping at both ends.
+    pub(crate) fn move_open_with(&mut self, delta: isize) {
+        if let Some(state) = self.open_with_state_mut() {
+            state.selected = move_selection(state.selected, state.row_count(), delta);
+        }
+    }
+
+    /// The row at `index`, when there is one.
+    pub(crate) fn select_open_with(&mut self, index: usize) {
+        if let Some(state) = self.open_with_state_mut()
+            && index < state.row_count()
+        {
+            state.selected = index;
+        }
+    }
+
+    pub(crate) fn set_open_with_filter_input(&mut self, input: Entity<InputState>) {
+        if let Some(state) = self.open_with_state_mut() {
+            state.filter_input = Some(input);
+        }
+    }
+
+    pub(crate) fn set_open_with_remember(&mut self, remember: bool) {
+        if let Some(state) = self.open_with_state_mut() {
+            state.remember = remember;
+        }
+    }
+
+    pub(crate) fn open_with_remember(&self) -> bool {
+        self.open_with_state().is_some_and(|state| state.remember)
+    }
+
+    /// The checkbox label of the "Open with…" chooser.
+    pub(crate) fn remember_label(&self) -> Option<String> {
+        self.open_with_state()
+            .map(|state| format!("Remember for {}", state.mime))
+    }
+
+    /// What confirming does now; `None` when no row is selected (a filter
+    /// that matches nothing) or this is not the chooser.
+    pub(crate) fn open_with_pick(&self) -> Option<OpenWithPick> {
+        let state = self.open_with_state()?;
+        if !state.other && state.selected == state.apps.len() {
+            return Some(OpenWithPick::Other);
+        }
+        let app = state.rows().into_iter().nth(state.selected)?;
+        Some(OpenWithPick::Launch {
+            path: state.path.clone(),
+            app,
+            remember: state.remember.then(|| state.mime.clone()),
+        })
     }
 
     /// The button that has the keyboard focus when the dialog opens: the
@@ -2045,9 +2224,13 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             "Replace it, skip this item, or keep both?".to_owned(),
             "Replace",
         ),
-        DialogKind::OpenWith { file, mime } => (
+        DialogKind::OpenWith { file, mime, other } => (
             format!("Open \u{201c}{file}\u{201d} with\u{2026}"),
-            format!("Applications for {mime}. Up and Down choose, Enter opens."),
+            if *other {
+                "Every application. Type to filter, Up and Down choose, Enter opens.".to_owned()
+            } else {
+                format!("Applications for {mime}. Up and Down choose, Enter opens.")
+            },
             "Open",
         ),
         DialogKind::DeviceBusy {
