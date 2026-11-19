@@ -309,7 +309,15 @@ impl Viewer {
                 }
             }
         };
-        for index in nav::neighbors(self.index, self.list.len()) {
+        // The neighbours wait until the current image is settled: on a phone
+        // (MTP) or network mount transfers queue on one channel, so preloading
+        // them first would make the image the user asked for arrive last.
+        let neighbours = if matches!(self.shown, Shown::Loading) {
+            Vec::new()
+        } else {
+            nav::neighbors(self.index, self.list.len())
+        };
+        for index in neighbours {
             let Some(neighbour) = self.list.get(index).cloned() else {
                 continue;
             };
