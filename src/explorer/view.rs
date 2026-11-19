@@ -67,6 +67,10 @@ use crate::explorer::tabs::{Affected, Placement, TabList};
 use crate::explorer::toasts;
 use crate::explorer::{entries, overlay, progress, sidebar, tabstrip, toolbar, util};
 
+/// How many images one background thumbnail lookup covers before the tiles
+/// it found are shown.
+const THUMBNAIL_BATCH: usize = 32;
+
 /// Key context of the whole explorer window.
 pub(crate) const EXPLORER_CONTEXT: &str = "FilefluxExplorer";
 /// Key context of the entries area, which carries the arrow-key navigation.
@@ -415,6 +419,10 @@ pub(crate) struct Tab {
     pub(crate) permission_task: Option<Task<()>>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
+    /// The thumbnail lookups of the listing, filled by `thumbs_task`.
+    pub(crate) thumbs: Arc<entries::Thumbs>,
+    /// The retained thumbnail lookup, replaced by the next commit.
+    thumbs_task: Option<Task<()>>,
     /// The retained arrangement job loop (see [`Explorer::arrange_tab`]).
     arrange_task: Option<Task<()>>,
     /// When the current stretch of arrangement jobs began.
@@ -539,6 +547,8 @@ impl Tab {
             permission_in_flight: None,
             permission_task: None,
             counts_task: None,
+            thumbs: Arc::new(entries::Thumbs::new()),
+            thumbs_task: None,
             arrange_task: None,
             arranging_since: None,
             arrange_hint_task: None,
@@ -1262,6 +1272,7 @@ impl Explorer {
                         scan.location
                     );
                     self.start_child_counts(id, cx);
+                    self.start_thumbnails(id, cx);
                     if let Some(tab) = self.tabs.by_id_mut(id) {
                         tab.permissions = None;
                     }
@@ -1282,6 +1293,7 @@ impl Explorer {
                     self.scroll_to_top(id, cx);
                 }
                 self.start_child_counts(id, cx);
+                self.start_thumbnails(id, cx);
                 let Some(tab) = self.tabs.by_id_mut(id) else {
                     return;
                 };
@@ -1610,6 +1622,53 @@ impl Explorer {
         });
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.counts_task = Some(task);
+        }
+    }
+
+    /// Looks up the cached thumbnails of tab `id`'s images on the background
+    /// executor, a batch at a time so the first tiles do not wait for a long
+    /// folder. The answers that still apply stay on screen meanwhile; a newer
+    /// commit replaces the task (dropping it).
+    fn start_thumbnails(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let trust_known = *tab.state.current() != Location::Recent;
+        let (keep, todo) = entries::plan_thumbnails(&tab.snapshot, &tab.thumbs, trust_known);
+        tab.thumbs = Arc::new(keep);
+        tab.thumbs_task = None;
+        if todo.is_empty() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            for batch in todo.chunks(THUMBNAIL_BATCH) {
+                let batch = batch.to_vec();
+                let answers = cx
+                    .background_executor()
+                    .spawn(async move {
+                        batch
+                            .into_iter()
+                            .map(|(path, modified)| {
+                                let found = fileflux::core::thumbnails::lookup(&path);
+                                (path, entries::Thumb { modified, found })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                let published = this.update(cx, |this, cx| {
+                    if let Some(tab) = this.tabs.by_id_mut(id) {
+                        Arc::make_mut(&mut tab.thumbs).extend(answers);
+                    }
+                    cx.notify();
+                });
+                if let Err(error) = published {
+                    log::debug!("the explorer closed before its thumbnails settled: {error}");
+                    break;
+                }
+            }
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.thumbs_task = Some(task);
         }
     }
 

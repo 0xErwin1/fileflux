@@ -16,6 +16,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bolt::composites::ListRow;
 use bolt::primitives::{Icon, WhenFocusVisible};
@@ -197,19 +198,79 @@ fn file_glyph_element(name: gpui_kit_assets::IconName, color: Hsla) -> gpui::Any
         .into_any_element()
 }
 
-/// The real thumbnail of an image file: GPUI's image loader decodes the
-/// path off the UI thread; while loading or on error the extension glyph
-/// shows instead. When the freedesktop thumbnail cache holds a current
-/// thumbnail of the file, that small PNG is decoded instead of the image.
-/// Object-fit cover inside the 62×46 bordered box.
+/// What the background lookup found for one image: the cached thumbnail, or
+/// `None` when the image itself is to be loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Thumb {
+    /// The entry's modification time when it was looked up.
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) found: Option<PathBuf>,
+}
+
+/// The lookups of one listing, by image path. A tile with no answer yet
+/// shows its glyph: rendering never touches the disk to find one.
+pub(crate) type Thumbs = HashMap<PathBuf, Thumb>;
+
+/// An image whose thumbnail is looked up: a regular file (a symlink shows
+/// the symlink glyph) of a format GPUI decodes.
+fn wants_thumbnail(entry: &Entry) -> bool {
+    entry.kind == EntryKind::File && !entry.is_symlink && has_thumbnail(&entry.name)
+}
+
+/// What a new listing does with the lookups of the previous one: the answers
+/// that still apply stay on screen (`.0`) while the images that need a
+/// lookup (`.1`, in listing order) are looked up again. With `trust_known`
+/// an image whose entry time did not change keeps its answer; the Recent
+/// list shows when a file was *used*, which says nothing about the file
+/// changing, so it trusts none.
+pub(crate) fn plan_thumbnails(
+    snapshot: &[Entry],
+    known: &Thumbs,
+    trust_known: bool,
+) -> (Thumbs, Vec<(PathBuf, Option<SystemTime>)>) {
+    let mut keep = Thumbs::new();
+    let mut todo = Vec::new();
+    for entry in snapshot.iter().filter(|entry| wants_thumbnail(entry)) {
+        match known.get(&entry.path) {
+            Some(thumb) if trust_known && thumb.modified == entry.modified => {
+                keep.insert(entry.path.clone(), thumb.clone());
+            }
+            Some(thumb) => {
+                keep.insert(entry.path.clone(), thumb.clone());
+                todo.push((entry.path.clone(), entry.modified));
+            }
+            None => todo.push((entry.path.clone(), entry.modified)),
+        }
+    }
+    (keep, todo)
+}
+
+/// The real thumbnail of an image file, once its lookup has answered (see
+/// [`Thumbs`]): GPUI's image loader decodes the path off the UI thread; while
+/// loading or on error the extension glyph shows instead. A current thumbnail
+/// of the freedesktop cache is decoded instead of the image. Before the
+/// lookup answers the glyph shows alone, so no large image is decoded for a
+/// tile whose small thumbnail is on its way. Object-fit cover inside the
+/// 62×46 bordered box.
 fn photo_thumbnail(
     path: PathBuf,
-    modified: Option<std::time::SystemTime>,
+    thumb: Option<&Thumb>,
     name: &OsStr,
     colors: &bolt::colors::Colors,
 ) -> gpui::AnyElement {
-    let path = fileflux::core::thumbnails::lookup(&path, modified).unwrap_or(path);
     let glyph = file_glyph(name);
+    let Some(thumb) = thumb else {
+        return div()
+            .w(px(PHOTO_WIDTH))
+            .h(px(PHOTO_HEIGHT))
+            .border_1()
+            .border_color(colors.line_2)
+            .bg(colors.raised)
+            .overflow_hidden()
+            .child(centered_glyph(glyph, colors.muted))
+            .into_any_element();
+    };
+    let path = thumb.found.clone().unwrap_or(path);
     let muted = colors.muted;
     div()
         .w(px(PHOTO_WIDTH))
@@ -394,6 +455,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     };
     let snapshot = Arc::clone(&this.tab().snapshot);
     let counts_for_rows = Arc::clone(this.tab().state.child_counts());
+    let thumbs_for_rows = Arc::clone(&this.tab().thumbs);
     let weak_for_rows = weak.clone();
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);
@@ -437,6 +499,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             selected: &selected_for_rows,
                             cut: &cut,
                             child_counts: &counts_for_rows,
+                            thumbs: &thumbs_for_rows,
                             renaming: renaming_for_rows.as_ref(),
                             drag: drag_for_rows.as_ref(),
                             outlined,
@@ -503,6 +566,8 @@ struct GridData<'a> {
     /// Entries cut and waiting for Paste, drawn dimmed.
     cut: &'a BTreeSet<PathBuf>,
     child_counts: &'a HashMap<PathBuf, Option<usize>>,
+    /// The background thumbnail lookups.
+    thumbs: &'a Thumbs,
     /// The inline rename editor, drawn in place of its entry's name.
     renaming: Option<&'a RenameView>,
     /// The visible selection, when tiles may start a drag (not in the Trash).
@@ -528,6 +593,7 @@ fn render_grid_row(
         selected,
         cut,
         child_counts,
+        thumbs,
         renaming,
         drag,
         outlined,
@@ -564,7 +630,7 @@ fn render_grid_row(
         } else if is_folder {
             folder_silhouette(colors.info, colors.strong, THUMB_HEIGHT).into_any_element()
         } else if has_thumbnail(&tile.name) {
-            photo_thumbnail(path.clone(), tile.modified, &tile.name, &colors)
+            photo_thumbnail(path.clone(), thumbs.get(&path), &tile.name, &colors)
         } else {
             file_glyph_element(file_glyph(&tile.name), colors.muted)
         };
@@ -913,5 +979,97 @@ mod tests {
         for name in ["a.heic", "a.svg", "a.txt", "png", ".png", "a.png.bak", "a"] {
             assert!(!eligible(name), "{name}");
         }
+    }
+
+    fn image(name: &str, secs: u64) -> Entry {
+        Entry {
+            name: name.into(),
+            path: PathBuf::from("/p").join(name),
+            kind: EntryKind::File,
+            is_symlink: false,
+            size: Some(1),
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+            origin: None,
+        }
+    }
+
+    /// Only regular image files are looked up, in listing order; nothing
+    /// here touches the disk.
+    #[test]
+    fn only_regular_images_are_looked_up_in_listing_order() {
+        let mut link = image("link.png", 1);
+        link.is_symlink = true;
+        let mut folder = image("dir.png", 1);
+        folder.kind = EntryKind::Directory;
+        let snapshot = [
+            image("b.jpg", 1),
+            image("notes.txt", 1),
+            link,
+            folder,
+            image("a.png", 2),
+        ];
+        let (keep, todo) = plan_thumbnails(&snapshot, &Thumbs::new(), true);
+        assert!(keep.is_empty());
+        let paths: Vec<_> = todo.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            paths,
+            [PathBuf::from("/p/b.jpg"), PathBuf::from("/p/a.png")]
+        );
+    }
+
+    /// A refresh keeps the answers that still apply on screen, looks a
+    /// changed image up again and forgets the entries that left.
+    #[test]
+    fn a_refresh_keeps_known_answers_and_looks_up_what_changed() {
+        let old = image("a.png", 1);
+        let same = image("b.png", 1);
+        let gone = image("gone.png", 1);
+        let mut known = Thumbs::new();
+        for entry in [&old, &same, &gone] {
+            known.insert(
+                entry.path.clone(),
+                Thumb {
+                    modified: entry.modified,
+                    found: Some(PathBuf::from("/cache").join(&entry.name)),
+                },
+            );
+        }
+        let snapshot = [image("a.png", 9), same.clone(), image("new.png", 1)];
+
+        let (keep, todo) = plan_thumbnails(&snapshot, &known, true);
+
+        assert!(
+            keep.contains_key(Path::new("/p/a.png")),
+            "stays until answered"
+        );
+        assert!(keep.contains_key(Path::new("/p/b.png")));
+        assert!(
+            !keep.contains_key(Path::new("/p/gone.png")),
+            "left the listing"
+        );
+        let paths: Vec<_> = todo.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            paths,
+            [PathBuf::from("/p/a.png"), PathBuf::from("/p/new.png")],
+            "the unchanged image keeps its answer"
+        );
+    }
+
+    /// The Recent list shows when a file was used, not when it changed, so
+    /// nothing there is trusted.
+    #[test]
+    fn the_recent_list_looks_every_image_up_again() {
+        let entry = image("a.png", 1);
+        let mut known = Thumbs::new();
+        known.insert(
+            entry.path.clone(),
+            Thumb {
+                modified: entry.modified,
+                found: None,
+            },
+        );
+        let (keep, todo) = plan_thumbnails(std::slice::from_ref(&entry), &known, false);
+        assert_eq!(keep.len(), 1);
+        assert_eq!(todo.len(), 1);
     }
 }

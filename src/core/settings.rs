@@ -493,21 +493,27 @@ fn migrate_arrangement(arrangement: &mut toml::Table) -> bool {
         None => Some(old_default.to_owned()),
         Some(value) => value.as_str().map(str::to_owned),
     };
-    let (Some(key), Some(dir)) = (
+    let reset = match (
         sort_value("sort_key", "name"),
         sort_value("sort_dir", "ascending"),
-    ) else {
-        arrangement.remove("sort_key");
-        arrangement.remove("sort_dir");
-        return true;
+    ) {
+        (Some(key), Some(dir)) => {
+            if key == "name" && dir == "ascending" {
+                arrangement.insert("sort_key".to_owned(), "modified".into());
+                arrangement.insert("sort_dir".to_owned(), "descending".into());
+            } else {
+                arrangement.insert("sort_key".to_owned(), key.into());
+                arrangement.insert("sort_dir".to_owned(), dir.into());
+            }
+            false
+        }
+        _ => {
+            arrangement.remove("sort_key");
+            arrangement.remove("sort_dir");
+            true
+        }
     };
-    if key == "name" && dir == "ascending" {
-        arrangement.insert("sort_key".to_owned(), "modified".into());
-        arrangement.insert("sort_dir".to_owned(), "descending".into());
-    } else {
-        arrangement.insert("sort_key".to_owned(), key.into());
-        arrangement.insert("sort_dir".to_owned(), dir.into());
-    }
+    // The hidden-files default moves on its own, whatever became of the sort.
     if arrangement
         .get("hide_hidden")
         .and_then(toml::Value::as_bool)
@@ -515,7 +521,7 @@ fn migrate_arrangement(arrangement: &mut toml::Table) -> bool {
     {
         arrangement.insert("hide_hidden".to_owned(), true.into());
     }
-    false
+    reset
 }
 
 // --- loading ------------------------------------------------------------------

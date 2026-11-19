@@ -1061,3 +1061,31 @@ fn a_non_string_sort_value_in_a_version_1_file_resets_only_the_arrangement() {
             .starts_with("Session file was invalid")
     );
 }
+
+fn load_text_with_notice(name: &str, text: &str) -> Settings {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().join("settings.toml");
+    std::fs::write(&path, text).expect("fixture writes");
+    let loaded = load_settings(&path, now());
+    assert!(loaded.notice.is_some(), "the reset is reported");
+    loaded.value
+}
+
+#[test]
+fn resetting_an_invalid_sort_still_migrates_the_hidden_files_default() {
+    // The version 1 default showed hidden files; a saved `false` moves to the
+    // new default even when the sort of the same arrangement had to be reset.
+    let settings = load_text_with_notice(
+        "migrate-nonstring-hidden",
+        "version = 1\n[preferences.arrangement]\nsort_key = 5\nhide_hidden = false\n\
+         folders_first = false\n",
+    );
+    let arrangement = settings.preferences.arrangement;
+    assert!(
+        arrangement.hide_hidden,
+        "hide_hidden = false still migrates"
+    );
+    assert!(!arrangement.folders_first, "other choices are kept");
+    assert_eq!(arrangement.sort_key, ArrangementPrefs::default().sort_key);
+    assert_eq!(arrangement.sort_dir, ArrangementPrefs::default().sort_dir);
+}

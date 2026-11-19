@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fileflux::core::thumbnails::{cache_root, find, thumbnail_file_name, thumbnail_uri};
+use fileflux::core::thumbnails::{Memo, cache_root, find, thumbnail_file_name, thumbnail_uri};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -247,5 +247,101 @@ fn a_changed_file_invalidates_its_thumbnail() -> TestResult {
         .open(&fixture.image)?
         .set_modified(SystemTime::now())?;
     assert_eq!(find(&fixture.cache, &fixture.image), None);
+    Ok(())
+}
+
+fn tagged(fixture: &Fixture, size: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let uri = fixture.uri();
+    fixture.cache_entry(
+        size,
+        &[("Thumb::URI", &uri), ("Thumb::MTime", &mtime_text())],
+    )
+}
+
+#[test]
+fn the_memory_answers_a_repeat_with_the_same_thumbnail() -> TestResult {
+    let fixture = Fixture::new("memo-hit")?;
+    let entry = tagged(&fixture, "normal")?;
+    let memo = Memo::default();
+    assert_eq!(
+        memo.lookup(&fixture.cache, &fixture.image),
+        Some(entry.clone())
+    );
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), Some(entry));
+    Ok(())
+}
+
+#[test]
+fn a_remembered_thumbnail_that_was_deleted_falls_back_to_the_image() -> TestResult {
+    let fixture = Fixture::new("memo-deleted")?;
+    let entry = tagged(&fixture, "normal")?;
+    let memo = Memo::default();
+    assert_eq!(
+        memo.lookup(&fixture.cache, &fixture.image),
+        Some(entry.clone())
+    );
+    fs::remove_file(&entry)?;
+    assert_eq!(
+        memo.lookup(&fixture.cache, &fixture.image),
+        None,
+        "the loader must get the full image, not a path that is gone"
+    );
+    // The same thumbnail written again is used again.
+    let again = tagged(&fixture, "normal")?;
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), Some(again));
+    Ok(())
+}
+
+#[test]
+fn a_remembered_thumbnail_that_was_rewritten_is_read_again() -> TestResult {
+    let fixture = Fixture::new("memo-rewritten")?;
+    let entry = tagged(&fixture, "normal")?;
+    let memo = Memo::default();
+    assert_eq!(
+        memo.lookup(&fixture.cache, &fixture.image),
+        Some(entry.clone())
+    );
+    // Another program replaces it with a thumbnail of an older state of the
+    // image (a different file: its length differs).
+    fixture.cache_entry(
+        "normal",
+        &[
+            ("Thumb::URI", &fixture.uri()),
+            ("Thumb::MTime", &(MTIME - 5).to_string()),
+            ("Thumb::Padding", "xxxxxxxxxxxxxxxxxxxx"),
+        ],
+    )?;
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), None);
+    Ok(())
+}
+
+#[test]
+fn the_memory_follows_the_images_own_modification_time() -> TestResult {
+    let fixture = Fixture::new("memo-mtime")?;
+    let entry = tagged(&fixture, "normal")?;
+    let memo = Memo::default();
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), Some(entry));
+    // The image changes: the thumbnail describes the old state.
+    File::options()
+        .write(true)
+        .open(&fixture.image)?
+        .set_modified(UNIX_EPOCH + Duration::from_secs(MTIME + 60))?;
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), None);
+    // Back to the time the thumbnail records: found again.
+    File::options()
+        .write(true)
+        .open(&fixture.image)?
+        .set_modified(UNIX_EPOCH + Duration::from_secs(MTIME))?;
+    assert!(memo.lookup(&fixture.cache, &fixture.image).is_some());
+    Ok(())
+}
+
+#[test]
+fn a_thumbnail_made_after_a_miss_is_found() -> TestResult {
+    let fixture = Fixture::new("memo-late")?;
+    let memo = Memo::default();
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), None);
+    let entry = tagged(&fixture, "normal")?;
+    assert_eq!(memo.lookup(&fixture.cache, &fixture.image), Some(entry));
     Ok(())
 }

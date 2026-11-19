@@ -2244,6 +2244,54 @@ mod tests {
         Ok(())
     }
 
+    /// A change of the recently-used file that arrives while the Recent list
+    /// is being read may have missed that read: committing the scan and then
+    /// running the deferred refresh re-reads the list exactly once.
+    #[test]
+    fn a_recent_change_during_a_scan_triggers_a_re_read_after_the_commit() -> TestResult {
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(Location::Recent))
+            .ok_or("scan")?;
+        assert!(
+            state.recent_changed().is_none(),
+            "the change arrives mid-scan: no second scan now"
+        );
+        assert!(
+            state.begin_deferred_op_refresh().is_none(),
+            "nothing re-reads while the scan is still pending"
+        );
+        assert!(state.commit(scan, listing(&[("a", EntryKind::File)])));
+
+        let again = state
+            .begin_deferred_op_refresh()
+            .ok_or("the deferred re-read")?;
+        assert_eq!(again.location, Location::Recent);
+        assert!(again.live, "a refresh keeps the selection");
+        assert!(state.commit(
+            again,
+            listing(&[("a", EntryKind::File), ("b", EntryKind::File)])
+        ));
+        assert_eq!(state.listing().entries.len(), 2);
+        assert!(
+            state.begin_deferred_op_refresh().is_none(),
+            "the postponed refresh runs once"
+        );
+        Ok(())
+    }
+
+    /// Without a change during the scan nothing is deferred.
+    #[test]
+    fn a_recent_scan_without_a_change_defers_nothing() -> TestResult {
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(Location::Recent))
+            .ok_or("scan")?;
+        assert!(state.commit(scan, listing(&[])));
+        assert!(state.begin_deferred_op_refresh().is_none());
+        Ok(())
+    }
+
     /// Our own operation refreshes even the Trash and supersedes a scan in
     /// flight, which may have read the location before the operation ran.
     #[test]

@@ -639,7 +639,7 @@ mod tests {
 #[cfg(test)]
 mod affected_tests {
     use super::*;
-    use crate::explorer::ops::Job;
+    use crate::explorer::ops::{Job, NewKind};
 
     fn dir(path: &str) -> Location {
         Location::Directory(PathBuf::from(path))
@@ -652,6 +652,62 @@ mod affected_tests {
             Affected::of_job(&job),
             Affected::Folders(vec![dir("/d"), Location::Trash, Location::Recent])
         );
+    }
+
+    /// Every job that relocates files (a cut paste and a drag-move are both
+    /// `Job::Paste`, a restore and an undo put items back elsewhere) takes
+    /// the Recent tabs along: Recent names files by path, and a moved file's
+    /// old path no longer exists.
+    #[test]
+    fn relocating_jobs_refresh_recent_tabs_and_leave_nothing_stale() {
+        use crate::explorer::ops::paste::{ClipMode, ConflictLink, PasteJob};
+        use std::sync::mpsc::channel;
+
+        let paste = |mode| {
+            let (requests, _) = channel();
+            let (_, replies) = channel();
+            Job::Paste(PasteJob {
+                sources: vec![PathBuf::from("/home/me/docs/a.txt")],
+                dest: PathBuf::from("/home/me/pics"),
+                mode,
+                link: ConflictLink { requests, replies },
+            })
+        };
+        let jobs = [
+            ("cut paste or drag-move", paste(ClipMode::Cut)),
+            ("copy paste", paste(ClipMode::Copy)),
+            (
+                "restore",
+                Job::Restore(vec![std::ffi::OsString::from("a.txt")]),
+            ),
+            (
+                "delete from trash",
+                Job::DeleteFromTrash(vec![std::ffi::OsString::from("a.txt")]),
+            ),
+            ("empty trash", Job::EmptyTrash(Vec::new())),
+        ];
+        let docs = dir("/home/me/docs");
+        let shown = [
+            &docs,
+            &Location::Recent,
+            &Location::Trash,
+            &Location::Recent,
+        ];
+        for (what, job) in &jobs {
+            let affected = Affected::of_job(job);
+            assert!(affected.touches(&Location::Recent), "{what}");
+            assert_eq!(
+                tabs_to_refresh(&shown, &affected, None),
+                [0, 1, 2, 3],
+                "{what}: every Recent tab re-reads"
+            );
+        }
+        // A job that cannot move anything out of Recent leaves it alone.
+        let created = Affected::of_job(&Job::Create {
+            dir: PathBuf::from("/home/me/docs"),
+            kind: NewKind::File,
+        });
+        assert_eq!(tabs_to_refresh(&shown, &created, None), [0]);
     }
 
     #[test]

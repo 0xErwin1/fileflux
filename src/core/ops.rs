@@ -58,6 +58,11 @@ trait Backend {
     fn is_weak(&self, dir: &Path) -> bool {
         FuseRoots::system().covers(dir)
     }
+
+    /// The identity source of an entry a direct copy just created.
+    fn created_metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
 }
 
 /// The real filesystem.
@@ -656,13 +661,19 @@ struct Made {
     path: PathBuf,
     is_dir: bool,
     /// `(st_dev, st_ino)`: a different file at the same path is not ours.
-    identity: (u64, u64),
+    /// `None` when looking at the entry failed right after creating it: it is
+    /// then rolled back by path alone, as it was before identities existed.
+    identity: Option<(u64, u64)>,
 }
 
 impl Made {
     /// Whether `path` still names the entry that was created.
     fn is_still_there(&self) -> bool {
-        fs::symlink_metadata(&self.path).is_ok_and(|meta| (meta.dev(), meta.ino()) == self.identity)
+        let Ok(meta) = fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        self.identity
+            .is_none_or(|identity| (meta.dev(), meta.ino()) == identity)
     }
 }
 
@@ -1006,13 +1017,21 @@ impl Ctx<'_> {
 
     /// Notes an entry a direct copy created, by the identity it has now.
     fn made(&mut self, path: &Path, is_dir: bool) {
-        if let Some(made) = &mut self.made
-            && let Ok(meta) = fs::symlink_metadata(path)
-        {
+        if let Some(made) = &mut self.made {
+            let identity = match self.backend.created_metadata(path) {
+                Ok(meta) => Some((meta.dev(), meta.ino())),
+                Err(error) => {
+                    log::debug!(
+                        "no identity for the created {}: {error}; rolling it back by path",
+                        path.display()
+                    );
+                    None
+                }
+            };
             made.push(Made {
                 path: path.to_path_buf(),
                 is_dir,
-                identity: (meta.dev(), meta.ino()),
+                identity,
             });
         }
     }
@@ -2260,6 +2279,8 @@ mod tests {
         set_permissions: Option<Errno>,
         /// The write numbered from this one (1-based) fails with `ENOSPC`.
         full_from: Option<usize>,
+        /// Looking at an entry right after creating it fails.
+        stat_fails: bool,
         /// The write with this number raises the cancel flag.
         cancel_at: Option<(usize, Arc<AtomicBool>)>,
         writes: Cell<usize>,
@@ -2277,6 +2298,13 @@ mod tests {
                 return Err(errno(error));
             }
             rename_noreplace(from, to)
+        }
+
+        fn created_metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+            if self.stat_fails {
+                return Err(errno(Errno::IO));
+            }
+            fs::symlink_metadata(path)
         }
 
         fn sync(&self, file: &fs::File) -> io::Result<()> {
@@ -2906,6 +2934,35 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_whose_stat_fails_right_after_creation_is_still_rolled_back() -> TestResult {
+        let sc = Scratch::new("vp-stat-fails")?;
+        let (src, d) = phone(&sc)?;
+        let album = sc.dir("src/album")?;
+        fs::write(album.join("one.jpg"), big(CHUNK))?;
+        fs::create_dir(album.join("sub"))?;
+        fs::write(album.join("sub/two.jpg"), big(CHUNK))?;
+        std::os::unix::fs::symlink("one.jpg", album.join("link"))?;
+        let _ = src;
+        let f = Fuse {
+            weak: true,
+            place_rename: Some(Errno::NOTSUP),
+            full_from: Some(4),
+            stat_fails: true,
+            ..Fuse::default()
+        };
+
+        let report = copy_on(&f, &[album], &d);
+
+        assert!(matches!(only_item(&report)?, ItemOutcome::Failed(_)));
+        assert!(
+            names(&d)?.is_empty(),
+            "nothing stays behind: {:?}",
+            names(&d)?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_weak_filesystem_only_skips_metadata_it_says_it_does_not_keep() -> TestResult {
         for unsupported in [Errno::NOTSUP, Errno::NOSYS, Errno::PERM, Errno::ACCESS] {
             for times in [true, false] {
@@ -2989,8 +3046,10 @@ mod tests {
 
     #[test]
     fn a_foreign_file_that_replaced_ours_at_the_same_path_is_kept() -> TestResult {
-        // The second write is on the file we are writing: a third party swaps
-        // that very path for a file of its own, then the disk fills up.
+        // Placing the partial copy is refused, so the copy goes direct;
+        // its first write finds the path it created already there: the backend deletes it, puts a file of "theirs" at the same
+        // path (ours stays open, so its inode cannot be reused) and fails with
+        // a full disk. The rollback must keep the foreign file.
         struct Swapper {
             path: PathBuf,
             writes: Cell<usize>,

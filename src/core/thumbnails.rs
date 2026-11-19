@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use md5::{Digest as _, Md5};
@@ -94,22 +94,49 @@ fn same_uri(a: &str, b: &str) -> bool {
         || matches!((decode_percent(a.as_bytes()), decode_percent(b.as_bytes())), (Some(a), Some(b)) if a == b)
 }
 
+/// What names `image` in the cache, read from the file as it is now.
+struct Source {
+    /// The file with its symlinks resolved: what the cache is keyed by.
+    canonical: PathBuf,
+    uri: String,
+    /// The file's own modification time, in seconds.
+    modified: u64,
+}
+
+impl Source {
+    /// `None` when the file cannot be reached.
+    fn of(image: &Path) -> Option<Self> {
+        let canonical = fs::canonicalize(image).ok()?;
+        let modified = mtime_seconds(fs::metadata(&canonical).ok()?.modified().ok()?)?;
+        let uri = thumbnail_uri(&canonical);
+        Some(Self {
+            canonical,
+            uri,
+            modified,
+        })
+    }
+}
+
 /// The cached thumbnail of `image` under `cache_root`, smallest size first,
 /// when one exists and still describes the file as it is now: its
 /// `Thumb::URI` is the file's canonical URI and its `Thumb::MTime` the
 /// file's modification time. Anything else (no thumbnail, an unreadable or
 /// untagged one, a stale one) is `None`, and the caller loads the image
 /// itself.
+///
+/// This stats, canonicalizes and reads files: call it off the UI thread.
 #[must_use]
 pub fn find(cache_root: &Path, image: &Path) -> Option<PathBuf> {
-    let canonical = fs::canonicalize(image).ok()?;
-    let modified = mtime_seconds(fs::metadata(&canonical).ok()?.modified().ok()?)?;
-    let uri = thumbnail_uri(&canonical);
-    let name = thumbnail_file_name(&uri);
+    find_for(cache_root, image, &Source::of(image)?)
+}
+
+fn find_for(cache_root: &Path, image: &Path, source: &Source) -> Option<PathBuf> {
+    let name = thumbnail_file_name(&source.uri);
     SIZE_DIRECTORIES.iter().find_map(|size| {
         let candidate = cache_root.join(size).join(&name);
         let (tagged_uri, tagged_mtime) = thumbnail_tags(&candidate)?;
-        let fresh = same_uri(&tagged_uri, &uri) && tagged_mtime.trim().parse() == Ok(modified);
+        let fresh = same_uri(&tagged_uri, &source.uri)
+            && tagged_mtime.trim().parse() == Ok(source.modified);
         if !fresh {
             log::debug!(
                 "thumbnail cache entry {} is stale for {}",
@@ -121,18 +148,88 @@ pub fn find(cache_root: &Path, image: &Path) -> Option<PathBuf> {
     })
 }
 
-/// How many answers [`lookup`] remembers before it starts over.
+/// How many answers a [`Memo`] remembers before it starts over.
 const MEMO_LIMIT: usize = 4096;
 
-type Memo = HashMap<(PathBuf, Option<SystemTime>), Option<PathBuf>>;
+/// A cached thumbnail that was found, with what its file looked like then.
+#[derive(Debug)]
+struct Hit {
+    thumbnail: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
 
-/// [`find`] against the process environment's cache, remembered per file and
-/// modification time so a repaint does not look again; a file that changed
-/// has a new modification time and so a new answer.
+impl Hit {
+    fn of(thumbnail: PathBuf) -> Option<Self> {
+        let meta = fs::metadata(&thumbnail).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            thumbnail,
+        })
+    }
+
+    /// Whether the cached file is still there as it was found: a thumbnail
+    /// another file manager deleted or rewrote must not reach the image
+    /// loader.
+    fn is_current(&self) -> bool {
+        fs::metadata(&self.thumbnail)
+            .is_ok_and(|meta| meta.len() == self.len && meta.modified().ok() == self.modified)
+    }
+}
+
+/// The answers of [`find`], remembered per file and its **own** modification
+/// time (the file's, never a "last used" time a listing may show instead) so
+/// a repaint or a refresh does not read the cache again. A remembered answer
+/// is checked against its cached file before it is handed out; only hits are
+/// remembered, so a thumbnail another program makes later is found.
+#[derive(Debug, Default)]
+pub struct Memo {
+    hits: Mutex<HashMap<(PathBuf, u64), Hit>>,
+}
+
+impl Memo {
+    /// [`find`] through the memory. Blocking, like [`find`].
+    #[must_use]
+    pub fn lookup(&self, cache_root: &Path, image: &Path) -> Option<PathBuf> {
+        let source = Source::of(image)?;
+        let key = (source.canonical.clone(), source.modified);
+        let remembered = self
+            .hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .map(|hit| (hit.is_current(), hit.thumbnail.clone()));
+        match remembered {
+            Some((true, thumbnail)) => return Some(thumbnail),
+            Some((false, _)) => {
+                // Deleted or rewritten since: ask the cache again, and fall
+                // back to the image itself when it has nothing current.
+                self.hits
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+            }
+            None => {}
+        }
+        let found = find_for(cache_root, image, &source)?;
+        let hit = Hit::of(found.clone())?;
+        let mut hits = self.hits.lock().unwrap_or_else(PoisonError::into_inner);
+        if hits.len() >= MEMO_LIMIT {
+            hits.clear();
+        }
+        hits.insert(key, hit);
+        Some(found)
+    }
+}
+
+/// [`Memo::lookup`] against the process environment's cache and one shared
+/// memory. Blocking: the explorer calls it on the background executor, never
+/// while rendering.
 #[must_use]
-pub fn lookup(image: &Path, modified: Option<SystemTime>) -> Option<PathBuf> {
+pub fn lookup(image: &Path) -> Option<PathBuf> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static MEMO: Mutex<Option<Memo>> = Mutex::new(None);
+    static MEMO: LazyLock<Memo> = LazyLock::new(Memo::default);
     let root = ROOT
         .get_or_init(|| {
             cache_root(
@@ -141,16 +238,7 @@ pub fn lookup(image: &Path, modified: Option<SystemTime>) -> Option<PathBuf> {
             )
         })
         .as_deref()?;
-    let key = (image.to_path_buf(), modified);
-    if let Some(known) = MEMO
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .and_then(|memo| memo.get(&key))
-    {
-        return known.clone();
-    }
-    let found = find(root, image);
+    let found = MEMO.lookup(root, image);
     match &found {
         Some(thumbnail) => log::debug!(
             "using cached thumbnail {} for {}",
@@ -159,11 +247,5 @@ pub fn lookup(image: &Path, modified: Option<SystemTime>) -> Option<PathBuf> {
         ),
         None => log::debug!("no usable cached thumbnail for {}", image.display()),
     }
-    let mut guard = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
-    let memo = guard.get_or_insert_with(HashMap::new);
-    if memo.len() >= MEMO_LIMIT {
-        memo.clear();
-    }
-    memo.insert(key, found.clone());
     found
 }
