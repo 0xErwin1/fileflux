@@ -58,8 +58,22 @@ const HIDDEN_FILE_LIMIT: u64 = 1 << 20;
 /// skipped, bytes kept as written). A missing, unreadable or non-regular
 /// file lists nothing: it only ever hides, so failing to read it is not an
 /// error of the folder.
+///
+/// Anyone who can write the folder controls `.hidden`, so it is only opened
+/// when it is a regular file, and opened non-blocking: a FIFO or device node
+/// planted there (or swapped in after the check) never stalls the listing.
 fn read_hidden_names(dir: &Path) -> BTreeSet<OsString> {
-    let Ok(file) = fs::File::open(dir.join(".hidden")) else {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = dir.join(".hidden");
+    if !fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return BTreeSet::new();
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(&path)
+    else {
         return BTreeSet::new();
     };
     let mut bytes = Vec::new();
@@ -577,6 +591,32 @@ mod tests {
                 .iter()
                 .all(|entry| entry.path.parent() == Some(scratch.path()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fifo_or_device_named_dot_hidden_never_blocks_the_listing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = scratch("hidden-fifo")?;
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            scratch.path().join(".hidden"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )?;
+        fs::write(scratch.path().join("shown.txt"), b"x")?;
+        let dir = scratch.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The receiver only disappears after the timeout already failed the test.
+            tx.send(read_directory(&dir).map(|listing| listing.hidden_names.len()))
+                .ok();
+        });
+        let hidden = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "read_directory blocked on a FIFO named .hidden")??;
+        assert_eq!(hidden, 0, "a FIFO is not a list of names");
         Ok(())
     }
 
