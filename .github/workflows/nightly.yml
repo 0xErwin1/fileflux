@@ -1,0 +1,361 @@
+name: Nightly
+
+# Rolling nightly build of the Linux `fileflux` package, like ReqFlux's and
+# DBFlux's: one prerelease under the single tag `nightly`, replaced by every
+# new build. It runs once a day and skips when main has not advanced since the
+# commit the `nightly` tag points at, so the tag count never grows and an idle
+# main publishes nothing. A manual dispatch always builds. Fileflux is
+# Linux-only (inotify, lsblk, gvfs), so there is no macOS build.
+
+on:
+  schedule:
+    # 03:17 UTC daily: a low-traffic window, off the top of the hour.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: Guard - canonical repo and new commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.guard.outputs.proceed }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Decide whether to build
+        id: guard
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          # Only the canonical repository runs the schedule; forks do not.
+          if [ "$REPOSITORY" != "0xErwin1/fileflux" ]; then
+            echo "Skipping nightly: not the canonical repository."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The single tag tracks main: a run from any other ref never moves it.
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::The nightly only builds main, not $REF."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # A manual run always builds, even with no new commits.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Manual dispatch: building regardless of new commits."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The `nightly` tag points at a pin commit (nix/nightly-info.nix with
+          # the real hash) whose first parent is the main commit the last
+          # nightly was built from. Skip when main has not advanced since then.
+          CURRENT="$(git rev-parse HEAD)"
+          if ! LAST="$(git rev-parse --verify --quiet 'nightly^')"; then
+            echo "No previous nightly tag: building."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$LAST" = "$CURRENT" ]; then
+            echo "No new commits on main since the last nightly ($LAST): skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Prose and designs do not reach the binary, so a range made only of
+          # them would publish the same build again. The tag stays put, so the
+          # next nightly's changes still cover those commits. A failed diff
+          # builds: a broken check costs a build rather than a missed nightly.
+          if ! changed="$(git diff --name-only "$LAST" "$CURRENT")"; then
+            echo "::warning::cannot diff $LAST..$CURRENT; building"
+          elif ! printf '%s\n' "$changed" | grep -qvE '(\.md$|^design/|^docs/)'; then
+            echo "main advanced $LAST -> $CURRENT with prose and design changes only: skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "main advanced $LAST -> $CURRENT: building."
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  compute-version:
+    name: Compute nightly version
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.nightly.outputs.version }}
+      short_sha: ${{ steps.nightly.outputs.short_sha }}
+      date: ${{ steps.nightly.outputs.date }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Compute version string
+        id: nightly
+        run: |
+          # The nightly version is the package version with its pre-release
+          # suffix stripped (0.1.0-dev.0 -> 0.1.0) plus the short commit as
+          # semver build metadata, which does not affect semver ordering.
+          MATCHES=$(grep -c '^version = "' Cargo.toml)
+          if [ "$MATCHES" -ne 1 ]; then
+            echo "::error::Expected exactly 1 package version line in Cargo.toml, found $MATCHES."
+            exit 1
+          fi
+          BASE=$(grep '^version = "' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/' | sed 's/-[^+]*//')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          NIGHTLY_VERSION="${BASE}-nightly+${SHORT_SHA}"
+          {
+            echo "version=${NIGHTLY_VERSION}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "date=$(date -u '+%Y-%m-%d')"
+          } >> "$GITHUB_OUTPUT"
+          echo "Nightly version: ${NIGHTLY_VERSION}"
+
+  build:
+    name: Build Linux
+    needs: compute-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfreetype-dev \
+            libfontconfig-dev libssl-dev libzstd-dev libasound2-dev
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The scheduled run is on main; a cache saved on a tag ref can never
+          # be read back (same rationale as DBFlux's build).
+          save-if: github.ref == 'refs/heads/main'
+
+      - name: Stamp package version
+        env:
+          VERSION: ${{ needs.compute-version.outputs.version }}
+        run: |
+          # Same single-line guard as compute-version. VERSION is read from
+          # env, not interpolated into the script, so crafted input cannot
+          # inject shell. No --locked on the build below: the stamp mutates
+          # Cargo.toml, so cargo must refresh the package entry in
+          # Cargo.lock; dependency-lock integrity is enforced by CI (--locked)
+          # on the same commit, where only the local package version differs.
+          MATCHES=$(grep -c '^version = "' Cargo.toml)
+          if [ "$MATCHES" -ne 1 ]; then
+            echo "::error::Expected exactly 1 package version line in Cargo.toml, found $MATCHES."
+            exit 1
+          fi
+          sed -i "s|^version = \".*\"|version = \"${VERSION}\"|" Cargo.toml
+          grep -qF "version = \"${VERSION}\"" Cargo.toml \
+            || { echo "::error::Version stamp did not apply."; exit 1; }
+
+      - name: Build Fileflux
+        run: cargo build --release
+
+      - name: Assemble the package
+        run: |
+          mkdir -p pkg/bin pkg/share/applications
+          cp target/release/fileflux pkg/bin/fileflux
+          cp packaging/fileflux.desktop pkg/share/applications/fileflux.desktop
+          # TODO: ship an icon (share/icons/hicolor/...) once Fileflux has one.
+          cp LICENSE pkg/LICENSE
+
+      - name: Create tar archive
+        run: |
+          cd pkg
+          tar -czf ../fileflux-linux-amd64.tar.gz .
+
+      - name: Generate checksum
+        run: sha256sum fileflux-linux-amd64.tar.gz > fileflux-linux-amd64.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: |
+            fileflux-linux-amd64.tar.gz
+            fileflux-linux-amd64.tar.gz.sha256
+          retention-days: 90
+
+  release:
+    name: Publish rolling nightly release
+    # Every platform must build before the release publishes: a failed build
+    # leaves the tag and the previous assets in place.
+    needs: [compute-version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          # The previous `nightly` tag scopes the list of changes.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts
+
+      - name: Compose nightly release body
+        env:
+          SHORT_SHA: ${{ needs.compute-version.outputs.short_sha }}
+          DATE: ${{ needs.compute-version.outputs.date }}
+        run: |
+          cat > release_body.md <<EOF
+          > **Nightly build**: built automatically from \`main\` once a day when it has new
+          > commits. Not recommended for production use. Each build replaces the previous one
+          > under the same \`nightly\` tag.
+          >
+          > Commit: \`${SHORT_SHA}\` - ${DATE}
+
+          EOF
+          # The tag still points at the previous pin commit here, and its
+          # first parent is the main commit that build came from, so
+          # nightly^..HEAD is what changed on main since then.
+          if git rev-parse --verify --quiet 'nightly^' >/dev/null; then
+            CHANGES=$(git log --no-merges --format='- %s (%h)' 'nightly^..HEAD')
+          else
+            CHANGES=$(git log --no-merges --format='- %s (%h)' -n 30 HEAD)
+          fi
+          if [ -n "$CHANGES" ]; then
+            {
+              echo "## Changes since the previous nightly"
+              echo ""
+              echo "$CHANGES"
+            } >> release_body.md
+          fi
+
+      - name: Remove the old dated nightlies and the previous assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Earlier nightlies were dated (nightly-YYYYMMDD): delete their
+          # releases and tags, so only the rolling `nightly` remains.
+          OLD_TAGS=$(git tag --list 'nightly-*')
+          while IFS= read -r OLD_TAG; do
+            [ -n "$OLD_TAG" ] || continue
+            if gh release view "$OLD_TAG" >/dev/null 2>&1; then
+              gh release delete "$OLD_TAG" --yes --cleanup-tag
+            else
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${OLD_TAG}"
+            fi
+          done <<<"$OLD_TAGS"
+
+          # The rolling release keeps its tag; clear its assets so the upload
+          # below never leaves an older build attached.
+          # Only a 404 means there is no release yet; any other API failure
+          # fails the step instead of silently skipping the clear.
+          if ! RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/nightly" 2>api_error.txt); then
+            if grep -q 'HTTP 404' api_error.txt; then
+              echo "No existing nightly release; nothing to clear."
+              exit 0
+            fi
+            cat api_error.txt >&2
+            exit 1
+          fi
+          ASSET_IDS=$(jq -r '.assets[].id' <<<"$RELEASE_JSON")
+          while IFS= read -r ASSET_ID; do
+            [ -n "$ASSET_ID" ] || continue
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}"
+          done <<<"$ASSET_IDS"
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Fileflux Nightly
+          body_path: release_body.md
+          prerelease: true
+          files: |
+            artifacts/fileflux-linux-amd64.tar.gz
+            artifacts/fileflux-linux-amd64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Last, so the tag only moves once the build is published: if anything
+      # above fails, the tag still points at the previous nightly, the guard
+      # sees new commits and the next scheduled run retries.
+      #
+      # The tag points at a pin commit on top of this build's main commit
+      # that rewrites nix/nightly-info.nix with the published tarball's hash,
+      # so `github:0xErwin1/fileflux/nightly#fileflux-nightly` fetches it. The
+      # pin commit is never pushed to main; pushing the tag carries it.
+      - name: Pin nix/nightly-info.nix and move the nightly tag
+        env:
+          NIGHTLY_VERSION: ${{ needs.compute-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          # SRI hash of the published tarball, without requiring nix.
+          HASH_AMD64="sha256-$(openssl dgst -sha256 -binary \
+            artifacts/fileflux-linux-amd64.tar.gz | base64 -w0)"
+
+          cat > nix/nightly-info.nix <<NIX_EOF
+          # Rolling nightly channel pointer, auto-generated by .github/workflows/nightly.yml.
+          #
+          # This file lives on the \`nightly\` git ref. The hash and version below
+          # match the artifact published in the current rolling nightly release.
+          # On \`main\` it only holds a placeholder: always consume via the
+          # \`nightly\` ref:
+          #
+          #   nix run github:0xErwin1/fileflux/nightly#fileflux-nightly
+          #
+          # From-source nightly (no hash needed):
+          #
+          #   nix run github:0xErwin1/fileflux/nightly#fileflux-source
+          {
+            version = "${NIGHTLY_VERSION}";
+
+            artifacts = {
+              "x86_64-linux" = {
+                url = "https://github.com/0xErwin1/fileflux/releases/download/nightly/fileflux-linux-amd64.tar.gz";
+                hash = "${HASH_AMD64}";
+              };
+            };
+          }
+          NIX_EOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add nix/nightly-info.nix
+          git commit -m "chore(nightly): pin nix/nightly-info.nix ${SHORT_SHA}"
+
+          git tag -f nightly HEAD
+          git push origin refs/tags/nightly --force
