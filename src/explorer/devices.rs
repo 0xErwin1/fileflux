@@ -535,7 +535,7 @@ impl DeviceHub {
 fn directory_of(location: &Location) -> Option<PathBuf> {
     match location {
         Location::Directory(path) => Some(path.clone()),
-        Location::Trash => None,
+        Location::Trash | Location::Recent => None,
     }
 }
 

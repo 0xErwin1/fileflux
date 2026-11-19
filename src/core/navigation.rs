@@ -20,7 +20,8 @@ use super::Location;
 /// - `back`/`forward` swap between the stacks and return `false` when the
 ///   target stack is empty, leaving state unchanged.
 /// - `up` is a regular `visit` of the parent directory, so it joins history;
-///   it is a no-op at the filesystem root and in [`Location::Trash`].
+///   it is a no-op at the filesystem root and in the virtual
+///   [`Location::Trash`] and [`Location::Recent`].
 #[derive(Clone, Debug)]
 pub struct Navigation {
     current: Location,
@@ -77,12 +78,13 @@ impl Navigation {
 
     /// Visits the parent of a directory location.
     ///
-    /// Returns `false` without changing state in [`Location::Trash`], at the
+    /// Returns `false` without changing state in [`Location::Trash`] or
+    /// [`Location::Recent`], at the
     /// filesystem root, or when the parent resolves to the current location.
     pub fn up(&mut self) -> bool {
         let parent = match &self.current {
             Location::Directory(path) => path.parent().map(Path::to_path_buf),
-            Location::Trash => None,
+            Location::Trash | Location::Recent => None,
         };
         let Some(parent) = parent else {
             return false;
@@ -110,7 +112,7 @@ impl Navigation {
             Location::Directory(path) => path
                 .parent()
                 .is_some_and(|parent| Location::Directory(parent.to_path_buf()) != self.current),
-            Location::Trash => false,
+            Location::Trash | Location::Recent => false,
         }
     }
 }
@@ -228,5 +230,11 @@ mod tests {
         assert!(!trash_nav.up(), "Trash Up is a no-op");
         assert_eq!(trash_nav.current(), &Location::Trash);
         assert!(!trash_nav.can_back());
+
+        let mut recent_nav = Navigation::new(Location::Recent);
+        assert!(!recent_nav.can_up());
+        assert!(!recent_nav.up(), "Recent Up is a no-op");
+        assert_eq!(recent_nav.current(), &Location::Recent);
+        assert!(!recent_nav.can_back());
     }
 }

@@ -513,6 +513,7 @@ fn a_sidebar_row_menu_offers_open_tab_favorite_copy_and_properties() {
         trash: false,
         favorite: false,
         terminal: false,
+        recent: false,
     });
     assert_eq!(
         flat(&rows),
@@ -541,6 +542,7 @@ fn a_favorite_row_offers_remove_instead_of_add() {
         trash: false,
         favorite: true,
         terminal: false,
+        recent: false,
     });
     assert_eq!(
         flat(&rows),
@@ -564,6 +566,7 @@ fn a_sidebar_row_offers_open_in_terminal_only_when_a_terminal_exists() {
         trash: false,
         favorite: false,
         terminal: true,
+        recent: false,
     });
     assert_eq!(
         flat(&rows),
@@ -684,6 +687,7 @@ fn the_sidebar_trash_row_offers_open_new_tab_and_empty_trash_only() {
             trash: true,
             favorite,
             terminal: true,
+            recent: false,
         });
         assert_eq!(
             flat(&rows),
@@ -693,6 +697,82 @@ fn the_sidebar_trash_row_offers_open_new_tab_and_empty_trash_only() {
         assert!(item(&rows, MenuCommand::AddFavorite).is_none());
         assert!(item(&rows, MenuCommand::CopyPath).is_none());
     }
+}
+
+#[test]
+fn the_sidebar_recent_row_offers_open_and_new_tab_only() {
+    for (favorite, terminal) in [(false, false), (true, true)] {
+        let rows = sidebar_menu_rows(&SidebarTarget {
+            trash: false,
+            favorite,
+            terminal,
+            recent: true,
+        });
+        assert_eq!(flat(&rows), ["Open", "Open in new tab"]);
+    }
+}
+
+#[test]
+fn the_recent_menu_of_one_entry_adds_open_containing_folder_and_never_creates() {
+    let mut one = target(false, 1, false, true);
+    one.folder_selected = true;
+    let rows = recent_menu_rows(menu_rows(&one), 1);
+    let labels = flat(&rows);
+    assert_eq!(labels.first().map(String::as_str), Some("Open"));
+    assert_eq!(
+        labels.get(1).map(String::as_str),
+        Some("Open containing folder")
+    );
+    assert!(item(&rows, MenuCommand::OpenContainingFolder).is_some_and(|item| item.enabled));
+    assert!(
+        item(&rows, MenuCommand::OpenInNewTab).is_some(),
+        "a folder still opens in a new tab"
+    );
+    for gone in [
+        MenuCommand::Paste,
+        MenuCommand::PasteIntoFolder,
+        MenuCommand::NewFolder,
+        MenuCommand::NewFile,
+    ] {
+        assert!(item(&rows, gone).is_none(), "{gone:?}");
+    }
+    for kept in [
+        MenuCommand::Cut,
+        MenuCommand::Copy,
+        MenuCommand::Rename,
+        MenuCommand::CopyPath,
+        MenuCommand::Properties,
+        MenuCommand::MoveToTrash,
+    ] {
+        assert!(item(&rows, kept).is_some(), "{kept:?}");
+    }
+    assert_no_stray_separators(&rows);
+}
+
+#[test]
+fn the_recent_menu_of_several_entries_has_no_open_containing_folder() {
+    let rows = recent_menu_rows(menu_rows(&target(false, 3, false, true)), 3);
+    assert!(item(&rows, MenuCommand::OpenContainingFolder).is_none());
+    assert!(item(&rows, MenuCommand::Paste).is_none());
+    assert!(item(&rows, MenuCommand::Copy).is_some());
+    assert_no_stray_separators(&rows);
+}
+
+#[test]
+fn the_recent_empty_space_menu_only_sorts_and_filters() {
+    let rows = recent_menu_rows(menu_rows(&target(false, 0, false, true)), 0);
+    assert_eq!(flat(&rows), ["Sort by", "Filter"]);
+}
+
+fn assert_no_stray_separators(rows: &[MenuRow]) {
+    assert!(!matches!(rows.first(), Some(MenuRow::Separator)), "leading");
+    assert!(!matches!(rows.last(), Some(MenuRow::Separator)), "trailing");
+    assert!(
+        !rows
+            .windows(2)
+            .any(|pair| matches!(pair, [MenuRow::Separator, MenuRow::Separator])),
+        "doubled"
+    );
 }
 
 #[test]

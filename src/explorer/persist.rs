@@ -168,6 +168,7 @@ pub(crate) fn session_tab(
             settings::SessionTab::directory(path.clone(), view, arrangement)
         }
         Location::Trash => settings::SessionTab::trash(view, arrangement),
+        Location::Recent => settings::SessionTab::recent(view, arrangement),
     }
 }
 
@@ -728,7 +729,9 @@ mod tests {
             assert_eq!(view_from_pref(view_to_pref(view)), view);
         }
         let tab = session_tab(&Location::Trash, View::List, &Arrangement::default());
-        assert!(tab.trash && tab.path.is_none());
+        assert!(tab.trash && tab.path.is_none() && !tab.recent);
+        let tab = session_tab(&Location::Recent, View::Grid, &Arrangement::default());
+        assert!(tab.recent && !tab.trash && tab.path.is_none());
         let tab = session_tab(
             &Location::Directory(PathBuf::from("/a")),
             View::Grid,

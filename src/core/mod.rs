@@ -14,16 +14,20 @@ pub mod kinds;
 pub mod navigation;
 pub mod ops;
 pub mod places;
+pub mod recent;
 pub mod settings;
 pub mod terminal;
+pub mod thumbnails;
 pub mod trash;
 pub mod watch;
 
-/// A navigable directory or the virtual read-only home Trash.
+/// A navigable directory, the virtual read-only home Trash or the virtual
+/// read-only list of recently used files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Location {
     Directory(PathBuf),
     Trash,
+    Recent,
 }
 
 /// The kind observed when the directory was scanned.

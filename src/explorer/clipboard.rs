@@ -92,7 +92,9 @@ impl Explorer {
     /// Whether Paste has something to paste.
     pub(crate) fn can_paste(&mut self, cx: &mut Context<Self>) -> bool {
         self.reconcile_clipboard(cx);
-        !self.in_trash() && self.clipboard.get().is_some()
+        !self.in_trash()
+            && *self.tab().state.current() != Location::Recent
+            && self.clipboard.get().is_some()
     }
 
     /// Ctrl+V and the menu's Paste / Paste into folder.
@@ -103,12 +105,12 @@ impl Explorer {
             return;
         };
         let Location::Directory(current) = self.tab().state.current().clone() else {
-            self.say(
-                Severity::Info,
-                "Can't paste into the Trash. Restore items instead",
-                window,
-                cx,
-            );
+            let reason = if self.tab().state.current() == &Location::Recent {
+                "Can't paste into Recent. Open a folder to paste into"
+            } else {
+                "Can't paste into the Trash. Restore items instead"
+            };
+            self.say(Severity::Info, reason, window, cx);
             return;
         };
         if clip.mode == ClipMode::Cut

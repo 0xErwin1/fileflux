@@ -361,12 +361,15 @@ impl Default for Settings {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionTab {
-    /// The folder, unless the tab shows the Trash.
+    /// The folder, unless the tab shows the Trash or the recent files.
     #[serde(with = "path_option", skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     /// The tab shows the virtual Trash.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub trash: bool,
+    /// The tab shows the virtual list of recently used files.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub recent: bool,
     pub view: ViewMode,
     pub arrangement: ArrangementPrefs,
 }
@@ -377,6 +380,7 @@ impl SessionTab {
         Self {
             path: Some(path),
             trash: false,
+            recent: false,
             view,
             arrangement,
         }
@@ -387,6 +391,18 @@ impl SessionTab {
         Self {
             path: None,
             trash: true,
+            recent: false,
+            view,
+            arrangement,
+        }
+    }
+
+    /// A tab on the recent files.
+    pub fn recent(view: ViewMode, arrangement: ArrangementPrefs) -> Self {
+        Self {
+            path: None,
+            trash: false,
+            recent: true,
             view,
             arrangement,
         }
@@ -993,6 +1009,7 @@ pub fn restore_session(session: &Session, home: Option<&Path>) -> Restored {
         .map(|tab| {
             let (location, fell_back_from) = match &tab.path {
                 _ if tab.trash => (Location::Trash, None),
+                _ if tab.recent => (Location::Recent, None),
                 Some(path) if path.is_absolute() => (Location::Directory(path.clone()), None),
                 Some(path) => (
                     Location::Directory(home.map_or_else(|| PathBuf::from("/"), Path::to_path_buf)),

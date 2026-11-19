@@ -27,6 +27,7 @@ use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
+use fileflux::core::recent;
 use fileflux::core::settings::{
     self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
 };
@@ -288,8 +289,9 @@ fn install_modal_seams(cx: &mut App) {
     });
 }
 
-/// Reads one location off the UI thread: a plain directory scan, or the
-/// home Trash listing. Recorded original Trash paths are never opened.
+/// Reads one location off the UI thread: a plain directory scan, the
+/// home Trash listing, or the recently used files. Recorded original Trash
+/// paths are never opened.
 /// A listing read on the background executor with everything the UI thread
 /// would otherwise build per commit: the arrangement index and the shared
 /// entry snapshot. Both cost a walk of the whole folder, so both are made
@@ -302,8 +304,12 @@ struct Loaded {
 }
 
 /// [`load_location`] plus the derived data of [`Loaded`].
-fn load_indexed(location: &Location, trash_root: Option<&Path>) -> io::Result<Loaded> {
-    let listing = load_location(location, trash_root)?;
+fn load_indexed(
+    location: &Location,
+    trash_root: Option<&Path>,
+    recent_file: Option<&Path>,
+) -> io::Result<Loaded> {
+    let listing = load_location(location, trash_root, recent_file)?;
     let index = Arc::new(ArrangeIndex::build_hiding(
         &listing.entries,
         &listing.hidden_names,
@@ -318,9 +324,17 @@ fn load_indexed(location: &Location, trash_root: Option<&Path>) -> io::Result<Lo
     })
 }
 
-fn load_location(location: &Location, trash_root: Option<&Path>) -> io::Result<Listing> {
+fn load_location(
+    location: &Location,
+    trash_root: Option<&Path>,
+    recent_file: Option<&Path>,
+) -> io::Result<Listing> {
     match location {
         Location::Directory(path) => fileflux::core::fs::read_directory(path),
+        Location::Recent => match recent_file {
+            Some(file) => fileflux::core::recent::read_recent(file),
+            None => Ok(Listing::default()),
+        },
         Location::Trash => match trash_root {
             Some(root) => fileflux::core::trash::read_trash(root),
             None => Err(io::Error::new(
@@ -611,6 +625,9 @@ pub(crate) struct Explorer {
     pub(crate) sidebar_error: Option<String>,
     /// The home Trash root once places are known.
     pub(crate) trash_root: Option<PathBuf>,
+    /// The freedesktop recently-used file the Recent view reads, when
+    /// `$XDG_DATA_HOME` or `$HOME` gives one.
+    pub(crate) recent_file: Option<PathBuf>,
     /// The whole-window focus, so Escape has somewhere to give the focus
     /// back and the shell keys work after a click on bare chrome.
     pub(crate) shell_focus: FocusHandle,
@@ -826,6 +843,10 @@ impl Explorer {
             // Known from the environment at once, so Del has a Trash even
             // before the places discovery answers.
             trash_root: startup_trash_root(
+                std::env::var_os("HOME").as_deref(),
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+            ),
+            recent_file: recent::recent_path(
                 std::env::var_os("HOME").as_deref(),
                 std::env::var_os("XDG_DATA_HOME").as_deref(),
             ),
@@ -1054,6 +1075,7 @@ impl Explorer {
     pub(crate) fn current_label(&self) -> String {
         match self.tab().state.current() {
             Location::Trash => "Home Trash".to_owned(),
+            Location::Recent => "Recent".to_owned(),
             Location::Directory(path) => {
                 if self
                     .places
@@ -1144,9 +1166,10 @@ impl Explorer {
         };
         let location = scan.location.clone();
         let trash_root = self.trash_root.clone();
-        let load = cx
-            .background_executor()
-            .spawn(async move { load_indexed(&location, trash_root.as_deref()) });
+        let recent_file = self.recent_file.clone();
+        let load = cx.background_executor().spawn(async move {
+            load_indexed(&location, trash_root.as_deref(), recent_file.as_deref())
+        });
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = load.await;
             if let Err(error) = this.update_in(cx, |this, window, cx| {
@@ -1332,14 +1355,18 @@ impl Explorer {
     /// a navigation in flight is reading (the Trash is not watched). Tabs on
     /// the same folder share one inotify watch inside the hub.
     fn sync_watches(&mut self, id: TabId) {
+        let recent_dir = self.recent_dir();
         let Some(hub) = self.hub.as_ref() else {
             return;
         };
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
+        // The Recent list is live through the folder of its file: the
+        // change of the file shows up as an event of that folder.
         let committed = match tab.state.current() {
             Location::Directory(path) => Some(path.clone()),
+            Location::Recent => recent_dir.clone(),
             Location::Trash => None,
         };
         let target = tab
@@ -1397,16 +1424,19 @@ impl Explorer {
             .filter(|(_, debounce)| debounce.ready(now))
             .map(|(path, _)| path.clone())
             .collect();
+        let recent_dir = self.recent_dir();
         for path in due {
             self.folder_debounce.remove(&path);
             self.bookmarks_folder_changed(&path, cx);
             let active = self.active_id();
             let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
             for id in ids {
-                let scan = self
-                    .tabs
-                    .by_id_mut(id)
-                    .and_then(|tab| tab.state.folder_changed(&path));
+                let recent_changed = recent_dir.as_deref() == Some(path.as_path());
+                let scan = self.tabs.by_id_mut(id).and_then(|tab| {
+                    tab.state
+                        .folder_changed(&path)
+                        .or_else(|| recent_changed.then(|| tab.state.recent_changed()).flatten())
+                });
                 if scan.is_some() {
                     log::debug!(
                         "live refresh of {} in tab {id} ({})",
@@ -1417,6 +1447,14 @@ impl Explorer {
                 self.start_scan_in(id, scan, window, cx);
             }
         }
+    }
+
+    /// The folder of the recently-used file, which a Recent tab watches.
+    fn recent_dir(&self) -> Option<PathBuf> {
+        self.recent_file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
     }
 
     /// The folders under a watch right now, as the watches name them.
@@ -2217,6 +2255,7 @@ fn committed_path_text(location: &Location) -> String {
     match location {
         Location::Directory(path) => path.to_string_lossy().into_owned(),
         Location::Trash => "Trash".to_owned(),
+        Location::Recent => "Recent".to_owned(),
     }
 }
 
@@ -2567,7 +2606,12 @@ impl Explorer {
     /// or nothing.
     fn render_scope_line(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let colors = bolt::colors(cx);
-        let text = if self.tab().state.current() == &Location::Trash {
+        let text = if self.tab().state.current() == &Location::Recent {
+            Some(
+                "Recent \u{2014} files other applications opened, newest first. Open containing folder shows where one lives."
+                    .to_owned(),
+            )
+        } else if self.tab().state.current() == &Location::Trash {
             Some(
                 "Home Trash \u{2014} Restore puts items back; Delete permanently and Empty Trash cannot be undone."
                     .to_owned(),
@@ -2673,6 +2717,7 @@ impl Explorer {
                 Button::new("explorer-new-folder", "New folder")
                     .primary()
                     .icon(crate::explorer::icon(gpui_kit_assets::IconName::FolderPlus))
+                    .disabled(self.tab().state.current() == &Location::Recent)
                     .tooltip("New folder (Ctrl+Shift+N)")
                     .on_click(cx.listener(|this, _event, window, cx| {
                         this.create_new(crate::explorer::ops::NewKind::Folder, window, cx);
@@ -2768,6 +2813,7 @@ impl Explorer {
         let path = match self.tab().state.current() {
             Location::Directory(path) => path.as_path(),
             Location::Trash => places.trash_root.as_path(),
+            Location::Recent => return None,
         };
         let usage = places.volume_containing(path)?.usage?;
         Some(usage.label())
@@ -2792,8 +2838,10 @@ impl Explorer {
             selection.len(),
             self.tab().state.selected_size(),
         );
-        // A single selected Trash entry keeps its recorded origin.
-        if self.in_trash()
+        // A single selected Trash entry keeps its recorded origin; a Recent
+        // one, its folder.
+        let origin_word = if self.in_trash() { "from" } else { "in" };
+        if (self.in_trash() || self.tab().state.current() == &Location::Recent)
             && let Some(path) = selection.iter().next().filter(|_| selection.len() == 1)
             && let Some(origin) = self
                 .tab()
@@ -2804,7 +2852,10 @@ impl Explorer {
                 .find(|entry| entry.path == *path)
                 .and_then(|entry| entry.origin.as_ref())
         {
-            count_text.push_str(&format!(" \u{b7} from {}", origin.to_string_lossy()));
+            count_text.push_str(&format!(
+                " \u{b7} {origin_word} {}",
+                origin.to_string_lossy()
+            ));
         }
 
         // Long names and paths are cut with an ellipsis instead of running

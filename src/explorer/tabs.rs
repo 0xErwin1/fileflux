@@ -191,6 +191,7 @@ impl<T> TabList<T> {
 pub(crate) fn tab_label(location: &Location, home: Option<&Path>) -> String {
     match location {
         Location::Trash => "Trash".to_owned(),
+        Location::Recent => "Recent".to_owned(),
         Location::Directory(path) if home == Some(path.as_path()) => "Home".to_owned(),
         Location::Directory(path) => path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
@@ -206,6 +207,7 @@ pub(crate) fn tab_tooltip(location: &Location, trash_root: Option<&Path>) -> Str
             || "Trash".to_owned(),
             |root| root.to_string_lossy().into_owned(),
         ),
+        Location::Recent => "Recent files".to_owned(),
         Location::Directory(path) => path.to_string_lossy().into_owned(),
     }
 }
@@ -239,10 +241,15 @@ impl Affected {
         };
         match job {
             Job::Create { dir, .. } => Self::Folders(vec![Location::Directory(dir.clone())]),
-            Job::Rename { path, .. } => Self::Folders(parents(std::slice::from_ref(path))),
+            Job::Rename { path, .. } => {
+                let mut folders = parents(std::slice::from_ref(path));
+                folders.push(Location::Recent);
+                Self::Folders(folders)
+            }
             Job::Trash(paths) | Job::DeletePermanently(paths) => {
                 let mut folders = parents(paths);
                 folders.push(Location::Trash);
+                folders.push(Location::Recent);
                 Self::Folders(folders)
             }
             Job::Restore(_)
@@ -532,6 +539,8 @@ mod tests {
         assert_eq!(tab_label(&dir("/home/me"), Some(&home)), "Home");
         assert_eq!(tab_label(&dir("/"), Some(&home)), "/");
         assert_eq!(tab_label(&Location::Trash, Some(&home)), "Trash");
+        assert_eq!(tab_label(&Location::Recent, Some(&home)), "Recent");
+        assert_eq!(tab_tooltip(&Location::Recent, None), "Recent files");
         assert_eq!(tab_label(&dir("/home/me"), None), "me");
     }
 
@@ -547,6 +556,24 @@ mod tests {
     }
 
     // --- operation refresh fan-out -----------------------------------------------
+
+    #[test]
+    fn jobs_that_remove_or_rename_files_refresh_the_recent_view() {
+        let trashed = Affected::of_job(&Job::Trash(vec![PathBuf::from("/home/me/docs/a.txt")]));
+        assert!(trashed.touches(&Location::Recent));
+        let deleted = Affected::of_job(&Job::DeletePermanently(vec![PathBuf::from("/d/a")]));
+        assert!(deleted.touches(&Location::Recent));
+        let renamed = Affected::of_job(&Job::Rename {
+            path: PathBuf::from("/home/me/docs/a.txt"),
+            new_name: OsString::from("b.txt"),
+        });
+        assert!(renamed.touches(&Location::Recent));
+        let created = Affected::of_job(&Job::Create {
+            dir: PathBuf::from("/home/me/docs"),
+            kind: NewKind::File,
+        });
+        assert!(!created.touches(&Location::Recent));
+    }
 
     #[test]
     fn an_operation_refreshes_every_tab_showing_an_affected_folder() {
@@ -572,7 +599,11 @@ mod tests {
             path: PathBuf::from("/a/x"),
             new_name: OsString::from("y"),
         });
-        assert_eq!(renamed, Affected::Folders(vec![dir("/a")]));
+        // A renamed file leaves the Recent list, which names it by its old path.
+        assert_eq!(
+            renamed,
+            Affected::Folders(vec![dir("/a"), Location::Recent])
+        );
     }
 
     #[test]
@@ -619,7 +650,7 @@ mod affected_tests {
         let job = Job::Trash(vec![PathBuf::from("/d/a"), PathBuf::from("/d/b")]);
         assert_eq!(
             Affected::of_job(&job),
-            Affected::Folders(vec![dir("/d"), Location::Trash])
+            Affected::Folders(vec![dir("/d"), Location::Trash, Location::Recent])
         );
     }
 

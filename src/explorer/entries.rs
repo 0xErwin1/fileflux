@@ -199,8 +199,16 @@ fn file_glyph_element(name: gpui_kit_assets::IconName, color: Hsla) -> gpui::Any
 
 /// The real thumbnail of an image file: GPUI's image loader decodes the
 /// path off the UI thread; while loading or on error the extension glyph
-/// shows instead. Object-fit cover inside the 62×46 bordered box.
-fn photo_thumbnail(path: PathBuf, name: &OsStr, colors: &bolt::colors::Colors) -> gpui::AnyElement {
+/// shows instead. When the freedesktop thumbnail cache holds a current
+/// thumbnail of the file, that small PNG is decoded instead of the image.
+/// Object-fit cover inside the 62×46 bordered box.
+fn photo_thumbnail(
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    name: &OsStr,
+    colors: &bolt::colors::Colors,
+) -> gpui::AnyElement {
+    let path = fileflux::core::thumbnails::lookup(&path, modified).unwrap_or(path);
     let glyph = file_glyph(name);
     let muted = colors.muted;
     div()
@@ -298,7 +306,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         });
     // The empty space of a shown folder takes drops into that folder (an
     // entry that is no target covers it while dragging, see
-    // `dnd::block_while_dragging`). The Trash view takes none.
+    // `dnd::block_while_dragging`). The Trash and Recent views take none.
     let weak_for_drops = cx.entity().downgrade();
     let container = match this.tab().state.current() {
         Location::Directory(dir) => dnd::drop_target(
@@ -307,7 +315,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             &weak_for_drops,
             cx,
         ),
-        Location::Trash => container,
+        Location::Trash | Location::Recent => container,
     };
 
     if this.tab().state.is_loading() && count == 0 {
@@ -322,6 +330,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     if this.tab().state.folder_is_empty() {
         let empty_note = if this.tab().state.current() == &Location::Trash {
             "Trash is empty. Deleted items would appear here."
+        } else if this.tab().state.current() == &Location::Recent {
+            "No recent files. Files you open in other applications would appear here."
         } else {
             "Favorites can point to an empty folder. Nothing to show yet."
         };
@@ -375,6 +385,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let weak = cx.entity().downgrade();
     let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.tab().state.selection().clone());
     let list_view = this.tab().state.view() == View::List;
+    let in_recent = this.tab().state.current() == &Location::Recent;
     let columns = this.rendered_columns.max(1);
     let item_count = if list_view {
         count
@@ -429,6 +440,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             renaming: renaming_for_rows.as_ref(),
                             drag: drag_for_rows.as_ref(),
                             outlined,
+                            in_recent,
                         };
                         render_grid_row(&data, row, columns, &weak_for_rows, cx)
                     })
@@ -497,6 +509,8 @@ struct GridData<'a> {
     drag: Option<&'a Arc<Vec<PathBuf>>>,
     /// The selection is the target of an open context menu.
     outlined: bool,
+    /// The Recent view: a tile's second line names the folder the file is in.
+    in_recent: bool,
 }
 
 /// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a
@@ -517,6 +531,7 @@ fn render_grid_row(
         renaming,
         drag,
         outlined,
+        in_recent,
     } = *data;
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
@@ -549,7 +564,7 @@ fn render_grid_row(
         } else if is_folder {
             folder_silhouette(colors.info, colors.strong, THUMB_HEIGHT).into_any_element()
         } else if has_thumbnail(&tile.name) {
-            photo_thumbnail(path.clone(), &tile.name, &colors)
+            photo_thumbnail(path.clone(), tile.modified, &tile.name, &colors)
         } else {
             file_glyph_element(file_glyph(&tile.name), colors.muted)
         };
@@ -561,6 +576,14 @@ fn render_grid_row(
                 .copied()
                 .flatten()
                 .map(util::format_item_count)
+        } else if in_recent {
+            // Where the file lives; its size is in the details panel.
+            tile.origin.as_deref().map(|folder| {
+                folder.file_name().map_or_else(
+                    || folder.to_string_lossy().into_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            })
         } else {
             tile.size.map(format_bytes)
         };

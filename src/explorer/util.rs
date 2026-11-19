@@ -99,7 +99,7 @@ const MAX_FOLDER_CRUMBS: usize = 4;
 
 /// The breadcrumbs of `location`: `Home` when under `home`, else `/`, then
 /// one segment per folder, collapsing the leading folders into an ellipsis
-/// beyond [`MAX_FOLDER_CRUMBS`]. The Trash is one segment. Targets keep the
+/// beyond [`MAX_FOLDER_CRUMBS`]. The Trash and Recent are one segment. Targets keep the
 /// raw path components; labels are lossy.
 pub(crate) fn breadcrumbs(
     location: &fileflux::core::Location,
@@ -114,6 +114,13 @@ pub(crate) fn breadcrumbs(
                 label: "Home Trash".to_owned(),
                 kind: CrumbKind::Folder,
                 target: Location::Trash,
+            }];
+        }
+        Location::Recent => {
+            return vec![Crumb {
+                label: "Recent".to_owned(),
+                kind: CrumbKind::Folder,
+                target: Location::Recent,
             }];
         }
         Location::Directory(path) => path,
@@ -434,6 +441,10 @@ mod tests {
         assert_eq!(
             shape(breadcrumbs(&Location::Trash, Some(home))),
             [("Home Trash".to_owned(), CrumbKind::Folder, Location::Trash)]
+        );
+        assert_eq!(
+            shape(breadcrumbs(&Location::Recent, Some(home))),
+            [("Recent".to_owned(), CrumbKind::Folder, Location::Recent)]
         );
     }
 

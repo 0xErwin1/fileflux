@@ -333,6 +333,7 @@ fn location_text(location: &Location) -> String {
     match location {
         Location::Directory(path) => path.to_string_lossy().into_owned(),
         Location::Trash => "Trash".to_owned(),
+        Location::Recent => "Recent".to_owned(),
     }
 }
 
@@ -547,7 +548,11 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
     }
     match &entry.origin {
         Some(origin) => rows.push(Fact::new(
-            "Original location",
+            if this.tab().state.current() == &Location::Recent {
+                "Folder"
+            } else {
+                "Original location"
+            },
             wrappable(&origin.to_string_lossy()),
         )),
         None => rows.push(Fact::new("Path", wrappable(&entry.path.to_string_lossy()))),

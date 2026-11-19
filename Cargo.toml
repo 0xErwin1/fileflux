@@ -44,6 +44,14 @@ serde = { version = "=1.0.229", default-features = false, features = ["derive", 
 toml = { version = "=1.2.1", default-features = false, features = ["std", "serde", "parse", "display"] }
 # The `lsblk -J` reader; the version is the one already in the lock through the GPUI stack.
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+# The recent-files list and the thumbnail cache read desktop-standard files
+# with crates the lock already holds through the GPUI stack, at the locked
+# versions: quick-xml for `recently-used.xbel`, md-5 for the thumbnail file
+# name (the md5 of the file's URI) and png for the `tEXt` chunks that tie a
+# thumbnail to its source.
+quick-xml = { version = "=0.41.0", default-features = false }
+md-5 = { version = "=0.10.6", default-features = false }
+png = { version = "=0.18.1", default-features = false }
 
 [lints.rust]
 unsafe_code = "deny"

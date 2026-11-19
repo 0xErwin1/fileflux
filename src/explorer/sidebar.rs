@@ -107,7 +107,8 @@ fn section_label(id: &'static str, text: &str, cx: &App) -> Stateful<Div> {
         .child(text.to_owned())
 }
 
-/// The Places section: Home, the user directories and the scoped Trash.
+/// The Places section: Home, the user directories, Recent and the scoped
+/// Trash.
 fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let colors = bolt::colors(cx);
     let mut section = div().flex_none().flex().flex_col();
@@ -147,6 +148,18 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
             cx,
         ));
     }
+    section = section.child(nav_row(
+        "place-recent".to_owned(),
+        "Recent",
+        this.recent_file
+            .as_ref()
+            .map_or_else(String::new, |file| file.to_string_lossy().into_owned()),
+        gpui_kit_assets::IconName::Clock,
+        &Location::Recent,
+        None,
+        this,
+        cx,
+    ));
     section.child(nav_row(
         "place-trash".to_owned(),
         "Home Trash",
@@ -530,10 +543,15 @@ fn row_shell(
             // Dropping on a row is dropping on its place: a folder, or the
             // Trash.
             let target = match location {
-                Location::Directory(path) => DropTarget::Folder(path.clone()),
-                Location::Trash => DropTarget::Trash,
+                Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
+                Location::Trash => Some(DropTarget::Trash),
+                // Nothing is dropped into the list of recent files.
+                Location::Recent => None,
             };
-            dnd::drop_target(row, target, &cx.entity().downgrade(), cx)
+            match target {
+                Some(target) => dnd::drop_target(row, target, &cx.entity().downgrade(), cx),
+                None => row,
+            }
         }
         None => row,
     };

@@ -1224,6 +1224,9 @@ pub(crate) enum MenuCommand {
     OpenInViewer,
     /// Open the single selected folder in a new background tab.
     OpenInNewTab,
+    /// Recent view: go to the folder that holds the single selected entry,
+    /// with the entry selected there.
+    OpenContainingFolder,
     /// Choose the application to open the single selected file with.
     OpenWith,
     Rename,
@@ -1538,6 +1541,42 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
     rows
 }
 
+/// The menu of the Recent view, from the folder view's `rows`: nothing is
+/// created or pasted into a list of files that live elsewhere, and one
+/// selected entry offers "Open containing folder".
+pub(crate) fn recent_menu_rows(rows: Vec<MenuRow>, selected: usize) -> Vec<MenuRow> {
+    let kept = |row: &MenuRow| {
+        !matches!(row, MenuRow::Item(spec) if matches!(
+            spec.command,
+            MenuCommand::NewFolder
+                | MenuCommand::NewFile
+                | MenuCommand::Paste
+                | MenuCommand::PasteIntoFolder
+                | MenuCommand::OpenTerminal
+                | MenuCommand::CopyFolderPath
+        ))
+    };
+    let mut shown: Vec<MenuRow> = Vec::with_capacity(rows.len() + 1);
+    for row in rows.into_iter().filter(kept) {
+        // A separator only ever sits between two items.
+        if row == MenuRow::Separator && matches!(shown.last(), None | Some(MenuRow::Separator)) {
+            continue;
+        }
+        let is_open = matches!(&row, MenuRow::Item(spec) if spec.command == MenuCommand::Open);
+        shown.push(row);
+        if is_open && selected == 1 {
+            shown.push(MenuRow::Item(MenuItemSpec::new(
+                MenuCommand::OpenContainingFolder,
+                "Open containing folder",
+            )));
+        }
+    }
+    if matches!(shown.last(), Some(MenuRow::Separator)) {
+        shown.pop();
+    }
+    shown
+}
+
 /// The title of the context menu: the single entry's name, "N items" for a
 /// multi-selection, or "<Folder> (this folder)" on the empty space.
 pub(crate) fn menu_title(selected: &[String], folder: &str) -> String {
@@ -1553,6 +1592,8 @@ pub(crate) fn menu_title(selected: &[String], folder: &str) -> String {
 pub(crate) struct SidebarTarget {
     /// The virtual Trash row.
     pub(crate) trash: bool,
+    /// The virtual Recent row: it only opens.
+    pub(crate) recent: bool,
     /// The row's folder is already a favorite.
     pub(crate) favorite: bool,
     /// Whether a terminal can be opened.
@@ -1573,6 +1614,9 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
         item(MenuCommand::Open, "Open", false),
         item(MenuCommand::OpenInNewTab, "Open in new tab", false),
     ];
+    if target.recent {
+        return rows;
+    }
     if target.trash {
         rows.extend([
             MenuRow::Separator,

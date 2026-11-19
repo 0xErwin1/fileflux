@@ -124,6 +124,7 @@ fn session_round_trip_keeps_tabs_views_arrangements_and_the_active_index() {
             ),
             SessionTab::directory(non_utf8, ViewMode::List, busy_arrangement()),
             SessionTab::trash(ViewMode::List, ArrangementPrefs::default()),
+            SessionTab::recent(ViewMode::Grid, ArrangementPrefs::default()),
         ],
     };
 
@@ -379,6 +380,7 @@ fn restore_opens_every_saved_tab_in_order_without_touching_the_filesystem() {
             tab(Path::new("/fx-nonexistent/a")),
             tab(Path::new("/fx-nonexistent/gone/deeper/still")),
             SessionTab::trash(ViewMode::Grid, ArrangementPrefs::default()),
+            SessionTab::recent(ViewMode::List, ArrangementPrefs::default()),
         ],
     };
     let restored = restore_session(&session, Some(Path::new("/home/u")));
@@ -395,6 +397,7 @@ fn restore_opens_every_saved_tab_in_order_without_touching_the_filesystem() {
             Location::Directory(PathBuf::from("/fx-nonexistent/a")),
             Location::Directory(PathBuf::from("/fx-nonexistent/gone/deeper/still")),
             Location::Trash,
+            Location::Recent,
         ]
     );
     assert!(restored.tabs.iter().all(|tab| tab.fell_back_from.is_none()));

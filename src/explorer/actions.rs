@@ -36,7 +36,7 @@ use super::ops::{
     menu_rows, move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command,
     rename_seed, rename_step, stem_range,
 };
-use super::ops::{SidebarTarget, menu_title, sidebar_menu_rows};
+use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
 use super::state::Transition;
 use super::tabs::{Affected, Placement, tabs_to_refresh};
@@ -1053,6 +1053,9 @@ impl Explorer {
             ),
         };
         let mut rows = menu_rows(&target);
+        if self.tab().state.current() == &Location::Recent {
+            rows = recent_menu_rows(rows, target.selected);
+        }
         let names: Vec<String> = self
             .selected_visible_paths()
             .iter()
@@ -1097,6 +1100,7 @@ impl Explorer {
         self.cancel_rename(window, cx);
         let mut rows = sidebar_menu_rows(&SidebarTarget {
             trash: location == Location::Trash,
+            recent: location == Location::Recent,
             favorite: self.favorites.contains(&location),
             terminal: self.terminal.is_some(),
         });
@@ -1302,6 +1306,7 @@ impl Explorer {
             MenuCommand::Arrange(_) | MenuCommand::Page(_) => {}
             MenuCommand::Open => self.open_selected(window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
+            MenuCommand::OpenContainingFolder => self.open_containing_folder(window, cx),
             MenuCommand::OpenInNewTab => self.open_selected_in_new_tab(window, cx),
             MenuCommand::OpenWith => self.open_with(window, cx),
             MenuCommand::Rename => self.start_rename(window, cx),
@@ -1578,6 +1583,23 @@ impl Explorer {
         }
     }
 
+    /// "Open containing folder" in the Recent view: goes to the folder of
+    /// the single selected file and selects the file there.
+    pub(crate) fn open_containing_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_visible_paths();
+        let [path] = selected.as_slice() else {
+            return;
+        };
+        let Some(folder) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        self.tab_mut().pending = Some(PendingSelect {
+            paths: vec![path.clone()],
+            rename: false,
+        });
+        self.navigate(Transition::Visit(Location::Directory(folder)), window, cx);
+    }
+
     /// "Open in viewer": the single selected image, even when it is not
     /// what Enter would open.
     pub(crate) fn open_in_viewer(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1626,7 +1648,7 @@ impl Explorer {
         let folder = match (folder, self.tab().state.current()) {
             (Some(folder), _) => folder,
             (None, Location::Directory(folder)) => folder.clone(),
-            (None, Location::Trash) => return,
+            (None, Location::Trash | Location::Recent) => return,
         };
         let command = terminal.command(&folder);
         self.launch(

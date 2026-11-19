@@ -178,7 +178,10 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     },
                 ))
                 .tooltip("Add or remove the current folder as a favorite")
-                .disabled(this.tab().state.current() == &Location::Trash)
+                .disabled(matches!(
+                    this.tab().state.current(),
+                    Location::Trash | Location::Recent
+                ))
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_favorite(cx);
                 })),
@@ -283,7 +286,7 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
         let target = crumb.target.clone();
         let drop = match &crumb.target {
             Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
-            Location::Trash => None,
+            Location::Trash | Location::Recent => None,
         };
         let mut segment = div()
             .id(("explorer-crumb", index))

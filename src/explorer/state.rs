@@ -126,7 +126,7 @@ impl Favorites {
     pub(crate) fn contains(&self, location: &Location) -> bool {
         match location {
             Location::Directory(path) => self.0.iter().any(|favorite| favorite.path == *path),
-            Location::Trash => false,
+            Location::Trash | Location::Recent => false,
         }
     }
 
@@ -360,9 +360,27 @@ impl ExplorerState {
         }
         let current = match self.nav.current() {
             Location::Directory(path) => Location::Directory(path.clone()),
-            Location::Trash => return None,
+            Location::Trash | Location::Recent => return None,
         };
         self.begin_scan(Transition::Visit(current), true, None)
+    }
+
+    /// The recently-used file changed. Returns the background re-read of
+    /// the Recent list when this tab shows it and no scan is pending; a scan
+    /// of the list in flight may have read the file before the change, so a
+    /// re-read is postponed until it commits
+    /// ([`Self::begin_deferred_op_refresh`]).
+    pub(crate) fn recent_changed(&mut self) -> Option<Scan> {
+        if let Some(pending) = &self.pending {
+            if pending.location == Location::Recent {
+                self.op_refresh_deferred = true;
+            }
+            return None;
+        }
+        if *self.nav.current() != Location::Recent {
+            return None;
+        }
+        self.begin_scan(Transition::Visit(Location::Recent), true, None)
     }
 
     /// The folder `folder` changed on disk. Returns the background re-read
@@ -389,7 +407,7 @@ impl ExplorerState {
     pub(crate) fn pending_directory(&self) -> Option<&Path> {
         match &self.pending.as_ref()?.location {
             Location::Directory(path) => Some(path),
-            Location::Trash => None,
+            Location::Trash | Location::Recent => None,
         }
     }
 
@@ -1023,7 +1041,7 @@ impl ExplorerState {
         }
         match self.nav.current() {
             Location::Directory(current) => Ok(Location::Directory(current.join(candidate))),
-            Location::Trash => Err(PathArgument::Unresolvable(
+            Location::Trash | Location::Recent => Err(PathArgument::Unresolvable(
                 "relative paths need a current directory".to_owned(),
             )),
         }
@@ -1811,6 +1829,11 @@ mod tests {
             "the Trash toggle is a no-op and keeps prior favorites"
         );
         assert!(!favorites.contains(&Location::Trash));
+
+        // Neither is the virtual Recent list.
+        flip(&mut favorites, &Location::Recent);
+        assert_eq!(paths(&favorites), [PathBuf::from("/fixture/b")]);
+        assert!(!favorites.contains(&Location::Recent));
     }
 
     #[test]
@@ -2195,6 +2218,29 @@ mod tests {
         assert_eq!(state.pending_directory(), None, "the Trash is no directory");
         assert!(state.commit(trash, listing(&[])));
         assert!(state.folder_changed(Path::new("/fixture")).is_none());
+        Ok(())
+    }
+
+    /// The recently-used file changing re-reads the Recent list, only when a
+    /// tab shows it and never over a scan in flight.
+    #[test]
+    fn a_change_of_the_recent_file_refreshes_only_a_shown_recent_list() -> TestResult {
+        let mut state = state();
+        assert!(state.recent_changed().is_none(), "a folder view ignores it");
+        let visit = state
+            .begin(Transition::Visit(Location::Recent))
+            .ok_or("scan")?;
+        assert_eq!(state.pending_directory(), None, "Recent is no directory");
+        assert!(
+            state.recent_changed().is_none(),
+            "a scan of the list is in flight"
+        );
+        assert!(state.commit(visit, listing(&[("a", EntryKind::File)])));
+        let again = state.recent_changed().ok_or("a re-read")?;
+        assert_eq!(again.location, Location::Recent);
+        assert!(again.live, "a refresh keeps the selection");
+        assert!(state.folder_changed(Path::new("/fixture")).is_none());
+        assert!(state.begin_live_refresh().is_none(), "a scan is pending");
         Ok(())
     }
 

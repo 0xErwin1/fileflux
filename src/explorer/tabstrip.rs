@@ -78,6 +78,7 @@ fn render_tab(
     let group: SharedString = format!("explorer-tab-group-{index}").into();
     let glyph = match location {
         Location::Trash => gpui_kit_assets::IconName::Trash,
+        Location::Recent => gpui_kit_assets::IconName::Clock,
         Location::Directory(_) => gpui_kit_assets::IconName::Folder,
     };
     let close_group = group.clone();
