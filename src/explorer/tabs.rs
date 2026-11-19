@@ -489,6 +489,7 @@ mod tests {
                 Listing {
                     entries: names.iter().map(|name| file(name)).collect(),
                     warnings: Vec::new(),
+                    ..Listing::default()
                 },
             )
         });

@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,8 +103,8 @@ pub(crate) struct SortSpec {
 impl Default for SortSpec {
     fn default() -> Self {
         Self {
-            key: SortKey::Name,
-            dir: SortDir::Ascending,
+            key: SortKey::Modified,
+            dir: SortDir::Descending,
             folders_first: true,
             natural: true,
         }
@@ -311,8 +312,9 @@ impl SizeRange {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum FilterChip {
     Category(FileCategory),
-    /// Hidden (dot) files are hidden.
-    NoHidden,
+    /// Hidden files are shown (they are hidden by default, so only the
+    /// shown state is a filter change worth a chip).
+    HiddenShown,
     Modified(DateRange),
     Size(SizeRange),
 }
@@ -321,7 +323,7 @@ impl FilterChip {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Category(category) => category.label(),
-            Self::NoHidden => "No hidden files",
+            Self::HiddenShown => "Hidden shown",
             Self::Modified(range) => range.label(),
             Self::Size(range) => range.label(),
         }
@@ -329,25 +331,43 @@ impl FilterChip {
 }
 
 /// The filters of a tab. All of them combine with AND, and with the name
-/// search. The default shows everything, hidden files included.
+/// search. The default hides hidden files (dotfiles and the names a folder's
+/// `.hidden` file lists) and filters nothing else.
 ///
 /// Folders have no byte size, so a size range never applies to them. A date
 /// range applies to folders only when `Folders` is the one chip selected;
 /// otherwise folders pass it.
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct Filters {
     /// The selected categories; none selected means every category.
     pub(crate) kinds: BTreeSet<FileCategory>,
-    /// Hide names starting with a dot.
+    /// Hide dotfiles and the names a `.hidden` file lists (Ctrl+H toggles).
     pub(crate) hide_hidden: bool,
     pub(crate) modified: Option<DateRange>,
     pub(crate) size: Option<SizeRange>,
 }
 
+impl Default for Filters {
+    fn default() -> Self {
+        Self {
+            kinds: BTreeSet::new(),
+            hide_hidden: true,
+            modified: None,
+            size: None,
+        }
+    }
+}
+
 impl Filters {
-    /// Nothing filters.
+    /// The filters a new tab starts with: nothing chosen, hidden files
+    /// hidden. No chip stands for this state.
     pub(crate) fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Whether every entry passes: hidden files shown and nothing chosen.
+    fn passes_everything(&self) -> bool {
+        !self.hide_hidden && self.kinds.is_empty() && self.modified.is_none() && self.size.is_none()
     }
 
     /// The active filters, in chip order.
@@ -356,7 +376,7 @@ impl Filters {
             .iter()
             .copied()
             .map(FilterChip::Category)
-            .chain(self.hide_hidden.then_some(FilterChip::NoHidden))
+            .chain((!self.hide_hidden).then_some(FilterChip::HiddenShown))
             .chain(self.modified.map(FilterChip::Modified))
             .chain(self.size.map(FilterChip::Size))
             .collect()
@@ -368,7 +388,7 @@ impl Filters {
             FilterChip::Category(category) => {
                 self.kinds.remove(&category);
             }
-            FilterChip::NoHidden => self.hide_hidden = false,
+            FilterChip::HiddenShown => self.hide_hidden = true,
             FilterChip::Modified(range) => {
                 if self.modified == Some(range) {
                     self.modified = None;
@@ -500,7 +520,7 @@ struct EntryKey {
     modified: Option<SystemTime>,
     category: FileCategory,
     is_dir: bool,
-    /// The name starts with a dot.
+    /// The name starts with a dot or a `.hidden` file lists it.
     hidden: bool,
     /// The name has an extension (possibly empty, as in `name.`).
     has_ext: bool,
@@ -640,6 +660,12 @@ impl ArrangeIndex {
     /// Indexes `entries`. Linear; blocking, so run it on the background
     /// executor, next to the scan that produced the listing.
     pub(crate) fn build(entries: &[Entry]) -> Self {
+        Self::build_hiding(entries, &BTreeSet::new())
+    }
+
+    /// [`Self::build`] where the names in `hidden_names` (a folder's
+    /// `.hidden` file) are hidden like dotfiles.
+    pub(crate) fn build_hiding(entries: &[Entry], hidden_names: &BTreeSet<OsString>) -> Self {
         let mut keys = Vec::with_capacity(entries.len());
         let mut display = Arena::with_capacity(entries.len());
         let mut lower = Arena::with_capacity(entries.len());
@@ -676,7 +702,8 @@ impl ArrangeIndex {
                 modified: entry.modified,
                 category: FileCategory::of_parts(&entry.name, is_dir, extension.as_deref()),
                 is_dir,
-                hidden: entry.name.as_encoded_bytes().first() == Some(&b'.'),
+                hidden: entry.name.as_encoded_bytes().first() == Some(&b'.')
+                    || hidden_names.contains(&entry.name),
                 has_ext: extension.is_some(),
             });
         }
@@ -1158,7 +1185,7 @@ pub(crate) struct FilterPass {
 
 impl FilterPass {
     fn compute(index: &ArrangeIndex, filters: &Filters, window: Option<&DateWindow>) -> Self {
-        let bits = if filters.is_default() {
+        let bits = if filters.passes_everything() {
             Bits::full(index.len())
         } else {
             let admission = Admission::new(filters, window);
@@ -1507,6 +1534,7 @@ impl ArrangeCache {
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{by_name, shown};
     use super::*;
     use chrono::FixedOffset;
     use fileflux::core::EntryKind;
@@ -1807,9 +1835,10 @@ mod tests {
     #[test]
     fn header_clicks_set_or_flip_and_keep_the_toggles() {
         let spec = SortSpec {
+            key: SortKey::Name,
+            dir: SortDir::Ascending,
             folders_first: false,
             natural: false,
-            ..SortSpec::default()
         };
         let flipped = spec.clicked(SortKey::Name);
         assert_eq!(
@@ -1824,14 +1853,36 @@ mod tests {
     }
 
     #[test]
-    fn the_default_arrangement_shows_everything_by_natural_name() -> TestResult {
+    fn the_default_arrangement_is_newest_first_with_hidden_files_hidden() -> TestResult {
         let arrangement = Arrangement::default();
+        assert_eq!(
+            (arrangement.sort.key, arrangement.sort.dir),
+            (SortKey::Modified, SortDir::Descending)
+        );
         assert!(arrangement.filters.is_default());
         assert!(arrangement.sort.folders_first && arrangement.sort.natural);
-        assert!(!arrangement.filters.hide_hidden, "hidden files show today");
-        assert!(arrangement.filters.chips().is_empty());
-        let list = fixture()?;
-        assert_eq!(arranged(&list, &arrangement, "")?.len(), list.len());
+        assert!(arrangement.filters.hide_hidden, "hidden files are hidden");
+        assert!(
+            arrangement.filters.chips().is_empty(),
+            "no chip in the default state"
+        );
+        let list = mixed()?;
+        assert_eq!(
+            arranged(&list, &arrangement, "")?,
+            ["pics", "a.png", "b.PNG", "c.mp4", "d.zip", "e.rs"],
+            "folders first, then newest first, no .config or .hidden.txt"
+        );
+        // Showing them adds the one chip, and removing it hides them again.
+        let mut filters = shown();
+        assert_eq!(filters.chips(), [FilterChip::HiddenShown]);
+        assert_eq!(FilterChip::HiddenShown.label(), "Hidden shown");
+        filters.remove(FilterChip::HiddenShown);
+        assert!(filters.is_default() && filters.chips().is_empty());
+        let everything = Arrangement {
+            filters: shown(),
+            ..Arrangement::default()
+        };
+        assert_eq!(arranged(&list, &everything, "")?.len(), list.len());
         Ok(())
     }
 
@@ -1851,7 +1902,7 @@ mod tests {
     fn with(filters: Filters) -> Arrangement {
         Arrangement {
             filters,
-            ..Arrangement::default()
+            ..by_name()
         }
     }
 
@@ -1861,7 +1912,7 @@ mod tests {
         let kinds = |set: &[FileCategory]| {
             with(Filters {
                 kinds: set.iter().copied().collect(),
-                ..Filters::default()
+                ..shown()
             })
         };
         assert_eq!(
@@ -1881,7 +1932,7 @@ mod tests {
                 &list,
                 &with(Filters {
                     hide_hidden: true,
-                    ..Filters::default()
+                    ..shown()
                 }),
                 ""
             )?,
@@ -1890,7 +1941,7 @@ mod tests {
         let date = |range| {
             with(Filters {
                 modified: Some(range),
-                ..Filters::default()
+                ..shown()
             })
         };
         assert_eq!(
@@ -1916,7 +1967,7 @@ mod tests {
         let size = |range| {
             with(Filters {
                 size: Some(range),
-                ..Filters::default()
+                ..shown()
             })
         };
         assert_eq!(
@@ -1944,14 +1995,14 @@ mod tests {
         let only_folders = with(Filters {
             kinds: BTreeSet::from([FileCategory::Folders]),
             modified: Some(DateRange::Today),
-            ..Filters::default()
+            ..shown()
         });
         assert_eq!(arranged(&list, &only_folders, "")?, ["pics"]);
         // A byte-size range never applies to folders, even then.
         let only_folders_sized = with(Filters {
             kinds: BTreeSet::from([FileCategory::Folders]),
             size: Some(SizeRange::Over1Gb),
-            ..Filters::default()
+            ..shown()
         });
         assert_eq!(
             arranged(&list, &only_folders_sized, "")?,
@@ -1972,7 +2023,7 @@ mod tests {
         assert_eq!(arranged(&list, &combined, "")?, ["b.PNG"]);
         let loose = with(Filters {
             kinds: BTreeSet::from([FileCategory::Images, FileCategory::Videos]),
-            ..Filters::default()
+            ..shown()
         });
         assert_eq!(arranged(&list, &loose, "PNG")?, ["a.png", "b.PNG"]);
         assert_eq!(arranged(&list, &loose, "b.")?, ["b.PNG"]);
@@ -1989,11 +2040,11 @@ mod tests {
         for filters in [
             Filters {
                 modified: Some(DateRange::Older),
-                ..Filters::default()
+                ..shown()
             },
             Filters {
                 size: Some(SizeRange::Under1Mb),
-                ..Filters::default()
+                ..shown()
             },
         ] {
             assert!(arranged(&unknown, &with(filters), "")?.is_empty());
@@ -2050,20 +2101,14 @@ mod tests {
     fn chips_name_the_active_filters_and_remove_one_by_one() {
         let mut filters = Filters {
             kinds: BTreeSet::from([FileCategory::Videos, FileCategory::Images]),
-            hide_hidden: true,
+            hide_hidden: false,
             modified: Some(DateRange::Last7Days),
             size: Some(SizeRange::Over1Gb),
         };
         let labels: Vec<&str> = filters.chips().into_iter().map(FilterChip::label).collect();
         assert_eq!(
             labels,
-            [
-                "Images",
-                "Videos",
-                "No hidden files",
-                "Last 7 days",
-                "> 1 GB"
-            ]
+            ["Images", "Videos", "Hidden shown", "Last 7 days", "> 1 GB"]
         );
         filters.remove(FilterChip::Category(FileCategory::Images));
         filters.remove(FilterChip::Size(SizeRange::Over1Gb));
@@ -2073,11 +2118,11 @@ mod tests {
             filters.chips(),
             [
                 FilterChip::Category(FileCategory::Videos),
-                FilterChip::NoHidden,
+                FilterChip::HiddenShown,
                 FilterChip::Modified(DateRange::Last7Days)
             ]
         );
-        filters.remove(FilterChip::NoHidden);
+        filters.remove(FilterChip::HiddenShown);
         filters.remove(FilterChip::Modified(DateRange::Last7Days));
         filters.remove(FilterChip::Category(FileCategory::Videos));
         assert!(filters.is_default());
@@ -2104,7 +2149,7 @@ mod tests {
         arrangement.apply(ArrangeCommand::ToggleSize(SizeRange::Over1Gb));
         arrangement.apply(ArrangeCommand::ToggleHidden);
         assert_eq!(arrangement.filters.modified, Some(DateRange::Older));
-        assert!(arrangement.filters.hide_hidden);
+        assert!(!arrangement.filters.hide_hidden, "Ctrl+H shows them");
         assert_eq!(arrangement.filters.chips().len(), 4);
         arrangement.apply(ArrangeCommand::ToggleDate(DateRange::Older));
         assert_eq!(
@@ -2130,6 +2175,27 @@ mod tests {
 #[cfg(test)]
 mod fixtures {
     use super::*;
+
+    /// Hidden files shown, nothing else chosen: what the filter fixtures
+    /// below were written against.
+    pub(super) fn shown() -> Filters {
+        Filters {
+            hide_hidden: false,
+            ..Filters::default()
+        }
+    }
+
+    /// The old default: by name ascending, hidden files shown.
+    pub(super) fn by_name() -> Arrangement {
+        Arrangement {
+            sort: SortSpec {
+                key: SortKey::Name,
+                dir: SortDir::Ascending,
+                ..SortSpec::default()
+            },
+            filters: shown(),
+        }
+    }
     use chrono::FixedOffset;
     use fileflux::core::EntryKind;
     use fileflux::core::fs::filtered_indices;
@@ -2430,7 +2496,8 @@ mod equivalence {
     use std::path::Path;
 
     use super::fixtures::{
-        Res, Rng, counts_for, now, random_arrangement, random_query, reference, tricky_listing,
+        Res, Rng, by_name, counts_for, now, random_arrangement, random_query, reference,
+        tricky_listing,
     };
     use super::*;
 
@@ -2502,7 +2569,7 @@ mod equivalence {
         let mut entries = tricky_listing(&mut rng, 400)?;
         fileflux::core::fs::sort_entries(&mut entries);
         let counts = FolderCounts::new();
-        let arrangement = Arrangement::default();
+        let arrangement = by_name();
         for query in ["", "a", "b1"] {
             assert_eq!(
                 arrangement.arranged(&entries, query, &counts, &at),
@@ -2765,7 +2832,7 @@ mod equivalence {
 /// The generation guard around the pipeline.
 #[cfg(test)]
 mod guard {
-    use super::fixtures::{Res, Rng, now, tricky_listing};
+    use super::fixtures::{Res, Rng, by_name, now, tricky_listing};
     use super::*;
 
     fn inputs(
@@ -2774,13 +2841,7 @@ mod guard {
         counts: &Arc<FolderCounts>,
         at: &DateTime<chrono::FixedOffset>,
     ) -> ArrangeInputs {
-        ArrangeInputs::new(
-            epoch,
-            Arrangement::default(),
-            query.to_owned(),
-            Arc::clone(counts),
-            at,
-        )
+        ArrangeInputs::new(epoch, by_name(), query.to_owned(), Arc::clone(counts), at)
     }
 
     #[test]

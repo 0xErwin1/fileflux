@@ -166,6 +166,7 @@ mod tests {
             can_paste: true,
             folder_selected: false,
             single_file: selected == 1,
+            folder_favorite: false,
         }
     }
 
@@ -188,7 +189,12 @@ mod tests {
         );
         assert_eq!(
             checked_labels(&rows),
-            ["Name", "Ascending", "Folders first", "Natural number order"]
+            [
+                "Modified",
+                "Descending",
+                "Folders first",
+                "Natural number order"
+            ]
         );
         assert!(matches!(rows.first(), Some(MenuRow::Header("Sort by"))));
 
@@ -230,8 +236,8 @@ mod tests {
         );
         assert_eq!(
             checked_labels(&rows),
-            ["Show hidden files"],
-            "shown by default"
+            Vec::<&str>::new(),
+            "hidden files are hidden by default"
         );
         let hidden = row(&rows, "Show hidden files");
         assert_eq!(hidden.and_then(|spec| spec.shortcut), Some("Ctrl+H"));
@@ -253,7 +259,13 @@ mod tests {
         let rows = filter_rows(&arrangement, false);
         assert_eq!(
             checked_labels(&rows),
-            ["Images", "Code", "Last 7 days", "> 1 GB"]
+            [
+                "Show hidden files",
+                "Images",
+                "Code",
+                "Last 7 days",
+                "> 1 GB"
+            ]
         );
         assert_eq!(
             row(&rows, "Clear all filters").map(|spec| spec.enabled),
@@ -289,8 +301,8 @@ mod tests {
             // Already-default choices and "clear" have nothing to change.
             let is_default_choice = matches!(
                 command,
-                ArrangeCommand::SortBy(SortKey::Name)
-                    | ArrangeCommand::SetDir(SortDir::Ascending)
+                ArrangeCommand::SortBy(SortKey::Modified)
+                    | ArrangeCommand::SetDir(SortDir::Descending)
                     | ArrangeCommand::ClearFilters
             );
             if !is_default_choice {

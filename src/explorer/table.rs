@@ -1029,8 +1029,12 @@ mod tests {
     /// ascending. Unknown columns map to no key.
     #[test]
     fn header_clicks_set_or_flip_the_sort() {
-        let name_asc = SortSpec::default();
-        assert_eq!(name_asc, spec(SortKey::Name, SortDir::Ascending));
+        let name_asc = spec(SortKey::Name, SortDir::Ascending);
+        assert_eq!(
+            SortSpec::default(),
+            spec(SortKey::Modified, SortDir::Descending),
+            "the default sort is the newest first"
+        );
         assert_eq!(
             name_asc.clicked(SortKey::Name),
             spec(SortKey::Name, SortDir::Descending)

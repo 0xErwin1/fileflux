@@ -460,7 +460,7 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     let shown = this
         .tab()
         .state
-        .is_filtering()
+        .shows_fewer_than_listed()
         .then(|| this.tab().state.visible_shared().len());
     let items = util::items_label(total, shown);
     vec![

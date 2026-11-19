@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use fileflux::core::Location;
+use fileflux::core::bookmarks::{self, Bookmark};
 use fileflux::core::kinds::FileCategory;
 use fileflux::core::settings::{
     self, ArrangementPrefs, CategoryPref, DatePref, Preferences, Restored, Session, Settings,
@@ -484,7 +485,13 @@ pub(crate) fn restore_fallback_notice(count: usize) -> String {
 pub(crate) struct Startup {
     /// The preferences, clamped to sane values.
     pub(crate) preferences: Preferences,
-    pub(crate) favorites: Vec<PathBuf>,
+    /// The favorites: the local entries of the GTK bookmarks file.
+    pub(crate) favorites: Vec<Bookmark>,
+    /// Favorites that could not move to the bookmarks file yet; they stay in
+    /// `settings.toml` and show with the others.
+    pub(crate) legacy_favorites: Vec<PathBuf>,
+    /// The bookmarks file, when `$HOME` or `$XDG_CONFIG_HOME` gives one.
+    pub(crate) bookmarks_path: Option<PathBuf>,
     /// The tabs to reopen; `None` opens the command-line path (or home).
     pub(crate) restored: Option<Restored>,
     pub(crate) persistence: Persistence,
@@ -505,9 +512,14 @@ impl Startup {
             home.as_deref(),
             std::env::var_os("XDG_STATE_HOME").as_deref(),
         );
+        let bookmarks_path = bookmarks::bookmarks_path(
+            home.as_deref(),
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        );
         Self::load_from(
             settings_path,
             session_path,
+            bookmarks_path,
             start,
             home.as_deref().map(Path::new),
             SystemTime::now(),
@@ -520,20 +532,67 @@ impl Startup {
     pub(crate) fn load_from(
         settings_path: Option<PathBuf>,
         session_path: Option<PathBuf>,
+        bookmarks_path: Option<PathBuf>,
         start: Option<&Path>,
         home: Option<&Path>,
         now: SystemTime,
     ) -> Self {
         let mut notices = Vec::new();
 
-        let (settings, settings_writable, settings_heal) = match &settings_path {
+        let (mut settings, settings_writable, settings_rewrite) = match &settings_path {
             Some(path) => {
                 let loaded = settings::load_settings(path, now);
                 notices.extend(loaded.notice);
-                (loaded.value, loaded.writable, loaded.heal)
+                (
+                    loaded.value,
+                    loaded.writable,
+                    loaded.heal || loaded.migrated,
+                )
             }
             None => (Settings::default(), false, false),
         };
+
+        // Version 1 kept the favorites in the settings: they move to the
+        // bookmarks once, and the settings are rewritten without them. When
+        // the move fails they stay where they are and are retried next launch.
+        let mut legacy_favorites = std::mem::take(&mut settings.favorites);
+        let mut settings_rewrite = settings_rewrite;
+        if let (Some(path), true, false) = (
+            &bookmarks_path,
+            settings_writable,
+            legacy_favorites.is_empty(),
+        ) {
+            match bookmarks::merge(path, &legacy_favorites) {
+                Ok(_) => {
+                    legacy_favorites.clear();
+                    settings_rewrite = true;
+                }
+                Err(error) => notices.push(format!(
+                    "Could not move the favorites to the GTK bookmarks ({error}); \
+                     keeping them in the settings"
+                )),
+            }
+        }
+        // Not writable settings (newer or unreadable) keep their favorites
+        // to themselves: nothing is shown from them and nothing is touched.
+        if !settings_writable {
+            legacy_favorites.clear();
+        }
+        let mut favorites = match &bookmarks_path {
+            Some(path) => bookmarks::read(path).unwrap_or_else(|error| {
+                notices.push(format!("Could not read the GTK bookmarks ({error})"));
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        for path in &legacy_favorites {
+            if !favorites.iter().any(|known| known.path == *path) {
+                favorites.push(Bookmark {
+                    path: path.clone(),
+                    label: None,
+                });
+            }
+        }
 
         // A command-line path means "just this folder": the session is
         // neither read nor restored nor overwritten.
@@ -542,7 +601,11 @@ impl Startup {
             Some(path) if uses_session => {
                 let loaded = settings::load_session(path, now);
                 notices.extend(loaded.notice);
-                (loaded.value, loaded.writable, loaded.heal)
+                (
+                    loaded.value,
+                    loaded.writable,
+                    loaded.heal || loaded.migrated,
+                )
             }
             _ => (Session::default(), false, false),
         };
@@ -562,14 +625,19 @@ impl Startup {
 
         Self {
             preferences: settings.preferences.clone().sanitized(),
-            favorites: settings.favorites.clone(),
+            favorites,
+            legacy_favorites: legacy_favorites.clone(),
+            bookmarks_path,
             restored,
             persistence: Persistence::new(
                 settings_path.filter(|_| settings_writable),
                 session_path.filter(|_| session_writable && uses_session),
                 // An invalid file kept aside is rewritten at the first tick:
                 // `None` never matches the live state.
-                (!settings_heal).then_some(settings),
+                (!settings_rewrite).then_some(Settings {
+                    favorites: legacy_favorites,
+                    ..settings
+                }),
                 (!session_heal).then_some(session),
             ),
             notices,
@@ -956,6 +1024,7 @@ mod tests {
         Startup::load_from(
             Some(dir.join("config/settings.toml")),
             Some(dir.join("state/session.toml")),
+            Some(dir.join("config/gtk-3.0/bookmarks")),
             start,
             Some(Path::new("/home/u")),
             SystemTime::UNIX_EPOCH,
@@ -1058,6 +1127,7 @@ mod tests {
         let mut second = Startup::load_from(
             Some(scratch.0.join("config/settings.toml")),
             Some(scratch.0.join("state/session.toml")),
+            Some(scratch.0.join("config/gtk-3.0/bookmarks")),
             None,
             Some(Path::new("/home/u")),
             SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
@@ -1076,6 +1146,148 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    // --- favorites come from the GTK bookmarks ------------------------------------
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("dir creates");
+        std::fs::write(path, text).expect("fixture writes");
+    }
+
+    fn favorite_paths(startup: &Startup) -> Vec<PathBuf> {
+        startup
+            .favorites
+            .iter()
+            .map(|bookmark| bookmark.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_favorites_are_the_local_bookmarks_with_their_labels() {
+        let scratch = Scratch::new("bookmarks-read");
+        write(
+            &scratch.0.join("config/gtk-3.0/bookmarks"),
+            "file:///srv/a Alpha\nsftp://h/x Remote\nfile:///srv/b\n",
+        );
+        write(&scratch.0.join("config/settings.toml"), "version = 2\n");
+        let startup = load(&scratch.0, None);
+        assert_eq!(
+            favorite_paths(&startup),
+            [PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]
+        );
+        assert_eq!(startup.favorites[0].label.as_deref(), Some("Alpha"));
+        assert!(startup.legacy_favorites.is_empty());
+        assert!(startup.notices.is_empty(), "{:?}", startup.notices);
+    }
+
+    #[test]
+    fn a_missing_bookmarks_file_means_no_favorites_and_no_notice() {
+        let scratch = Scratch::new("bookmarks-missing");
+        let startup = load(&scratch.0, None);
+        assert!(startup.favorites.is_empty());
+        assert!(startup.notices.is_empty(), "{:?}", startup.notices);
+        assert!(
+            !scratch.0.join("config/gtk-3.0").exists(),
+            "reading creates nothing"
+        );
+    }
+
+    #[test]
+    fn version_1_favorites_move_to_the_bookmarks_once_and_leave_the_settings() {
+        let scratch = Scratch::new("bookmarks-migrate");
+        let bookmarks = scratch.0.join("config/gtk-3.0/bookmarks");
+        let original = "# mine\nfile:///srv/b Bee\nsftp://h/x Remote\n";
+        write(&bookmarks, original);
+        write(
+            &scratch.0.join("config/settings.toml"),
+            "version = 1\nfavorites = [\"/srv/a\", \"/srv/b\", \"/srv/c d\"]\n",
+        );
+
+        let mut first = load(&scratch.0, None);
+
+        assert_eq!(
+            std::fs::read_to_string(&bookmarks).expect("reads"),
+            format!("{original}file:///srv/a\nfile:///srv/c%20d\n"),
+            "missing ones appended in order, the rest untouched"
+        );
+        assert_eq!(
+            favorite_paths(&first),
+            [
+                PathBuf::from("/srv/b"),
+                PathBuf::from("/srv/a"),
+                PathBuf::from("/srv/c d")
+            ]
+        );
+        assert!(first.legacy_favorites.is_empty());
+        assert!(first.notices.is_empty(), "{:?}", first.notices);
+
+        // The settings file is rewritten at the first tick without them.
+        first_tick(&mut first);
+        let text = std::fs::read_to_string(scratch.0.join("config/settings.toml")).expect("reads");
+        assert!(!text.contains("favorites"), "{text}");
+        assert!(text.contains("version = 2"), "{text}");
+
+        // The next launch changes nothing and finds the same favorites.
+        let second = load(&scratch.0, None);
+        assert_eq!(favorite_paths(&second), favorite_paths(&first));
+        assert_eq!(
+            std::fs::read_to_string(&bookmarks).expect("reads"),
+            format!("{original}file:///srv/a\nfile:///srv/c%20d\n")
+        );
+    }
+
+    #[test]
+    fn favorites_stay_in_the_settings_when_the_bookmarks_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = Scratch::new("bookmarks-unwritable");
+        let gtk = scratch.0.join("config/gtk-3.0");
+        std::fs::create_dir_all(&gtk).expect("dir creates");
+        std::fs::set_permissions(&gtk, std::fs::Permissions::from_mode(0o500))
+            .expect("permissions set");
+        let can_still_write = std::fs::write(gtk.join("probe"), "").is_ok();
+        write(
+            &scratch.0.join("config/settings.toml"),
+            "version = 1\nfavorites = [\"/srv/a\"]\n",
+        );
+
+        let startup = load(&scratch.0, None);
+        std::fs::set_permissions(&gtk, std::fs::Permissions::from_mode(0o700))
+            .expect("permissions restored");
+        if can_still_write {
+            return; // running as root: a read-only directory proves nothing
+        }
+        assert_eq!(startup.legacy_favorites, [PathBuf::from("/srv/a")]);
+        assert_eq!(favorite_paths(&startup), [PathBuf::from("/srv/a")]);
+        assert!(
+            startup.notices[0].contains("favorites"),
+            "{:?}",
+            startup.notices
+        );
+    }
+
+    #[test]
+    fn a_settings_file_that_must_not_be_written_does_not_touch_the_bookmarks() {
+        let scratch = Scratch::new("bookmarks-newer");
+        write(
+            &scratch.0.join("config/settings.toml"),
+            "version = 9\nfavorites = [\"/srv/a\"]\n",
+        );
+        let startup = load(&scratch.0, None);
+        assert!(startup.favorites.is_empty());
+        assert!(!scratch.0.join("config/gtk-3.0/bookmarks").exists());
+    }
+
+    #[test]
+    fn version_2_settings_never_re_add_a_favorite_removed_from_the_bookmarks() {
+        let scratch = Scratch::new("bookmarks-removed");
+        write(
+            &scratch.0.join("config/gtk-3.0/bookmarks"),
+            "file:///srv/b\n",
+        );
+        write(&scratch.0.join("config/settings.toml"), "version = 2\n");
+        let startup = load(&scratch.0, None);
+        assert_eq!(favorite_paths(&startup), [PathBuf::from("/srv/b")]);
     }
 
     #[test]

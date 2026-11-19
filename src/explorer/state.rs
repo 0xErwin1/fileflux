@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Local, TimeZone};
 
+use fileflux::core::bookmarks::Bookmark;
 use fileflux::core::navigation::Navigation;
 use fileflux::core::{Entry, Listing, Location};
 
@@ -97,47 +98,52 @@ pub(crate) fn retain_existing(
         .collect()
 }
 
-/// The favorites, shared by every tab of the window: in the order they were
-/// added, unique, never the virtual Trash. They are saved in the settings
-/// file by [`super::persist`]; this type only holds them.
+/// The favorites, shared by every tab of the window: the local entries of the
+/// GTK bookmarks file, in its order, unique, never the virtual Trash. The
+/// file itself is read and written by [`fileflux::core::bookmarks`]; this
+/// type holds what the sidebar shows between those reads.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Favorites(Vec<PathBuf>);
+pub(crate) struct Favorites(Vec<Bookmark>);
 
 impl Favorites {
-    /// The saved favorites, in their order, without repeats.
-    pub(crate) fn from_paths(paths: Vec<PathBuf>) -> Self {
-        let mut unique: Vec<PathBuf> = Vec::with_capacity(paths.len());
-        for path in paths {
-            if !unique.contains(&path) {
-                unique.push(path);
+    /// The bookmarks, in their order, without repeats of one folder.
+    pub(crate) fn from_bookmarks(bookmarks: Vec<Bookmark>) -> Self {
+        let mut unique: Vec<Bookmark> = Vec::with_capacity(bookmarks.len());
+        for bookmark in bookmarks {
+            if !unique.iter().any(|known| known.path == bookmark.path) {
+                unique.push(bookmark);
             }
         }
         Self(unique)
     }
 
-    /// The favorites, in the order they were added.
-    pub(crate) fn list(&self) -> &[PathBuf] {
+    /// The favorites, in the bookmarks file's order.
+    pub(crate) fn bookmarks(&self) -> &[Bookmark] {
         &self.0
     }
 
     /// Whether `location` is a favorite directory.
     pub(crate) fn contains(&self, location: &Location) -> bool {
         match location {
-            Location::Directory(path) => self.0.contains(path),
+            Location::Directory(path) => self.0.iter().any(|favorite| favorite.path == *path),
             Location::Trash => false,
         }
     }
 
-    /// Adds the directory `location` or removes it again. The virtual Trash
-    /// is never favorited.
-    pub(crate) fn toggle(&mut self, location: &Location) {
+    /// Makes the directory `location` a favorite (without a label) or not;
+    /// the virtual Trash never is.
+    pub(crate) fn set(&mut self, location: &Location, favorite: bool) {
         let Location::Directory(path) = location else {
             return;
         };
-        if self.0.contains(path) {
-            self.0.retain(|favorite| favorite != path);
-        } else {
-            self.0.push(path.clone());
+        let present = self.contains(location);
+        if favorite && !present {
+            self.0.push(Bookmark {
+                path: path.clone(),
+                label: None,
+            });
+        } else if !favorite && present {
+            self.0.retain(|known| known.path != *path);
         }
     }
 }
@@ -512,6 +518,16 @@ impl ExplorerState {
         self.listing = listing;
         self.listing_epoch += 1;
         let index = index.filter(|index| index.len() == self.listing.entries.len());
+        // A folder with a `.hidden` file needs its names in the index; the
+        // lazy build of the cache would not know them.
+        let index = index.or_else(|| {
+            (!self.listing.hidden_names.is_empty()).then(|| {
+                Arc::new(ArrangeIndex::build_hiding(
+                    &self.listing.entries,
+                    &self.listing.hidden_names,
+                ))
+            })
+        });
         let epoch = self.listing_epoch;
         self.arrange.with(|cache| cache.reset(epoch, index));
         if scan.live {
@@ -695,6 +711,15 @@ impl ExplorerState {
     /// The name search or a filter is narrowing the listing.
     pub(crate) fn is_filtering(&self) -> bool {
         !self.query.is_empty() || !self.arrangement.filters.is_default()
+    }
+
+    /// The counts read "N of M": the search or a filter narrows the listing,
+    /// or the default hides some hidden files (which has no chip, so the
+    /// count is what tells the user entries are missing).
+    pub(crate) fn shows_fewer_than_listed(&self) -> bool {
+        self.is_filtering()
+            || (self.arrangement.filters.hide_hidden
+                && self.visible_shared().len() < self.listing.entries.len())
     }
 
     /// The search or the filters hide every entry of a folder that has
@@ -1037,6 +1062,7 @@ mod tests {
                 .map(|(name, kind)| entry(name, *kind))
                 .collect(),
             warnings: Vec::new(),
+            ..Listing::default()
         }
     }
 
@@ -1083,7 +1109,8 @@ mod tests {
             scan,
             Listing {
                 entries: files,
-                warnings: Vec::new()
+                warnings: Vec::new(),
+                ..Listing::default()
             }
         ));
         state.set_view(View::List);
@@ -1213,7 +1240,8 @@ mod tests {
             scan,
             Listing {
                 entries,
-                warnings: Vec::new()
+                warnings: Vec::new(),
+                ..Listing::default()
             }
         ));
         Ok(state)
@@ -1228,12 +1256,11 @@ mod tests {
             state.set_view(view);
             assert_eq!(
                 displayed(&state),
-                ["pics", ".secret.png", "IMG_2.png", "IMG_10.png", "todo.txt"],
-                "{view:?}"
+                ["pics", "IMG_2.png", "IMG_10.png", "todo.txt"],
+                "{view:?}: hidden files are hidden by default"
             );
         }
         state.arrange(ArrangeCommand::ToggleCategory(FileCategory::Images));
-        state.arrange(ArrangeCommand::ToggleHidden);
         for view in [View::Grid, View::List] {
             state.set_view(view);
             assert_eq!(displayed(&state), ["IMG_2.png", "IMG_10.png"], "{view:?}");
@@ -1248,7 +1275,6 @@ mod tests {
         use crate::explorer::arrange::ArrangeCommand;
         let mut state = mixed_state()?;
         state.select_only(Path::new("/fixture/todo.txt"));
-        state.arrange(ArrangeCommand::ToggleHidden);
         assert_eq!(
             displayed(&state),
             ["pics", "IMG_2.png", "IMG_10.png", "todo.txt"]
@@ -1315,7 +1341,11 @@ mod tests {
         assert!(!state.folder_is_empty());
         state.arrange(ArrangeCommand::ClearFilters);
         assert!(!state.is_filtering());
-        assert_eq!(state.visible_indices().len(), 5);
+        assert_eq!(
+            state.visible_indices().len(),
+            4,
+            "the default hides the dotfile again"
+        );
         Ok(())
     }
 
@@ -1343,6 +1373,68 @@ mod tests {
     }
 
     #[test]
+    fn the_counts_say_n_of_m_when_the_default_hides_some_hidden_files() -> TestResult {
+        use crate::explorer::arrange::ArrangeCommand;
+        let mut state = mixed_state()?;
+        assert!(!state.is_filtering(), "the default is no filter chip");
+        assert!(
+            state.shows_fewer_than_listed(),
+            "one of five entries is a hidden dotfile"
+        );
+        state.arrange(ArrangeCommand::ToggleHidden);
+        assert!(state.is_filtering(), "hidden shown is a chip: a filter");
+        assert_eq!(state.visible_shared().len(), 5, "and every entry shows");
+
+        let mut plain = committed()?;
+        assert!(
+            !plain.shows_fewer_than_listed(),
+            "nothing hidden, nothing missing"
+        );
+        plain.set_query("zzz".into());
+        assert!(plain.shows_fewer_than_listed());
+        Ok(())
+    }
+
+    #[test]
+    fn names_in_a_dot_hidden_file_hide_like_dotfiles_until_ctrl_h() -> TestResult {
+        use crate::explorer::arrange::ArrangeCommand;
+        let mut state = state();
+        let scan = state
+            .begin(Transition::Visit(dir("/fixture/a")))
+            .ok_or("begin must return a scan")?;
+        let mut listing = listing(&[
+            ("notes.txt", EntryKind::File),
+            ("secret.txt", EntryKind::File),
+            (".dot", EntryKind::File),
+            ("Private", EntryKind::Directory),
+        ]);
+        listing.hidden_names = ["secret.txt", "Private"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert!(state.commit(scan, listing.clone()));
+        assert_eq!(displayed(&state), ["notes.txt"]);
+        state.arrange(ArrangeCommand::ToggleHidden);
+        assert_eq!(
+            displayed(&state),
+            ["Private", ".dot", "notes.txt", "secret.txt"],
+            "the same toggle shows dotfiles and listed names"
+        );
+        // The scan thread's own index hides them the same way.
+        let mut indexed = ExplorerState::new(dir("/fixture/a"), None);
+        let scan = indexed
+            .begin(Transition::Visit(dir("/fixture/b")))
+            .ok_or("begin must return a scan")?;
+        let index = Arc::new(ArrangeIndex::build_hiding(
+            &listing.entries,
+            &listing.hidden_names,
+        ));
+        assert!(indexed.commit_indexed(scan, listing, index));
+        assert_eq!(displayed(&indexed), ["notes.txt"]);
+        Ok(())
+    }
+
+    #[test]
     fn a_new_tab_inherits_sort_and_filters_then_diverges() -> TestResult {
         use crate::explorer::arrange::{ArrangeCommand, DateRange};
         let mut source = mixed_state()?;
@@ -1355,7 +1447,7 @@ mod tests {
         fresh.click_sort(SortKey::Size);
         assert_ne!(fresh.arrangement(), source.arrangement());
         assert!(
-            source.arrangement().filters.hide_hidden,
+            !source.arrangement().filters.hide_hidden,
             "the source keeps its own"
         );
         assert_eq!(source.sort().key, SortKey::Modified);
@@ -1680,30 +1772,41 @@ mod tests {
 
     #[test]
     fn favorites_are_unique_and_never_the_trash() {
+        let paths = |favorites: &Favorites| -> Vec<PathBuf> {
+            favorites
+                .bookmarks()
+                .iter()
+                .map(|bookmark| bookmark.path.clone())
+                .collect()
+        };
+        let flip = |favorites: &mut Favorites, location: &Location| {
+            let favorite = !favorites.contains(location);
+            favorites.set(location, favorite);
+        };
         let mut favorites = Favorites::default();
-        assert!(favorites.list().is_empty());
+        assert!(favorites.bookmarks().is_empty());
         assert!(!favorites.contains(&dir("/fixture/a")));
 
-        favorites.toggle(&dir("/fixture/a"));
-        assert_eq!(favorites.list(), [PathBuf::from("/fixture/a")]);
+        flip(&mut favorites, &dir("/fixture/a"));
+        assert_eq!(paths(&favorites), [PathBuf::from("/fixture/a")]);
         assert!(favorites.contains(&dir("/fixture/a")));
 
         // Re-adding is a remove: the toggle is one button.
-        favorites.toggle(&dir("/fixture/a"));
-        assert!(favorites.list().is_empty());
+        flip(&mut favorites, &dir("/fixture/a"));
+        assert!(favorites.bookmarks().is_empty());
 
         // Toggling another directory keeps exactly one entry per directory.
-        favorites.toggle(&dir("/fixture/b"));
-        assert_eq!(favorites.list(), [PathBuf::from("/fixture/b")]);
-        favorites.toggle(&dir("/fixture/b"));
-        assert!(favorites.list().is_empty());
-        favorites.toggle(&dir("/fixture/b"));
-        assert_eq!(favorites.list(), [PathBuf::from("/fixture/b")]);
+        flip(&mut favorites, &dir("/fixture/b"));
+        assert_eq!(paths(&favorites), [PathBuf::from("/fixture/b")]);
+        flip(&mut favorites, &dir("/fixture/b"));
+        assert!(favorites.bookmarks().is_empty());
+        flip(&mut favorites, &dir("/fixture/b"));
+        assert_eq!(paths(&favorites), [PathBuf::from("/fixture/b")]);
 
         // The virtual Trash is never favorited.
-        favorites.toggle(&Location::Trash);
+        flip(&mut favorites, &Location::Trash);
         assert_eq!(
-            favorites.list(),
+            paths(&favorites),
             [PathBuf::from("/fixture/b")],
             "the Trash toggle is a no-op and keeps prior favorites"
         );
@@ -1857,7 +1960,8 @@ mod tests {
             scan,
             Listing {
                 entries: names.iter().map(|n| entry(n, EntryKind::File)).collect(),
-                warnings: Vec::new()
+                warnings: Vec::new(),
+                ..Listing::default()
             }
         ));
         Ok(state)

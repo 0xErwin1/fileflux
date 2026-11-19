@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{self, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -44,9 +44,9 @@ use serde::{Deserialize, Serialize};
 use super::Location;
 
 /// The `version` of the settings file this build reads and writes.
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 /// The `version` of the session file this build reads and writes.
-pub const SESSION_VERSION: u32 = 1;
+pub const SESSION_VERSION: u32 = 2;
 
 /// The directory both files live in, below the XDG base directory.
 const APP_DIR: &str = "fileflux";
@@ -249,7 +249,7 @@ pub struct ArrangementPrefs {
     pub sort_dir: SortDirPref,
     pub folders_first: bool,
     pub natural: bool,
-    /// Hide names starting with a dot.
+    /// Hide dotfiles and the names listed in a folder's `.hidden` file.
     pub hide_hidden: bool,
     /// The selected categories; none means every category.
     pub kinds: Vec<CategoryPref>,
@@ -262,11 +262,11 @@ pub struct ArrangementPrefs {
 impl Default for ArrangementPrefs {
     fn default() -> Self {
         Self {
-            sort_key: SortKeyPref::Name,
-            sort_dir: SortDirPref::Ascending,
+            sort_key: SortKeyPref::Modified,
+            sort_dir: SortDirPref::Descending,
             folders_first: true,
             natural: true,
-            hide_hidden: false,
+            hide_hidden: true,
             kinds: Vec::new(),
             modified: None,
             size: None,
@@ -338,8 +338,11 @@ impl Preferences {
 #[serde(default)]
 pub struct Settings {
     pub version: u32,
-    /// The favorite folders, in the order they were added.
-    #[serde(with = "path_list")]
+    /// Legacy favorites of a version 1 file. The favorites now live in the
+    /// GTK bookmarks (see [`super::bookmarks`]); the explorer moves these
+    /// there once and saves the file without them, so this is empty in a
+    /// file written by this version.
+    #[serde(with = "path_list", skip_serializing_if = "Vec::is_empty")]
     pub favorites: Vec<PathBuf>,
     pub preferences: Preferences,
 }
@@ -416,16 +419,69 @@ trait Stored: Serialize + DeserializeOwned + Default {
     const LABEL: &'static str;
     /// The newest `version` this build understands.
     const VERSION: u32;
+
+    /// Brings a table written by an older version up to [`Self::VERSION`],
+    /// touching only what the older meaning requires.
+    fn migrate(table: &mut toml::Table);
 }
 
 impl Stored for Settings {
     const LABEL: &'static str = "Settings";
     const VERSION: u32 = SETTINGS_VERSION;
+
+    fn migrate(table: &mut toml::Table) {
+        if let Some(arrangement) = table
+            .get_mut("preferences")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|preferences| preferences.get_mut("arrangement"))
+            .and_then(toml::Value::as_table_mut)
+        {
+            migrate_arrangement(arrangement);
+        }
+    }
 }
 
 impl Stored for Session {
     const LABEL: &'static str = "Session";
     const VERSION: u32 = SESSION_VERSION;
+
+    fn migrate(table: &mut toml::Table) {
+        let tabs = table.get_mut("tabs").and_then(toml::Value::as_array_mut);
+        for tab in tabs.into_iter().flatten() {
+            if let Some(arrangement) = tab
+                .as_table_mut()
+                .and_then(|tab| tab.get_mut("arrangement"))
+                .and_then(toml::Value::as_table_mut)
+            {
+                migrate_arrangement(arrangement);
+            }
+        }
+    }
+}
+
+/// Version 1 → 2: the defaults changed from Name ascending with hidden files
+/// shown to Modified descending with hidden files hidden. Only a saved value
+/// equal to the old default moves; any other saved choice stays, and a key
+/// the file omits keeps the meaning it had (the old default) when its
+/// partner key was a choice.
+fn migrate_arrangement(arrangement: &mut toml::Table) {
+    let text = |key: &str| arrangement.get(key).and_then(toml::Value::as_str);
+    let key = text("sort_key").unwrap_or("name").to_owned();
+    let dir = text("sort_dir").unwrap_or("ascending").to_owned();
+    if key == "name" && dir == "ascending" {
+        arrangement.insert("sort_key".to_owned(), "modified".into());
+        arrangement.insert("sort_dir".to_owned(), "descending".into());
+    } else {
+        arrangement.insert("sort_key".to_owned(), key.into());
+        arrangement.insert("sort_dir".to_owned(), dir.into());
+    }
+    if arrangement
+        .get("hide_hidden")
+        .and_then(toml::Value::as_bool)
+        == Some(false)
+    {
+        arrangement.insert("hide_hidden".to_owned(), true.into());
+    }
 }
 
 // --- loading ------------------------------------------------------------------
@@ -440,6 +496,9 @@ pub struct Loaded<T> {
     /// Whether the app may write the file: `false` when it was written by a
     /// newer version or could not be read, so it is never overwritten.
     pub writable: bool,
+    /// The file was written by an older version and was migrated in memory:
+    /// the next save should replace it, so the migration happens once.
+    pub migrated: bool,
     /// The file was invalid and its copy is safely aside: the next save
     /// should replace it with a valid file, so the notice shows once.
     pub heal: bool,
@@ -458,7 +517,7 @@ pub fn load_session(path: &Path, now: SystemTime) -> Loaded<Session> {
 
 /// How a file's bytes read.
 enum Parsed<T> {
-    Value(T),
+    Value(T, bool),
     /// Written by a newer Fileflux: its `version`.
     Newer(i64),
     /// Not UTF-8, not TOML, or not the expected shape.
@@ -472,7 +531,7 @@ fn parse<T: Stored>(bytes: &[u8]) -> Parsed<T> {
             text.parse::<toml::Table>()
                 .map_err(|error| error.to_string())
         });
-    let table = match parsed {
+    let mut table = match parsed {
         Ok(table) => table,
         Err(reason) => return Parsed::Invalid(reason),
     };
@@ -482,8 +541,17 @@ fn parse<T: Stored>(bytes: &[u8]) -> Parsed<T> {
     {
         return Parsed::Newer(version);
     }
+    // A file without a version was written by hand: its values are choices.
+    let older = table
+        .get("version")
+        .and_then(toml::Value::as_integer)
+        .is_some_and(|version| version < i64::from(T::VERSION));
+    if older {
+        T::migrate(&mut table);
+        table.insert("version".to_owned(), i64::from(T::VERSION).into());
+    }
     match table.try_into::<T>() {
-        Ok(value) => Parsed::Value(value),
+        Ok(value) => Parsed::Value(value, older),
         Err(error) => Parsed::Invalid(error.to_string()),
     }
 }
@@ -499,6 +567,7 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
                 value: T::default(),
                 notice: None,
                 writable: true,
+                migrated: false,
                 heal: false,
             };
         }
@@ -510,16 +579,18 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
                     T::LABEL
                 )),
                 writable: false,
+                migrated: false,
                 heal: false,
             };
         }
     };
 
     match parse::<T>(&bytes) {
-        Parsed::Value(value) => Loaded {
+        Parsed::Value(value, migrated) => Loaded {
             value,
             notice: None,
             writable: true,
+            migrated,
             heal: false,
         },
         Parsed::Newer(version) => Loaded {
@@ -530,6 +601,7 @@ fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
                 T::LABEL
             )),
             writable: false,
+            migrated: false,
             heal: false,
         },
         Parsed::Invalid(reason) => corrupt(path, &file_name, now, &reason),
@@ -562,6 +634,7 @@ fn corrupt<T: Stored>(path: &Path, file_name: &str, now: SystemTime, reason: &st
         value: T::default(),
         notice: Some(notice),
         writable: kept,
+        migrated: false,
         heal: kept,
     }
 }
@@ -716,7 +789,7 @@ fn merge_with_disk(path: &Path, base: &Settings, ours: &Settings) -> io::Result<
         Err(error) => return Err(error),
     };
     match parse::<Settings>(&bytes) {
-        Parsed::Value(disk) => Ok(merge_settings(base, ours, &disk)),
+        Parsed::Value(disk, _) => Ok(merge_settings(base, ours, &disk)),
         Parsed::Newer(version) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -782,7 +855,7 @@ const MAX_LINK_HOPS: usize = 40;
 /// The file a write to `path` must replace: `path` itself, or what a chain
 /// of symlinks (a dotfile manager's) finally points at, which may not exist
 /// yet. The symlink itself is never replaced.
-fn write_target(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn write_target(path: &Path) -> io::Result<PathBuf> {
     let mut current = path.to_path_buf();
     for _ in 0..MAX_LINK_HOPS {
         match std::fs::symlink_metadata(&current) {
@@ -803,6 +876,13 @@ fn write_target(path: &Path) -> io::Result<PathBuf> {
 /// symlink, synced, then renamed over the target; the directory is synced
 /// after, best effort. The temporary file is removed when anything fails.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with_mode(path, bytes, 0o600)
+}
+
+/// [`write_atomic`] for a file with another permission `mode`, set exactly
+/// (the process umask does not narrow it): the GTK bookmarks keep the mode
+/// the user's file has.
+pub(crate) fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let target = write_target(path)?;
     let dir = target
         .parent()
@@ -815,9 +895,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut out = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
             .open(&tmp)?;
+        out.set_permissions(std::fs::Permissions::from_mode(mode))?;
         out.write_all(bytes)?;
         out.sync_all()?;
         std::fs::rename(&tmp, &target)

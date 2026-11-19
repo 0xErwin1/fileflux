@@ -777,3 +777,157 @@ fn a_file_without_the_details_width_loads_and_unknown_keys_are_ignored() {
     let loaded = load_settings(&path, now());
     assert_eq!(loaded.value.preferences.details_width, 420);
 }
+
+// --- defaults and their migration ----------------------------------------------
+
+#[test]
+fn the_new_defaults_are_modified_descending_with_hidden_files_hidden() {
+    let defaults = ArrangementPrefs::default();
+    assert_eq!(defaults.sort_key, SortKeyPref::Modified);
+    assert_eq!(defaults.sort_dir, SortDirPref::Descending);
+    assert!(defaults.folders_first, "folders stay first");
+    assert!(defaults.hide_hidden, "hidden files are hidden by default");
+    assert_eq!(SETTINGS_VERSION, 2);
+    assert_eq!(SESSION_VERSION, 2);
+}
+
+fn load_text(name: &str, text: &str) -> Settings {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().join("settings.toml");
+    std::fs::write(&path, text).expect("fixture writes");
+    let loaded = load_settings(&path, now());
+    assert_eq!(loaded.notice, None);
+    assert!(loaded.writable);
+    loaded.value
+}
+
+#[test]
+fn a_version_1_file_holding_the_old_defaults_gets_the_new_ones() {
+    let settings = load_text(
+        "migrate-old-defaults",
+        "version = 1\n[preferences.arrangement]\nsort_key = \"name\"\nsort_dir = \"ascending\"\n\
+         hide_hidden = false\nfolders_first = true\nnatural = true\n",
+    );
+    let arrangement = settings.preferences.arrangement;
+    assert_eq!(arrangement.sort_key, SortKeyPref::Modified);
+    assert_eq!(arrangement.sort_dir, SortDirPref::Descending);
+    assert!(arrangement.hide_hidden);
+    assert_eq!(settings.version, SETTINGS_VERSION);
+}
+
+#[test]
+fn a_version_1_file_keeps_every_other_saved_choice() {
+    // Name descending is a choice, not the old default: it stays. The two
+    // defaults move independently, so hide_hidden=false still becomes true.
+    let settings = load_text(
+        "migrate-keeps-choices",
+        "version = 1\n[preferences.arrangement]\nsort_key = \"name\"\nsort_dir = \"descending\"\n\
+         hide_hidden = false\nfolders_first = false\n",
+    );
+    let arrangement = settings.preferences.arrangement;
+    assert_eq!(arrangement.sort_key, SortKeyPref::Name);
+    assert_eq!(arrangement.sort_dir, SortDirPref::Descending);
+    assert!(!arrangement.folders_first, "other fields are untouched");
+    assert!(arrangement.hide_hidden);
+
+    let settings = load_text(
+        "migrate-keeps-size",
+        "version = 1\n[preferences.arrangement]\nsort_key = \"size\"\nsort_dir = \"ascending\"\n\
+         hide_hidden = true\n",
+    );
+    let arrangement = settings.preferences.arrangement;
+    assert_eq!(arrangement.sort_key, SortKeyPref::Size);
+    assert_eq!(arrangement.sort_dir, SortDirPref::Ascending);
+    assert!(arrangement.hide_hidden);
+
+    // A lone sort_dir = "descending" means Name descending in version 1.
+    let settings = load_text(
+        "migrate-lone-direction",
+        "version = 1\n[preferences.arrangement]\nsort_dir = \"descending\"\n",
+    );
+    let arrangement = settings.preferences.arrangement;
+    assert_eq!(arrangement.sort_key, SortKeyPref::Name);
+    assert_eq!(arrangement.sort_dir, SortDirPref::Descending);
+}
+
+#[test]
+fn a_version_2_file_is_never_migrated() {
+    let settings = load_text(
+        "migrate-current",
+        "version = 2\n[preferences.arrangement]\nsort_key = \"name\"\nsort_dir = \"ascending\"\n\
+         hide_hidden = false\n",
+    );
+    let arrangement = settings.preferences.arrangement;
+    assert_eq!(arrangement.sort_key, SortKeyPref::Name);
+    assert_eq!(arrangement.sort_dir, SortDirPref::Ascending);
+    assert!(!arrangement.hide_hidden, "a current explicit choice stays");
+}
+
+#[test]
+fn a_session_of_version_1_migrates_each_tab_the_same_way() {
+    let scratch = Scratch::new("migrate-session");
+    let path = scratch.path().join("session.toml");
+    std::fs::write(
+        &path,
+        "version = 1\nactive = 0\n\
+         [[tabs]]\npath = \"/a\"\n[tabs.arrangement]\nsort_key = \"name\"\nsort_dir = \"ascending\"\nhide_hidden = false\n\
+         [[tabs]]\npath = \"/b\"\n[tabs.arrangement]\nsort_key = \"type\"\nsort_dir = \"ascending\"\nhide_hidden = false\n",
+    )
+    .expect("fixture writes");
+    let loaded = load_session(&path, now());
+    assert_eq!(loaded.notice, None);
+    let first = &loaded.value.tabs[0].arrangement;
+    assert_eq!(first.sort_key, SortKeyPref::Modified);
+    assert_eq!(first.sort_dir, SortDirPref::Descending);
+    assert!(first.hide_hidden);
+    let second = &loaded.value.tabs[1].arrangement;
+    assert_eq!(second.sort_key, SortKeyPref::Type);
+    assert_eq!(second.sort_dir, SortDirPref::Ascending);
+    assert!(second.hide_hidden, "hide_hidden=false was the old default");
+    assert_eq!(loaded.value.version, SESSION_VERSION);
+
+    std::fs::write(
+        &path,
+        "version = 2\nactive = 0\n[[tabs]]\npath = \"/a\"\n[tabs.arrangement]\nsort_key = \"name\"\n\
+         sort_dir = \"ascending\"\nhide_hidden = false\n",
+    )
+    .expect("fixture writes");
+    let current = load_session(&path, now()).value.tabs[0].arrangement.clone();
+    assert_eq!(current.sort_key, SortKeyPref::Name);
+    assert!(!current.hide_hidden);
+}
+
+#[test]
+fn a_migrated_file_is_marked_so_it_is_rewritten_and_a_newer_one_still_is_not() {
+    let scratch = Scratch::new("migrate-marked");
+    let path = scratch.path().join("settings.toml");
+    std::fs::write(&path, "version = 1\n").expect("fixture writes");
+    let loaded = load_settings(&path, now());
+    assert!(loaded.migrated);
+    assert!(loaded.writable);
+
+    std::fs::write(&path, "version = 2\n").expect("fixture writes");
+    assert!(!load_settings(&path, now()).migrated);
+
+    std::fs::write(&path, "version = 3\n").expect("fixture writes");
+    let newer = load_settings(&path, now());
+    assert!(!newer.migrated);
+    assert!(!newer.writable);
+    assert_eq!(newer.value, Settings::default());
+}
+
+#[test]
+fn legacy_favorites_load_from_a_version_1_file_and_are_not_written_when_empty() {
+    let settings = load_text(
+        "legacy-favorites",
+        "version = 1\nfavorites = [\"/a\", \"/b\"]\n",
+    );
+    assert_eq!(paths(&settings), ["/a", "/b"]);
+
+    let scratch = Scratch::new("legacy-empty");
+    let path = scratch.path().join("settings.toml");
+    save_settings(&path, &Settings::default()).expect("saves");
+    let text = std::fs::read_to_string(&path).expect("reads");
+    assert!(!text.contains("favorites"), "{text}");
+    assert!(text.contains("version = 2"), "{text}");
+}
