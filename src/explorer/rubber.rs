@@ -234,6 +234,13 @@ pub(crate) fn combine(
     }
 }
 
+/// Whether releasing the left button clears the selection: only a press on
+/// empty space that never became a rectangle (it stayed under the drag
+/// threshold) and carried no modifier. Ctrl and Shift clicks keep it.
+pub(crate) fn release_clears_selection(rectangle: bool, mode: Mode) -> bool {
+    !rectangle && mode == Mode::Replace
+}
+
 /// How far to scroll this tick for a pointer at window `pointer_y` over a
 /// viewport spanning `top..bottom`: negative scrolls up, positive down, zero
 /// away from the edges. It grows with how deep the pointer is in the edge
@@ -375,11 +382,13 @@ impl Explorer {
     ) {
         self.entry_press = None;
         self.suppress_click = false;
+        // No active-drag check: a press never happens during an in-app drag
+        // (the button is held), so a drag left over from an earlier gesture
+        // must not keep empty-space clicks from working.
         if event.button != MouseButton::Left
             || self.dialogs.is_open()
             || self.menu.is_some()
             || self.renaming.is_some()
-            || cx.has_active_drag()
         {
             return;
         }
@@ -508,7 +517,7 @@ impl Explorer {
         let Some(band) = self.rubber_band.take() else {
             return;
         };
-        if !band.active && band.mode == Mode::Replace {
+        if release_clears_selection(band.active, band.mode) {
             self.tab_mut().state.clear_notice();
             self.tab_mut().state.clear_selection();
         }
@@ -957,5 +966,24 @@ mod tests {
         };
         assert!(!list.accepts((500.0, 90.0)), "column header");
         assert!(list.accepts((500.0, 100.0)));
+    }
+
+    #[test]
+    fn a_plain_click_on_empty_space_clears_the_selection() {
+        // Pressed and released under the threshold: never a rectangle.
+        assert!(release_clears_selection(false, Mode::Replace));
+    }
+
+    #[test]
+    fn ctrl_and_shift_clicks_on_empty_space_keep_the_selection() {
+        assert!(!release_clears_selection(false, Mode::Toggle));
+        assert!(!release_clears_selection(false, Mode::Add));
+    }
+
+    #[test]
+    fn a_finished_rectangle_keeps_what_it_selected() {
+        for mode in [Mode::Replace, Mode::Toggle, Mode::Add] {
+            assert!(!release_clears_selection(true, mode));
+        }
     }
 }
