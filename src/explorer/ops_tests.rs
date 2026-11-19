@@ -209,6 +209,44 @@ fn the_undo_stack_is_bounded_and_forgets_the_oldest() {
     assert_eq!(oldest, Some(6), "the first five entries were dropped");
 }
 
+#[test]
+fn two_presses_that_find_nothing_draining_undo_two_distinct_entries_newest_first() -> TestResult {
+    let mut stack = UndoStack::default();
+    let older = stack.push(rename_action("/x/a", "/x/b"));
+    let newer = stack.push(rename_action("/x/c", "/x/d"));
+
+    let mut undone = Vec::new();
+    for _ in 0..2 {
+        let id = stack
+            .newest()
+            .map(|entry| entry.id)
+            .ok_or("an entry is left")?;
+        assert_eq!(stack.begin(id), Ok(()));
+        undone.push(stack.settle(id, true).map(|entry| entry.id));
+    }
+
+    assert_eq!(undone, [Some(newer), Some(older)]);
+    assert_eq!(stack.len(), 0);
+    assert_eq!(stack.newest(), None);
+    Ok(())
+}
+
+#[test]
+fn an_entry_evicted_while_its_undo_is_pending_never_runs() {
+    let mut stack = UndoStack::default();
+    let first = stack.push(rename_action("/x/a", "/x/b"));
+    assert_eq!(stack.begin(first), Ok(()));
+
+    for n in 0..UNDO_LIMIT {
+        stack.push(rename_action("/x/a", &format!("/x/{n}")));
+    }
+    assert_eq!(stack.get(first), None, "the limit pushed it out");
+
+    assert_eq!(stack.settle(first, true), None, "nothing to run");
+    assert_eq!(stack.len(), UNDO_LIMIT, "no other entry was taken instead");
+    assert_eq!(stack.begin(first), Err(Unavailable::Gone));
+}
+
 // --- rename helpers ------------------------------------------------------------
 
 #[test]

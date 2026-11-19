@@ -1872,6 +1872,87 @@ mod tests {
         Ok(())
     }
 
+    /// Runs `transition` to its end on `state`, as a finished device check
+    /// followed by a finished scan would.
+    fn settle_step(state: &mut crate::explorer::state::ExplorerState, step: Transition) {
+        if let Some(scan) = state.begin(step) {
+            state.commit(scan, Default::default());
+        }
+    }
+
+    #[test]
+    fn a_double_up_while_draining_stays_on_the_checked_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::explorer::state::ExplorerState;
+        let dir = |path: &str| Location::Directory(PathBuf::from(path));
+        let mut state = ExplorerState::new(dir("/m/a/b/c"), Some(PathBuf::from("/m")));
+
+        // Two quick Up presses: nothing has committed, both check /m/a/b.
+        let first = state.target_of(&Transition::Up);
+        let second = state.target_of(&Transition::Up);
+        assert_eq!(first, Some(dir("/m/a/b")));
+        assert_eq!(second, first);
+        let (Some(first), Some(second)) = (first, second) else {
+            return Err("up has a target".into());
+        };
+
+        let step = CheckedStep::of(Transition::Up, state.target_of(&Transition::Up), first);
+        assert_eq!(step.into_transition(), Transition::Up, "as asked");
+        settle_step(&mut state, Transition::Up);
+        let now = state.target_of(&Transition::Up);
+        assert_eq!(now, Some(dir("/m/a")), "the unchecked parent is next");
+
+        let step = CheckedStep::of(Transition::Up, now, second);
+        let entered = state
+            .begin(step.into_transition())
+            .map(|scan| scan.location);
+        assert_eq!(entered, Some(dir("/m/a/b")), "the checked parent, not /m/a");
+        Ok(())
+    }
+
+    #[test]
+    fn a_double_forward_never_reaches_the_unchecked_entry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::explorer::state::ExplorerState;
+        let dir = |path: &str| Location::Directory(PathBuf::from(path));
+        let mut state = ExplorerState::new(dir("/m/start"), Some(PathBuf::from("/m")));
+        settle_step(&mut state, Transition::Visit(dir("/m/one")));
+        settle_step(&mut state, Transition::Visit(dir("/m/two")));
+        settle_step(&mut state, Transition::Back);
+        settle_step(&mut state, Transition::Back);
+        assert_eq!(state.target_of(&Transition::Back), None, "at the start");
+
+        // Two quick Forward presses: both check /m/one.
+        let first = state.target_of(&Transition::Forward);
+        let second = state.target_of(&Transition::Forward);
+        assert_eq!(first, Some(dir("/m/one")));
+        assert_eq!(second, first);
+        let (Some(first), Some(second)) = (first, second) else {
+            return Err("forward has a target".into());
+        };
+
+        let step = CheckedStep::of(
+            Transition::Forward,
+            state.target_of(&Transition::Forward),
+            first,
+        );
+        assert_eq!(step.into_transition(), Transition::Forward, "as asked");
+        settle_step(&mut state, Transition::Forward);
+        let now = state.target_of(&Transition::Forward);
+        assert_eq!(now, Some(dir("/m/two")), "the unchecked entry is next");
+
+        let step = CheckedStep::of(Transition::Forward, now, second);
+        let entered = state
+            .begin(step.into_transition())
+            .map(|scan| scan.location);
+        assert_eq!(
+            entered,
+            Some(dir("/m/one")),
+            "the checked entry, not /m/two"
+        );
+        Ok(())
+    }
+
     // --- polling and queue ----------------------------------------------------
 
     #[test]

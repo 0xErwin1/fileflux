@@ -363,9 +363,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    /// A script written while another test forks can be exec'd with
+    /// ETXTBSY: the tests that run fake programs take turns.
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A scratch directory under the system temp directory, removed on drop.
-    struct Scratch(PathBuf);
+    struct Scratch(
+        PathBuf,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
 
     impl Scratch {
         fn new(tag: &str) -> Self {
@@ -375,7 +381,10 @@ mod tests {
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&dir).expect("scratch is created");
-            Self(dir)
+            let turn = TURN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self(dir, turn)
         }
 
         fn dir(&self, rel: &str) -> PathBuf {
@@ -400,8 +409,12 @@ mod tests {
                 log.display()
             );
             let path = bin.join(name);
-            fs::write(&path, script).expect("script writes");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            // Written and closed under another name, then renamed into place,
+            // so nothing ever execs a file that is still open for writing.
+            let temp = bin.join(format!(".{name}.new"));
+            fs::write(&temp, script).expect("script writes");
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).expect("chmod");
+            fs::rename(&temp, &path).expect("script is put in place");
             path
         }
 
@@ -434,12 +447,28 @@ mod tests {
                 .expect("has a name")
                 .to_string_lossy()
                 .into_owned();
-            let status = Command::new(&command.program)
-                .args(&command.args)
-                .current_dir(&command.cwd)
-                .stdin(Stdio::null())
-                .status()
-                .expect("the fake terminal runs");
+            // Tests in other modules fork too, and a child forked while the
+            // script was open for writing holds it until its own exec: that
+            // is ETXTBSY for a moment, never a real failure.
+            let mut attempts = 0;
+            let status = loop {
+                let spawned = Command::new(&command.program)
+                    .args(&command.args)
+                    .current_dir(&command.cwd)
+                    .stdin(Stdio::null())
+                    .status();
+                match spawned {
+                    Err(error)
+                        if error.raw_os_error()
+                            == Some(rustix::io::Errno::TXTBSY.raw_os_error())
+                            && attempts < 100 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => break other.expect("the fake terminal runs"),
+                }
+            };
             assert!(status.success());
             let log = fs::read_to_string(self.0.join("log").join(&name)).expect("log exists");
             let (argv, cwd) = log.split_once('\n').expect("two lines");

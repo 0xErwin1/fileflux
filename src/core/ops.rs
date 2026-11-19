@@ -651,10 +651,19 @@ struct Ctx<'a> {
     made: Option<Vec<Made>>,
 }
 
-/// An entry a direct copy created.
+/// An entry a direct copy created, with the identity it had when created.
 struct Made {
     path: PathBuf,
     is_dir: bool,
+    /// `(st_dev, st_ino)`: a different file at the same path is not ours.
+    identity: (u64, u64),
+}
+
+impl Made {
+    /// Whether `path` still names the entry that was created.
+    fn is_still_there(&self) -> bool {
+        fs::symlink_metadata(&self.path).is_ok_and(|meta| (meta.dev(), meta.ino()) == self.identity)
+    }
 }
 
 /// What a transfer says once when a weak filesystem refuses the metadata.
@@ -682,13 +691,19 @@ fn is_errno(error: &io::Error, any: &[Errno]) -> bool {
 }
 
 /// Whether a failed timestamp or mode change means "this filesystem does not
-/// keep that" (`ENOTSUP`, the same number as `EOPNOTSUPP` on Linux; `ENOSYS`; the
-/// `EPERM`/`EACCES` FUSE answers with) rather than a real failure such as
+/// keep that" (`ENOTSUP`, the same number as `EOPNOTSUPP` on Linux; `ENOSYS`;
+/// `EINVAL`, which MTP backends answer; the `EPERM`/`EACCES` FUSE answers with) rather than a real failure such as
 /// `EIO` or a full disk.
 fn metadata_unsupported(error: &io::Error) -> bool {
     is_errno(
         error,
-        &[Errno::NOTSUP, Errno::NOSYS, Errno::PERM, Errno::ACCESS],
+        &[
+            Errno::NOTSUP,
+            Errno::NOSYS,
+            Errno::INVAL,
+            Errno::PERM,
+            Errno::ACCESS,
+        ],
     )
 }
 
@@ -974,8 +989,11 @@ impl Ctx<'_> {
         if built.is_err() {
             self.deferred.clear();
             for entry in made.iter().rev() {
-                // `remove_dir` only takes an empty folder, `remove_file`
-                // never a folder: neither can remove what is not ours.
+                // A different file now at the path is not ours. `remove_dir`
+                // only takes an empty folder, `remove_file` never a folder.
+                if !entry.is_still_there() {
+                    continue;
+                }
                 if entry.is_dir {
                     fs::remove_dir(&entry.path).ok();
                 } else {
@@ -986,12 +1004,15 @@ impl Ctx<'_> {
         built
     }
 
-    /// Notes an entry a direct copy created.
+    /// Notes an entry a direct copy created, by the identity it has now.
     fn made(&mut self, path: &Path, is_dir: bool) {
-        if let Some(made) = &mut self.made {
+        if let Some(made) = &mut self.made
+            && let Ok(meta) = fs::symlink_metadata(path)
+        {
             made.push(Made {
                 path: path.to_path_buf(),
                 is_dir,
+                identity: (meta.dev(), meta.ino()),
             });
         }
     }
@@ -2962,6 +2983,170 @@ mod tests {
                 "{unsupported:?}"
             );
             assert!(names(&d)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_foreign_file_that_replaced_ours_at_the_same_path_is_kept() -> TestResult {
+        // The second write is on the file we are writing: a third party swaps
+        // that very path for a file of its own, then the disk fills up.
+        struct Swapper {
+            path: PathBuf,
+            writes: Cell<usize>,
+        }
+        impl Backend for Swapper {
+            fn place_rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Err(errno(Errno::NOTSUP))
+            }
+            fn write(&self, file: &mut fs::File, data: &[u8]) -> io::Result<()> {
+                self.writes.set(self.writes.get() + 1);
+                // Only the direct copy writes to the real name.
+                if self.path.exists() {
+                    // Ours stays open (its inode cannot be reused) while the
+                    // path now names another file.
+                    fs::remove_file(&self.path)?;
+                    fs::write(&self.path, b"theirs")?;
+                    return Err(errno(Errno::NOSPC));
+                }
+                file.write_all(data)
+            }
+            fn is_weak(&self, _: &Path) -> bool {
+                true
+            }
+        }
+        let sc = Scratch::new("vp-swap")?;
+        let (_, d) = phone(&sc)?;
+        let src = sc.dir("src")?;
+        fs::write(src.join("big.bin"), big(CHUNK * 2))?;
+        let swapper = Swapper {
+            path: d.join("big.bin"),
+            writes: Cell::new(0),
+        };
+
+        let report = transfer_on(
+            &[src.join("big.bin")],
+            &d,
+            Mode::Copy,
+            no_conflict,
+            |_| {},
+            &AtomicBool::new(false),
+            &swapper,
+        );
+
+        assert!(matches!(only_item(&report)?, ItemOutcome::Failed(_)));
+        assert_eq!(fs::read(d.join("big.bin"))?, b"theirs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_foreign_file_in_a_nested_folder_of_ours_stays() -> TestResult {
+        struct NestedRacer {
+            theirs: PathBuf,
+            writes: Cell<usize>,
+        }
+        impl Backend for NestedRacer {
+            fn place_rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Err(errno(Errno::NOTSUP))
+            }
+            fn write(&self, file: &mut fs::File, data: &[u8]) -> io::Result<()> {
+                self.writes.set(self.writes.get() + 1);
+                if self.writes.get() == 4 {
+                    fs::write(&self.theirs, b"theirs")?;
+                    return Err(errno(Errno::NOSPC));
+                }
+                file.write_all(data)
+            }
+            fn is_weak(&self, _: &Path) -> bool {
+                true
+            }
+        }
+        let sc = Scratch::new("vp-nested")?;
+        let (_, d) = phone(&sc)?;
+        let album = sc.dir("src/album")?;
+        fs::create_dir(album.join("sub"))?;
+        fs::write(album.join("sub/one.jpg"), b"1")?;
+        fs::write(album.join("sub/two.jpg"), b"2")?;
+        fs::write(album.join("sub/three.jpg"), b"3")?;
+        let racer = NestedRacer {
+            theirs: d.join("album/sub/theirs.txt"),
+            writes: Cell::new(0),
+        };
+
+        let report = transfer_on(
+            &[album],
+            &d,
+            Mode::Copy,
+            no_conflict,
+            |_| {},
+            &AtomicBool::new(false),
+            &racer,
+        );
+
+        assert!(matches!(only_item(&report)?, ItemOutcome::Failed(_)));
+        assert_eq!(names(&d.join("album/sub"))?, ["theirs.txt"]);
+        assert_eq!(fs::read(d.join("album/sub/theirs.txt"))?, b"theirs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_weak_direct_copy_tolerates_an_unsupported_fsync() -> TestResult {
+        for unsupported in [Errno::NOTSUP, Errno::INVAL, Errno::NOSYS] {
+            let sc = Scratch::new("direct-fsync")?;
+            let (src, d) = phone(&sc)?;
+            fs::write(src.join("a.txt"), b"hello")?;
+            let f = Fuse {
+                weak: true,
+                place_rename: Some(Errno::NOTSUP),
+                sync: Some(unsupported),
+                ..Fuse::default()
+            };
+
+            let report = copy_on(&f, &[src.join("a.txt")], &d);
+
+            let dest = only_ok(&report)?;
+            assert_eq!(fs::read(dest)?, b"hello", "{unsupported:?}");
+            assert!(report.notes.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn einval_on_metadata_is_tolerated_on_a_weak_filesystem_only() -> TestResult {
+        for times in [true, false] {
+            for folder in [false, true] {
+                let sc = Scratch::new("weak-einval")?;
+                let (src, d) = phone(&sc)?;
+                let item = if folder {
+                    sc.dir("src/e")?
+                } else {
+                    fs::write(src.join("a.txt"), b"x")?;
+                    src.join("a.txt")
+                };
+                let mk = |weak| Fuse {
+                    weak,
+                    set_modified: times.then_some(Errno::INVAL),
+                    set_permissions: (!times).then_some(Errno::INVAL),
+                    ..Fuse::default()
+                };
+                let report = copy_on(&mk(true), std::slice::from_ref(&item), &d);
+                assert!(
+                    matches!(only_item(&report)?, ItemOutcome::Ok { .. }),
+                    "times={times} folder={folder}"
+                );
+                assert_eq!(report.notes.len(), 1);
+
+                let strict = sc.dir("strict")?;
+                let report = copy_on(&mk(false), &[item], &strict);
+                assert!(
+                    matches!(
+                        only_item(&report)?,
+                        ItemOutcome::Failed(TransferError::Io(_))
+                    ),
+                    "local fs times={times} folder={folder}"
+                );
+                assert!(names(&strict)?.is_empty());
+            }
         }
         Ok(())
     }
