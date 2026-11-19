@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use bolt::composites::{BackAction, ChildAction, HOVER_OPEN_DELAY, HoverIntent, MenuNav};
 use bolt::controls::{InputEvent, InputState};
 use bolt::toast::{Toast, ToastAction};
 use fileflux::core::Location;
@@ -26,15 +27,15 @@ use fileflux::core::apps::{self, App, OpenWith};
 use fileflux::core::images::is_image_path;
 
 use super::arrange::ArrangeCommand;
-use super::arrange_menu::page_rows;
+use super::arrange_menu;
 use super::devices::{device_menu_rows, job_paths, with_device_rows};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
-    ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
-    MenuPage, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick, RenameCheck,
+    ARM_DELAY, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx,
+    MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick, RenameCheck,
     RenameStep, Report, Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row, check_rename,
-    dismissed_notice, menu_rows, next_menu_index, no_trash_dialog, open_target, open_with_command,
-    rename_seed, rename_step, stem_range,
+    dismissed_notice, menu_rows, no_trash_dialog, open_target, open_with_command, rename_seed,
+    rename_step, stem_range,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
@@ -79,8 +80,8 @@ impl Renaming {
 /// outlined for as long as the menu is up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuOn {
-    /// A toolbar button's Sort or Filter menu: nothing to outline.
-    Nothing,
+    /// A subbar button's Sort or Filter menu: nothing to outline.
+    Arrange(ArrangeMenu),
     /// The selected entries of the shown folder.
     Entries,
     /// The empty space of the entries area: the folder itself.
@@ -105,13 +106,14 @@ pub(crate) struct MenuState {
     pub(crate) title: Option<String>,
     pub(crate) position: Point<Pixels>,
     pub(crate) rows: Vec<MenuRow>,
-    /// The highlighted row (keyboard or hover).
-    pub(crate) selected: Option<usize>,
-    /// Which page the rows are.
-    pub(crate) page: MenuPage,
-    /// The context menu's rows while a Sort or Filter page drilled into it,
-    /// restored by "Back".
-    pub(crate) parent: Option<Vec<MenuRow>>,
+    /// The highlighted row at every open level; a level is open exactly
+    /// when the path reaches it (see [`super::menu_tree`]).
+    pub(crate) nav: MenuNav,
+    /// When the pointer's rest on a submenu row opens its flyout.
+    pub(crate) hover: HoverIntent,
+    /// Whether the keyboard drove the highlight last: the focus ring shows
+    /// on it.
+    pub(crate) keyboard: bool,
 }
 
 /// What to select (and whether to start renaming) once the listing that
@@ -1053,7 +1055,7 @@ impl Explorer {
                 [(path, true)] if self.favorites.contains(&Location::Directory(path.clone()))
             ),
         };
-        let mut rows = menu_rows(&target);
+        let mut rows = menu_rows(&target, self.tab().state.arrangement());
         if self.tab().state.current().lists_files_from_elsewhere() {
             rows = recent_menu_rows(rows, target.selected);
         }
@@ -1077,14 +1079,7 @@ impl Explorer {
             cx.notify();
             return;
         }
-        self.show_menu(
-            position,
-            rows,
-            MenuPage::Context,
-            (menu_on, Some(title)),
-            window,
-            cx,
-        );
+        self.show_menu(position, rows, (menu_on, Some(title)), window, cx);
     }
 
     /// Opens the menu of one sidebar row, named after it, and outlines the
@@ -1114,7 +1109,6 @@ impl Explorer {
         self.show_menu(
             position,
             rows,
-            MenuPage::Context,
             (
                 MenuOn::Sidebar {
                     row,
@@ -1143,7 +1137,6 @@ impl Explorer {
         self.show_menu(
             position,
             device_menu_rows(actions),
-            MenuPage::Context,
             (MenuOn::Device { row, device }, Some(name)),
             window,
             cx,
@@ -1155,20 +1148,11 @@ impl Explorer {
         &mut self,
         position: Point<Pixels>,
         rows: Vec<MenuRow>,
-        page: MenuPage,
         (on, title): (MenuOn, Option<String>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.menu = Some(MenuState {
-            on,
-            title,
-            position,
-            rows,
-            selected: None,
-            page,
-            parent: None,
-        });
+        self.menu = Some(MenuState::new(on, title, position, rows));
         cx.defer_in(window, |this, window, cx| {
             if this.menu.is_some() {
                 this.menu_focus.focus(window, cx);
@@ -1178,17 +1162,17 @@ impl Explorer {
     }
 
     /// The Sort or Filter menu a subbar button opens, on this tab's
-    /// arrangement.
+    /// arrangement: the same rows the context menu's submenu holds.
     pub(crate) fn open_arrange_menu(
         &mut self,
-        page: MenuPage,
+        menu: ArrangeMenu,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.cancel_rename(window, cx);
-        let rows = page_rows(page, self.tab().state.arrangement(), false);
-        self.show_menu(position, rows, page, (MenuOn::Nothing, None), window, cx);
+        let rows = arrange_menu::rows(menu, self.tab().state.arrangement());
+        self.show_menu(position, rows, (MenuOn::Arrange(menu), None), window, cx);
     }
 
     /// Changes the active tab's sort or filters (menus, chips, Ctrl+H).
@@ -1204,39 +1188,14 @@ impl Explorer {
         if self.tab().state.arrangement().filters.hide_hidden != hidden_before {
             self.restart_search_in(id, cx);
         }
-        // The open Sort/Filter menu redraws its check marks.
+        // The open menu redraws its check marks.
         let arrangement = self.tab().state.arrangement().clone();
-        if let Some(menu) = self.menu.as_mut()
-            && menu.page != MenuPage::Context
-        {
-            menu.rows = page_rows(menu.page, &arrangement, menu.parent.is_some());
-        }
-        cx.notify();
-    }
-
-    /// Shows `page` in the open menu: drilling into Sort/Filter from the
-    /// context menu, or "Back" out of it.
-    fn show_menu_page(&mut self, page: MenuPage, cx: &mut Context<Self>) {
-        let arrangement = self.tab().state.arrangement().clone();
-        let Some(menu) = self.menu.as_mut() else {
-            return;
-        };
-        match page {
-            MenuPage::Context => {
-                let Some(rows) = menu.parent.take() else {
-                    return;
-                };
-                menu.rows = rows;
-            }
-            MenuPage::Sort | MenuPage::Filter => {
-                if menu.page == MenuPage::Context {
-                    menu.parent = Some(std::mem::take(&mut menu.rows));
-                }
-                menu.rows = page_rows(page, &arrangement, menu.parent.is_some());
+        if let Some(menu) = self.menu.as_mut() {
+            match menu.on {
+                MenuOn::Arrange(kind) => menu.rows = arrange_menu::rows(kind, &arrangement),
+                _ => arrange_menu::refresh(&mut menu.rows, &arrangement),
             }
         }
-        menu.page = page;
-        menu.selected = None;
         cx.notify();
     }
 
@@ -1247,24 +1206,113 @@ impl Explorer {
         }
     }
 
-    /// Up/Down in the menu.
+    /// Up/Down in the menu: moves within the deepest open level.
     pub(crate) fn move_menu(&mut self, forward: bool, cx: &mut Context<Self>) {
         if let Some(menu) = self.menu.as_mut() {
-            menu.selected = next_menu_index(&menu.rows, menu.selected, forward);
+            menu.step(forward);
             cx.notify();
         }
     }
 
-    /// Enter in the menu: runs the highlighted item.
+    /// Enter in the menu: opens the highlighted submenu, or runs the
+    /// highlighted item.
     pub(crate) fn confirm_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu_child(true, window, cx);
+    }
+
+    /// Right in the menu: opens the highlighted submenu; on an item it does
+    /// nothing.
+    pub(crate) fn menu_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu_child(false, window, cx);
+    }
+
+    fn open_menu_child(&mut self, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match menu.open_child() {
+            ChildAction::Opened => cx.notify(),
+            ChildAction::Activate if activate => {
+                let path = menu.nav.cursor().path().to_vec();
+                self.activate_menu_path(&path, window, cx);
+            }
+            ChildAction::Activate | ChildAction::None => cx.notify(),
+        }
+    }
+
+    /// Left in the menu: closes the open flyout; at the root it does nothing.
+    pub(crate) fn menu_left(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.menu.as_mut()
+            && menu.nav.cursor().open_flyouts() > 0
+        {
+            menu.back();
+            cx.notify();
+        }
+    }
+
+    /// Escape in the menu: closes the open flyout, then the menu.
+    pub(crate) fn menu_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match menu.back() {
+            BackAction::ClosedLevel => cx.notify(),
+            BackAction::Dismissed => self.close_menu(window, cx),
+        }
+    }
+
+    /// A submenu row was clicked: opens its flyout beside it.
+    pub(crate) fn menu_open_flyout(&mut self, level: usize, index: usize, cx: &mut Context<Self>) {
+        if let Some(menu) = self.menu.as_mut()
+            && menu.open_flyout(level, index)
+        {
+            cx.notify();
+        }
+    }
+
+    /// The pointer entered a row: the highlight follows it, and resting on a
+    /// submenu row opens its flyout after [`HOVER_OPEN_DELAY`].
+    pub(crate) fn menu_row_hovered(&mut self, level: usize, index: usize, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let moved = menu.hover_row(level, index, Instant::now());
+        let pending = menu.hover.pending().is_some();
+        if moved {
+            cx.notify();
+        }
+        if pending {
+            // Fire-and-forget: a tick before the row's deadline decides
+            // nothing, and one after the menu closed finds no menu.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(HOVER_OPEN_DELAY).await;
+                if let Err(error) = this.update(cx, |this, cx| {
+                    if let Some(menu) = this.menu.as_mut()
+                        && menu.hover_tick(Instant::now())
+                    {
+                        cx.notify();
+                    }
+                }) {
+                    log::debug!("the menu outlived its explorer: {error}");
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// A leaf row of the menu was activated, by click or Enter.
+    pub(crate) fn activate_menu_path(
+        &mut self,
+        path: &[usize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let command = self
             .menu
             .as_ref()
-            .and_then(|menu| menu.selected.and_then(|at| menu.rows.get(at)))
-            .and_then(|row| match row {
-                MenuRow::Item(item) if item.enabled => Some(item.command),
-                MenuRow::Item(_) | MenuRow::Header(_) | MenuRow::Separator => None,
-            });
+            .and_then(|menu| menu.item_at(path))
+            .filter(|item| item.enabled)
+            .map(|item| item.command);
         if let Some(command) = command {
             self.run_menu_command(command, window, cx);
         }
@@ -1279,10 +1327,8 @@ impl Explorer {
     ) {
         // Sort and filter rows keep the menu open: several categories can
         // be ticked in a row, and the checks redraw.
-        match command {
-            MenuCommand::Arrange(change) => return self.arrange(change, cx),
-            MenuCommand::Page(page) => return self.show_menu_page(page, cx),
-            _ => {}
+        if let MenuCommand::Arrange(change) = command {
+            return self.arrange(change, cx);
         }
         // A sidebar row's menu acts on that row's place, not on the entries.
         let (sidebar, device_row) = match self.menu.as_ref().map(|menu| &menu.on) {
@@ -1310,7 +1356,7 @@ impl Explorer {
                 }
             }
             MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
-            MenuCommand::Arrange(_) | MenuCommand::Page(_) => {}
+            MenuCommand::Arrange(_) => {}
             MenuCommand::Open => self.open_selected(window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
             MenuCommand::OpenContainingFolder => self.open_containing_folder(window, cx),

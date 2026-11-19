@@ -1,5 +1,5 @@
 //! The Sort and Filter menus as data: the rows the subbar buttons open and
-//! the empty-space context menu drills into. Both draw from the one
+//! the cascading submenus of the empty-space context menu. Both draw from the one
 //! [`Arrangement`], and every row's command goes through
 //! [`Arrangement::apply`], so the menus, the chips, Ctrl+H and the list
 //! header can never disagree.
@@ -7,7 +7,7 @@
 use fileflux::core::kinds::FileCategory;
 
 use super::arrange::{ArrangeCommand, Arrangement, DateRange, SizeRange, SortDir, SortKey};
-use super::ops::{MenuCommand, MenuItemSpec, MenuPage, MenuRow};
+use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow, SubmenuSpec};
 
 /// The shortcut hint of the hidden-files row.
 pub(crate) const HIDDEN_SHORTCUT: &str = "Ctrl+H";
@@ -19,25 +19,10 @@ fn choice(command: ArrangeCommand, label: &'static str, checked: bool) -> MenuRo
     })
 }
 
-/// The row that returns from a drilled-in page to the context menu.
-fn back_rows() -> [MenuRow; 2] {
-    [
-        MenuRow::Item(MenuItemSpec::new(
-            MenuCommand::Page(MenuPage::Context),
-            "Back",
-        )),
-        MenuRow::Separator,
-    ]
-}
-
-/// The rows of the Sort page. `back` adds the way back to the context menu.
-pub(crate) fn sort_rows(arrangement: &Arrangement, back: bool) -> Vec<MenuRow> {
+/// The rows of the Sort menu.
+pub(crate) fn sort_rows(arrangement: &Arrangement) -> Vec<MenuRow> {
     let sort = arrangement.sort;
-    let mut rows = Vec::new();
-    if back {
-        rows.extend(back_rows());
-    }
-    rows.push(MenuRow::Header("Sort by"));
+    let mut rows = vec![MenuRow::Header("Sort by")];
     rows.extend(
         SortKey::ALL
             .into_iter()
@@ -63,32 +48,30 @@ pub(crate) fn sort_rows(arrangement: &Arrangement, back: bool) -> Vec<MenuRow> {
     rows
 }
 
-/// The rows of the Filter page: the hidden-files toggle and "Clear all" on
+/// The rows of the Filter menu: the hidden-files toggle and "Clear all" on
 /// top, where a short window never scrolls them out of reach, then the
-/// three groups. `back` adds the way back to the context menu.
-pub(crate) fn filter_rows(arrangement: &Arrangement, back: bool) -> Vec<MenuRow> {
+/// three groups.
+pub(crate) fn filter_rows(arrangement: &Arrangement) -> Vec<MenuRow> {
     let filters = &arrangement.filters;
-    let mut rows = Vec::new();
-    if back {
-        rows.extend(back_rows());
-    }
-    rows.push(MenuRow::Item(MenuItemSpec {
-        shortcut: Some(HIDDEN_SHORTCUT),
-        checked: Some(!filters.hide_hidden),
-        ..MenuItemSpec::new(
-            MenuCommand::Arrange(ArrangeCommand::ToggleHidden),
-            "Show hidden files",
-        )
-    }));
-    rows.push(MenuRow::Item(MenuItemSpec {
-        enabled: !filters.is_default(),
-        ..MenuItemSpec::new(
-            MenuCommand::Arrange(ArrangeCommand::ClearFilters),
-            "Clear all filters",
-        )
-    }));
-    rows.push(MenuRow::Separator);
-    rows.push(MenuRow::Header("Type"));
+    let mut rows = vec![
+        MenuRow::Item(MenuItemSpec {
+            shortcut: Some(HIDDEN_SHORTCUT),
+            checked: Some(!filters.hide_hidden),
+            ..MenuItemSpec::new(
+                MenuCommand::Arrange(ArrangeCommand::ToggleHidden),
+                "Show hidden files",
+            )
+        }),
+        MenuRow::Item(MenuItemSpec {
+            enabled: !filters.is_default(),
+            ..MenuItemSpec::new(
+                MenuCommand::Arrange(ArrangeCommand::ClearFilters),
+                "Clear all filters",
+            )
+        }),
+        MenuRow::Separator,
+        MenuRow::Header("Type"),
+    ];
     rows.extend(FileCategory::ALL.into_iter().map(|category| {
         choice(
             ArrangeCommand::ToggleCategory(category),
@@ -117,26 +100,43 @@ pub(crate) fn filter_rows(arrangement: &Arrangement, back: bool) -> Vec<MenuRow>
     rows
 }
 
-/// The rows of `page` for `arrangement`; the context page is not built
-/// here (it depends on the selection), so it yields nothing.
-pub(crate) fn page_rows(page: MenuPage, arrangement: &Arrangement, back: bool) -> Vec<MenuRow> {
-    match page {
-        MenuPage::Sort => sort_rows(arrangement, back),
-        MenuPage::Filter => filter_rows(arrangement, back),
-        MenuPage::Context => Vec::new(),
+/// The rows of `menu` for `arrangement`.
+pub(crate) fn rows(menu: ArrangeMenu, arrangement: &Arrangement) -> Vec<MenuRow> {
+    match menu {
+        ArrangeMenu::Sort => sort_rows(arrangement),
+        ArrangeMenu::Filter => filter_rows(arrangement),
+    }
+}
+
+/// The row of a context menu that opens `menu` as a cascading submenu.
+pub(crate) fn submenu(menu: ArrangeMenu, arrangement: &Arrangement) -> MenuRow {
+    MenuRow::Submenu(SubmenuSpec {
+        menu,
+        label: menu.label(),
+        rows: rows(menu, arrangement),
+    })
+}
+
+/// Redraws the checks of every Sort/Filter submenu in `rows` from
+/// `arrangement`, after a choice changed it.
+pub(crate) fn refresh(rows_to_refresh: &mut [MenuRow], arrangement: &Arrangement) {
+    for row in rows_to_refresh {
+        if let MenuRow::Submenu(spec) = row {
+            spec.rows = rows(spec.menu, arrangement);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::explorer::ops::{MenuTarget, menu_rows, next_menu_index};
+    use crate::explorer::ops::{MenuTarget, menu_rows};
 
     fn items(rows: &[MenuRow]) -> Vec<&MenuItemSpec> {
         rows.iter()
             .filter_map(|row| match row {
                 MenuRow::Item(spec) => Some(spec),
-                MenuRow::Header(_) | MenuRow::Separator => None,
+                MenuRow::Header(_) | MenuRow::Separator | MenuRow::Submenu(_) => None,
             })
             .collect()
     }
@@ -157,6 +157,13 @@ mod tests {
         items(rows).into_iter().find(|spec| spec.label == label)
     }
 
+    fn submenu_of(rows: &[MenuRow], menu: ArrangeMenu) -> Option<&SubmenuSpec> {
+        rows.iter().find_map(|row| match row {
+            MenuRow::Submenu(spec) if spec.menu == menu => Some(spec),
+            _ => None,
+        })
+    }
+
     fn target(selected: usize, in_trash: bool) -> MenuTarget {
         MenuTarget {
             in_trash,
@@ -171,9 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn the_sort_page_checks_the_active_key_direction_and_toggles() {
+    fn the_sort_menu_checks_the_active_key_direction_and_toggles() {
         let mut arrangement = Arrangement::default();
-        let rows = sort_rows(&arrangement, false);
+        let rows = sort_rows(&arrangement);
         assert_eq!(
             labels(&rows),
             [
@@ -202,14 +209,14 @@ mod tests {
         arrangement.apply(ArrangeCommand::SetDir(SortDir::Descending));
         arrangement.apply(ArrangeCommand::ToggleFoldersFirst);
         arrangement.apply(ArrangeCommand::ToggleNatural);
-        let rows = sort_rows(&arrangement, false);
+        let rows = sort_rows(&arrangement);
         assert_eq!(checked_labels(&rows), ["Type", "Descending"]);
     }
 
     #[test]
-    fn the_filter_page_lists_the_four_groups_with_their_check_states() {
+    fn the_filter_menu_lists_the_four_groups_with_their_check_states() {
         let mut arrangement = Arrangement::default();
-        let rows = filter_rows(&arrangement, false);
+        let rows = filter_rows(&arrangement);
         assert_eq!(
             labels(&rows),
             [
@@ -256,7 +263,7 @@ mod tests {
         ] {
             arrangement.apply(command);
         }
-        let rows = filter_rows(&arrangement, false);
+        let rows = filter_rows(&arrangement);
         assert_eq!(
             checked_labels(&rows),
             [
@@ -278,14 +285,10 @@ mod tests {
         let arrangement = Arrangement::default();
         let mut commands = Vec::new();
         let mut unexpected = Vec::new();
-        for rows in [
-            sort_rows(&arrangement, true),
-            filter_rows(&arrangement, true),
-        ] {
+        for rows in [sort_rows(&arrangement), filter_rows(&arrangement)] {
             for spec in items(&rows) {
                 match spec.command {
                     MenuCommand::Arrange(command) => commands.push(command),
-                    MenuCommand::Page(MenuPage::Context) => {}
                     other => unexpected.push((spec.label, other)),
                 }
             }
@@ -294,7 +297,7 @@ mod tests {
             unexpected.is_empty(),
             "not sort/filter commands: {unexpected:?}"
         );
-        assert_eq!(commands.len(), 8 + 8 + 5 + 4 + 2);
+        assert_eq!(commands.len(), 8 + 2 + 8 + 5 + 4);
         for command in commands {
             let mut changed = Arrangement::default();
             changed.apply(command);
@@ -312,89 +315,78 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_space_menu_opens_sort_and_filter_pages() {
-        let rows = menu_rows(&target(0, false));
-        let sort = row(&rows, "Sort by");
-        let filter = row(&rows, "Filter");
+    fn the_empty_space_menu_nests_sort_and_filter_as_submenus() {
+        let arrangement = Arrangement::default();
+        let rows = menu_rows(&target(0, false), &arrangement);
+        let sort = submenu_of(&rows, ArrangeMenu::Sort);
+        let filter = submenu_of(&rows, ArrangeMenu::Filter);
+        assert_eq!(sort.map(|spec| spec.label), Some("Sort by"));
+        assert_eq!(filter.map(|spec| spec.label), Some("Filter"));
         assert_eq!(
-            sort.map(|spec| (spec.command, spec.submenu, spec.enabled)),
-            Some((MenuCommand::Page(MenuPage::Sort), true, true))
+            sort.map(|spec| spec.rows.clone()),
+            Some(sort_rows(&arrangement)),
+            "the flyout holds the Sort menu's rows"
         );
         assert_eq!(
-            filter.map(|spec| (spec.command, spec.submenu, spec.enabled)),
-            Some((MenuCommand::Page(MenuPage::Filter), true, true))
+            filter.map(|spec| spec.rows.clone()),
+            Some(filter_rows(&arrangement))
         );
-        // The pages sit between the paste group and the terminal rows, set
-        // off by separators.
-        let at = |label| {
+        // The submenus sit between the paste group and the terminal rows, set
+        // off by separators, and no flat Sort/Filter row remains.
+        let at = |menu| {
             rows.iter()
-                .position(|row| matches!(row, MenuRow::Item(spec) if spec.label == label))
+                .position(|row| matches!(row, MenuRow::Submenu(spec) if spec.menu == menu))
         };
-        assert_eq!(at("Filter"), at("Sort by").map(|sort| sort + 1));
+        assert_eq!(
+            at(ArrangeMenu::Filter),
+            at(ArrangeMenu::Sort).map(|sort| sort + 1)
+        );
         assert!(matches!(
-            at("Sort by").and_then(|sort| rows.get(sort - 1)),
+            at(ArrangeMenu::Sort).and_then(|sort| rows.get(sort - 1)),
             Some(MenuRow::Separator)
         ));
+        assert!(row(&rows, "Sort by").is_none() && row(&rows, "Filter").is_none());
         assert!(row(&rows, "New folder").is_some() && row(&rows, "Paste").is_some());
     }
 
     #[test]
+    fn the_submenu_checks_follow_the_arrangement() {
+        let mut arrangement = Arrangement::default();
+        let mut rows = menu_rows(&target(0, false), &arrangement);
+        arrangement.apply(ArrangeCommand::SortBy(SortKey::Name));
+        arrangement.apply(ArrangeCommand::ToggleCategory(FileCategory::Images));
+        arrangement.apply(ArrangeCommand::ToggleHidden);
+        refresh(&mut rows, &arrangement);
+        let sort = submenu_of(&rows, ArrangeMenu::Sort).map(|spec| checked_labels(&spec.rows));
+        assert_eq!(
+            sort,
+            Some(vec![
+                "Name",
+                "Descending",
+                "Folders first",
+                "Natural number order"
+            ])
+        );
+        let filter = submenu_of(&rows, ArrangeMenu::Filter).map(|spec| checked_labels(&spec.rows));
+        assert_eq!(filter, Some(vec!["Show hidden files", "Images"]));
+    }
+
+    #[test]
     fn entry_and_trash_menus_are_unchanged() {
+        let arrangement = Arrangement::default();
         for selected in [1, 3] {
-            let rows = menu_rows(&target(selected, false));
-            assert!(row(&rows, "Sort by").is_none(), "{selected} selected");
-            assert!(row(&rows, "Filter").is_none(), "{selected} selected");
+            let rows = menu_rows(&target(selected, false), &arrangement);
+            assert!(
+                rows.iter().all(|row| !matches!(row, MenuRow::Submenu(_))),
+                "{selected} selected"
+            );
         }
         for selected in [0, 2] {
-            let rows = menu_rows(&target(selected, true));
+            let rows = menu_rows(&target(selected, true), &arrangement);
             assert!(
-                row(&rows, "Sort by").is_none(),
+                rows.iter().all(|row| !matches!(row, MenuRow::Submenu(_))),
                 "trash, {selected} selected"
             );
         }
-    }
-
-    #[test]
-    fn the_drilled_in_pages_offer_the_way_back_first() {
-        let arrangement = Arrangement::default();
-        for page in [MenuPage::Sort, MenuPage::Filter] {
-            let rows = page_rows(page, &arrangement, true);
-            let first = items(&rows).into_iter().next();
-            assert_eq!(
-                first.map(|spec| (spec.label, spec.command)),
-                Some(("Back", MenuCommand::Page(MenuPage::Context)))
-            );
-            let direct = page_rows(page, &arrangement, false);
-            assert!(
-                row(&direct, "Back").is_none(),
-                "the subbar menus have no back row"
-            );
-            assert_eq!(items(&direct).len() + 1, items(&rows).len());
-        }
-        assert!(page_rows(MenuPage::Context, &arrangement, false).is_empty());
-    }
-
-    #[test]
-    fn arrow_keys_skip_headers_and_disabled_rows() {
-        let arrangement = Arrangement::default();
-        let rows = filter_rows(&arrangement, false);
-        // Down from nothing lands on the first item; "Clear all filters" is
-        // disabled and skipped on the way down.
-        let first = next_menu_index(&rows, None, true);
-        assert_eq!(first, Some(0));
-        assert_eq!(
-            next_menu_index(&rows, first, true),
-            Some(4),
-            "past the separator and the Type header"
-        );
-        // Up from nothing wraps to the last row.
-        let last = next_menu_index(&rows, None, false);
-        assert_eq!(
-            last.and_then(|at| rows.get(at)).map(|row| match row {
-                MenuRow::Item(spec) => spec.label,
-                _ => "",
-            }),
-            Some("> 1 GB")
-        );
     }
 }

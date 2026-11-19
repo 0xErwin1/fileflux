@@ -1248,6 +1248,7 @@ mod tests {
                 MenuRow::Separator => "-".to_owned(),
                 MenuRow::Header(label) => format!("# {label}"),
                 MenuRow::Item(item) => item.label.to_owned(),
+                MenuRow::Submenu(spec) => spec.label.to_owned(),
             })
             .collect()
     }

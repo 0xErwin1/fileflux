@@ -9,10 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use chrono::{TimeZone, Utc};
 use fileflux::core::ops::{ItemOutcome, ItemReport, TransferError};
 
-use super::super::{
-    DialogState, Job, MenuCommand, MenuItemSpec, MenuRow, MenuTarget, menu_rows, next_menu_index,
-    run_job,
-};
+use super::super::{DialogState, Job, MenuCommand, MenuItemSpec, MenuRow, MenuTarget, run_job};
 use super::*;
 use crate::explorer::progress::Unit;
 
@@ -195,6 +192,11 @@ fn target(selected: usize, can_paste: bool, folder_selected: bool) -> MenuTarget
     }
 }
 
+/// The menu rows on the default arrangement.
+fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
+    super::super::menu_rows(target, &crate::explorer::arrange::Arrangement::default())
+}
+
 fn spec(rows: &[MenuRow], command: MenuCommand) -> Option<&MenuItemSpec> {
     rows.iter().find_map(|row| match row {
         MenuRow::Item(item) if item.command == command => Some(item),
@@ -284,16 +286,18 @@ fn the_trash_view_never_offers_the_clipboard() {
 #[test]
 fn the_arrow_keys_skip_a_disabled_paste() {
     let rows = menu_rows(&target(0, false, false));
-    let mut at = None;
+    let nodes = crate::explorer::menu_tree::nodes(None, &rows);
+    let mut nav = bolt::composites::MenuNav::new();
+    nav.reset(&nodes);
     let mut visited = Vec::new();
     for _ in 0..10 {
-        at = next_menu_index(&rows, at, true);
-        if let Some(MenuRow::Item(item)) = at.and_then(|index| rows.get(index)) {
-            visited.push(item.command);
+        nav.step(&nodes, true);
+        if let Some(node) = nav.current(&nodes) {
+            visited.push(node.item.label.to_string());
         }
     }
-    assert!(!visited.contains(&MenuCommand::Paste), "{visited:?}");
-    assert!(visited.contains(&MenuCommand::NewFolder));
+    assert!(!visited.iter().any(|label| label == "Paste"), "{visited:?}");
+    assert!(visited.iter().any(|label| label == "New folder"));
 }
 
 #[test]

@@ -38,7 +38,8 @@ use fileflux::core::trash::{
 use fileflux::core::watch::nearest_existing_ancestor;
 use gpui::Entity;
 
-use super::arrange::ArrangeCommand;
+use super::arrange::{ArrangeCommand, Arrangement};
+use super::arrange_menu;
 use super::progress::Sink;
 
 #[path = "paste.rs"]
@@ -1257,8 +1258,6 @@ pub(crate) enum MenuCommand {
     PasteIntoFolder,
     /// A sort or filter change; the menu stays open and redraws its checks.
     Arrange(ArrangeCommand),
-    /// Shows another page of the open menu ("Sort by", "Filter").
-    Page(MenuPage),
     /// Sidebar rows: pin the row's folder to the Favorites.
     AddFavorite,
     /// Sidebar rows: unpin the row's folder from the Favorites.
@@ -1271,14 +1270,23 @@ pub(crate) enum MenuCommand {
     Eject,
 }
 
-/// Which page of the one menu is showing. The empty-space menu opens on
-/// [`MenuPage::Context`] and drills into the other two; the subbar buttons
-/// open them directly.
+/// Which arrangement menu a submenu row opens: the empty-space context menu
+/// nests both as cascading submenus, and the subbar buttons open either one
+/// directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MenuPage {
-    Context,
+pub(crate) enum ArrangeMenu {
     Sort,
     Filter,
+}
+
+impl ArrangeMenu {
+    /// The label of the row that opens this menu.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Sort => "Sort by",
+            Self::Filter => "Filter",
+        }
+    }
 }
 
 /// One drawn menu item.
@@ -1293,8 +1301,6 @@ pub(crate) struct MenuItemSpec {
     pub(crate) enabled: bool,
     /// `Some` for a checkable row: `true` draws the check mark.
     pub(crate) checked: Option<bool>,
-    /// The row opens another page of the menu: drawn with a chevron.
-    pub(crate) submenu: bool,
 }
 
 impl MenuItemSpec {
@@ -1307,15 +1313,26 @@ impl MenuItemSpec {
             danger: false,
             enabled: true,
             checked: None,
-            submenu: false,
         }
     }
+}
+
+/// A row that opens a cascading submenu beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubmenuSpec {
+    pub(crate) menu: ArrangeMenu,
+    pub(crate) label: &'static str,
+    /// The rows of the flyout, checks included (see
+    /// [`super::arrange_menu::refresh`]).
+    pub(crate) rows: Vec<MenuRow>,
 }
 
 /// A row of the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuRow {
     Item(MenuItemSpec),
+    /// A row whose flyout opens on hover, Right or Enter.
+    Submenu(SubmenuSpec),
     /// A caption naming the group of rows under it; never selectable.
     Header(&'static str),
     Separator,
@@ -1413,8 +1430,9 @@ pub(crate) fn add_viewer_row(rows: &mut Vec<MenuRow>) {
 }
 
 /// The menu rows for a target; empty when there is nothing to offer (the
-/// caller then opens no menu). Drag & drop comes with its own task.
-pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
+/// caller then opens no menu). Drag & drop comes with its own task. The
+/// empty-space menu nests Sort and Filter, checked from `arrangement`.
+pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<MenuRow> {
     let item = |command, label, shortcut, danger| {
         MenuRow::Item(MenuItemSpec {
             shortcut,
@@ -1529,8 +1547,8 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
         MenuRow::Separator,
         paste(MenuCommand::Paste, "Paste"),
         MenuRow::Separator,
-        page_row(MenuPage::Sort, "Sort by"),
-        page_row(MenuPage::Filter, "Filter"),
+        arrange_menu::submenu(ArrangeMenu::Sort, arrangement),
+        arrange_menu::submenu(ArrangeMenu::Filter, arrangement),
         MenuRow::Separator,
     ];
     if target.terminal {
@@ -1648,41 +1666,6 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
         item(MenuCommand::Properties, "Properties", false),
     ]);
     rows
-}
-
-/// A row that opens another page of the menu.
-pub(crate) fn page_row(page: MenuPage, label: &'static str) -> MenuRow {
-    MenuRow::Item(MenuItemSpec {
-        submenu: true,
-        ..MenuItemSpec::new(MenuCommand::Page(page), label)
-    })
-}
-
-/// The row the arrow keys move to from `current` (`None`: nothing
-/// highlighted yet), skipping separators and disabled items and wrapping around. `forward`
-/// false goes up. `None` when the menu has no item.
-pub(crate) fn next_menu_index(
-    rows: &[MenuRow],
-    current: Option<usize>,
-    forward: bool,
-) -> Option<usize> {
-    let count = rows.len();
-    let mut index = current;
-    for _ in 0..count {
-        index = Some(match (index, forward) {
-            (None, true) => 0,
-            (None, false) => count.checked_sub(1)?,
-            (Some(at), true) => (at + 1) % count,
-            (Some(at), false) => (at + count - 1) % count,
-        });
-        if matches!(
-            index.and_then(|at| rows.get(at)),
-            Some(MenuRow::Item(MenuItemSpec { enabled: true, .. }))
-        ) {
-            return index;
-        }
-    }
-    None
 }
 
 // --- confirmation dialogs -----------------------------------------------------------

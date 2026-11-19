@@ -6,21 +6,21 @@
 //! `bolt::modals::Modal` with `Button`s, and the editor is Bolt's `Input`.
 
 use bolt::composites::{
-    MenuItem, render_menu_container, render_menu_header, render_menu_item, render_menu_overlay,
-    render_separator,
+    LevelMetrics, MenuTreeEvent, MenuTreeLayout, level_height, render_menu_overlay,
+    render_menu_tree,
 };
 use bolt::controls::{Button, Checkbox, Input, InputEnter, InputEscape};
 use bolt::modals::Modal;
-use bolt::tokens::Spacing;
+use bolt::tokens::{Borders, MenuMetrics, Spacing};
 use gpui::{
-    Anchor, AnyElement, App, Context, InteractiveElement as _, IntoElement as _, MouseButton,
-    ParentElement as _, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, anchored,
-    deferred, div, point, prelude::FluentBuilder as _, px,
+    AnyElement, App, Context, InteractiveElement as _, IntoElement as _, MouseButton,
+    ParentElement as _, Pixels, Point, Size, StatefulInteractiveElement as _, Styled as _,
+    WeakEntity, Window, deferred, div, point, prelude::FluentBuilder as _, px, size,
 };
 
 use super::actions::RenameView;
 use super::icon;
-use super::ops::{DialogAction, DialogChoice, DialogKind, MenuCommand, MenuPage, MenuRow};
+use super::ops::{DialogAction, DialogChoice, DialogKind};
 use super::view::{Explorer, MENU_CONTEXT};
 
 /// The menu and the dialog, when open. Also hands the keyboard back to the
@@ -38,142 +38,100 @@ pub(crate) fn render(
         this.entries_focus().focus(window, cx);
     }
     let mut layers = Vec::new();
-    layers.extend(render_menu(this, cx));
+    layers.extend(render_menu(this, window, cx));
     layers.extend(render_dialog(this, cx));
     layers
 }
 
-fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
-    use gpui_kit_assets::IconName;
-    Some(match command {
-        // Sort and filter choices show their check mark instead.
-        MenuCommand::Arrange(_) => return None,
-        MenuCommand::Page(MenuPage::Sort) => IconName::ArrowUpDown,
-        MenuCommand::Page(MenuPage::Filter) => IconName::ListFilter,
-        MenuCommand::Page(MenuPage::Context) => IconName::ChevronLeft,
-        MenuCommand::AddFavorite => IconName::Star,
-        MenuCommand::RemoveFavorite => IconName::StarFill,
-        MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
-        MenuCommand::OpenInViewer => IconName::Image,
-        MenuCommand::OpenInNewTab => IconName::ExternalLink,
-        MenuCommand::OpenContainingFolder => IconName::FolderOpen,
-        MenuCommand::Rename => IconName::Pencil,
-        MenuCommand::CopyPath | MenuCommand::CopyFolderPath => IconName::Link,
-        MenuCommand::Properties => IconName::Info,
-        MenuCommand::MoveToTrash | MenuCommand::DeletePermanently | MenuCommand::EmptyTrash => {
-            IconName::Trash
-        }
-        MenuCommand::NewFolder => IconName::FolderPlus,
-        MenuCommand::NewFile => IconName::FilePlus,
-        MenuCommand::OpenTerminal => IconName::Terminal,
-        MenuCommand::Restore => IconName::Undo2,
-        MenuCommand::Cut => IconName::Scissors,
-        MenuCommand::Copy => IconName::Copy,
-        MenuCommand::Paste | MenuCommand::PasteIntoFolder => IconName::ClipboardPaste,
-        MenuCommand::Mount => IconName::HardDrive,
-        MenuCommand::Unmount | MenuCommand::Eject => IconName::Eject,
-    })
+/// Width of the root panel: wide enough for "Delete permanently…" and its
+/// shortcut; a longer target title truncates.
+const MENU_WIDTH: f32 = 260.0;
+
+/// The row heights of the current theme, the way the cascade resolves them,
+/// to place the root panel before it draws.
+fn level_metrics(cx: &App) -> LevelMetrics {
+    LevelMetrics {
+        row_height: bolt::fonts::ui_px(cx, MenuMetrics::ROW_HEIGHT),
+        detail_row_height: bolt::fonts::ui_px(cx, MenuMetrics::DETAIL_ROW_HEIGHT),
+        header_height: bolt::fonts::ui_px(cx, MenuMetrics::HEADER_ICON)
+            + MenuMetrics::HEADER_PADDING_TOP
+            + MenuMetrics::HEADER_PADDING_BOTTOM,
+        separator_height: Borders::THIN + MenuMetrics::SEPARATOR_MARGIN_Y * 2.0,
+        padding_y: MenuMetrics::PADDING_Y,
+    }
 }
 
-fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
+/// Where the root panel opens: at `wanted`, moved left and up as far as the
+/// window's edges require. Only the flyouts flip and clamp on their own.
+fn root_origin(
+    wanted: Point<Pixels>,
+    panel: Size<Pixels>,
+    viewport: Size<Pixels>,
+) -> Point<Pixels> {
+    let margin = MenuMetrics::FLYOUT_MARGIN;
+    let x = wanted
+        .x
+        .min(viewport.width - panel.width - margin)
+        .max(margin);
+    let y = wanted
+        .y
+        .min(viewport.height - panel.height - margin)
+        .max(margin);
+    point(x, y)
+}
+
+fn render_menu(this: &Explorer, window: &Window, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
     let Some(menu) = this.menu.as_ref() else {
         return Vec::new();
     };
     let weak = cx.entity().downgrade();
-    // The target header: what the rows below act on. Only the context page
-    // shows it (the Sort and Filter pages carry their own captions), and it
-    // takes no part in the row indices, hover or keyboard.
-    let title = menu
-        .title
-        .as_ref()
-        .filter(|_| menu.page == MenuPage::Context)
-        .map(|title| {
-            div()
-                .id("explorer-menu-title")
-                .max_w(px(320.0))
-                .child(
-                    div()
-                        .truncate()
-                        .child(render_menu_header(&MenuItem::header(title.clone()), cx)),
-                )
-                .child(render_separator(cx))
-                .into_any_element()
-        });
-    let children: Vec<AnyElement> = menu
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| match row {
-            MenuRow::Separator => render_separator(cx).into_any_element(),
-            MenuRow::Header(label) => {
-                render_menu_header(&MenuItem::header(*label), cx).into_any_element()
-            }
-            MenuRow::Item(spec) => {
-                let mut item = MenuItem::new(spec.label);
-                if let Some(name) = command_icon(spec.command) {
-                    item = item.icon(icon(name));
-                }
-                if let Some(checked) = spec.checked {
-                    item = item.checked(checked);
-                }
-                if spec.submenu {
-                    item = item.submenu();
-                }
-                if let Some(shortcut) = spec.shortcut {
-                    item = item.shortcut(shortcut);
-                }
-                if spec.danger {
-                    item = item.danger();
-                }
-                if !spec.enabled {
-                    item = item.disabled();
-                }
-                let command = spec.command;
-                let click_weak = weak.clone();
-                let hover_weak = weak.clone();
-                render_menu_item(
-                    "explorer-menu",
-                    &item,
-                    index,
-                    menu.selected == Some(index),
-                    move |_event, window, cx| {
-                        if let Err(error) = click_weak.update(cx, |this, cx| {
-                            this.run_menu_command(command, window, cx);
-                        }) {
-                            log::debug!("the menu outlived its explorer: {error}");
-                        }
-                    },
-                    move |cx| {
-                        if let Err(error) = hover_weak.update(cx, |this, cx| {
-                            if let Some(menu) = this.menu.as_mut()
-                                && menu.selected != Some(index)
-                            {
-                                menu.selected = Some(index);
-                                cx.notify();
-                            }
-                        }) {
-                            log::debug!("the menu outlived its explorer: {error}");
-                        }
-                    },
-                    cx,
-                )
-                .into_any_element()
-            }
-        })
-        .collect();
-
+    let nodes = menu.nodes();
+    let viewport = window.bounds().size;
+    let width = px(MENU_WIDTH);
+    let height = level_height(&nodes, &level_metrics(cx));
+    let layout = MenuTreeLayout {
+        origin: root_origin(menu.position, size(width, height), viewport),
+        width,
+        viewport,
+        keyboard_focus: menu.keyboard,
+    };
     let dismiss = weak.clone();
-    // The Filter page is taller than a short window: the rows scroll inside
-    // the frame, which stays put.
-    let rows = div()
-        .id("explorer-menu-rows")
-        .flex()
-        .flex_col()
-        .max_h(px(700.0))
-        .overflow_y_scroll()
-        .children(children);
-    let rows = div().flex().flex_col().children(title).child(rows);
-    let panel = render_menu_container(vec![rows], cx).min_w(px(250.0));
+    let handle = window.window_handle();
+    let tree = render_menu_tree(
+        "explorer-menu",
+        &nodes,
+        &menu.nav,
+        layout,
+        move |event, cx| {
+            let result = match event {
+                // Running a row needs the window (it may open a dialog or move
+                // the keyboard focus), and this callback runs while the window
+                // is busy dispatching the click: run the row once it is free.
+                MenuTreeEvent::Activated { path, .. } => {
+                    let weak = weak.clone();
+                    cx.defer(move |cx| {
+                        let outcome = handle.update(cx, |_, window, cx| {
+                            weak.update(cx, |this, cx| this.activate_menu_path(&path, window, cx))
+                        });
+                        if let Err(error) = outcome.and_then(|inner| inner) {
+                            log::debug!("the menu outlived its explorer: {error}");
+                        }
+                    });
+                    Ok(())
+                }
+                MenuTreeEvent::Opened { level, index } => weak
+                    .update(cx, |this, cx| this.menu_open_flyout(level, index, cx))
+                    .map_err(|error| error.to_string()),
+                MenuTreeEvent::Hovered { level, index } => weak
+                    .update(cx, |this, cx| this.menu_row_hovered(level, index, cx))
+                    .map_err(|error| error.to_string()),
+            };
+            if let Err(error) = result {
+                log::debug!("the menu outlived its explorer: {error}");
+            }
+        },
+        cx,
+    );
     vec![
         // Under the menu: any click elsewhere closes it.
         deferred(div().absolute().size_full().child(render_menu_overlay(
@@ -190,18 +148,13 @@ fn render_menu(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
         .with_priority(1)
         .into_any_element(),
         deferred(
-            anchored()
-                .position(menu.position)
-                .anchor(Anchor::TopLeft)
-                .snap_to_window()
-                .child(
-                    div()
-                        .id("explorer-menu")
-                        .occlude()
-                        .key_context(MENU_CONTEXT)
-                        .track_focus(&this.menu_focus)
-                        .child(panel),
-                ),
+            div()
+                .id("explorer-menu")
+                .absolute()
+                .size_full()
+                .key_context(MENU_CONTEXT)
+                .track_focus(&this.menu_focus)
+                .child(tree),
         )
         .with_priority(2)
         .into_any_element(),

@@ -391,9 +391,15 @@ fn a_padded_name_is_renamed_as_typed_and_the_user_is_told() -> TestResult {
 
 // --- context menu model ---------------------------------------------------------
 
+/// The menu rows on the default arrangement.
+fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
+    super::menu_rows(target, &Arrangement::default())
+}
+
 fn flat(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
+            MenuRow::Submenu(spec) => spec.label.to_owned(),
             MenuRow::Separator => "-".to_owned(),
             MenuRow::Header(label) => format!("# {label}"),
             MenuRow::Item(item) => item.label.to_owned(),
@@ -807,27 +813,33 @@ fn the_arrow_keys_walk_the_items_skip_separators_and_wrap() {
     let rows = menu_rows(&target(false, 1, false, true));
     // 0 Open, 1 -, 2 Cut, 3 Copy, 4 Paste (disabled: nothing to paste),
     // 5 -, 6 Rename, 7 Copy path, 8 -, 9 Properties, 10 Trash, 11 Delete…
-    assert_eq!(next_menu_index(&rows, None, true), Some(0));
+    let nodes = crate::explorer::menu_tree::nodes(None, &rows);
+    let mut nav = bolt::composites::MenuNav::new();
+    // From the item at `from`, one step in `forward`'s direction.
+    let mut from = |from: Option<usize>, forward: bool| {
+        match from {
+            Some(index) => {
+                nav.set_level(0, index, &nodes);
+            }
+            None => nav.reset(&nodes),
+        }
+        nav.step(&nodes, forward);
+        nav.cursor().highlight(0)
+    };
     assert_eq!(
-        next_menu_index(&rows, Some(0), true),
+        from(None, true),
         Some(2),
-        "skips the separator"
+        "from the first item, past the separator"
     );
+    assert_eq!(from(Some(0), true), Some(2), "skips the separator");
     assert_eq!(
-        next_menu_index(&rows, Some(3), true),
+        from(Some(3), true),
         Some(6),
         "skips the disabled Paste and the separator"
     );
-    assert_eq!(
-        next_menu_index(&rows, Some(11), true),
-        Some(0),
-        "wraps down"
-    );
-    assert_eq!(next_menu_index(&rows, None, false), Some(11));
-    assert_eq!(next_menu_index(&rows, Some(6), false), Some(3));
-    assert_eq!(next_menu_index(&rows, Some(0), false), Some(11), "wraps up");
-    assert_eq!(next_menu_index(&[MenuRow::Separator], None, true), None);
-    assert_eq!(next_menu_index(&[], None, false), None);
+    assert_eq!(from(Some(11), true), Some(0), "wraps down");
+    assert_eq!(from(Some(6), false), Some(3));
+    assert_eq!(from(Some(0), false), Some(11), "wraps up");
 }
 
 // --- confirmation text ---------------------------------------------------------

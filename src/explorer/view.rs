@@ -54,7 +54,7 @@ use crate::explorer::devices::{CheckedStep, DeviceHub};
 use crate::explorer::favorites::{BookmarkSync, favorites_of};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
-use crate::explorer::ops::{DialogQueue, MenuPage};
+use crate::explorer::ops::{ArrangeMenu, DialogQueue};
 use crate::explorer::ops::{OpenAction, Severity, UndoStack, open_action};
 use crate::explorer::panes::{self, PaneLayout, Panes, PerPane, Side};
 use crate::explorer::persist::{
@@ -134,7 +134,11 @@ actions!(
         MenuDown,
         /// Runs the highlighted context-menu item.
         MenuConfirm,
-        /// Closes the context menu.
+        /// Opens the highlighted context-menu submenu.
+        MenuRight,
+        /// Closes the open context-menu submenu.
+        MenuLeft,
+        /// Closes the open context-menu submenu, then the menu.
         MenuCancel,
         /// Cancels the open confirmation dialog.
         DialogCancel,
@@ -267,6 +271,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", MenuUp, Some(MENU_CONTEXT)),
         KeyBinding::new("down", MenuDown, Some(MENU_CONTEXT)),
         KeyBinding::new("enter", MenuConfirm, Some(MENU_CONTEXT)),
+        KeyBinding::new("right", MenuRight, Some(MENU_CONTEXT)),
+        KeyBinding::new("left", MenuLeft, Some(MENU_CONTEXT)),
         KeyBinding::new("escape", MenuCancel, Some(MENU_CONTEXT)),
         KeyBinding::new("escape", DialogCancel, Some("Modal")),
         KeyBinding::new("up", DialogUp, Some("Modal")),
@@ -3189,8 +3195,14 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &MenuConfirm, window, cx| {
                 this.confirm_menu(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &MenuRight, window, cx| {
+                this.menu_right(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuLeft, _window, cx| {
+                this.menu_left(cx);
+            }))
             .on_action(cx.listener(|this, _: &MenuCancel, window, cx| {
-                this.close_menu(window, cx);
+                this.menu_escape(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DialogCancel, window, cx| {
                 this.cancel_dialog(window, cx);
@@ -3530,7 +3542,7 @@ impl Explorer {
                     .tooltip("Sort by name, size, date or type")
                     .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                         let position = overlay::under_button(event.position());
-                        this.open_arrange_menu(MenuPage::Sort, position, window, cx);
+                        this.open_arrange_menu(ArrangeMenu::Sort, position, window, cx);
                     })),
             )
             .child(
@@ -3540,7 +3552,7 @@ impl Explorer {
                     .tooltip("Filter by type, date, size or hidden files")
                     .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                         let position = overlay::under_button(event.position());
-                        this.open_arrange_menu(MenuPage::Filter, position, window, cx);
+                        this.open_arrange_menu(ArrangeMenu::Filter, position, window, cx);
                     })),
             )
             .child(if self.tab().state.current() == &Location::Trash {
