@@ -149,8 +149,25 @@ fn jpeg_size<R: Read + Seek>(reader: &mut R) -> io::Result<Option<(u32, u32)>> {
 
 /// [`dimensions`] of the file at `path`.
 pub(crate) fn file_dimensions(path: &Path) -> io::Result<Option<(u32, u32)>> {
-    dimensions(&mut std::fs::File::open(path)?)
+    let mut file = std::fs::File::open(path)?;
+    // One large read instead of the parser's byte-sized ones: on a phone
+    // (gvfs MTP) or network mount every read is a round trip to the device.
+    let mut head = Vec::with_capacity(HEAD_READ);
+    (&mut file).take(HEAD_READ as u64).read_to_end(&mut head)?;
+    if let Some(size) = dimensions(&mut io::Cursor::new(&head))? {
+        return Ok(Some(size));
+    }
+    if head.len() < HEAD_READ {
+        // The whole file was read: there is no size to find.
+        return Ok(None);
+    }
+    // The size sits past the first block (a large embedded preview, say).
+    dimensions(&mut io::BufReader::with_capacity(HEAD_READ, file))
 }
+
+/// How much of a file [`file_dimensions`] reads up front; covers the EXIF
+/// block phone cameras write before the frame header.
+const HEAD_READ: usize = 256 * 1024;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing)]
@@ -240,6 +257,35 @@ mod tests {
         jpeg.extend(3000u16.to_be_bytes()); // height
         jpeg.extend(4000u16.to_be_bytes()); // width
         assert_eq!(read(jpeg), Some((4000, 3000)));
+    }
+
+    /// A JPEG whose frame header follows `app_segments` full APP1 blocks.
+    fn jpeg_after_app_segments(app_segments: usize) -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        for _ in 0..app_segments {
+            jpeg.extend([0xFF, 0xE1, 0xFF, 0xFF]);
+            jpeg.extend(std::iter::repeat_n(0u8, 0xFFFF - 2));
+        }
+        jpeg.extend([0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        jpeg.extend(3000u16.to_be_bytes());
+        jpeg.extend(4000u16.to_be_bytes());
+        jpeg
+    }
+
+    #[test]
+    fn file_dimensions_finds_the_size_before_and_past_the_first_read() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("fileflux-header-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let near = dir.join("near.jpg");
+        let far = dir.join("far.jpg");
+        std::fs::write(&near, jpeg_after_app_segments(1))?;
+        // Five 64 KiB segments put the frame header past HEAD_READ.
+        std::fs::write(&far, jpeg_after_app_segments(5))?;
+        let found = (file_dimensions(&near), file_dimensions(&far));
+        std::fs::remove_dir_all(&dir)?;
+        assert_eq!(found.0?, Some((4000, 3000)));
+        assert_eq!(found.1?, Some((4000, 3000)));
+        Ok(())
     }
 
     #[test]
