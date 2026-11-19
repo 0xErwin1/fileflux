@@ -6,8 +6,10 @@ Goal: manage removable drives and partitions from the sidebar. Branch: main (loc
 - S2 (original list): "Montar, desmontar y expulsar USB."
 
 ## Tasks
-- T1 | S1-S2 | route: writer | pending | Device discovery (mounted + unmounted mountable block devices), mount/unmount/eject via udisksctl argv without shell, busy-operation guard, tab fallback, live device updates, sidebar UI + context menu, tests + native validation | commit: -
+- T1 | S1-S2 | route: writer | done | Device discovery (mounted + unmounted mountable block devices), mount/unmount/eject via udisksctl argv without shell, busy-operation guard, tab fallback, live device updates, sidebar UI + context menu, tests + native validation | commit: 85af66c
+- T2 | S1 | route: independent gentle-ai-verify (Risk 1, 4) | pending | Verify busy guard, eject ordering, tab fallback, system-disk exclusion against the real (read-only) lsblk of this machine, parser robustness | commit: n/a
 
 ## Log
 - L1: "Que es lo siguiente?" → agent recommended devices.
 - L2: "Si, dale con eso"
+- L3: T1 (85af66c): RED 32/36 core + 13 explorer vs stubs, GREEN; lib suite x15. Tests 211+391+9+4+30. Native Xvfb with fake lsblk/udisksctl PASS: rows (mounted + 'Not mounted'), click-to-mount argv + navigate, eject tooltip, menu, eject during a 6000-file copy waits (unmount logged only after the copy finished, 0 watches on the device, then power-off), tab moved out before unmount with notice, busy error toast, polling refresh only while focused (2 s). Decisions: polling instead of /dev/disk/by-uuid inotify; any disk with a system mount or active swap hidden from the unmounted list; fallback for /run/media/<user>/X lands on /run/media/<user>. Hand-written lsblk JSON reader (serde_json exists in the lock: candidate to replace).
