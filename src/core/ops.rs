@@ -656,14 +656,35 @@ struct Ctx<'a> {
     made: Option<Vec<Made>>,
 }
 
+/// Device, inode and birth time of a file. Device and inode alone are not
+/// enough: ext4 hands a deleted file's inode number to the next file
+/// created, so a file that replaced ours would look like ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    born: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(meta: &fs::Metadata) -> FileIdentity {
+        FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            born: meta.created().ok(),
+        }
+    }
+}
+
 /// An entry a direct copy created, with the identity it had when created.
 struct Made {
     path: PathBuf,
     is_dir: bool,
-    /// `(st_dev, st_ino)`: a different file at the same path is not ours.
+    /// Device, inode and birth time: a different file at the same path is
+    /// not ours.
     /// `None` when looking at the entry failed right after creating it: it is
     /// then rolled back by path alone, as it was before identities existed.
-    identity: Option<(u64, u64)>,
+    identity: Option<FileIdentity>,
 }
 
 impl Made {
@@ -673,7 +694,7 @@ impl Made {
             return false;
         };
         self.identity
-            .is_none_or(|identity| (meta.dev(), meta.ino()) == identity)
+            .is_none_or(|identity| FileIdentity::of(&meta) == identity)
     }
 }
 
@@ -1019,7 +1040,7 @@ impl Ctx<'_> {
     fn made(&mut self, path: &Path, is_dir: bool) {
         if let Some(made) = &mut self.made {
             let identity = match self.backend.created_metadata(path) {
-                Ok(meta) => Some((meta.dev(), meta.ino())),
+                Ok(meta) => Some(FileIdentity::of(&meta)),
                 Err(error) => {
                     log::debug!(
                         "no identity for the created {}: {error}; rolling it back by path",

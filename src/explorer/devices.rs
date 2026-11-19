@@ -1507,7 +1507,11 @@ mod tests {
 
     #[test]
     fn an_undo_touches_where_it_puts_things_back() {
-        let identity = Identity { dev: 1, ino: 2 };
+        let identity = Identity {
+            dev: 1,
+            ino: 2,
+            born: None,
+        };
         let rename = UndoAction::Rename {
             old: p("/mnt/a/old"),
             new: p("/mnt/a/new"),

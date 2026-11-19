@@ -71,13 +71,19 @@ impl NewKind {
     }
 }
 
-/// Which file a path named when an operation finished: device and inode.
-/// An undo acts only when the item at the recorded location is still this
-/// one; a different file under the same name is someone else's.
+/// Which file a path named when an operation finished: device, inode and
+/// birth time. An undo acts only when the item at the recorded location is
+/// still this one; a different file under the same name is someone else's.
+///
+/// Device and inode alone are not enough: ext4 hands a deleted file's inode
+/// number to the next file created, so "delete, then write a new file with
+/// the same name" looks identical. The birth time (statx `btime`) tells
+/// them apart wherever the filesystem records it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
+    pub(crate) born: Option<std::time::SystemTime>,
 }
 
 impl Identity {
@@ -85,6 +91,7 @@ impl Identity {
         Identity {
             dev: meta.dev(),
             ino: meta.ino(),
+            born: meta.created().ok(),
         }
     }
 

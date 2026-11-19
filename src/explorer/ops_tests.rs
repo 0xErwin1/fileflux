@@ -96,7 +96,11 @@ fn rename_action(old: &str, new: &str) -> UndoAction {
     UndoAction::Rename {
         old: PathBuf::from(old),
         new: PathBuf::from(new),
-        identity: Identity { dev: 1, ino: 2 },
+        identity: Identity {
+            dev: 1,
+            ino: 2,
+            born: None,
+        },
     }
 }
 
@@ -107,7 +111,11 @@ fn the_undo_stack_pops_the_newest_and_take_removes_only_that_entry() {
     let b = stack.push(UndoAction::Create {
         path: PathBuf::from("/x/new"),
         kind: NewKind::Folder,
-        identity: Identity { dev: 1, ino: 3 },
+        identity: Identity {
+            dev: 1,
+            ino: 3,
+            born: None,
+        },
     });
     let c = stack.push(rename_action("/x/c", "/x/d"));
     assert_eq!(stack.len(), 3);
@@ -2646,4 +2654,30 @@ fn open_in_viewer_follows_open_and_leaves_open_with_in_place() {
         add_viewer_row(&mut rows);
         assert_eq!(flat(&rows), before);
     }
+}
+
+#[test]
+fn a_new_file_that_reuses_a_deleted_inode_is_not_the_same_item() {
+    // ext4 reuses inode numbers right away; only the birth time differs.
+    let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+    let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(200);
+    let ours = Identity {
+        dev: 7,
+        ino: 42,
+        born: Some(earlier),
+    };
+    let reused = Identity {
+        dev: 7,
+        ino: 42,
+        born: Some(later),
+    };
+    assert_ne!(ours, reused);
+    assert_eq!(
+        ours,
+        Identity {
+            dev: 7,
+            ino: 42,
+            born: Some(earlier)
+        }
+    );
 }

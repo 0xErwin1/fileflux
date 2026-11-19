@@ -735,7 +735,11 @@ fn the_conflict_dialog_describes_both_items_and_defaults_to_skip() {
 // --- undo plan ----------------------------------------------------------------------------------
 
 fn identity_of_all(_: &Path) -> Option<Identity> {
-    Some(Identity { dev: 1, ino: 2 })
+    Some(Identity {
+        dev: 1,
+        ino: 2,
+        born: None,
+    })
 }
 
 #[test]
