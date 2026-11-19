@@ -18,9 +18,9 @@ use std::sync::Arc;
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, Spacing};
 use gpui::{
-    App, AppContext as _, Context, ExternalPaths, InteractiveElement, IntoElement,
-    ParentElement as _, Pixels, Point, Render, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, px,
+    App, AppContext as _, Context, ExternalDragPayload, ExternalPaths, FileDragPaths,
+    InteractiveElement, IntoElement, ParentElement as _, Pixels, Point, Render,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
 };
 use gpui_component::ActiveTheme as _;
 
@@ -241,31 +241,83 @@ pub(crate) fn drag_source<E: StatefulInteractiveElement>(
         Arc::new(vec![path.clone()])
     };
     let weak = weak.clone();
-    element.on_drag(
-        DraggedEntries { paths },
-        move |dragged, grab, _window, cx| {
-            if !selected
-                && let Err(error) = weak.update(cx, |this, cx| {
-                    this.tab_mut().state.select_only(&path);
-                    cx.notify();
-                })
-            {
-                log::debug!("the dragged row outlived its explorer: {error}");
-            }
-            let one = dragged.paths.len() == 1;
-            let preview = DragPreview {
-                text: preview_text(&dragged.paths),
-                glyph: if one {
-                    glyph
-                } else {
-                    gpui_kit_assets::IconName::Files
-                },
-                folder: one && folder,
-                grab,
+    let payload_explorer = weak.clone();
+    let dragged_path = path.clone();
+    element
+        .on_drag(
+            DraggedEntries { paths },
+            move |dragged, grab, _window, cx| {
+                if !selected
+                    && let Err(error) = weak.update(cx, |this, cx| {
+                        this.tab_mut().state.select_only(&path);
+                        cx.notify();
+                    })
+                {
+                    log::debug!("the dragged row outlived its explorer: {error}");
+                }
+                let one = dragged.paths.len() == 1;
+                let preview = DragPreview {
+                    text: preview_text(&dragged.paths),
+                    glyph: if one {
+                        glyph
+                    } else {
+                        gpui_kit_assets::IconName::Files
+                    },
+                    folder: one && folder,
+                    grab,
+                };
+                cx.new(|_| preview)
+            },
+        )
+        // Leaving the window hands the drag to the desktop as a file list, so
+        // the entries can be dropped on other applications.
+        .external_drag_payload(move |dragged: &DraggedEntries, _window, cx| {
+            external_payload(dragged, &dragged_path, folder, &payload_explorer, cx)
+        })
+}
+
+/// Pairs each dragged path with whether it is a folder: the grabbed row
+/// knows its own kind, the rest of the selection is looked up in
+/// `directories`.
+fn file_kinds(
+    paths: &[PathBuf],
+    dragged_path: &Path,
+    dragged_is_dir: bool,
+    directories: &std::collections::HashSet<&Path>,
+) -> Vec<(PathBuf, bool)> {
+    paths
+        .iter()
+        .map(|path| {
+            let is_dir = if path == dragged_path {
+                dragged_is_dir
+            } else {
+                directories.contains(path.as_path())
             };
-            cx.new(|_| preview)
-        },
-    )
+            (path.clone(), is_dir)
+        })
+        .collect()
+}
+
+/// The file list offered to other applications: each path with its kind,
+/// taken from the listing in memory (never a stat on the UI thread, which
+/// can block on a phone or network mount).
+fn external_payload(
+    dragged: &DraggedEntries,
+    dragged_path: &Path,
+    dragged_is_dir: bool,
+    explorer: &WeakEntity<Explorer>,
+    cx: &App,
+) -> Option<ExternalDragPayload> {
+    let explorer = explorer.upgrade()?;
+    let state = &explorer.read(cx).tab().state;
+    let directories: std::collections::HashSet<&Path> = state
+        .selected_entries()
+        .into_iter()
+        .filter(|entry| entry.kind == fileflux::core::EntryKind::Directory)
+        .map(|entry| entry.path.as_path())
+        .collect();
+    let files = file_kinds(&dragged.paths, dragged_path, dragged_is_dir, &directories);
+    Some(ExternalDragPayload::Files(FileDragPaths::new(files)))
 }
 
 /// While something is dragged, an entry that is not a target hides what is
@@ -407,6 +459,25 @@ mod tests {
     }
     fn folder(path: &str) -> DropTarget {
         DropTarget::Folder(p(path))
+    }
+
+    #[test]
+    fn file_kinds_marks_the_grabbed_row_and_selected_folders() {
+        let paths = vec![p("/w/photo.jpg"), p("/w/docs"), p("/w/notes.txt")];
+        let directories = std::collections::HashSet::from([Path::new("/w/docs")]);
+        assert_eq!(
+            file_kinds(&paths, Path::new("/w/photo.jpg"), false, &directories),
+            vec![
+                (p("/w/photo.jpg"), false),
+                (p("/w/docs"), true),
+                (p("/w/notes.txt"), false),
+            ]
+        );
+        // The grabbed row's own kind wins even before the listing knows it.
+        assert_eq!(
+            file_kinds(&[p("/w/new")], Path::new("/w/new"), true, &directories),
+            vec![(p("/w/new"), true)]
+        );
     }
     fn check(sources: &[&str], target: &DropTarget) -> DropCheck {
         let sources: Vec<PathBuf> = sources.iter().map(|s| p(s)).collect();

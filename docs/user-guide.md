@@ -260,6 +260,7 @@ Drag selected entries from the grid or the list (dragging an unselected entry se
 - **Action:** by default a drop **moves on the same device and copies across devices**. Hold **Ctrl** to copy or **Shift** to move (Ctrl wins).
 - **Home Trash row:** moves to the Trash through the same undoable job as Del.
 - **From other applications:** files dropped on a folder are always copied, never moved, and cannot be dropped on the Trash row.
+- **To other applications:** dragging past the window's edge hands the dragged entries to the desktop as a file list (`text/uri-list`), so a browser, chat or another file manager can take them; the receiving application decides whether it copies, moves or uploads. Wayland only for now: on X11 the drag stays inside Fileflux.
 - **Escape** during a drag cancels it; releasing outside any target does nothing.
 
 ## Progress and toasts
