@@ -42,19 +42,19 @@ use super::{icon, util};
 /// one.
 pub(crate) const TILE_WIDTH: f32 = 112.0;
 /// Tile top padding above the thumbnail slot.
-const TILE_TOP_PADDING: f32 = 12.0;
+pub(crate) const TILE_TOP_PADDING: f32 = 12.0;
 /// Width of the thumbnail slot every glyph, folder and photo draws in.
-const THUMB_WIDTH: f32 = 64.0;
+pub(crate) const THUMB_WIDTH: f32 = 64.0;
 /// Height of the thumbnail slot, so the folder silhouette, the file glyphs
 /// and the photo thumbnails share a baseline row.
-const THUMB_HEIGHT: f32 = 52.0;
+pub(crate) const THUMB_HEIGHT: f32 = 52.0;
 /// Size of a file glyph inside the thumbnail slot (thinner and larger than
 /// the earlier 32 px glyph, as in the artboard).
 const GLYPH_SIZE: f32 = 40.0;
 /// Gap between the thumbnail slot and the filename.
-const NAME_GAP: f32 = 8.0;
+pub(crate) const NAME_GAP: f32 = 8.0;
 /// One filename line's height; long names clip at two lines.
-const NAME_LINE: f32 = 17.0;
+pub(crate) const NAME_LINE: f32 = 17.0;
 /// Gap between the filename and the size subline.
 const SUB_GAP: f32 = 2.0;
 /// The mono 11 px subline's height.
@@ -364,6 +364,14 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .pt(px(GRID_TOP_PADDING))
                 .pb(Spacing::XL)
         })
+        // A left press anywhere in the pane, margins included, may start a
+        // rubber band (see `rubber::classify`).
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.rubber_press(event, window, cx);
+            }),
+        )
         // Right click on the empty space: the folder's menu. A click on an
         // entry stops here first (see `entry_context_menu`).
         .on_mouse_down(
@@ -554,12 +562,6 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             .flex()
             .flex_col()
             .child(measure_width(&weak, this.tabs.focus()))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.rubber_press(event, window, cx);
-                }),
-            )
             .child(rows)
             .children(this.rubber_overlay(this.tabs.focus(), cx)),
     )
@@ -870,6 +872,10 @@ pub(crate) fn handle_entry_click(
 ) {
     if let Err(error) = weak.update(cx, |this, cx| {
         this.entries_focus().focus(window, cx);
+        if this.suppress_click {
+            // The press was on the tile's padding: a rubber band, not a click.
+            return;
+        }
         if click_count >= 2 {
             this.open_path(&path, window, cx);
         } else if modifiers.shift {

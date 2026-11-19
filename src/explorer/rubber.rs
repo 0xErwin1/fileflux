@@ -19,7 +19,10 @@ use gpui::{
 use gpui_component::{ActiveTheme, Size};
 
 use super::dnd;
-use super::entries::{TILE_GAP, TILE_HEIGHT, TILE_WIDTH};
+use super::entries::{
+    NAME_GAP, NAME_LINE, THUMB_HEIGHT, THUMB_WIDTH, TILE_GAP, TILE_HEIGHT, TILE_TOP_PADDING,
+    TILE_WIDTH,
+};
 use super::panes::Side;
 use super::state::SelectionSnapshot;
 use super::state::View;
@@ -43,6 +46,76 @@ pub(crate) enum Layout {
     Grid { columns: usize },
     /// Full-width rows of one height.
     List { row_height: f32 },
+}
+
+/// Average width of one filename character at the tile's 13 px text.
+const NAME_CHAR_WIDTH: f32 = 7.0;
+/// Slack around the drawn icon and name that still counts as the entry.
+const ART_SLACK: f32 = 4.0;
+
+/// What a press landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Press {
+    /// The drawn entry: a list row, or a tile's icon or name.
+    Entry(usize),
+    /// A tile's box but not its drawn icon or name: empty space as far as
+    /// the user sees it, although the tile element is there.
+    Padding(usize),
+    /// Nothing: gaps, margins, past the last column or row.
+    Empty,
+}
+
+/// Whether a point local to a tile (its top-left is the origin) is on the
+/// drawn thumbnail or filename, with a little slack. `name_chars` sizes the
+/// name block, which the tile centers under the thumbnail.
+pub(crate) fn in_tile_art(local_x: f32, local_y: f32, name_chars: usize) -> bool {
+    let center = TILE_WIDTH / 2.0;
+    let within =
+        |from: f32, to: f32, value: f32| value >= from - ART_SLACK && value <= to + ART_SLACK;
+    let thumb = within(
+        center - THUMB_WIDTH / 2.0,
+        center + THUMB_WIDTH / 2.0,
+        local_x,
+    ) && within(TILE_TOP_PADDING, TILE_TOP_PADDING + THUMB_HEIGHT, local_y);
+    if thumb {
+        return true;
+    }
+    // The name wraps inside the tile's padded width and clamps at two lines.
+    let inner = TILE_WIDTH - 8.0;
+    let text = name_chars as f32 * NAME_CHAR_WIDTH;
+    let lines = (text / inner).ceil().clamp(1.0, 2.0);
+    let width = text.min(inner);
+    let top = TILE_TOP_PADDING + THUMB_HEIGHT + NAME_GAP;
+    within(center - width / 2.0, center + width / 2.0, local_x)
+        && within(top, top + lines * NAME_LINE, local_y)
+}
+
+/// Classifies a press at a content point.
+pub(crate) fn classify(
+    layout: Layout,
+    count: usize,
+    x: f32,
+    y: f32,
+    name_chars: impl Fn(usize) -> usize,
+) -> Press {
+    let Some(index) = entry_at(layout, count, x, y) else {
+        return Press::Empty;
+    };
+    match layout {
+        Layout::List { .. } => Press::Entry(index),
+        Layout::Grid { columns } => {
+            let pitch = TILE_WIDTH + TILE_GAP;
+            let column = index % columns;
+            let row = index / columns;
+            let local_x = x - column as f32 * pitch;
+            let local_y = y - row as f32 * TILE_HEIGHT;
+            if in_tile_art(local_x, local_y, name_chars(index)) {
+                Press::Entry(index)
+            } else {
+                Press::Padding(index)
+            }
+        }
+    }
 }
 
 /// An axis-aligned rectangle in content coordinates.
@@ -207,6 +280,8 @@ pub(crate) struct Band {
     /// Whether the pointer left the press threshold: the press is then a
     /// rectangle, otherwise still a click.
     active: bool,
+    /// The press was on a tile's padding rather than in open space.
+    over_tile: bool,
     /// The autoscroll loop; dropping the band stops it.
     _scroll: Option<Task<()>>,
 }
@@ -214,6 +289,8 @@ pub(crate) struct Band {
 /// Where the rows are on screen: the window rectangle they scroll in (the
 /// list's excludes its header) and the current vertical scroll offset.
 struct Viewport {
+    /// Presses above this are not on the rows (the list's column header).
+    min_y: f32,
     left: f32,
     top: f32,
     right: f32,
@@ -231,11 +308,11 @@ impl Viewport {
         (point.0 + self.left, point.1 + self.top + self.offset_y)
     }
 
-    fn contains(&self, point: (f32, f32)) -> bool {
-        point.0 >= self.left
-            && point.0 < self.right - SCROLLBAR_STRIP
-            && point.1 >= self.top
-            && point.1 < self.bottom
+    /// Whether a press here may start a band: anywhere in the pane,
+    /// margins included, except the list header and the scrollbar strip.
+    fn accepts(&self, point: (f32, f32)) -> bool {
+        let on_scrollbar = point.0 >= self.right - SCROLLBAR_STRIP && point.0 < self.right;
+        point.1 >= self.min_y && !on_scrollbar
     }
 }
 
@@ -273,6 +350,11 @@ impl Explorer {
         let offset_y = f32::from(handle.0.borrow().base_handle.offset().y).min(0.0);
         Some((
             Viewport {
+                min_y: if header > 0.0 {
+                    f32::from(bounds.top()) + header
+                } else {
+                    f32::NEG_INFINITY
+                },
                 left: f32::from(bounds.left()),
                 top: f32::from(bounds.top()) + header,
                 right: f32::from(bounds.right()),
@@ -291,6 +373,8 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.entry_press = None;
+        self.suppress_click = false;
         if event.button != MouseButton::Left
             || self.dialogs.is_open()
             || self.menu.is_some()
@@ -303,12 +387,27 @@ impl Explorer {
             return;
         };
         let pointer = (f32::from(event.position.x), f32::from(event.position.y));
-        if !viewport.contains(pointer) {
+        if !viewport.accepts(pointer) {
             return;
         }
         let (x, y) = viewport.to_content(pointer);
         let visible = self.tab().state.visible_shared();
-        if let Some(index) = entry_at(layout, visible.len(), x, y) {
+        let snapshot = std::sync::Arc::clone(&self.tab().snapshot);
+        let name_chars = |index: usize| {
+            visible
+                .get(index)
+                .and_then(|&entry| snapshot.get(entry))
+                .map_or(0, |entry| entry.display_name().chars().count())
+        };
+        let target = classify(layout, visible.len(), x, y, name_chars);
+        let over_tile = matches!(target, Press::Padding(_));
+        if over_tile {
+            // The tile element is under the pointer, but not what is drawn:
+            // its click is ignored, and any file drag it starts is stopped.
+            self.suppress_click = true;
+            dnd::press_gate(event.position, cx);
+        }
+        if let Press::Entry(index) = target {
             // An entry: its own click and drag run; remember the press so a
             // drag that never left the threshold can still act as a click.
             self.entry_press = visible
@@ -332,8 +431,15 @@ impl Explorer {
             mode: Mode::from_modifiers(event.modifiers.control, event.modifiers.shift),
             base: self.tab().state.selection_snapshot(),
             active: false,
+            over_tile,
             _scroll: None,
         });
+    }
+
+    /// Whether the band in flight began on a tile's empty padding, where a
+    /// file drag must not start.
+    pub(crate) fn rubber_over_tile(&self) -> bool {
+        self.rubber_band.as_ref().is_some_and(|band| band.over_tile)
     }
 
     /// An entry drag left the drag threshold: an unselected entry is
@@ -518,9 +624,18 @@ impl Band {
 /// from the entries area's paint pass.
 pub(crate) fn listen(weak: &gpui::WeakEntity<Explorer>, side: Side, window: &mut Window) {
     let moves = weak.clone();
-    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+    window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
         if phase != gpui::DispatchPhase::Capture {
             return;
+        }
+        // GPUI starts a file drag from any tile element; one that began on
+        // a tile's empty padding is a rubber band instead.
+        if cx.has_active_drag()
+            && moves
+                .read_with(cx, |this, _| this.rubber_over_tile())
+                .unwrap_or(false)
+        {
+            cx.stop_active_drag(window);
         }
         if cx.has_active_drag()
             && dnd::observe_gate(event.position, cx).is_armed()
@@ -739,5 +854,108 @@ mod tests {
         assert!(past_threshold(press, (108.0, 100.0)));
         assert!(past_threshold(press, (100.0, 91.0)));
         assert!(past_threshold(press, (106.0, 106.0)), "diagonal 8.49");
+    }
+
+    #[test]
+    fn only_the_drawn_icon_and_name_of_a_tile_are_the_entry() {
+        let mid = TILE_WIDTH / 2.0;
+        let icon_y = TILE_TOP_PADDING + THUMB_HEIGHT / 2.0;
+        assert!(in_tile_art(mid, icon_y, 8), "icon centre");
+        assert!(!in_tile_art(2.0, icon_y, 8), "left of the icon");
+        assert!(
+            !in_tile_art(TILE_WIDTH - 2.0, icon_y, 8),
+            "right of the icon"
+        );
+        assert!(!in_tile_art(mid, 2.0, 8), "above the icon");
+        let name_y = TILE_TOP_PADDING + THUMB_HEIGHT + NAME_GAP + NAME_LINE / 2.0;
+        assert!(in_tile_art(mid, name_y, 8), "name centre");
+        assert!(!in_tile_art(2.0, name_y, 4), "beside a short name");
+        assert!(in_tile_art(8.0, name_y, 40), "a long name fills the tile");
+        assert!(!in_tile_art(mid, TILE_HEIGHT - 1.0, 8), "below the name");
+        // The gap between thumbnail and name belongs to neither.
+        let gap_y = TILE_TOP_PADDING + THUMB_HEIGHT + NAME_GAP / 2.0;
+        assert!(!in_tile_art(2.0, gap_y, 8));
+    }
+
+    #[test]
+    fn classify_tells_art_from_tile_padding_gaps_and_margins() {
+        let chars = |_| 8;
+        let icon = (TILE_WIDTH / 2.0, TILE_TOP_PADDING + 10.0);
+        assert_eq!(classify(GRID, 10, icon.0, icon.1, chars), Press::Entry(0));
+        assert_eq!(
+            classify(GRID, 10, PITCH + icon.0, TILE_HEIGHT + icon.1, chars),
+            Press::Entry(5)
+        );
+        assert_eq!(classify(GRID, 10, 3.0, 3.0, chars), Press::Padding(0));
+        assert_eq!(
+            classify(GRID, 10, TILE_WIDTH + 2.0, icon.1, chars),
+            Press::Empty
+        );
+        assert_eq!(
+            classify(GRID, 10, -5.0, icon.1, chars),
+            Press::Empty,
+            "margin"
+        );
+        assert_eq!(
+            classify(GRID, 10, icon.0, -5.0, chars),
+            Press::Empty,
+            "top margin"
+        );
+        assert_eq!(
+            classify(GRID, 10, icon.0, 5.0 * TILE_HEIGHT, chars),
+            Press::Empty
+        );
+        assert_eq!(
+            classify(
+                GRID,
+                10,
+                2.0 * PITCH + icon.0,
+                2.0 * TILE_HEIGHT + icon.1,
+                chars
+            ),
+            Press::Empty,
+            "past the partial last row"
+        );
+        assert_eq!(classify(LIST, 3, 500.0, 65.0, chars), Press::Entry(2));
+        assert_eq!(classify(LIST, 3, 500.0, 95.0, chars), Press::Empty);
+    }
+
+    #[test]
+    fn viewport_maps_presses_through_the_scroll_offset() {
+        let viewport = Viewport {
+            left: 300.0,
+            top: 100.0,
+            right: 1000.0,
+            bottom: 800.0,
+            offset_y: -2.0 * TILE_HEIGHT,
+            min_y: f32::NEG_INFINITY,
+        };
+        // Window y 100 + 10 is 2 rows plus 10 px down the folder.
+        let (x, y) = viewport.to_content((300.0 + 5.0, 110.0));
+        assert_eq!((x, y), (5.0, 2.0 * TILE_HEIGHT + 10.0));
+        assert_eq!(classify(GRID, 100, x, y, |_| 8), Press::Padding(2 * 4));
+        assert_eq!(viewport.to_window((x, y)), (305.0, 110.0));
+    }
+
+    #[test]
+    fn viewport_accepts_margins_but_not_header_or_scrollbar() {
+        let grid = Viewport {
+            left: 300.0,
+            top: 100.0,
+            right: 1000.0,
+            bottom: 800.0,
+            offset_y: 0.0,
+            min_y: f32::NEG_INFINITY,
+        };
+        assert!(grid.accepts((290.0, 96.0)), "left and top margins");
+        assert!(grid.accepts((1010.0, 500.0)), "right margin");
+        assert!(grid.accepts((500.0, 830.0)), "bottom margin");
+        assert!(!grid.accepts((1000.0 - 5.0, 500.0)), "scrollbar strip");
+        let list = Viewport {
+            min_y: 100.0,
+            ..grid
+        };
+        assert!(!list.accepts((500.0, 90.0)), "column header");
+        assert!(list.accepts((500.0, 100.0)));
     }
 }

@@ -820,6 +820,9 @@ pub(crate) struct Explorer {
     pub(crate) rubber_band: Option<rubber::Band>,
     /// The entry the left button went down on, until it goes up.
     pub(crate) entry_press: Option<rubber::EntryPress>,
+    /// The press began on a tile's empty padding: the tile's click is not
+    /// an entry click.
+    pub(crate) suppress_click: bool,
 }
 
 impl Focusable for Explorer {
@@ -1027,6 +1030,7 @@ impl Explorer {
             devices: DeviceHub::from_env(),
             rubber_band: None,
             entry_press: None,
+            suppress_click: false,
         };
         this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
