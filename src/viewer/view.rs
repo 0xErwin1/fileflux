@@ -72,6 +72,15 @@ impl Ready {
     }
 }
 
+/// What a header probe allows for one image.
+enum Screen {
+    /// The header is still being read.
+    Pending,
+    /// Over the size cap: shown as a notice, never decoded.
+    Refused(u32, u32),
+    Allowed,
+}
+
 /// How many decoded pixels make one logical pixel for the file at `path`.
 fn density_of(path: &Path) -> f32 {
     let is_svg = path
@@ -117,6 +126,9 @@ pub(crate) struct Viewer {
     wheel_travel: f32,
     /// Header-sniffed sizes, so neighbours are screened without decoding.
     probes: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// Paths whose header is being read off the UI thread: on a phone (MTP)
+    /// or network mount even a header read can take seconds.
+    probing: HashSet<PathBuf>,
     /// Paths whose decoded image GPUI's asset cache holds for us.
     requested: HashSet<PathBuf>,
     meta: FileMeta,
@@ -145,6 +157,7 @@ impl Viewer {
             drag: None,
             wheel_travel: 0.0,
             probes: HashMap::new(),
+            probing: HashSet::new(),
             requested: HashSet::new(),
             meta: FileMeta {
                 size: None,
@@ -176,19 +189,37 @@ impl Viewer {
         self.rotating = false;
         self.drag = None;
         self.drop_rotated(cx);
-        self.meta = self
-            .current()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map_or(
-                FileMeta {
-                    size: None,
-                    modified: None,
-                },
-                |meta| FileMeta {
-                    size: Some(meta.len()),
-                    modified: meta.modified().ok(),
-                },
-            );
+        self.meta = FileMeta {
+            size: None,
+            modified: None,
+        };
+        if let Some(path) = self.current().map(Path::to_path_buf) {
+            // A stat on a phone or network mount can block for seconds.
+            cx.spawn(async move |this, cx| {
+                let read = cx
+                    .background_executor()
+                    .spawn({
+                        let path = path.clone();
+                        async move { std::fs::metadata(&path).ok() }
+                    })
+                    .await;
+                if let Err(error) = this.update(cx, |this, cx| {
+                    if this.current() != Some(path.as_path()) {
+                        return;
+                    }
+                    if let Some(meta) = read {
+                        this.meta = FileMeta {
+                            size: Some(meta.len()),
+                            modified: meta.modified().ok(),
+                        };
+                        cx.notify();
+                    }
+                }) {
+                    log::debug!("the viewer closed before the file's details arrived: {error}");
+                }
+            })
+            .detach();
+        }
         window.set_window_title(&format!("{} — Fileflux", self.current_name()));
         cx.notify();
     }
@@ -209,17 +240,38 @@ impl Viewer {
 
     // ---- image state ------------------------------------------------
 
-    /// The header size of `path`, read once.
-    fn probe(&mut self, path: &Path) -> Option<(u32, u32)> {
-        *self
-            .probes
-            .entry(path.to_path_buf())
-            .or_insert_with(|| header::file_dimensions(path).ok().flatten())
-    }
-
-    fn refuses(&mut self, path: &Path) -> Option<(u32, u32)> {
-        self.probe(path)
-            .filter(|&(width, height)| header::exceeds_cap(width, height))
+    /// Whether `path` may be decoded: its header size is read once, off the
+    /// UI thread, and an image over the cap is refused without decoding.
+    fn screen(&mut self, path: &Path, cx: &mut Context<Self>) -> Screen {
+        match self.probes.get(path) {
+            Some(Some((width, height))) if header::exceeds_cap(*width, *height) => {
+                Screen::Refused(*width, *height)
+            }
+            Some(_) => Screen::Allowed,
+            None => {
+                if self.probing.insert(path.to_path_buf()) {
+                    let owned = path.to_path_buf();
+                    cx.spawn(async move |this, cx| {
+                        let found = cx
+                            .background_executor()
+                            .spawn({
+                                let path = owned.clone();
+                                async move { header::file_dimensions(&path).ok().flatten() }
+                            })
+                            .await;
+                        if let Err(error) = this.update(cx, |this, cx| {
+                            this.probing.remove(&owned);
+                            this.probes.insert(owned, found);
+                            cx.notify();
+                        }) {
+                            log::debug!("the viewer closed before a header was read: {error}");
+                        }
+                    })
+                    .detach();
+                }
+                Screen::Pending
+            }
+        }
     }
 
     /// Loads the current image through GPUI's asset cache, preloads the
@@ -229,25 +281,31 @@ impl Viewer {
             return;
         };
         let mut keep = HashSet::new();
-        self.shown = if let Some((width, height)) = self.refuses(&path) {
-            Shown::TooLarge(width, height)
-        } else {
-            keep.insert(path.clone());
-            match window.use_asset::<ImgResourceLoader>(&Resource::from(path.clone()), cx) {
-                None => Shown::Loading,
-                Some(Err(error)) => {
-                    log::warn!("cannot open {}: {error}", path.display());
-                    Shown::Failed
-                }
-                Some(Ok(image)) => {
-                    let size = image.size(0);
-                    Shown::Ready(Ready {
-                        width: u32::try_from(i32::from(size.width)).unwrap_or(0),
-                        height: u32::try_from(i32::from(size.height)).unwrap_or(0),
-                        density: density_of(&path),
-                        frames: image.frame_count(),
-                        image,
-                    })
+        let was_failed = matches!(self.shown, Shown::Failed);
+        self.shown = match self.screen(&path, cx) {
+            Screen::Pending => Shown::Loading,
+            Screen::Refused(width, height) => Shown::TooLarge(width, height),
+            Screen::Allowed => {
+                keep.insert(path.clone());
+                match window.use_asset::<ImgResourceLoader>(&Resource::from(path.clone()), cx) {
+                    None => Shown::Loading,
+                    Some(Err(error)) => {
+                        // Logged once, not on every frame the failure is drawn.
+                        if !was_failed {
+                            log::warn!("cannot open {}: {error}", path.display());
+                        }
+                        Shown::Failed
+                    }
+                    Some(Ok(image)) => {
+                        let size = image.size(0);
+                        Shown::Ready(Ready {
+                            width: u32::try_from(i32::from(size.width)).unwrap_or(0),
+                            height: u32::try_from(i32::from(size.height)).unwrap_or(0),
+                            density: density_of(&path),
+                            frames: image.frame_count(),
+                            image,
+                        })
+                    }
                 }
             }
         };
@@ -255,7 +313,7 @@ impl Viewer {
             let Some(neighbour) = self.list.get(index).cloned() else {
                 continue;
             };
-            if self.refuses(&neighbour).is_none() {
+            if matches!(self.screen(&neighbour, cx), Screen::Allowed) {
                 // Starts decoding; the result waits in the asset cache.
                 let _ =
                     window.get_asset::<ImgResourceLoader>(&Resource::from(neighbour.clone()), cx);
