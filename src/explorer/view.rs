@@ -653,6 +653,9 @@ pub(crate) struct Explorer {
     /// Whether the sidebar is shown; narrow windows park it behind the
     /// sidebar toggle.
     pub(crate) sidebar_open: bool,
+    /// Whether a narrow window's parked sidebar overlay is open. It starts
+    /// closed; see [`sidebar::overlay_open_after`].
+    pub(crate) sidebar_overlay_open: bool,
     /// The docked sidebar's width in CSS pixels: the saved preference (the
     /// reference design's 290 by default).
     pub(crate) sidebar_width: f32,
@@ -865,6 +868,7 @@ impl Explorer {
             list_widths: ListWidths::default(),
             entries_width: None,
             sidebar_open: !preferences.sidebar_collapsed,
+            sidebar_overlay_open: false,
             sidebar_width: preferences.sidebar_width as f32,
             details_width: preferences.details_width as f32,
             panel_drag: None,
@@ -1634,7 +1638,9 @@ impl Explorer {
             return;
         };
         let trust_known = *tab.state.current() != Location::Recent;
-        let (keep, todo) = entries::plan_thumbnails(&tab.snapshot, &tab.thumbs, trust_known);
+        let displayed = tab.state.visible_shared();
+        let (keep, todo) =
+            entries::plan_thumbnails(&tab.snapshot, &displayed, &tab.thumbs, trust_known);
         tab.thumbs = Arc::new(keep);
         tab.thumbs_task = None;
         if todo.is_empty() {
@@ -1886,12 +1892,23 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Applies `event` to the parked sidebar overlay.
+    pub(crate) fn close_sidebar_overlay(&mut self, event: sidebar::OverlayEvent) {
+        self.sidebar_overlay_open = sidebar::overlay_open_after(self.sidebar_overlay_open, event);
+    }
+
     /// Escape anywhere else in the shell: drops the selection and returns
     /// the focus to the shell, so a second Escape never reaches the
     /// window close path by accident.
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Escape while dragging cancels the drag and nothing else.
         if cx.stop_active_drag(window) {
+            return;
+        }
+        // Escape closes the parked sidebar overlay first and nothing else.
+        if self.sidebar_overlay_open {
+            self.close_sidebar_overlay(sidebar::OverlayEvent::Escape);
+            cx.notify();
             return;
         }
         if !self.tab().state.selection().is_empty() {
@@ -2337,6 +2354,7 @@ impl Render for Explorer {
                 .unwrap_or_else(|| self.content_width(window)),
         );
 
+        self.close_sidebar_overlay(sidebar::OverlayEvent::Resized { narrow });
         let document = self.render_document_island(window, cx);
         let side = sidebar::render(self, narrow, cx);
 
@@ -2368,14 +2386,21 @@ impl Render for Explorer {
                 middle = middle.child(sidebar).child(document).child(handle);
             }
             Some(sidebar) => {
-                middle = middle.child(document).child(
-                    div()
-                        .absolute()
-                        .left(IslandMetrics::GAP)
-                        .top(IslandMetrics::GAP)
-                        .bottom(Spacing::LG + IslandMetrics::GAP)
-                        .child(sidebar),
-                )
+                // A click outside the overlay closes it and goes no further:
+                // the backdrop covers the document island, toolbar included.
+                let backdrop = div()
+                    .id("explorer-sidebar-backdrop")
+                    .absolute()
+                    .size_full()
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.close_sidebar_overlay(sidebar::OverlayEvent::OutsideClick);
+                            cx.notify();
+                        }),
+                    );
+                middle = middle.child(document).child(backdrop).child(sidebar)
             }
             None => middle = middle.child(document),
         }

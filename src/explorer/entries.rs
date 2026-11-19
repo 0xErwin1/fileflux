@@ -219,18 +219,37 @@ fn wants_thumbnail(entry: &Entry) -> bool {
 
 /// What a new listing does with the lookups of the previous one: the answers
 /// that still apply stay on screen (`.0`) while the images that need a
-/// lookup (`.1`, in listing order) are looked up again. With `trust_known`
+/// lookup (`.1`) are looked up again, the displayed images first: `displayed`
+/// holds the indices into `snapshot` in the order the view shows them, so
+/// the tiles on screen resolve first; the images the view hides follow in
+/// listing order, and an index outside the snapshot is skipped. With `trust_known`
 /// an image whose entry time did not change keeps its answer; the Recent
 /// list shows when a file was *used*, which says nothing about the file
 /// changing, so it trusts none.
 pub(crate) fn plan_thumbnails(
     snapshot: &[Entry],
+    displayed: &[usize],
     known: &Thumbs,
     trust_known: bool,
 ) -> (Thumbs, Vec<(PathBuf, Option<SystemTime>)>) {
     let mut keep = Thumbs::new();
     let mut todo = Vec::new();
-    for entry in snapshot.iter().filter(|entry| wants_thumbnail(entry)) {
+    let mut seen = vec![false; snapshot.len()];
+    let mut order = Vec::with_capacity(snapshot.len());
+    for &index in displayed {
+        if let Some(seen) = seen.get_mut(index)
+            && !std::mem::replace(seen, true)
+        {
+            order.push(index);
+        }
+    }
+    order.extend(
+        seen.iter()
+            .enumerate()
+            .filter_map(|(index, seen)| (!seen).then_some(index)),
+    );
+    let ordered = order.into_iter().filter_map(|index| snapshot.get(index));
+    for entry in ordered.filter(|entry| wants_thumbnail(entry)) {
         match known.get(&entry.path) {
             Some(thumb) if trust_known && thumb.modified == entry.modified => {
                 keep.insert(entry.path.clone(), thumb.clone());
@@ -1008,7 +1027,7 @@ mod tests {
             folder,
             image("a.png", 2),
         ];
-        let (keep, todo) = plan_thumbnails(&snapshot, &Thumbs::new(), true);
+        let (keep, todo) = plan_thumbnails(&snapshot, &[], &Thumbs::new(), true);
         assert!(keep.is_empty());
         let paths: Vec<_> = todo.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
@@ -1036,7 +1055,7 @@ mod tests {
         }
         let snapshot = [image("a.png", 9), same.clone(), image("new.png", 1)];
 
-        let (keep, todo) = plan_thumbnails(&snapshot, &known, true);
+        let (keep, todo) = plan_thumbnails(&snapshot, &[], &known, true);
 
         assert!(
             keep.contains_key(Path::new("/p/a.png")),
@@ -1055,6 +1074,31 @@ mod tests {
         );
     }
 
+    /// The lookups follow the displayed order, so the tiles on screen answer
+    /// first; images the view hides (or an order that is not known yet)
+    /// follow in listing order, and a stale index is skipped.
+    #[test]
+    fn lookups_follow_the_displayed_order_then_the_rest() {
+        let snapshot = [
+            image("a.png", 1),
+            image("b.png", 1),
+            image("hidden.png", 1),
+            image("c.png", 1),
+        ];
+        let displayed = [3, 1, 0, 9, 1];
+        let (_, todo) = plan_thumbnails(&snapshot, &displayed, &Thumbs::new(), true);
+        let paths: Vec<_> = todo.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/p/c.png"),
+                PathBuf::from("/p/b.png"),
+                PathBuf::from("/p/a.png"),
+                PathBuf::from("/p/hidden.png"),
+            ]
+        );
+    }
+
     /// The Recent list shows when a file was used, not when it changed, so
     /// nothing there is trusted.
     #[test]
@@ -1068,7 +1112,7 @@ mod tests {
                 found: None,
             },
         );
-        let (keep, todo) = plan_thumbnails(std::slice::from_ref(&entry), &known, false);
+        let (keep, todo) = plan_thumbnails(std::slice::from_ref(&entry), &[0], &known, false);
         assert_eq!(keep.len(), 1);
         assert_eq!(todo.len(), 1);
     }

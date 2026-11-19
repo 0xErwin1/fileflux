@@ -46,8 +46,14 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .icon_only()
                 .icon(icon(gpui_kit_assets::IconName::PanelLeft))
                 .tooltip("Show or hide the places sidebar")
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.sidebar_open = !this.sidebar_open;
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    if f32::from(window.viewport_size().width) < super::view::NARROW_WIDTH {
+                        // Narrow: the toggle opens or closes the overlay and
+                        // leaves the docked preference alone.
+                        this.close_sidebar_overlay(super::sidebar::OverlayEvent::Toggle);
+                    } else {
+                        this.sidebar_open = !this.sidebar_open;
+                    }
                     cx.notify();
                 })),
         )

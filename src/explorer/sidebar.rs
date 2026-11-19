@@ -35,14 +35,47 @@ use super::state::Transition;
 use super::tabs::Placement;
 use super::view::Explorer;
 
-/// The sidebar island, or nothing while it is toggled closed — at either
-/// window width, since a collapsed sidebar must not resurrect on a resize.
+/// What can open or close the parked sidebar of a narrow window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayEvent {
+    /// The sidebar toggle in the toolbar.
+    Toggle,
+    /// Escape.
+    Escape,
+    /// A click anywhere outside the overlay.
+    OutsideClick,
+    /// A row was chosen (after navigating).
+    RowChosen,
+    /// The window was laid out at a width that is narrow or not.
+    Resized { narrow: bool },
+}
+
+/// Whether the parked sidebar is open after `event`. It starts closed, only
+/// the toggle opens it, and a window that is not narrow parks it closed
+/// again, so a resize never opens it by itself.
+pub(crate) fn overlay_open_after(open: bool, event: OverlayEvent) -> bool {
+    match event {
+        OverlayEvent::Toggle => !open,
+        OverlayEvent::Escape | OverlayEvent::OutsideClick | OverlayEvent::RowChosen => false,
+        OverlayEvent::Resized { narrow } => open && narrow,
+    }
+}
+
+/// The sidebar island, or nothing while it is toggled closed. A wide window
+/// docks it while `sidebar_open`; a narrow one overlays it only while the
+/// parked overlay is open, so a collapsed sidebar must not resurrect on a
+/// resize and a resize must not open the overlay.
 pub(crate) fn render(
     this: &Explorer,
     narrow: bool,
     cx: &mut Context<Explorer>,
 ) -> Option<Stateful<Div>> {
-    if !this.sidebar_open {
+    let shown = if narrow {
+        this.sidebar_overlay_open
+    } else {
+        this.sidebar_open
+    };
+    if !shown {
         return None;
     }
     let colors = bolt::colors(cx);
@@ -78,6 +111,9 @@ pub(crate) fn render(
                 .top(IslandMetrics::GAP)
                 .bottom(px(46.0))
                 .w(px(this.sidebar_width))
+                // Every mouse event over the overlay stays on it: a click on
+                // a row never reaches the toolbar or the tiles below.
+                .occlude()
                 .overflow_y_scroll()
                 .child(island),
         );
@@ -501,8 +537,12 @@ fn row_shell(
             cx.listener(move |this, _event, window, cx| match &click_target {
                 (Some(location), _) => {
                     this.navigate(Transition::Visit(location.clone()), window, cx);
+                    this.close_sidebar_overlay(OverlayEvent::RowChosen);
                 }
-                (None, Some(device)) => this.activate_device(device.clone(), window, cx),
+                (None, Some(device)) => {
+                    this.activate_device(device.clone(), window, cx);
+                    this.close_sidebar_overlay(OverlayEvent::RowChosen);
+                }
                 (None, None) => {}
             }),
         )
@@ -812,6 +852,31 @@ mod tests {
     use super::*;
 
     const SIDEBAR: (f32, f32) = (200.0, 600.0);
+
+    /// The parked sidebar opens only through the toggle, closes on Escape,
+    /// an outside click or a chosen row, and a resize never opens it.
+    #[test]
+    fn the_parked_overlay_opens_only_by_the_toggle() {
+        use OverlayEvent::*;
+        assert!(overlay_open_after(false, Toggle));
+        assert!(!overlay_open_after(true, Toggle));
+        for closing in [Escape, OutsideClick, RowChosen] {
+            assert!(!overlay_open_after(true, closing), "{closing:?} closes");
+            assert!(
+                !overlay_open_after(false, closing),
+                "{closing:?} stays closed"
+            );
+        }
+        assert!(
+            !overlay_open_after(false, Resized { narrow: true }),
+            "becoming narrow does not open it"
+        );
+        assert!(overlay_open_after(true, Resized { narrow: true }));
+        assert!(
+            !overlay_open_after(true, Resized { narrow: false }),
+            "a wide window parks it closed"
+        );
+    }
     const DETAILS: (f32, f32) = (240.0, 600.0);
 
     /// Dragging the right edge of the sidebar to the right grows it by the
