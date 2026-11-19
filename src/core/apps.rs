@@ -18,6 +18,11 @@ pub struct DesktopEntry {
     pub no_display: bool,
     pub hidden: bool,
     pub terminal: bool,
+    /// The `Categories` list (`TerminalEmulator`, `Utility`, ...).
+    pub categories: Vec<String>,
+    /// `X-TerminalArgDir`, the xdg-terminal-exec key naming the argument that
+    /// sets a terminal's working directory (`--working-directory=`).
+    pub terminal_arg_dir: Option<String>,
 }
 
 /// An application that can open a file.
@@ -126,6 +131,17 @@ pub fn parse_desktop_entry(content: &str) -> Option<DesktopEntry> {
             "NoDisplay" => entry.no_display = value == "true",
             "Hidden" => entry.hidden = value == "true",
             "Terminal" => entry.terminal = value == "true",
+            "Categories" => {
+                entry.categories = value
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|category| !category.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
+            "X-TerminalArgDir" => {
+                entry.terminal_arg_dir = (!value.is_empty()).then(|| value.to_owned());
+            }
             _ => {}
         }
     }
@@ -388,6 +404,34 @@ fn desktop_files(root: &Path, dir: &Path, depth: usize, found: &mut Vec<(String,
     }
 }
 
+/// Every desktop entry under `dirs` with its id, in precedence order: a file
+/// in an earlier directory hides one with the same id in a later one (even
+/// when it is itself hidden or unreadable as an application, which then
+/// leaves no entry at all). Nothing is filtered by `NoDisplay` or `Hidden`;
+/// the caller decides.
+pub fn desktop_entries(dirs: &[PathBuf]) -> Vec<(String, DesktopEntry)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for root in dirs {
+        let mut files = Vec::new();
+        desktop_files(root, root, 0, &mut files);
+        files.sort();
+        for (id, path) in files {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id.clone());
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Some(entry) = parse_desktop_entry(&String::from_utf8_lossy(&bytes)) {
+                entries.push((id, entry));
+            }
+        }
+    }
+    entries
+}
+
 /// The applications under `dirs` that can open `mime`. A file in an earlier
 /// directory hides one with the same id in a later one (even when it is
 /// itself hidden). Entries that are `NoDisplay`, `Hidden`, run in a
@@ -559,6 +603,8 @@ mod tests {
                 no_display: false,
                 hidden: false,
                 terminal: false,
+                categories: Vec::new(),
+                terminal_arg_dir: None,
             })
         );
     }

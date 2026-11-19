@@ -1,0 +1,349 @@
+//! The GTK bookmarks file (`$XDG_CONFIG_HOME/gtk-3.0/bookmarks`) as the
+//! favorites store: parsing, labels, percent-encoding, the lines Fileflux
+//! does not understand, and the atomic, order-preserving writes. Every test
+//! works in a fresh directory under the system temp directory and never
+//! touches the user's real bookmarks.
+
+#![allow(clippy::expect_used, clippy::indexing_slicing)]
+
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt as _;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+
+use fileflux::core::bookmarks::{
+    Bookmark, add, bookmarks_path, file_uri, merge, parse, read, remove,
+};
+
+/// A scratch directory removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "fileflux-bookmarks-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("scratch directory is created");
+        Self(dir)
+    }
+
+    fn file(&self) -> PathBuf {
+        self.0.join("gtk-3.0/bookmarks")
+    }
+
+    fn write(&self, text: &[u8]) -> PathBuf {
+        let file = self.file();
+        std::fs::create_dir_all(file.parent().expect("has a parent")).expect("dir creates");
+        std::fs::write(&file, text).expect("fixture writes");
+        file
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        drop(std::fs::remove_dir_all(&self.0));
+    }
+}
+
+fn favorites(bytes: &[u8]) -> Vec<(PathBuf, Option<String>)> {
+    parse(bytes)
+        .favorites()
+        .into_iter()
+        .map(|Bookmark { path, label }| (path, label))
+        .collect()
+}
+
+fn bytes_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+#[test]
+fn the_file_follows_xdg_config_home_and_falls_back_to_home() {
+    assert_eq!(
+        bookmarks_path(Some("/h".as_ref()), Some("/cfg".as_ref())),
+        Some(PathBuf::from("/cfg/gtk-3.0/bookmarks"))
+    );
+    assert_eq!(
+        bookmarks_path(Some("/h".as_ref()), None),
+        Some(PathBuf::from("/h/.config/gtk-3.0/bookmarks"))
+    );
+    assert_eq!(
+        bookmarks_path(Some("/h".as_ref()), Some("relative".as_ref())),
+        Some(PathBuf::from("/h/.config/gtk-3.0/bookmarks")),
+        "a relative XDG variable is ignored"
+    );
+    assert_eq!(bookmarks_path(None, None), None);
+    assert_eq!(bookmarks_path(Some("".as_ref()), None), None);
+}
+
+#[test]
+fn local_entries_are_favorites_with_their_label_when_present() {
+    let text = b"file:///home/u/Projects\nfile:///srv/data Shared data\nfile:///x   \n";
+    assert_eq!(
+        favorites(text),
+        [
+            (PathBuf::from("/home/u/Projects"), None),
+            (PathBuf::from("/srv/data"), Some("Shared data".to_owned())),
+            (PathBuf::from("/x"), None),
+        ]
+    );
+}
+
+#[test]
+fn percent_escapes_decode_to_spaces_unicode_and_raw_non_utf8_bytes() {
+    let text = b"file:///home/u/My%20Docs\n\
+                 file:///home/u/caf%C3%A9%20%E2%82%AC Caf\xc3\xa9\n\
+                 file:///data/caf%E9%FF\n\
+                 file:///100%25/a%23b\n\
+                 file:///broken%zz%4\n";
+    assert_eq!(
+        favorites(text),
+        [
+            (PathBuf::from("/home/u/My Docs"), None),
+            (
+                PathBuf::from("/home/u/caf\u{e9} \u{20ac}"),
+                Some("Caf\u{e9}".to_owned())
+            ),
+            (bytes_path(b"/data/caf\xe9\xff"), None),
+            (PathBuf::from("/100%/a#b"), None),
+            (PathBuf::from("/broken%zz%4"), None),
+        ]
+    );
+}
+
+#[test]
+fn remote_comment_blank_and_relative_lines_are_not_favorites() {
+    let text = b"# a comment\n\
+                 \n\
+                 sftp://host/home/u Server\n\
+                 smb://nas/share\n\
+                 file://otherhost/srv\n\
+                 file://relative\n\
+                 file:///kept\n\
+                 garbage\n";
+    assert_eq!(favorites(text), [(PathBuf::from("/kept"), None)]);
+}
+
+#[test]
+fn localhost_is_a_local_authority() {
+    assert_eq!(
+        favorites(b"file://localhost/srv/a\n"),
+        [(PathBuf::from("/srv/a"), None)]
+    );
+}
+
+#[test]
+fn crlf_and_a_missing_final_newline_parse_the_same() {
+    assert_eq!(
+        favorites(b"file:///a Label\r\nfile:///b\r\nfile:///c"),
+        [
+            (PathBuf::from("/a"), Some("Label".to_owned())),
+            (PathBuf::from("/b"), None),
+            (PathBuf::from("/c"), None),
+        ]
+    );
+}
+
+#[test]
+fn a_missing_file_has_no_favorites_and_an_unreadable_one_is_an_error() {
+    let scratch = Scratch::new("missing");
+    assert_eq!(read(&scratch.file()).expect("missing is empty"), []);
+    // A directory where the file should be cannot be read as a file.
+    std::fs::create_dir_all(scratch.file()).expect("dir creates");
+    assert!(read(&scratch.file()).is_err());
+}
+
+#[test]
+fn file_uris_escape_everything_but_unreserved_characters_and_slashes() {
+    assert_eq!(
+        file_uri(Path::new("/home/u/Projects")),
+        "file:///home/u/Projects"
+    );
+    assert_eq!(
+        file_uri(Path::new("/a b/ü#%")),
+        "file:///a%20b/%C3%BC%23%25"
+    );
+    assert_eq!(file_uri(&bytes_path(b"/d/caf\xe9")), "file:///d/caf%E9");
+    for path in [
+        PathBuf::from("/a b/ü#%?&=+"),
+        bytes_path(b"/d/caf\xe9\xff/x y"),
+        PathBuf::from("/plain"),
+    ] {
+        let text = format!("{}\n", file_uri(&path));
+        assert_eq!(favorites(text.as_bytes()), [(path, None)]);
+    }
+}
+
+#[test]
+fn adding_appends_one_line_and_keeps_everything_else_byte_for_byte() {
+    let scratch = Scratch::new("add");
+    let original: &[u8] =
+        b"# mine\nfile:///home/u/Docs Documents\nsftp://host/srv Server\n\nsmb://nas/x\n";
+    let file = scratch.write(original);
+
+    assert!(add(&file, Path::new("/home/u/New Folder")).expect("adds"));
+
+    let mut expected = original.to_vec();
+    expected.extend_from_slice(b"file:///home/u/New%20Folder\n");
+    assert_eq!(std::fs::read(&file).expect("reads"), expected);
+}
+
+#[test]
+fn adding_a_present_folder_changes_nothing_even_with_another_spelling() {
+    let scratch = Scratch::new("add-twice");
+    let original = b"file:///home/u/Docs Documents\n";
+    let file = scratch.write(original);
+    assert!(!add(&file, Path::new("/home/u/Docs")).expect("no-op"));
+    assert!(!add(&file, Path::new("/home/u/Docs/")).expect("no-op"));
+    assert_eq!(std::fs::read(&file).expect("reads"), original);
+}
+
+#[test]
+fn adding_to_a_missing_file_creates_it_and_its_directory() {
+    let scratch = Scratch::new("add-missing");
+    let file = scratch.file();
+    assert!(add(&file, Path::new("/srv/a")).expect("adds"));
+    assert_eq!(std::fs::read(&file).expect("reads"), b"file:///srv/a\n");
+    let leftovers: Vec<_> = std::fs::read_dir(file.parent().expect("parent"))
+        .expect("reads")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(
+        leftovers,
+        [OsString::from("bookmarks")],
+        "no temporary file"
+    );
+}
+
+#[test]
+fn adding_keeps_crlf_endings_and_terminates_an_unterminated_last_line() {
+    let scratch = Scratch::new("add-crlf");
+    let file = scratch.write(b"file:///a\r\nfile:///b");
+    add(&file, Path::new("/c")).expect("adds");
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"file:///a\r\nfile:///b\r\nfile:///c\r\n"
+    );
+
+    let scratch = Scratch::new("add-unterminated");
+    let file = scratch.write(b"file:///a\nfile:///b");
+    add(&file, Path::new("/c")).expect("adds");
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"file:///a\nfile:///b\nfile:///c\n"
+    );
+}
+
+#[test]
+fn removing_drops_only_the_matching_lines_and_keeps_order_labels_and_unknown_lines() {
+    let scratch = Scratch::new("remove");
+    let file = scratch.write(
+        b"# top\nfile:///a Alpha\nsftp://h/x Remote\nfile:///b%20c\nfile:///b%20c Again\nfile:///d\n",
+    );
+
+    assert!(remove(&file, Path::new("/b c")).expect("removes"));
+
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"# top\nfile:///a Alpha\nsftp://h/x Remote\nfile:///d\n"
+    );
+    assert!(!remove(&file, Path::new("/never-there")).expect("no-op"));
+    assert!(!remove(&scratch.0.join("absent/bookmarks"), Path::new("/a")).expect("no-op"));
+    assert!(
+        !scratch.0.join("absent").exists(),
+        "removing creates nothing"
+    );
+}
+
+#[test]
+fn removing_matches_a_non_utf8_path_by_its_bytes() {
+    let scratch = Scratch::new("remove-bytes");
+    let file = scratch.write(b"file:///d/caf%E9\nfile:///d/caf%C3%A9\n");
+    assert!(remove(&file, &bytes_path(b"/d/caf\xe9")).expect("removes"));
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"file:///d/caf%C3%A9\n"
+    );
+}
+
+#[test]
+fn merging_appends_the_missing_folders_in_order_and_reports_how_many() {
+    let scratch = Scratch::new("merge");
+    let file = scratch.write(b"file:///b Bee\nsftp://h/x\n");
+    let added = merge(
+        &file,
+        &[
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c d"),
+            PathBuf::from("/a"),
+        ],
+    )
+    .expect("merges");
+    assert_eq!(added, 2);
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"file:///b Bee\nsftp://h/x\nfile:///a\nfile:///c%20d\n"
+    );
+    assert_eq!(merge(&file, &[PathBuf::from("/a")]).expect("merges"), 0);
+}
+
+#[test]
+fn a_write_keeps_the_file_mode() {
+    let scratch = Scratch::new("mode");
+    let file = scratch.write(b"file:///a\n");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+    add(&file, Path::new("/b")).expect("adds");
+    let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o640);
+
+    let scratch = Scratch::new("mode-new");
+    let file = scratch.file();
+    add(&file, Path::new("/b")).expect("adds");
+    let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o644, "a new file is world-readable like GTK's");
+}
+
+#[test]
+fn a_symlinked_file_is_written_through_and_stays_a_symlink() {
+    let scratch = Scratch::new("symlink");
+    let target = scratch.0.join("dotfiles/bookmarks");
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("dir creates");
+    std::fs::write(&target, "file:///a\n").expect("fixture writes");
+    let link = scratch.file();
+    std::fs::create_dir_all(link.parent().expect("parent")).expect("dir creates");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink creates");
+
+    add(&link, Path::new("/b")).expect("adds");
+
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("stat")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("reads"),
+        b"file:///a\nfile:///b\n"
+    );
+}
+
+#[test]
+fn concurrent_adds_never_lose_a_line() {
+    let scratch = Scratch::new("concurrent");
+    let file = scratch.write(b"");
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let file = &file;
+            scope.spawn(move || {
+                for index in 0..10 {
+                    add(file, Path::new(&format!("/w{worker}/{index}"))).expect("adds");
+                }
+            });
+        }
+    });
+    assert_eq!(read(&file).expect("reads").len(), 40);
+}

@@ -5,10 +5,11 @@
 //! explicit [`Listing::warnings`] instead of hiding entries.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileType, Metadata};
-use std::io;
+use std::io::{self, Read as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -46,7 +47,36 @@ pub fn read_directory(path: &Path) -> io::Result<Listing> {
         }
     }
     sort_entries(&mut listing.entries);
+    listing.hidden_names = read_hidden_names(path);
     Ok(listing)
+}
+
+/// The most of a `.hidden` file that is read: a list of names, never large.
+const HIDDEN_FILE_LIMIT: u64 = 1 << 20;
+
+/// The names in `<dir>/.hidden`, one per line (`\n` or `\r\n`, blank lines
+/// skipped, bytes kept as written). A missing, unreadable or non-regular
+/// file lists nothing: it only ever hides, so failing to read it is not an
+/// error of the folder.
+fn read_hidden_names(dir: &Path) -> BTreeSet<OsString> {
+    let Ok(file) = fs::File::open(dir.join(".hidden")) else {
+        return BTreeSet::new();
+    };
+    let mut bytes = Vec::new();
+    if !file.metadata().is_ok_and(|meta| meta.is_file())
+        || file
+            .take(HIDDEN_FILE_LIMIT)
+            .read_to_end(&mut bytes)
+            .is_err()
+    {
+        return BTreeSet::new();
+    }
+    bytes
+        .split(|&byte| byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(|line| OsStr::from_bytes(line).to_os_string())
+        .collect()
 }
 
 /// Sorts entries folders-first, then by natural name order
@@ -378,6 +408,7 @@ fn metadata_facts(meta: &Metadata) -> (EntryKind, Option<u64>, Option<SystemTime
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::symlink as symlink_file;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -643,6 +674,70 @@ mod tests {
         assert_eq!(entry.kind, EntryKind::File);
         Ok(())
     }
+    #[test]
+    fn a_hidden_file_lists_the_names_hidden_in_that_folder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = scratch("dot-hidden")?;
+        fs::write(scratch.path().join("secret.txt"), "s")?;
+        fs::write(scratch.path().join("shown.txt"), "s")?;
+        fs::create_dir(scratch.path().join("Private Folder"))?;
+        fs::write(
+            scratch.path().join(".hidden"),
+            b"secret.txt
+
+Private Folder
+not-there
+  padded 
+sub/nested
+last",
+        )?;
+        let listing = read_directory(scratch.path())?;
+        let names: Vec<String> = listing
+            .hidden_names
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "  padded ",
+                "Private Folder",
+                "last",
+                "not-there",
+                "secret.txt",
+                "sub/nested"
+            ],
+            "one name per line, CR and blank lines dropped, nothing trimmed or filtered"
+        );
+        assert_eq!(
+            listing.entries.len(),
+            4,
+            "hidden entries stay in the listing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_names_keep_non_utf8_bytes_and_a_folder_without_the_file_has_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = scratch("dot-hidden-bytes")?;
+        assert!(read_directory(scratch.path())?.hidden_names.is_empty());
+        fs::write(scratch.path().join(".hidden"), b"caf\xe9\n")?;
+        let listing = read_directory(scratch.path())?;
+        assert!(
+            listing.hidden_names.contains(OsStr::from_bytes(b"caf\xe9")),
+            "{:?}",
+            listing.hidden_names
+        );
+        // A directory named .hidden is not a list.
+        let other = scratch.path().join("other");
+        fs::create_dir_all(other.join(".hidden"))?;
+        let listing = read_directory(&other)?;
+        assert!(listing.hidden_names.is_empty());
+        assert_eq!(listing.entries.len(), 1);
+        Ok(())
+    }
+
     #[test]
     fn child_counts_counts_each_directory_and_reports_unreadable_as_none()
     -> Result<(), Box<dyn std::error::Error>> {

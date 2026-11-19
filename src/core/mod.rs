@@ -1,10 +1,12 @@
 //! Filesystem-independent shared data for the read-only explorer.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 pub mod apps;
+pub mod bookmarks;
 pub mod devices;
 pub mod fs;
 pub mod images;
@@ -13,6 +15,7 @@ pub mod navigation;
 pub mod ops;
 pub mod places;
 pub mod settings;
+pub mod terminal;
 pub mod trash;
 pub mod watch;
 
@@ -60,4 +63,7 @@ impl Entry {
 pub struct Listing {
     pub entries: Vec<Entry>,
     pub warnings: Vec<String>,
+    /// The names the folder's `.hidden` file lists (Nautilus and Thunar's
+    /// convention): hidden like dotfiles, but still in `entries`.
+    pub hidden_names: BTreeSet<OsString>,
 }

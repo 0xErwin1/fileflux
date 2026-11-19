@@ -196,6 +196,7 @@ pub fn read_trash(root: &Path) -> io::Result<Listing> {
     Ok(Listing {
         entries: entries.into_iter().map(|(_, entry)| entry).collect(),
         warnings,
+        ..Listing::default()
     })
 }
 
