@@ -45,10 +45,10 @@ use gpui_component::tooltip::Tooltip;
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
 use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
-use crate::explorer::devices::{DeviceHub, refusal};
+use crate::explorer::devices::DeviceHub;
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
-use crate::explorer::ops::{DialogQueue, MenuPage, Severity};
+use crate::explorer::ops::{DialogQueue, MenuPage};
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
@@ -1088,22 +1088,17 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Scan> {
-        // A device that is being ejected is not entered. A folder that is
-        // visited may reach it through a symlink, which is resolved off the
-        // UI thread: its scan starts a moment later and is not returned.
+        // A device that is being ejected is not entered, whichever way the
+        // folder is reached (a visit, a history step, Up): a history entry
+        // may be a symlink into it, which is resolved off the UI thread, so
+        // its scan starts a moment later and is not returned.
         if self.devices.is_draining()
             && let Some(Location::Directory(path)) = self.tab().state.target_of(&transition)
         {
-            if matches!(transition, Transition::Visit(_)) {
-                self.when_not_ejecting(vec![path], window, cx, move |this, window, cx| {
-                    this.navigate_now(transition, window, cx);
-                });
-                return None;
-            }
-            if let Some(text) = refusal(self.devices.draining(), &[path]) {
-                self.say(Severity::Info, text, window, cx);
-                return None;
-            }
+            self.when_not_ejecting(vec![path], window, cx, move |this, window, cx| {
+                this.navigate_now(transition, window, cx);
+            });
+            return None;
         }
         self.navigate_now(transition, window, cx)
     }

@@ -948,25 +948,33 @@ impl Explorer {
 
     /// Ctrl+Z: undoes the newest operation of the session.
     pub(crate) fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.undo.pop() {
-            Some(entry) => {
-                // Its toast's Undo button would now do nothing: close it.
-                if let Some(toast) = entry.toast {
-                    self.toast_host
-                        .update(cx, |host, cx| host.dismiss(toast, cx));
-                }
-                self.run_undo(entry, window, cx);
-            }
+        match self.undo.newest().map(|entry| entry.id) {
+            Some(id) => self.undo_entry(id, window, cx),
             None => self.say(Severity::Info, "Nothing to undo", window, cx),
         }
     }
 
-    /// A toast's Undo button: undoes exactly that operation.
+    /// A toast's Undo button: undoes exactly that operation. The entry
+    /// leaves the history only once the device gate lets the undo start: an
+    /// undo refused because its device is being ejected stays undoable.
     pub(crate) fn undo_entry(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        match self.undo.take(id) {
-            Some(entry) => self.run_undo(entry, window, cx),
-            None => self.say(Severity::Info, "Already undone", window, cx),
-        }
+        let Some(entry) = self.undo.get(id) else {
+            return self.say(Severity::Info, "Already undone", window, cx);
+        };
+        let touches = job_paths(&Job::Undo(entry.action.clone()), &self.job_ctx().trash_root);
+        self.when_not_ejecting(touches, window, cx, move |this, window, cx| {
+            match this.undo.take(id) {
+                Some(entry) => {
+                    // Its toast's Undo button would now do nothing: close it.
+                    if let Some(toast) = entry.toast {
+                        this.toast_host
+                            .update(cx, |host, cx| host.dismiss(toast, cx));
+                    }
+                    this.run_undo(entry, window, cx);
+                }
+                None => this.say(Severity::Info, "Already undone", window, cx),
+            }
+        });
     }
 
     fn run_undo(&mut self, entry: UndoEntry, window: &mut Window, cx: &mut Context<Self>) {

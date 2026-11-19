@@ -172,7 +172,19 @@ impl UndoStack {
         }
     }
 
-    /// Removes and returns the newest entry (Ctrl+Z).
+    /// The newest entry, left on the stack: an undo that may be refused
+    /// looks before it takes.
+    pub(crate) fn newest(&self) -> Option<&UndoEntry> {
+        self.entries.last()
+    }
+
+    /// One entry by id, left on the stack.
+    pub(crate) fn get(&self, id: u64) -> Option<&UndoEntry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    /// Removes and returns the newest entry.
+    #[cfg(test)]
     pub(crate) fn pop(&mut self) -> Option<UndoEntry> {
         self.entries.pop()
     }

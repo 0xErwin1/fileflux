@@ -1716,6 +1716,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn back_forward_and_up_into_a_symlinked_folder_are_refused_by_real_location()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::explorer::state::{ExplorerState, Transition};
+        let root = std::env::temp_dir().join(format!("ff-nav-link-{}", std::process::id()));
+        let mount = root.join("media/USB");
+        std::fs::create_dir_all(mount.join("existing"))?;
+        std::fs::create_dir_all(root.join("home"))?;
+        let link = root.join("home/usblink");
+        std::os::unix::fs::symlink(&mount, &link)?;
+        let draining = plan("USB", &mount.to_string_lossy());
+
+        let dir = |path: &Path| Location::Directory(path.to_path_buf());
+        let mut state = ExplorerState::new(dir(&root.join("home")), Some(root.join("home")));
+        for step in [link.join("existing"), root.join("home")] {
+            let scan = state.begin(Transition::Visit(dir(&step)));
+            if let Some(scan) = scan {
+                state.commit(scan, Default::default());
+            }
+        }
+        // Back lands in the symlinked folder; Up from it would land in the link.
+        let back = state.target_of(&Transition::Back);
+        let Some(Location::Directory(back)) = back else {
+            return Err("back has a target".into());
+        };
+        assert_eq!(back, link.join("existing"));
+        assert_eq!(
+            refusal(std::slice::from_ref(&draining), std::slice::from_ref(&back)),
+            None,
+            "by text the symlinked folder looks harmless"
+        );
+        let real = real_location(&back);
+        let verdict = refusal(std::slice::from_ref(&draining), &[real]);
+        let cleanup = std::fs::remove_dir_all(&root);
+        assert_eq!(verdict, Some("USB is being ejected".to_owned()));
+        cleanup?;
+        Ok(())
+    }
+
     // --- polling and queue ----------------------------------------------------
 
     #[test]

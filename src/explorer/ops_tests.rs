@@ -124,6 +124,18 @@ fn the_undo_stack_pops_the_newest_and_take_removes_only_that_entry() {
 }
 
 #[test]
+fn looking_at_an_entry_leaves_it_on_the_stack_so_a_refused_undo_loses_nothing() {
+    let mut stack = UndoStack::default();
+    let a = stack.push(rename_action("/x/a", "/x/b"));
+    let b = stack.push(rename_action("/x/c", "/x/d"));
+    assert_eq!(stack.newest().map(|entry| entry.id), Some(b));
+    assert_eq!(stack.get(a).map(|entry| entry.id), Some(a));
+    assert_eq!(stack.get(99), None);
+    assert_eq!(stack.len(), 2, "nothing was removed");
+    assert_eq!(stack.pop().map(|entry| entry.id), Some(b));
+}
+
+#[test]
 fn an_entry_remembers_its_toast_so_ctrl_z_can_close_the_stale_undo_button() {
     let mut stack = UndoStack::default();
     let a = stack.push(rename_action("/x/a", "/x/b"));

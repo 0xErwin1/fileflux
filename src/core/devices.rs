@@ -513,7 +513,17 @@ pub fn fallback_target(
     location
         .ancestors()
         .find(|ancestor| !path_is_on_mounts(ancestor, mounts) && exists(ancestor))
-        .map(Path::to_path_buf)
+        .map(|ancestor| {
+            // A shown `…/a/..` is the folder above `a`: name it as such.
+            if ancestor
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            {
+                real_location(ancestor)
+            } else {
+                ancestor.to_path_buf()
+            }
+        })
         .or_else(|| home.map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -1306,6 +1316,27 @@ mod tests {
             Path::exists,
         );
         assert_eq!(target, fixture.0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fallback_path_has_no_dot_dot_left() -> TestResult {
+        let fixture = Fixture::new()?;
+        let mount = fixture.0.join("media/USB");
+        fs::create_dir_all(&mount)?;
+        fs::create_dir_all(fixture.0.join("home/a"))?;
+        let target = fallback_target(
+            &fixture.0.join("home/a/.."),
+            std::slice::from_ref(&mount),
+            None,
+            Path::exists,
+        );
+        assert_eq!(target, real_location(&fixture.0.join("home")));
+        assert!(
+            target
+                .components()
+                .all(|part| part != std::path::Component::ParentDir)
+        );
         Ok(())
     }
 
