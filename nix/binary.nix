@@ -1,7 +1,8 @@
 # Prebuilt-binary derivation for Fileflux.
 #
 # Pulls the matching tarball from the GitHub Release named by the info file
-# (./nightly-info.nix, the rolling nightly) and installs it into a Nix store
+# (./nightly-info.nix, the rolling nightly; its url is a per-build immutable
+# asset, not the rolling tarball) and installs it into a Nix store
 # path. Avoids compiling from source on the consumer machine.
 #
 # Supported systems: the ones listed in the info file's `artifacts`
