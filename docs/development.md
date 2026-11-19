@@ -66,6 +66,20 @@ Rules:
 
 `scripts/native-smoke.py` (X11 or XWayland, standard library plus `libXtst`) launches the local build against a synthetic HOME/XDG fixture, drives its own window with XTest, and asserts the window title around path edits and failed submits. What it cannot automate it reports as `MANUAL` (exit 3); it never claims a visual check it did not perform.
 
+## Nix packages
+
+`flake.nix` outputs, for `x86_64-linux` and `aarch64-linux` (the prebuilt nightly only for `x86_64-linux`):
+
+| Output | What it is |
+|---|---|
+| `packages.fileflux` (also `default`, `fileflux-source`) | The source build with `rustPlatform.buildRustPackage` and the desktop entry |
+| `packages.fileflux-nightly` | The prebuilt binary of the rolling `nightly` release (`nix/binary.nix`, pinned by `nix/nightly-info.nix`), installed as `fileflux-nightly` |
+| `apps.fileflux`, `apps.fileflux-nightly` | `nix run` entry points for the two packages |
+| `overlays.default` | `pkgs.fileflux`, `pkgs.fileflux-source`, `pkgs.fileflux-nightly`, built from the consumer's package set |
+| `devShells.default` | The shell described above |
+
+The hashes in `nix/nightly-info.nix` are placeholders on `main`; the nightly workflow rewrites them on the `nightly` ref, so consume the prebuilt package as `github:0xErwin1/fileflux/nightly#fileflux-nightly`. The source build currently fails while vendoring the `gpui-component` git dependency (the same failure as ReqFlux's); CI is unaffected because it builds with Cargo.
+
 ## Scripts and assets
 
 | Path | Purpose |

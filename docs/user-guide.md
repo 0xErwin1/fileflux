@@ -62,16 +62,16 @@ A sidebar of places on the left, the folder in the middle, and an optional [deta
 | Folder subbar | Current folder name, "4 folders · 7 files" count, **Sort**, **Filter**, **New folder**, active filter chips |
 | Status bar | "N items" or "N selected · size", loading and error notices, a progress indicator for long operations, free space of the current volume |
 
-Drag the right edge of the sidebar or the left edge of the details panel to resize them; double-click a handle to restore the default width. The sidebar is clamped to 200–600 px, the details panel to 240–600 px. Narrow windows park the sidebar as an overlay; the sidebar toggle shows or hides it at any width. The widths are remembered.
+Drag the right edge of the sidebar or the left edge of the details panel (a 6 px handle with a tint line on hover) to resize them; double-click a handle to restore the default width (290 px sidebar, 300 px details). The sidebar is clamped to 200–600 px and always leaves the folder pane 360 px; the details panel to 240–600 px and never wider than the window leaves room for the entries. Narrow windows park the sidebar as an overlay, without a resize handle, keeping its width; the sidebar toggle shows or hides it at any width, and the path, search and view controls always stay reachable. The widths are remembered (`sidebar_width`, `details_width` in [settings](settings.md#files-and-locations)).
 
-Fileflux always starts in Bolt's dark palette; there is no theme toggle.
+The window title is the current folder plus Fileflux ("Home — Fileflux") and follows the active tab. Fileflux always starts in Bolt's dark palette; there is no theme toggle.
 
 ## Navigation
 
 | Control | Behavior |
 |---|---|
-| Sidebar | Home, Desktop, Documents, Downloads, Music, Pictures and Videos (from your freedesktop user-dirs config), your favorites, the Home Trash and the Devices section. Names only; full paths in tooltips. Each volume shows a usage meter and "X free of Y" |
-| Breadcrumbs | Each segment navigates. Long paths collapse their leading segments |
+| Sidebar | Home, Desktop, Documents, Downloads, Music, Pictures and Videos (from your freedesktop user-dirs config), your favorites, the Home Trash and the Devices section. Names only; full paths in tooltips. Volumes come from the mount table, one entry per device without virtual or duplicate bind mounts (the root filesystem reads "System"), each with a usage meter and "X free of Y" from `statvfs`. See [Devices](devices.md) |
+| Breadcrumbs | A Home icon and "Home" under `$HOME`, else `/`, with chevron separators. Each segment navigates and the current folder reads strong. Long paths collapse their leading segments instead of overflowing |
 | Path field | Click the bar's empty space or press Ctrl+L. Enter navigates to an absolute, relative or `~/…` path (no shell evaluation). Escape or leaving the field restores the committed path. An invalid or missing path reports an error and changes nothing |
 | History | Alt+←, Alt+→ and Alt+↑ (back, forward, up). A failed load changes nothing |
 | Favorites | Your GTK bookmarks (`~/.config/gtk-3.0/bookmarks`, shared with Nautilus and Thunar). The toolbar star, a folder's context menu and a sidebar row's menu add or remove one; an edit made by another program shows live. The Trash cannot be a favorite. See [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks) |
@@ -157,9 +157,11 @@ The sidebar's Favorites are the local lines of `$XDG_CONFIG_HOME/gtk-3.0/bookmar
 ## Open, Open with and terminal
 
 - **Open** (double click or Enter): folders navigate. Images open the [image viewer](#image-viewer). A symlink to a folder is entered like the folder. Files, links to files and broken links open with the default application (`xdg-open <path>`, detached, no shell); a failure to start it appears in the status bar. Trash entries are not opened: restore them first.
-- **Open with…** (context menu, one selected file; not folders, not in the Trash): lists the default application first, then every other application whose `.desktop` file declares the file's MIME type. Up/Down choose, Enter or a click opens. The MIME type comes from `xdg-mime query filetype` (the extension is the fallback). Applications are found in `$XDG_DATA_HOME/applications` and each `$XDG_DATA_DIRS/applications`; hidden entries, terminal applications and ones that take no file are not listed. The program is started without a shell, detached, in the file's folder. If nothing handles the type, a toast says so.
-- **Open in terminal** (context menu on one selected folder, on a sidebar row and on empty space): starts your terminal in that folder (the shown folder on empty space), with no shell. The terminal is the first that exists of: `$TERMINAL`, `xdg-terminal-exec`, the desktop ids in `xdg-terminals.list`, a desktop entry with `Categories=TerminalEmulator` (known terminals first), then ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, kgx, konsole, xfce4-terminal, xterm. Terminals that ignore the working directory of the process get their own argument (`--working-directory`, `--directory`, `--workdir`, `start --cwd`). The item is omitted when no terminal is found.
+- **Open with…** (context menu, one selected file; not folders, not in the Trash): lists the default application first, then every other application whose `.desktop` file declares the file's MIME type. Up/Down choose, Enter or a click opens. The MIME type comes from `xdg-mime query filetype` (the extension is the fallback). Applications are found in `$XDG_DATA_HOME/applications` (else `~/.local/share/applications`) and each `$XDG_DATA_DIRS/applications` (else `/usr/local/share:/usr/share`); a same-named file in an earlier directory hides the later one. Every `text/*` type also matches applications that list `text/plain`. `NoDisplay=true`, `Hidden=true`, `Terminal=true` entries, ones whose `Exec=` takes no file (`%f %F %u %U`), and ones that put a field code inside a quoted argument (forbidden by the Desktop Entry spec, and with `sh -c "… %f"` it would let a file name run as a shell command) are not listed. `Exec=` is split by the Desktop Entry quoting rules: `%f`/`%F` become the path, `%u`/`%U` its `file://` URI, `%%` a percent sign, and the other codes are dropped. The program is started without a shell, detached, in the file's folder. If nothing handles the type, a toast says so. There is no "Other application…" entry.
+- **Open in terminal** (context menu on one selected folder, on a sidebar row and on empty space): starts your terminal in that folder (the shown folder on empty space), with no shell. The terminal is the first that exists of: `$TERMINAL`, `xdg-terminal-exec`, the desktop ids in `xdg-terminals.list`, a desktop entry with `Categories=TerminalEmulator` (known terminals first), then ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, kgx, konsole, xfce4-terminal, xterm. Terminals that ignore the working directory of the process get their own argument: `--working-directory=DIR` (ghostty, foot, gnome-terminal, kgx, xfce4-terminal), `--working-directory DIR` (alacritty), `--directory DIR` (kitty), `--workdir DIR` (konsole), `start --cwd DIR` (wezterm); xterm uses its working directory, and a terminal found through a desktop entry uses the entry's `X-TerminalArgDir` when it has one. `<desktop>-xdg-terminals.list` variants for `$XDG_CURRENT_DESKTOP` are tried first, and the lists are read from `$XDG_CONFIG_HOME` then `$XDG_CONFIG_DIRS`. The lookup reads `.desktop` files, so it runs off the UI thread at startup; the item is omitted until a terminal is found, and when none is.
 - **Open in viewer** (context menu, one selected image), and **Open in new tab**, **Add to favorites** / **Remove from favorites** (selected folder, not in the Trash).
+
+The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), Rename, Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, Paste, **Sort by ›** and **Filter ›** (the same options as the subbar menus, each opening its page inside the menu with a Back row), Open in terminal and Copy folder path.
 
 ## File operations
 
@@ -182,7 +184,7 @@ Everything that changes the disk runs off the UI thread, reports its result in a
 
 **Del never deletes: it moves to the Trash** and offers **Undo** in the toast. Permanent deletion only comes from Shift+Del, the Trash view, or an unavailable Trash, and always behind a confirmation.
 
-- Items go to the home Trash on the home device, else to `$topdir/.Trash-$uid` of their mount. The shared `$topdir/.Trash` is not used.
+- Items go to the home Trash on the home device (known from `$XDG_DATA_HOME` / `$HOME` at startup, so Del works before the sidebar has loaded), else to `$topdir/.Trash-$uid` of their mount. The shared `$topdir/.Trash` is not used.
 - If an item has no usable Trash, a dialog asks whether to delete it permanently. Nothing is deleted without that answer; declining reports "N items not deleted (no Trash available)".
 - Phones and other gvfs mounts have no Trash: deleting there asks and deletes permanently (see [Devices](devices.md#phones-and-gvfs-mounts)).
 - **Trash view** (sidebar row **Home Trash**): **Restore** puts items back; on a name conflict both are kept and the restored one gets "name (2)". **Delete permanently…** and **Empty Trash** each ask first. The view refreshes after every operation.
@@ -190,7 +192,7 @@ Everything that changes the disk runs off the UI thread, reports its result in a
 
 ## Undo
 
-Ctrl+Z, or the toast's Undo button, undoes the last rename, Move to Trash, New folder/file, copy or move. The history is per session and survives navigation.
+Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file, copy or move. The history is per session and survives navigation.
 
 | Operation | What undo does |
 |---|---|

@@ -18,7 +18,7 @@ One package, one library and one binary.
 | Binary `fileflux` | `src/main.rs`, `src/gui.rs`, `src/theme.rs` | Parses the command line through `fileflux::cli`, starts GPUI, installs Bolt's dark theme, opens the explorer or the viewer inside `gpui_component`'s `Root` |
 | Explorer | `src/explorer/` | The window: state, views, sidebar, toolbar, tabs, dialogs, progress, key bindings |
 | Viewer | `src/viewer/` | The image viewer window: navigation, zoom, rotation, info panel |
-| Integration tests | `tests/` | `cli.rs`, `settings.rs`, `open_with_quoting.rs` |
+| Integration tests | `tests/` | `cli.rs`, `settings.rs`, `bookmarks.rs`, `devices_real_location.rs`, `open_with_quoting.rs` |
 | Benchmark | `examples/read_dir_bench.rs` | Directory-scan timing helper |
 
 ### `fileflux::core`
@@ -88,7 +88,11 @@ Names are bounded to 255 bytes: invented names ("name (2).ext") shorten the stem
 
 ## Pinned stack
 
-The GPUI stack follows DBFlux, as ReqFlux does, so all three apps build against one GPUI and one Bolt. `Cargo.toml` pins `gpui-pre`, `gpui-component`, `gpui-pre-linux` and `bolt` to one DBFlux git revision through `[patch.crates-io]`; move that revision together with DBFlux. The Rust toolchain is pinned in `rust-toolchain.toml` and installed by the Nix shell. The design language is documented in [`design/system.md`](../design/system.md).
+The GPUI stack follows DBFlux, as ReqFlux does, so all three apps build against one GPUI and one Bolt. `Cargo.toml` pins `gpui-pre` (0.3.9), `gpui-base`, `gpui-component` (0.7.3), `gpui-pre-linux` and `bolt` to one DBFlux git revision through `[patch.crates-io]`: DBFlux's patched GPUI (frame-observer hooks), its patched editor build and its Wayland keymap fix. Move that revision together with DBFlux. `flake.lock` pins the Nix inputs to the revisions ReqFlux ships. The Rust toolchain is pinned in `rust-toolchain.toml` and installed by the Nix shell. 
+
+## Design
+
+The implemented look follows [`design/file-explorer/01-familiar-grid.html`](../design/file-explorer/01-familiar-grid.html) and [`design/system.md`](../design/system.md): a desk with 8 px gutters (the empty top gutter has no brand text or icon), a 290 px sidebar, opposing 14 px island chamfers, square selection rows with a 2 px tint bar, and Bolt's palette and font roles. The `02` and `03` artboards remain alternatives.
 
 ## Related
 
