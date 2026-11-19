@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 /// One sidebar entry: a stable label plus the exact filesystem path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,9 +263,66 @@ fn within<T: Send + 'static>(
 }
 
 /// [`volume_usage`] that cannot hang: `None` after [`GVFS_USAGE_TIMEOUT`].
+///
+/// A thread stuck in the kernel is never joined, so at most one `statvfs` per
+/// path is ever in flight: while one still hangs, asking again answers `None`
+/// at once instead of leaking another thread on every refresh.
 fn bounded_usage(path: &Path) -> Option<Usage> {
+    static IN_FLIGHT: LazyLock<Arc<InFlight>> = LazyLock::new(Arc::default);
+    bounded_usage_via(&IN_FLIGHT, path, GVFS_USAGE_TIMEOUT, volume_usage)
+}
+
+/// [`bounded_usage`] against a given gate and `statvfs`.
+fn bounded_usage_via(
+    gate: &Arc<InFlight>,
+    path: &Path,
+    timeout: std::time::Duration,
+    query: impl FnOnce(&Path) -> Option<Usage> + Send + 'static,
+) -> Option<Usage> {
+    let claim = gate.claim(path)?;
     let path = path.to_path_buf();
-    within(GVFS_USAGE_TIMEOUT, move || volume_usage(&path)).flatten()
+    within(timeout, move || {
+        // Held until the call returns, however late that is.
+        let _claim = claim;
+        query(&path)
+    })
+    .flatten()
+}
+
+/// The paths with a `statvfs` still running.
+#[derive(Debug, Default)]
+struct InFlight(Mutex<Vec<PathBuf>>);
+
+/// The right to run a `statvfs` on one path; released on drop.
+#[derive(Debug)]
+struct Claim {
+    gate: Arc<InFlight>,
+    path: PathBuf,
+}
+
+impl InFlight {
+    fn paths(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `None` while another call for `path` has not returned.
+    fn claim(self: &Arc<Self>, path: &Path) -> Option<Claim> {
+        let mut paths = self.paths();
+        if paths.iter().any(|busy| busy == path) {
+            return None;
+        }
+        paths.push(path.to_path_buf());
+        Some(Claim {
+            gate: Arc::clone(self),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.gate.paths().retain(|busy| *busy != self.path);
+    }
 }
 
 /// Where FUSE filesystems (and gvfs) are mounted: those paths have weaker
@@ -272,7 +330,9 @@ fn bounded_usage(path: &Path) -> Option<Usage> {
 /// timestamps or modes, no Trash), and operations degrade on them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FuseRoots {
-    fuse: Vec<PathBuf>,
+    /// Every mount of the table, in table order, with whether it is FUSE or
+    /// gvfs: the deepest mount that holds a path decides what the path is.
+    mounts: Vec<(PathBuf, bool)>,
     gvfs: Vec<PathBuf>,
 }
 
@@ -291,16 +351,18 @@ impl FuseRoots {
                 continue;
             };
             let mount = PathBuf::from(OsString::from_vec(decode_fstab_field(mount)));
+            let weak = fs_type == b"fuse" || fs_type == b"fuseblk" || fs_type.starts_with(b"fuse.");
             if fs_type == b"fuse.gvfsd-fuse" {
-                roots.gvfs.push(mount);
-            } else if fs_type == b"fuse" || fs_type == b"fuseblk" || fs_type.starts_with(b"fuse.") {
-                roots.fuse.push(mount);
+                roots.gvfs.push(mount.clone());
             }
+            roots.mounts.push((mount, weak));
         }
         if let Some(root) = gvfs_root {
-            roots.gvfs.push(root.to_path_buf());
-            if let Ok(real) = fs::canonicalize(root) {
-                roots.gvfs.push(real);
+            let mut known = vec![root.to_path_buf()];
+            known.extend(fs::canonicalize(root).ok());
+            for root in known {
+                roots.gvfs.push(root.clone());
+                roots.mounts.push((root, true));
             }
         }
         roots
@@ -313,9 +375,23 @@ impl FuseRoots {
         Self::from_table(&mounts, gvfs_root_from_env().as_deref())
     }
 
-    /// Whether `path` is on a FUSE filesystem or on gvfs.
+    /// Whether `path` is on a FUSE filesystem or on gvfs: decided by the
+    /// deepest mount that holds it, so a disk mounted under a FUSE mount is
+    /// still a disk. Of two mounts on the same path the later one (the one
+    /// on top) decides.
     pub fn covers(&self, path: &Path) -> bool {
-        self.is_gvfs(path) || self.fuse.iter().any(|root| path.starts_with(root))
+        self.mounts
+            .iter()
+            .filter(|(mount, _)| path.starts_with(mount))
+            .fold((0, false), |best, (mount, weak)| {
+                let depth = mount.components().count();
+                if depth >= best.0 {
+                    (depth, *weak)
+                } else {
+                    best
+                }
+            })
+            .1
     }
 
     /// Whether `path` is on gvfs: a phone or a network share that has no
@@ -351,6 +427,9 @@ pub struct Places {
     pub places: Vec<Place>,
     pub volumes: Vec<Volume>,
     pub trash_root: PathBuf,
+    /// Where FUSE and gvfs are mounted, read with the volumes (off the UI
+    /// thread: resolving the gvfs directory can block on a stuck mount).
+    pub fuse: FuseRoots,
     pub warnings: Vec<String>,
 }
 
@@ -417,6 +496,7 @@ pub fn discover() -> io::Result<Places> {
     )?;
     warnings.extend(discovered.warnings);
     discovered.warnings = warnings;
+    discovered.fuse = FuseRoots::system();
     if let Some(root) = gvfs_root_from_env() {
         discovered.volumes.extend(gvfs_volumes(&root));
     }
@@ -579,6 +659,7 @@ pub fn discover_with(
         places,
         volumes,
         trash_root,
+        fuse: FuseRoots::default(),
         warnings,
     })
 }
@@ -1117,6 +1198,7 @@ snapfuse /snap/core22/1 squashfs ro 0 0\n\
                 volume("data", "/mnt/data"),
             ],
             trash_root: PathBuf::from("/home/me/.local/share/Trash"),
+            fuse: FuseRoots::default(),
             warnings: Vec::new(),
         };
         let label = |path: &str| {
@@ -1555,5 +1637,91 @@ fusectl /sys/fs/fuse/connections fusectl rw 0 0\n\
         );
         assert!(!FuseRoots::default().covers(Path::new("/mnt/remote")));
         Ok(())
+    }
+
+    #[test]
+    fn the_deepest_mount_decides_whether_a_path_is_on_fuse() {
+        let mounts = b"/dev/sda2 / ext4 rw 0 0\n\
+me@host:/ /mnt/remote fuse.sshfs rw 0 0\n\
+/dev/sdc1 /mnt/remote/usb ext4 rw 0 0\n\
+/dev/sdd1 /mnt/remote/usb/ntfs fuseblk rw 0 0\n\
+/dev/sde1 /mnt/stack ext4 rw 0 0\n\
+other:/ /mnt/stack fuse.sshfs rw 0 0\n\
+other:/ /mnt/stack2 fuse.sshfs rw 0 0\n\
+/dev/sde2 /mnt/stack2 ext4 rw 0 0\n";
+
+        let roots = FuseRoots::from_table(mounts, None);
+
+        for (path, fuse) in [
+            ("/mnt/remote/file", true),
+            ("/mnt/remote/usb", false),
+            ("/mnt/remote/usb/photos/a.jpg", false),
+            ("/mnt/remote/usb/ntfs/doc", true),
+            ("/mnt/remote/usb2/x", true),
+            ("/home/me", false),
+            ("/mnt/stack/x", true),
+            ("/mnt/stack2/x", false),
+        ] {
+            assert_eq!(roots.covers(Path::new(path)), fuse, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_disk_mounted_inside_the_gvfs_directory_is_a_disk() {
+        let gvfs = Path::new("/run/user/1000/gvfs");
+        let mounts = b"gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n\
+/dev/sdb1 /run/user/1000/gvfs/mtp:host=P/disk ext4 rw 0 0\n";
+
+        let roots = FuseRoots::from_table(mounts, Some(gvfs));
+
+        assert!(roots.covers(Path::new("/run/user/1000/gvfs/mtp:host=P/DCIM")));
+        assert!(!roots.covers(Path::new("/run/user/1000/gvfs/mtp:host=P/disk/x")));
+    }
+
+    #[test]
+    fn a_hung_statvfs_is_not_asked_again_until_it_returns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let gate = Arc::new(InFlight::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let usage = || Usage::from_blocks(1, 10, 5);
+        let path = Path::new("/run/user/1000/gvfs/mtp:host=P");
+        let (release, hung) = std::sync::mpsc::channel::<()>();
+        let counted = Arc::clone(&calls);
+
+        let first = bounded_usage_via(&gate, path, Duration::from_millis(50), move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            hung.recv().ok();
+            None
+        });
+        assert_eq!(first, None, "the hung call is given up on");
+
+        for _ in 0..5 {
+            let counted = Arc::clone(&calls);
+            let again = bounded_usage_via(&gate, path, Duration::from_millis(50), move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                usage()
+            });
+            assert_eq!(again, None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no thread per refresh");
+        let other = Path::new("/run/user/1000/gvfs/mtp:host=Q");
+        assert_eq!(
+            bounded_usage_via(&gate, other, Duration::from_secs(5), move |_| usage()),
+            usage(),
+            "another mount is independent"
+        );
+
+        release.send(()).ok();
+        let started = Instant::now();
+        while gate.claim(path).is_none() {
+            assert!(started.elapsed() < Duration::from_secs(10), "never freed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            bounded_usage_via(&gate, path, Duration::from_secs(5), move |_| usage()),
+            usage(),
+            "asked again once the hung call returned"
+        );
     }
 }

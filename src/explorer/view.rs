@@ -48,7 +48,7 @@ use gpui_component::tooltip::Tooltip;
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
 use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
-use crate::explorer::devices::DeviceHub;
+use crate::explorer::devices::{CheckedStep, DeviceHub};
 use crate::explorer::favorites::{BookmarkSync, favorites_of};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
@@ -1085,10 +1085,20 @@ impl Explorer {
         // may be a symlink into it, which is resolved off the UI thread, so
         // its scan starts a moment later and is not returned.
         if self.devices.is_draining()
-            && let Some(Location::Directory(path)) = self.tab().state.target_of(&transition)
+            && let Some(checked) = self.tab().state.target_of(&transition)
+            && let Location::Directory(path) = &checked
         {
-            self.when_not_ejecting(vec![path], window, cx, move |this, window, cx| {
-                this.navigate_now(transition, window, cx);
+            let tab = self.active_id();
+            let paths = vec![path.clone()];
+            self.when_not_ejecting(paths, window, cx, move |this, window, cx| {
+                // The check took a moment: the user may have gone to another
+                // tab, or pressed again. Only the checked folder is entered.
+                if this.active_id() != tab {
+                    return;
+                }
+                let now = this.tab().state.target_of(&transition);
+                let step = CheckedStep::of(transition, now, checked);
+                this.navigate_now(step.into_transition(), window, cx);
             });
             return None;
         }

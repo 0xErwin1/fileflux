@@ -30,7 +30,7 @@ use fileflux::core::apps::{App, OpenWith, expand_exec};
 use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
-use fileflux::core::places::FuseRoots;
+use fileflux::core::places::{FuseRoots, Places};
 use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
 };
@@ -146,6 +146,18 @@ pub(crate) struct UndoEntry {
 pub(crate) struct UndoStack {
     entries: Vec<UndoEntry>,
     last_id: u64,
+    /// Entries whose undo waits for the device check: no second press may
+    /// start the same one.
+    pending: Vec<u64>,
+}
+
+/// Why an entry cannot be claimed for an undo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unavailable {
+    /// Not on the stack: undone already (or never there).
+    Gone,
+    /// Another undo of it is waiting for its device check.
+    InFlight,
 }
 
 impl UndoStack {
@@ -181,6 +193,28 @@ impl UndoStack {
     /// One entry by id, left on the stack.
     pub(crate) fn get(&self, id: u64) -> Option<&UndoEntry> {
         self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    /// Claims entry `id` for an undo that waits for the device check. Until
+    /// [`Self::settle`], the entry stays on the stack (a refused undo keeps
+    /// it) but no other undo can claim it.
+    pub(crate) fn begin(&mut self, id: u64) -> Result<(), Unavailable> {
+        if self.get(id).is_none() {
+            Err(Unavailable::Gone)
+        } else if self.pending.contains(&id) {
+            Err(Unavailable::InFlight)
+        } else {
+            self.pending.push(id);
+            Ok(())
+        }
+    }
+
+    /// Ends the claim of [`Self::begin`] with the verdict of the final
+    /// device check: allowed, the entry leaves the history and is returned
+    /// to run; refused, it stays undoable.
+    pub(crate) fn settle(&mut self, id: u64, allowed: bool) -> Option<UndoEntry> {
+        self.pending.retain(|pending| *pending != id);
+        if allowed { self.take(id) } else { None }
     }
 
     /// Removes and returns the newest entry.
@@ -307,8 +341,27 @@ impl JobCtx {
     /// `$topdir/.Trash-$uid` of the mount (from `mounts`) that holds the
     /// path; anything else is `NoTrash`. Paths on gvfs (phones, shares) have
     /// no Trash, whatever `mounts` says.
+    #[cfg(test)]
     pub(crate) fn from_env(trash_root: PathBuf, mounts: Vec<PathBuf>) -> JobCtx {
         Self::from_env_with(trash_root, mounts, FuseRoots::system())
+    }
+
+    /// The chooser for the discovered `places`, on the UI thread: the mounts
+    /// and the FUSE roots are the ones discovery read off it, so this reads
+    /// neither the mount table nor the filesystem. Without places the root is
+    /// empty, which no Trash can be chosen under: deletes then ask for
+    /// confirmation instead.
+    pub(crate) fn for_places(places: Option<&Places>, trash_root: Option<PathBuf>) -> JobCtx {
+        let mounts = places.map_or_else(Vec::new, |places| {
+            places
+                .volumes
+                .iter()
+                .filter(|volume| !volume.kind.is_gvfs())
+                .map(|volume| volume.path.clone())
+                .collect()
+        });
+        let roots = places.map_or_else(FuseRoots::default, |places| places.fuse.clone());
+        Self::from_env_with(trash_root.unwrap_or_default(), mounts, roots)
     }
 
     /// [`Self::from_env`] with the FUSE roots given.

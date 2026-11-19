@@ -32,9 +32,9 @@ use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
     MenuPage, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, RenameCheck, RenameStep, Report,
-    Severity, UndoAction, UndoEntry, add_viewer_row, check_rename, dismissed_notice, menu_rows,
-    move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command, rename_seed,
-    rename_step, stem_range,
+    Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row, check_rename, dismissed_notice,
+    menu_rows, move_selection, next_menu_index, no_trash_dialog, open_target, open_with_command,
+    rename_seed, rename_step, stem_range,
 };
 use super::ops::{SidebarTarget, menu_title, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
@@ -156,17 +156,7 @@ impl Explorer {
     // --- jobs ------------------------------------------------------------------
 
     pub(crate) fn job_ctx(&self) -> JobCtx {
-        let mounts = self.places.as_ref().map_or_else(Vec::new, |places| {
-            places
-                .volumes
-                .iter()
-                .filter(|volume| !volume.kind.is_gvfs())
-                .map(|volume| volume.path.clone())
-                .collect()
-        });
-        // Without discovered places the root is empty, which no trash can
-        // be chosen under: deletes then ask for confirmation instead.
-        JobCtx::from_env(self.trash_root.clone().unwrap_or_default(), mounts)
+        JobCtx::for_places(self.places.as_ref(), self.trash_root.clone())
     }
 
     /// Runs `job` on the background executor and applies its report when it
@@ -966,15 +956,27 @@ impl Explorer {
     }
 
     /// A toast's Undo button: undoes exactly that operation. The entry
-    /// leaves the history only once the device gate lets the undo start: an
-    /// undo refused because its device is being ejected stays undoable.
+    /// leaves the history only once the final device check lets the undo
+    /// start: an undo refused because its device is being ejected stays
+    /// undoable, and while its check is pending no other press can start
+    /// the same entry.
     pub(crate) fn undo_entry(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.undo.get(id) else {
             return self.say(Severity::Info, "Already undone", window, cx);
         };
         let touches = job_paths(&Job::Undo(entry.action.clone()), &self.job_ctx().trash_root);
-        self.when_not_ejecting(touches, window, cx, move |this, window, cx| {
-            match this.undo.take(id) {
+        match self.undo.begin(id) {
+            Ok(()) => {}
+            Err(Unavailable::Gone) => {
+                return self.say(Severity::Info, "Already undone", window, cx);
+            }
+            Err(Unavailable::InFlight) => {
+                return self.say(Severity::Info, "Already undoing that", window, cx);
+            }
+        }
+        // With no device going away the check answers at once, in this call.
+        self.check_not_ejecting(touches, window, cx, move |this, refused, window, cx| {
+            match this.undo.settle(id, refused.is_none()) {
                 Some(entry) => {
                     // Its toast's Undo button would now do nothing: close it.
                     if let Some(toast) = entry.toast {
@@ -983,11 +985,17 @@ impl Explorer {
                     }
                     this.run_undo(entry, window, cx);
                 }
-                None => this.say(Severity::Info, "Already undone", window, cx),
+                None => match refused {
+                    Some(text) => this.say(Severity::Info, text, window, cx),
+                    None => this.say(Severity::Info, "Already undone", window, cx),
+                },
             }
         });
     }
 
+    /// Starts the undo of an entry that has passed the device check: the
+    /// job is not gated a second time, because a refusal now would drop an
+    /// entry that already left the history.
     fn run_undo(&mut self, entry: UndoEntry, window: &mut Window, cx: &mut Context<Self>) {
         // Restoring several items takes a while: it can be cancelled, and
         // what was not restored stays undoable.
@@ -995,7 +1003,19 @@ impl Explorer {
             entry.action,
             UndoAction::Rename { .. } | UndoAction::Create { .. }
         );
-        self.start_job("Undoing", Job::Undo(entry.action), cancellable, window, cx);
+        let job = Job::Undo(entry.action);
+        let ctx = self.job_ctx();
+        let affected = Affected::of_job(&job);
+        let touches = job_paths(&job, &ctx.trash_root);
+        self.start_work(
+            "Undoing",
+            Unit::Items,
+            cancellable,
+            (affected, touches),
+            move |sink| super::ops::run_job(job, &ctx, &sink),
+            window,
+            cx,
+        );
     }
 
     // --- context menu ----------------------------------------------------------------

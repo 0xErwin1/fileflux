@@ -124,6 +124,45 @@ fn the_undo_stack_pops_the_newest_and_take_removes_only_that_entry() {
 }
 
 #[test]
+fn two_ctrl_z_presses_never_start_the_same_entry_twice() {
+    let mut stack = UndoStack::default();
+    let older = stack.push(rename_action("/x/a", "/x/b"));
+    let newest = stack.push(rename_action("/x/c", "/x/d"));
+
+    // First press: its device check is pending, the entry is claimed.
+    assert_eq!(stack.begin(newest), Ok(()));
+    // Second press during the drain targets the same newest entry.
+    assert_eq!(stack.begin(newest), Err(Unavailable::InFlight));
+    assert_eq!(stack.len(), 2, "claiming takes nothing out of the history");
+
+    let entry = stack.settle(newest, true);
+    assert_eq!(
+        entry.map(|entry| entry.id),
+        Some(newest),
+        "runs exactly once"
+    );
+    assert_eq!(stack.begin(newest), Err(Unavailable::Gone));
+    assert_eq!(stack.settle(newest, true), None, "nothing to run twice");
+    assert_eq!(stack.begin(older), Ok(()), "the older entry is still there");
+}
+
+#[test]
+fn a_refused_undo_keeps_its_entry_and_can_be_tried_again() {
+    let mut stack = UndoStack::default();
+    let id = stack.push(rename_action("/x/a", "/x/b"));
+    stack.attach_toast(id, 7);
+
+    assert_eq!(stack.begin(id), Ok(()));
+    assert_eq!(stack.settle(id, false), None, "refused: nothing to run");
+
+    assert_eq!(stack.len(), 1, "the refusal did not pop the entry");
+    assert_eq!(stack.begin(id), Ok(()), "and the claim is released");
+    let entry = stack.settle(id, true);
+    assert_eq!(entry.and_then(|entry| entry.toast), Some(7));
+    assert_eq!(stack.len(), 0);
+}
+
+#[test]
 fn looking_at_an_entry_leaves_it_on_the_stack_so_a_refused_undo_loses_nothing() {
     let mut stack = UndoStack::default();
     let a = stack.push(rename_action("/x/a", "/x/b"));
@@ -1966,6 +2005,40 @@ fn a_phone_has_no_trash_so_the_delete_asks_for_permanent_deletion() -> TestResul
         .map(|e| e.file_name())
         .collect();
     assert_eq!(created, [os("Internal shared storage")]);
+    Ok(())
+}
+
+#[test]
+fn the_job_context_takes_the_fuse_roots_discovery_cached() -> TestResult {
+    use fileflux::core::places::Places;
+    let scratch = Scratch::new("ctx-cached-roots")?;
+    let gvfs = scratch.dir("run/gvfs")?;
+    let photo = scratch.file("run/gvfs/mtp:host=Fake_Phone_123/DCIM/IMG_1.jpg", "x")?;
+    // Roots resolved by discovery, off the UI thread: the context is built
+    // from them and never reads the mount table or resolves a path itself,
+    // so it knows this scratch gvfs directory (the process environment does
+    // not).
+    let places = Places {
+        home: scratch.0.clone(),
+        desktop: scratch.0.join("Desktop"),
+        places: Vec::new(),
+        volumes: Vec::new(),
+        trash_root: scratch.trash(),
+        fuse: FuseRoots::from_table(b"", Some(&gvfs)),
+        warnings: Vec::new(),
+    };
+
+    let ctx = JobCtx::for_places(Some(&places), Some(scratch.trash()));
+    let report = run_job(Job::Trash(vec![photo.clone()]), &ctx, &sink());
+
+    assert_eq!(report.needs_permanent, std::slice::from_ref(&photo));
+    assert!(photo.exists(), "no Trash on the phone, nothing deleted");
+    // Without places nothing can be trashed: the delete asks first.
+    let bare = JobCtx::for_places(None, None);
+    let local = scratch.file("local.txt", "y")?;
+    let report = run_job(Job::Trash(vec![local.clone()]), &bare, &sink());
+    assert_eq!(report.needs_permanent, std::slice::from_ref(&local));
+    assert!(local.exists());
     Ok(())
 }
 

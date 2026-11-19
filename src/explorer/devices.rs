@@ -20,7 +20,7 @@ use fileflux::core::devices::{
     find_tool, gio_unmount_plan, list_blocks, mount, path_is_on_mounts, path_uses_mounts,
     real_location, run_power_off, run_unmount, unmount_plan, unmount_program,
 };
-use fileflux::core::places::{Volume, VolumeKind, discover_volumes};
+use fileflux::core::places::{FuseRoots, Volume, VolumeKind, discover_volumes};
 use fileflux::core::watch::{
     DeviceRoots, DeviceSource, DeviceWatcher, RefreshGate, safety_poll_due,
 };
@@ -186,6 +186,32 @@ pub(crate) fn recheck(running: &[(u64, Vec<PathBuf>)], plan: &DevicePlan) -> Res
         0 => Ok(()),
         1 => Err("an operation started using it".to_owned()),
         count => Err(format!("{count} operations started using it")),
+    }
+}
+
+/// A navigation step whose destination passed the device check. The step
+/// that runs once the check has finished is built only here, from the
+/// location that was checked, never re-derived from the history as it is by
+/// then (two quick Back presses would otherwise both take the second step,
+/// which nobody checked).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CheckedStep(Transition);
+
+impl CheckedStep {
+    /// The step to take to `checked` once its check ended. `now` is what
+    /// `transition` would reach now: when that still is `checked` the
+    /// transition runs as asked (history keeps its meaning); when the
+    /// history moved meanwhile, the step visits `checked` instead.
+    pub(crate) fn of(transition: Transition, now: Option<Location>, checked: Location) -> Self {
+        if now.as_ref() == Some(&checked) {
+            Self(transition)
+        } else {
+            Self(Transition::Visit(checked))
+        }
+    }
+
+    pub(crate) fn into_transition(self) -> Transition {
+        self.0
     }
 }
 
@@ -563,14 +589,17 @@ impl Explorer {
         let lsblk = self.devices.lsblk.clone();
         let read = cx.background_executor().spawn(async move {
             let volumes = discover_volumes(home.as_deref());
+            // Read here, not at the next delete: resolving the gvfs
+            // directory can block, and that must never be the UI thread.
+            let roots = FuseRoots::system();
             let blocks = lsblk.map(|program| list_blocks(&program));
-            (volumes, blocks)
+            (volumes, roots, blocks)
         });
         cx.spawn(async move |this, cx| {
-            let (volumes, blocks) = read.await;
-            if let Err(error) =
-                this.update(cx, |this, cx| this.apply_device_read(volumes, blocks, cx))
-            {
+            let (volumes, roots, blocks) = read.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.apply_device_read(volumes, roots, blocks, cx)
+            }) {
                 log::debug!("the explorer closed before the devices were read: {error}");
             }
         })
@@ -580,11 +609,15 @@ impl Explorer {
     fn apply_device_read(
         &mut self,
         volumes: io::Result<Vec<Volume>>,
+        roots: FuseRoots,
         blocks: Option<Result<Vec<BlockNode>, DeviceError>>,
         cx: &mut Context<Self>,
     ) {
         self.devices.polling = false;
         let mut changed = false;
+        if let Some(places) = self.places.as_mut() {
+            places.fuse = roots;
+        }
         match volumes {
             Ok(volumes) => {
                 if let Some(places) = self.places.as_mut()
@@ -802,11 +835,34 @@ impl Explorer {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
+        self.check_not_ejecting(
+            paths,
+            window,
+            cx,
+            move |this, refused, window, cx| match refused {
+                Some(text) => this.say(Severity::Info, text, window, cx),
+                None => then(this, window, cx),
+            },
+        );
+    }
+
+    /// [`Self::when_not_ejecting`] that hands the verdict to `done` (the
+    /// refusal text, or `None` when the paths are free) instead of saying
+    /// it, for work that has to settle its own state either way. `done` runs
+    /// at once while no device is going away, else right after the final
+    /// check, on the UI thread: nothing can change between the two.
+    pub(crate) fn check_not_ejecting(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Option<String>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         if !self.devices.is_draining() {
-            return then(self, window, cx);
+            return done(self, None, window, cx);
         }
         if let Some(text) = refusal(self.devices.draining(), &paths) {
-            return self.say(Severity::Info, text, window, cx);
+            return done(self, Some(text), window, cx);
         }
         let real = cx.background_executor().spawn(async move {
             paths
@@ -817,10 +873,8 @@ impl Explorer {
         cx.spawn_in(window, async move |this, cx| {
             let real = real.await;
             if let Err(error) = this.update_in(cx, |this, window, cx| {
-                match refusal(this.devices.draining(), &real) {
-                    Some(text) => this.say(Severity::Info, text, window, cx),
-                    None => then(this, window, cx),
-                }
+                let verdict = refusal(this.devices.draining(), &real);
+                done(this, verdict, window, cx);
             }) {
                 log::debug!("the explorer closed before a device check ended: {error}");
             }
@@ -1751,6 +1805,69 @@ mod tests {
         let verdict = refusal(std::slice::from_ref(&draining), &[real]);
         let cleanup = std::fs::remove_dir_all(&root);
         assert_eq!(verdict, Some("USB is being ejected".to_owned()));
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_deferred_step_enters_only_the_folder_that_was_checked()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::explorer::state::ExplorerState;
+        let root = std::env::temp_dir().join(format!("ff-checked-step-{}", std::process::id()));
+        let mount = root.join("media/USB");
+        std::fs::create_dir_all(mount.join("existing"))?;
+        std::fs::create_dir_all(root.join("home/safe"))?;
+        let link = root.join("home/usblink");
+        std::os::unix::fs::symlink(&mount, &link)?;
+        let draining = plan("USB", &mount.to_string_lossy());
+        let dir = |path: &Path| Location::Directory(path.to_path_buf());
+        let visit = |state: &mut ExplorerState, path: &Path| {
+            if let Some(scan) = state.begin(Transition::Visit(dir(path))) {
+                state.commit(scan, Default::default());
+            }
+        };
+        // History: the symlinked folder, then a safe one, then where we are.
+        let safe = root.join("home/safe");
+        let mut state = ExplorerState::new(dir(&link), Some(root.join("home")));
+        visit(&mut state, &safe);
+        visit(&mut state, &root.join("home"));
+
+        // Two quick Back presses: nothing has committed yet, so both check
+        // the same target, the safe folder.
+        let first = state.target_of(&Transition::Back);
+        let second = state.target_of(&Transition::Back);
+        assert_eq!(first, Some(dir(&safe)));
+        assert_eq!(second, first);
+        let (Some(first), Some(second)) = (first, second) else {
+            return Err("back has a target".into());
+        };
+
+        // The first deferred step commits; the second finds the history one
+        // step further, on the symlink into the draining device.
+        let step = CheckedStep::of(Transition::Back, state.target_of(&Transition::Back), first);
+        assert_eq!(step.into_transition(), Transition::Back, "as asked");
+        let Some(scan) = state.begin(Transition::Back) else {
+            return Err("the first Back starts a scan".into());
+        };
+        state.commit(scan, Default::default());
+        let now = state.target_of(&Transition::Back);
+        assert_eq!(now, Some(dir(&link)), "the unchecked entry is next");
+        assert_eq!(
+            refusal(std::slice::from_ref(&draining), &[real_location(&link)]),
+            Some("USB is being ejected".to_owned()),
+            "entering it would have been refused had it been checked"
+        );
+
+        let step = CheckedStep::of(Transition::Back, now, second);
+        let entered = state
+            .begin(step.into_transition())
+            .map(|scan| scan.location);
+        let cleanup = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            entered,
+            Some(dir(&safe)),
+            "the checked folder, not the link"
+        );
         cleanup?;
         Ok(())
     }

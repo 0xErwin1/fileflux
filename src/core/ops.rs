@@ -495,7 +495,7 @@ fn transfer_on(
         notes: Vec::new(),
         weak: false,
         direct: false,
-        created: 0,
+        made: None,
     };
     let mut report = TransferReport::default();
     for (source, size) in sources.iter().zip(sizes) {
@@ -645,8 +645,16 @@ struct Ctx<'a> {
     /// A weak destination refused the rename that puts a partial copy under
     /// its real name: the rest of the transfer copies straight to it.
     direct: bool,
-    /// Entries this transfer created so far (files, folders, links).
-    created: u64,
+    /// What a direct copy has created so far, in order, so a failure removes
+    /// exactly that and nothing a third party wrote there meanwhile. `None`
+    /// outside a direct copy.
+    made: Option<Vec<Made>>,
+}
+
+/// An entry a direct copy created.
+struct Made {
+    path: PathBuf,
+    is_dir: bool,
 }
 
 /// What a transfer says once when a weak filesystem refuses the metadata.
@@ -655,26 +663,42 @@ const METADATA_NOTE: &str = "Modification times and permissions could not be set
 /// Whether a failed rename means "this filesystem cannot do that" rather
 /// than a problem with the names involved.
 fn rename_unsupported(error: &io::Error) -> bool {
-    [
-        Errno::NOTSUP,
-        Errno::NOSYS,
-        Errno::INVAL,
-        Errno::XDEV,
-        Errno::PERM,
-    ]
-    .iter()
-    .any(|unsupported| error.raw_os_error() == Some(unsupported.raw_os_error()))
+    is_errno(
+        error,
+        &[
+            Errno::NOTSUP,
+            Errno::NOSYS,
+            Errno::INVAL,
+            Errno::XDEV,
+            Errno::PERM,
+        ],
+    )
+}
+
+/// Whether `error` is one of the OS errors in `any`.
+fn is_errno(error: &io::Error, any: &[Errno]) -> bool {
+    any.iter()
+        .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()))
+}
+
+/// Whether a failed timestamp or mode change means "this filesystem does not
+/// keep that" (`ENOTSUP`, the same number as `EOPNOTSUPP` on Linux; `ENOSYS`; the
+/// `EPERM`/`EACCES` FUSE answers with) rather than a real failure such as
+/// `EIO` or a full disk.
+fn metadata_unsupported(error: &io::Error) -> bool {
+    is_errno(
+        error,
+        &[Errno::NOTSUP, Errno::NOSYS, Errno::PERM, Errno::ACCESS],
+    )
 }
 
 impl Ctx<'_> {
-    /// `fsync` where the filesystem has none is not a failure: there is
-    /// nothing more to wait for.
+    /// `fsync` where a weak filesystem has none is not a failure: there is
+    /// nothing more to wait for. On a disk, any failure is one.
     fn sync_file(&self, file: &fs::File) -> io::Result<()> {
         match self.backend.sync(file) {
             Err(error)
-                if [Errno::NOTSUP, Errno::INVAL, Errno::NOSYS]
-                    .iter()
-                    .any(|none| error.raw_os_error() == Some(none.raw_os_error())) =>
+                if self.weak && is_errno(&error, &[Errno::NOTSUP, Errno::INVAL, Errno::NOSYS]) =>
             {
                 Ok(())
             }
@@ -682,11 +706,12 @@ impl Ctx<'_> {
         }
     }
 
-    /// A timestamp or mode that a weak filesystem refuses is noted, once,
-    /// and the transfer goes on; on a disk it is still a failure.
+    /// A timestamp or mode that a weak filesystem says it does not keep is
+    /// noted, once, and the transfer goes on; on a disk, and for any other
+    /// failure on a weak filesystem (`EIO`...), it is still a failure.
     fn lenient(&mut self, result: io::Result<()>) -> io::Result<()> {
         match result {
-            Err(_) if self.weak => {
+            Err(error) if self.weak && metadata_unsupported(&error) => {
                 if !self.notes.iter().any(|note| note == METADATA_NOTE) {
                     self.notes.push(METADATA_NOTE.to_owned());
                 }
@@ -934,23 +959,41 @@ impl Ctx<'_> {
 
     /// Writes the copy straight to `target`, which must not exist (a name
     /// that appeared meanwhile is never overwritten or deleted). A failed or
-    /// cancelled copy deletes what it created.
+    /// cancelled copy deletes exactly the entries it created, newest first;
+    /// a folder that somebody else put something into stays.
     fn copy_direct(&mut self, src: &Path, target: &Path) -> Result<(), TransferError> {
         if occupied(target)? {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
         self.deferred.clear();
-        let created = self.created;
+        self.made = Some(Vec::new());
         let built = self
             .copy_node(src, target)
             .and_then(|()| self.finalize_dirs().map_err(TransferError::from));
+        let made = self.made.take().unwrap_or_default();
         if built.is_err() {
             self.deferred.clear();
-            if self.created > created {
-                remove_all(target).ok();
+            for entry in made.iter().rev() {
+                // `remove_dir` only takes an empty folder, `remove_file`
+                // never a folder: neither can remove what is not ours.
+                if entry.is_dir {
+                    fs::remove_dir(&entry.path).ok();
+                } else {
+                    fs::remove_file(&entry.path).ok();
+                }
             }
         }
         built
+    }
+
+    /// Notes an entry a direct copy created.
+    fn made(&mut self, path: &Path, is_dir: bool) {
+        if let Some(made) = &mut self.made {
+            made.push(Made {
+                path: path.to_path_buf(),
+                is_dir,
+            });
+        }
     }
 
     fn finalize_dirs(&mut self) -> io::Result<()> {
@@ -978,10 +1021,10 @@ impl Ctx<'_> {
         let kind = meta.file_type();
         if kind.is_symlink() {
             std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
-            self.created += 1;
+            self.made(dst, false);
         } else if kind.is_dir() {
             fs::create_dir(dst)?;
-            self.created += 1;
+            self.made(dst, true);
             self.deferred.push(DeferredDir {
                 path: dst.to_path_buf(),
                 permissions: meta.permissions(),
@@ -1016,7 +1059,7 @@ impl Ctx<'_> {
             .create_new(true)
             .mode(meta.mode() & 0o7777)
             .open(dst)?;
-        self.created += 1;
+        self.made(dst, false);
         let mut buffer = vec![0u8; CHUNK];
         let mut copied = 0u64;
         loop {
@@ -2321,12 +2364,13 @@ mod tests {
     }
 
     #[test]
-    fn fsync_unsupported_is_not_a_failure_anywhere() -> TestResult {
+    fn fsync_unsupported_is_not_a_failure_on_a_weak_filesystem() -> TestResult {
         for unsupported in [Errno::NOTSUP, Errno::INVAL] {
             let scratch = Scratch::new("fsync")?;
             let (src, dcim) = phone(&scratch)?;
             fs::write(src.join("a.txt"), b"hello")?;
             let fuse = Fuse {
+                weak: true,
                 sync: Some(unsupported),
                 ..Fuse::default()
             };
@@ -2630,6 +2674,295 @@ mod tests {
         remove_permanently(&dcim.join("Camera"))?;
 
         assert!(names(&dcim)?.is_empty());
+        Ok(())
+    }
+
+    // --- T6 probes -----------------------------------------------------------
+
+    fn vp_ino(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(p).map(|m| m.ino()).unwrap_or(0)
+    }
+    #[test]
+    fn weak_replace_direct_failure_restores_original() -> TestResult {
+        let sc = Scratch::new("vp1")?;
+        let (src, d) = phone(&sc)?;
+        fs::write(src.join("a.bin"), big(2 * CHUNK + 1))?;
+        fs::write(d.join("a.bin"), b"ORIG")?;
+        let i = vp_ino(&d.join("a.bin"));
+        let f = Fuse {
+            weak: true,
+            place_rename: Some(Errno::NOTSUP),
+            full_from: Some(4),
+            ..Fuse::default()
+        };
+        let r = transfer_on(
+            &[src.join("a.bin")],
+            &d,
+            Mode::Copy,
+            |_| Conflict::Replace,
+            |_| {},
+            &AtomicBool::new(false),
+            &f,
+        );
+        assert!(matches!(
+            only_item(&r)?,
+            ItemOutcome::Failed(TransferError::Io(_))
+        ));
+        assert_eq!(names(&d)?, ["a.bin"]);
+        assert_eq!(fs::read(d.join("a.bin"))?, b"ORIG");
+        assert_eq!(vp_ino(&d.join("a.bin")), i);
+        Ok(())
+    }
+    #[test]
+    fn strict_dest_refusing_rename_never_goes_direct() -> TestResult {
+        let sc = Scratch::new("vp2")?;
+        let (src, d) = phone(&sc)?;
+        fs::write(src.join("a.txt"), b"x")?;
+        let f = Fuse {
+            place_rename: Some(Errno::NOTSUP),
+            ..Fuse::default()
+        };
+        let r = copy_on(&f, &[src.join("a.txt")], &d);
+        assert!(
+            matches!(only_item(&r)?,ItemOutcome::Failed(TransferError::Io(e)) if e.raw_os_error()==Some(Errno::NOTSUP.raw_os_error()))
+        );
+        assert!(names(&d)?.is_empty());
+        assert_eq!(f.places.get(), 1);
+        Ok(())
+    }
+    #[test]
+    fn a_folder_somebody_else_made_is_never_removed() -> TestResult {
+        struct R(PathBuf);
+        impl Backend for R {
+            fn place_rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                fs::create_dir(&self.0)?;
+                fs::write(self.0.join("theirs.txt"), b"t")?;
+                Err(errno(Errno::NOTSUP))
+            }
+            fn is_weak(&self, _: &Path) -> bool {
+                true
+            }
+        }
+        let sc = Scratch::new("vp3")?;
+        let (_, d) = phone(&sc)?;
+        let a = sc.dir("src/album")?;
+        fs::write(a.join("one.jpg"), b"1")?;
+        let r = transfer_on(
+            &[a],
+            &d,
+            Mode::Copy,
+            no_conflict,
+            |_| {},
+            &AtomicBool::new(false),
+            &R(d.join("album")),
+        );
+        assert!(matches!(only_item(&r)?, ItemOutcome::Failed(_)));
+        assert_eq!(names(&d.join("album"))?, ["theirs.txt"]);
+        Ok(())
+    }
+    #[test]
+    fn local_folder_mode_or_time_failure_still_fails() -> TestResult {
+        let sc = Scratch::new("vp4")?;
+        let (src, d) = phone(&sc)?;
+        sc.dir("src/e")?;
+        for f in [
+            Fuse {
+                set_permissions: Some(Errno::PERM),
+                ..Fuse::default()
+            },
+            Fuse {
+                set_modified: Some(Errno::PERM),
+                ..Fuse::default()
+            },
+        ] {
+            let r = copy_on(&f, &[src.join("e")], &d);
+            assert!(matches!(
+                only_item(&r)?,
+                ItemOutcome::Failed(TransferError::Io(_))
+            ));
+            assert!(names(&d)?.is_empty() && r.notes.is_empty());
+        }
+        Ok(())
+    }
+    #[test]
+    fn weak_cancel_in_second_direct_item_keeps_the_first() -> TestResult {
+        let sc = Scratch::new("vp5")?;
+        let (src, d) = phone(&sc)?;
+        fs::write(src.join("a.bin"), b"first")?;
+        fs::write(src.join("b.bin"), big(3 * CHUNK))?;
+        let c = Arc::new(AtomicBool::new(false));
+        let f = Fuse {
+            weak: true,
+            place_rename: Some(Errno::NOTSUP),
+            cancel_at: Some((3, Arc::clone(&c))),
+            ..Fuse::default()
+        };
+        let r = run_on(
+            &f,
+            &[src.join("a.bin"), src.join("b.bin")],
+            &d,
+            Mode::Copy,
+            &c,
+        );
+        assert!(r.cancelled);
+        assert_eq!(names(&d)?, ["a.bin"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_somebody_else_wrote_into_our_folder_is_never_removed() -> TestResult {
+        // The second write is the direct copy's: a third party drops a file next
+        // to ours and the disk fills up.
+        struct Racer {
+            theirs: PathBuf,
+            writes: Cell<usize>,
+        }
+        impl Backend for Racer {
+            fn place_rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Err(errno(Errno::NOTSUP))
+            }
+            fn write(&self, file: &mut fs::File, data: &[u8]) -> io::Result<()> {
+                self.writes.set(self.writes.get() + 1);
+                if self.writes.get() == 2 {
+                    fs::write(&self.theirs, b"theirs")?;
+                    return Err(errno(Errno::NOSPC));
+                }
+                file.write_all(data)
+            }
+            fn is_weak(&self, _: &Path) -> bool {
+                true
+            }
+        }
+        let sc = Scratch::new("vp-inside")?;
+        let (_, d) = phone(&sc)?;
+        let album = sc.dir("src/album")?;
+        fs::write(album.join("one.jpg"), b"1")?;
+        let racer = Racer {
+            theirs: d.join("album").join("theirs.txt"),
+            writes: Cell::new(0),
+        };
+
+        let report = transfer_on(
+            &[album],
+            &d,
+            Mode::Copy,
+            no_conflict,
+            |_| {},
+            &AtomicBool::new(false),
+            &racer,
+        );
+
+        assert!(matches!(only_item(&report)?, ItemOutcome::Failed(_)));
+        assert_eq!(names(&d.join("album"))?, ["theirs.txt"]);
+        assert_eq!(fs::read(d.join("album/theirs.txt"))?, b"theirs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_direct_copy_removes_all_of_what_it_made() -> TestResult {
+        let sc = Scratch::new("vp-ours")?;
+        let (src, d) = phone(&sc)?;
+        let album = sc.dir("src/album")?;
+        fs::write(album.join("one.jpg"), big(CHUNK))?;
+        fs::create_dir(album.join("sub"))?;
+        fs::write(album.join("sub/two.jpg"), big(CHUNK))?;
+        std::os::unix::fs::symlink("one.jpg", album.join("link"))?;
+        let _ = src;
+        // The 4th write is the 2nd direct one: everything made so far is ours.
+        let f = Fuse {
+            weak: true,
+            place_rename: Some(Errno::NOTSUP),
+            full_from: Some(4),
+            ..Fuse::default()
+        };
+
+        let report = copy_on(&f, &[album], &d);
+
+        assert!(matches!(only_item(&report)?, ItemOutcome::Failed(_)));
+        assert!(names(&d)?.is_empty(), "{:?}", names(&d)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_weak_filesystem_only_skips_metadata_it_says_it_does_not_keep() -> TestResult {
+        for unsupported in [Errno::NOTSUP, Errno::NOSYS, Errno::PERM, Errno::ACCESS] {
+            for times in [true, false] {
+                let sc = Scratch::new("weak-lenient")?;
+                let (src, d) = phone(&sc)?;
+                fs::write(src.join("a.txt"), b"x")?;
+                let f = Fuse {
+                    weak: true,
+                    set_modified: times.then_some(unsupported),
+                    set_permissions: (!times).then_some(unsupported),
+                    ..Fuse::default()
+                };
+                let report = copy_on(&f, &[src.join("a.txt")], &d);
+                assert!(
+                    matches!(only_item(&report)?, ItemOutcome::Ok { .. }),
+                    "{unsupported:?} {times}"
+                );
+                assert_eq!(report.notes.len(), 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_weak_filesystem_that_fails_on_metadata_for_real_still_fails() -> TestResult {
+        for failure in [Errno::IO, Errno::NOSPC, Errno::ROFS] {
+            for times in [true, false] {
+                for folder in [false, true] {
+                    let sc = Scratch::new("weak-eio")?;
+                    let (src, d) = phone(&sc)?;
+                    let item = if folder {
+                        sc.dir("src/e")?
+                    } else {
+                        fs::write(src.join("a.txt"), b"x")?;
+                        src.join("a.txt")
+                    };
+                    let f = Fuse {
+                        weak: true,
+                        set_modified: times.then_some(failure),
+                        set_permissions: (!times).then_some(failure),
+                        ..Fuse::default()
+                    };
+                    let report = copy_on(&f, &[item], &d);
+                    assert!(
+                        matches!(
+                            only_item(&report)?,
+                            ItemOutcome::Failed(TransferError::Io(_))
+                        ),
+                        "{failure:?} times={times} folder={folder}"
+                    );
+                    assert!(names(&d)?.is_empty());
+                    assert!(report.notes.is_empty());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_disk_whose_fsync_is_unsupported_still_fails_the_copy() -> TestResult {
+        for unsupported in [Errno::NOTSUP, Errno::INVAL, Errno::NOSYS] {
+            let sc = Scratch::new("strict-fsync")?;
+            let (src, d) = phone(&sc)?;
+            fs::write(src.join("a.txt"), b"hello")?;
+            let f = Fuse {
+                sync: Some(unsupported),
+                ..Fuse::default()
+            };
+            let report = copy_on(&f, &[src.join("a.txt")], &d);
+            assert!(
+                matches!(
+                    only_item(&report)?,
+                    ItemOutcome::Failed(TransferError::Io(_))
+                ),
+                "{unsupported:?}"
+            );
+            assert!(names(&d)?.is_empty());
+        }
         Ok(())
     }
 }
