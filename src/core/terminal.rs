@@ -712,10 +712,18 @@ mod tests {
     fn a_machine_without_a_terminal_has_none() {
         let scratch = Scratch::new("none");
         scratch.dir("bin");
-        assert_eq!(resolve(&scratch.env()), None);
-        assert_eq!(resolve(&TerminalEnv::default()), None);
+        // Every lookup root is a scratch directory and `TERMINAL` and the
+        // desktop are spelled out as absent, so nothing of the machine
+        // (its PATH, /usr/share, /etc/xdg) can supply a terminal. The default
+        // environment is not used: its fallbacks are the system directories.
+        let env = TerminalEnv {
+            terminal: None,
+            current_desktop: None,
+            ..scratch.env()
+        };
+        assert_eq!(resolve(&env), None);
         scratch.write("bin/notes", "text");
-        assert_eq!(resolve(&scratch.env()), None, "a plain file is no terminal");
+        assert_eq!(resolve(&env), None, "a plain file is no terminal");
     }
 
     #[test]

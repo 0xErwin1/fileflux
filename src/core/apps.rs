@@ -855,4 +855,95 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn desktop_entries_keeps_the_earlier_directory_even_when_its_file_is_unusable() -> TestResult {
+        let scratch = Scratch::new("entries-precedence")?;
+        // Earlier directory: `broken` has no Exec (unparsable as an
+        // application), `good` is fine. Later directory: both have valid
+        // entries under the same ids, plus one id only it has.
+        scratch.write(
+            "first/applications/broken.desktop",
+            "[Desktop Entry]\nName=Broken\n",
+        )?;
+        scratch.write(
+            "first/applications/good.desktop",
+            "[Desktop Entry]\nName=First Good\nExec=first-good\n",
+        )?;
+        scratch.write(
+            "second/applications/broken.desktop",
+            "[Desktop Entry]\nName=Second Broken\nExec=second-broken\n",
+        )?;
+        scratch.write(
+            "second/applications/good.desktop",
+            "[Desktop Entry]\nName=Second Good\nExec=second-good\n",
+        )?;
+        scratch.write(
+            "second/applications/only.desktop",
+            "[Desktop Entry]\nName=Only\nExec=only\n",
+        )?;
+        let dirs = [
+            scratch.0.join("first/applications"),
+            scratch.0.join("second/applications"),
+        ];
+
+        let entries: Vec<(String, String)> = desktop_entries(&dirs)
+            .into_iter()
+            .map(|(id, entry)| (id, entry.exec))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("good.desktop".to_owned(), "first-good".to_owned()),
+                ("only.desktop".to_owned(), "only".to_owned()),
+            ],
+            "the unparsable earlier `broken` still hides the later one"
+        );
+        Ok(())
+    }
+
+    fn entry_with(extra: &str) -> Option<DesktopEntry> {
+        parse_desktop_entry(&format!("[Desktop Entry]\nName=T\nExec=t\n{extra}\n"))
+    }
+
+    #[test]
+    fn categories_split_on_semicolons_and_drop_empty_and_blank_segments() {
+        let categories = |value: &str| {
+            entry_with(&format!("Categories={value}"))
+                .map(|entry| entry.categories)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            categories("System;TerminalEmulator;"),
+            ["System", "TerminalEmulator"]
+        );
+        assert_eq!(
+            categories(" System ;; ;  TerminalEmulator ;;"),
+            ["System", "TerminalEmulator"]
+        );
+        assert_eq!(categories(""), Vec::<String>::new());
+        assert_eq!(categories("   "), Vec::<String>::new());
+        assert_eq!(categories(";;;"), Vec::<String>::new());
+        assert_eq!(
+            entry_with("").map(|entry| entry.categories),
+            Some(Vec::new()),
+            "no key, no categories"
+        );
+    }
+
+    #[test]
+    fn x_terminal_arg_dir_is_the_trimmed_value_and_none_when_empty() {
+        let arg_dir = |line: &str| entry_with(line).and_then(|entry| entry.terminal_arg_dir);
+        assert_eq!(
+            arg_dir("X-TerminalArgDir=--cwd="),
+            Some("--cwd=".to_owned())
+        );
+        assert_eq!(
+            arg_dir("X-TerminalArgDir=   --working-directory  "),
+            Some("--working-directory".to_owned())
+        );
+        assert_eq!(arg_dir("X-TerminalArgDir="), None);
+        assert_eq!(arg_dir("X-TerminalArgDir=    "), None);
+        assert_eq!(arg_dir(""), None);
+    }
 }

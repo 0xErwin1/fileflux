@@ -931,3 +931,62 @@ fn legacy_favorites_load_from_a_version_1_file_and_are_not_written_when_empty() 
     assert!(!text.contains("favorites"), "{text}");
     assert!(text.contains("version = 2"), "{text}");
 }
+
+#[test]
+fn a_version_1_arrangement_with_out_of_domain_sort_values_is_invalid_and_set_aside() {
+    let cases = [
+        ("sort_key = 5\nsort_dir = \"ascending\"", "number-key"),
+        ("sort_key = \"name\"\nsort_dir = true", "bool-dir"),
+        ("sort_key = [\"name\"]", "array-key"),
+        ("sort_dir = 3", "lone-number-dir"),
+        (
+            "sort_key = \"bogus\"\nsort_dir = \"ascending\"",
+            "unknown-key",
+        ),
+        (
+            "sort_key = \"name\"\nsort_dir = \"sideways\"",
+            "unknown-dir",
+        ),
+    ];
+    for (arrangement, tag) in cases {
+        let text = format!("version = 1\n[preferences.arrangement]\n{arrangement}\n");
+        let scratch = Scratch::new(&format!("migrate-invalid-{tag}"));
+        let path = scratch.path().join("settings.toml");
+        std::fs::write(&path, &text).expect("fixture writes");
+
+        let loaded = load_settings(&path, now());
+
+        assert_eq!(loaded.value, Settings::default(), "{tag}");
+        assert!(loaded.heal, "{tag}: the invalid file is rewritten later");
+        assert!(!loaded.migrated, "{tag}");
+        let notice = loaded.notice.expect("a notice is produced");
+        assert!(
+            notice.starts_with(
+                "Settings file was invalid; using defaults (kept as settings.toml.bad-"
+            ),
+            "{tag}: {notice}"
+        );
+        let aside: Vec<String> = entries(scratch.path())
+            .into_iter()
+            .filter(|name| name.starts_with("settings.toml.bad-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{tag}: {aside:?}");
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join(&aside[0])).expect("aside reads"),
+            text,
+            "{tag}: the original is kept byte for byte"
+        );
+    }
+
+    // A session tab is held to the same domain.
+    let scratch = Scratch::new("migrate-invalid-session");
+    let path = scratch.path().join("session.toml");
+    std::fs::write(
+        &path,
+        "version = 1\n[[tabs]]\nkind = \"directory\"\npath = \"/a\"\n[tabs.arrangement]\nsort_key = 7\n",
+    )
+    .expect("fixture writes");
+    let loaded = load_session(&path, now());
+    assert_eq!(loaded.value, Session::default());
+    assert!(loaded.heal);
+}

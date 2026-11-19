@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use fileflux::core::bookmarks::{
-    Bookmark, add, bookmarks_path, file_uri, merge, parse, read, remove,
+    Bookmark, add, add_observed, bookmarks_path, file_uri, merge, parse, read, remove,
 };
 
 /// A scratch directory removed when the test ends.
@@ -346,4 +346,88 @@ fn concurrent_adds_never_lose_a_line() {
         }
     });
     assert_eq!(read(&file).expect("reads").len(), 40);
+}
+
+#[test]
+fn an_external_write_before_the_rename_is_merged_not_overwritten() {
+    let scratch = Scratch::new("lost-update");
+    let file = scratch.write(b"file:///a\n");
+    let mut external = Some(());
+    let hook_file = file.clone();
+    let added = add_observed(&file, Path::new("/mine"), &mut || {
+        if external.take().is_some() {
+            std::fs::write(&hook_file, b"file:///a\nsftp://h/x Theirs\n").expect("other writes");
+        }
+    })
+    .expect("adds");
+    assert!(added);
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"file:///a\nsftp://h/x Theirs\nfile:///mine\n"
+    );
+    let leftovers = std::fs::read_dir(file.parent().expect("parent"))
+        .expect("reads")
+        .count();
+    assert_eq!(
+        leftovers, 1,
+        "the abandoned attempt leaves no temporary file"
+    );
+}
+
+#[test]
+fn an_external_write_that_already_added_the_folder_makes_the_add_a_no_op() {
+    let scratch = Scratch::new("lost-update-same");
+    let file = scratch.write(b"file:///a\n");
+    let hook_file = file.clone();
+    let mut once = true;
+    let added = add_observed(&file, Path::new("/mine"), &mut || {
+        if std::mem::take(&mut once) {
+            std::fs::write(&hook_file, b"file:///a\nfile:///mine Theirs\n").expect("other writes");
+        }
+    })
+    .expect("adds");
+    assert!(!added);
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        b"file:///a\nfile:///mine Theirs\n"
+    );
+}
+
+#[test]
+fn a_file_that_never_stops_changing_is_an_error_and_keeps_the_other_programs_content() {
+    let scratch = Scratch::new("lost-update-storm");
+    let file = scratch.write(b"");
+    let hook_file = file.clone();
+    let mut round = 0_u32;
+    let result = add_observed(&file, Path::new("/mine"), &mut || {
+        round += 1;
+        std::fs::write(&hook_file, format!("file:///other{round}\n")).expect("other writes");
+    });
+    assert!(result.is_err());
+    assert!(
+        std::fs::read_to_string(&file)
+            .expect("reads")
+            .starts_with("file:///other")
+    );
+    let leftovers = std::fs::read_dir(file.parent().expect("parent"))
+        .expect("reads")
+        .count();
+    assert_eq!(leftovers, 1, "no temporary file");
+}
+
+#[test]
+fn relative_folders_are_rejected_by_add_and_merge_and_nothing_is_written() {
+    let scratch = Scratch::new("relative");
+    let original = b"file:///a\n";
+    let file = scratch.write(original);
+    let error = add(&file, Path::new("relative/dir")).expect_err("rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("relative/dir"), "{error}");
+    let error = merge(&file, &[PathBuf::from("/ok"), PathBuf::from("rel")]).expect_err("rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(&file).expect("reads"), original);
+
+    let missing = scratch.0.join("absent/bookmarks");
+    assert!(add(&missing, Path::new("")).is_err());
+    assert!(!scratch.0.join("absent").exists(), "nothing is created");
 }

@@ -11,9 +11,10 @@
 //!
 //! Every change reads the file again, edits those bytes and writes them
 //! atomically (see [`super::settings`]: a temporary file beside the target,
-//! renamed over it, through a symlink, keeping the file's mode), so an edit
-//! made by another program meanwhile is never overwritten. Changes of this
-//! process are serialized by one lock.
+//! renamed over it, through a symlink, keeping the file's mode). Right
+//! before the rename the file is read once more: an edit another program made
+//! meanwhile is merged with (the change is applied again to its content),
+//! never overwritten. Changes of this process are serialized by one lock.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -22,7 +23,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use super::settings::{write_atomic_with_mode, write_target};
+use super::settings::{write_atomic_guarded, write_target};
 
 const GTK_DIR: &str = "gtk-3.0";
 const BOOKMARKS_FILE: &str = "bookmarks";
@@ -264,27 +265,79 @@ pub fn read(path: &Path) -> io::Result<Vec<Bookmark>> {
     Ok(parse(&read_bytes(path)?).favorites())
 }
 
+/// How many times a change starts over on fresh content before giving up.
+const MAX_ATTEMPTS: usize = 5;
+
 /// Reads the file again, applies `edit` and writes the result when `edit`
 /// changed something; returns whether it did.
-fn update(path: &Path, edit: impl FnOnce(&mut BookmarkFile) -> bool) -> io::Result<bool> {
+///
+/// Right before the rename the file is read once more: when another program
+/// changed it since this attempt read it, the attempt is dropped and `edit`
+/// is applied to the fresh content (so `edit` may run more than once and must
+/// start from nothing each time), up to [`MAX_ATTEMPTS`] times.
+/// `before_rename` runs just before that last check.
+fn update(
+    path: &Path,
+    before_rename: &mut dyn FnMut(),
+    mut edit: impl FnMut(&mut BookmarkFile) -> bool,
+) -> io::Result<bool> {
     let _lock = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut file = parse(&read_bytes(path)?);
-    if !edit(&mut file) {
-        return Ok(false);
+    for _ in 0..MAX_ATTEMPTS {
+        let read = read_bytes(path)?;
+        let mut file = parse(&read);
+        if !edit(&mut file) {
+            return Ok(false);
+        }
+        let mode = std::fs::metadata(write_target(path)?)
+            .map_or(NEW_FILE_MODE, |meta| meta.permissions().mode() & 0o7777);
+        let written = write_atomic_guarded(path, &file.to_bytes(), mode, || {
+            before_rename();
+            Ok(read_bytes(path)? == read)
+        })?;
+        if written {
+            return Ok(true);
+        }
     }
-    let mode = std::fs::metadata(write_target(path)?)
-        .map_or(NEW_FILE_MODE, |meta| meta.permissions().mode() & 0o7777);
-    write_atomic_with_mode(path, &file.to_bytes(), mode)?;
-    Ok(true)
+    Err(io::Error::other(
+        "the bookmarks file keeps changing under another program's writes",
+    ))
+}
+
+fn require_absolute(folder: &Path) -> io::Result<()> {
+    if folder.is_absolute() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "bookmark folder {} is not an absolute path",
+                folder.display()
+            ),
+        ))
+    }
 }
 
 /// Adds `folder` as the last bookmark; `false` when it already is one.
 ///
 /// # Errors
 ///
-/// Any I/O failure; the file is left as it was.
+/// A relative `folder` (it would be a line no program reads), or any I/O
+/// failure; the file is left as it was.
 pub fn add(path: &Path, folder: &Path) -> io::Result<bool> {
-    update(path, |file| file.append(folder))
+    add_observed(path, folder, &mut || {})
+}
+
+/// [`add`] that calls `before_rename` after the new content is ready and
+/// just before the file is checked and replaced: tests use it to play the
+/// other program's write.
+#[doc(hidden)]
+pub fn add_observed(
+    path: &Path,
+    folder: &Path,
+    before_rename: &mut dyn FnMut(),
+) -> io::Result<bool> {
+    require_absolute(folder)?;
+    update(path, before_rename, |file| file.append(folder))
 }
 
 /// Removes every bookmark of `folder`; `false` when there was none (and
@@ -294,7 +347,7 @@ pub fn add(path: &Path, folder: &Path) -> io::Result<bool> {
 ///
 /// Any I/O failure; the file is left as it was.
 pub fn remove(path: &Path, folder: &Path) -> io::Result<bool> {
-    update(path, |file| file.drop_folder(folder))
+    update(path, &mut || {}, |file| file.drop_folder(folder))
 }
 
 /// Appends the `folders` that are not bookmarks yet, in order; returns how
@@ -303,10 +356,15 @@ pub fn remove(path: &Path, folder: &Path) -> io::Result<bool> {
 ///
 /// # Errors
 ///
-/// Any I/O failure; the file is left as it was.
+/// A relative folder (nothing is written) or any I/O failure; the file is
+/// left as it was.
 pub fn merge(path: &Path, folders: &[PathBuf]) -> io::Result<usize> {
+    for folder in folders {
+        require_absolute(folder)?;
+    }
     let mut added = 0;
-    update(path, |file| {
+    update(path, &mut || {}, |file| {
+        added = 0;
         for folder in folders {
             added += usize::from(file.append(folder));
         }

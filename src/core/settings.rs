@@ -464,10 +464,22 @@ impl Stored for Session {
 /// equal to the old default moves; any other saved choice stays, and a key
 /// the file omits keeps the meaning it had (the old default) when its
 /// partner key was a choice.
+///
+/// A sort value that is not a string is not a choice this version ever wrote:
+/// the arrangement is left as it is, so loading it fails and the file is
+/// kept aside like any other invalid one (an unknown string fails the same
+/// way), instead of silently becoming a default.
 fn migrate_arrangement(arrangement: &mut toml::Table) {
-    let text = |key: &str| arrangement.get(key).and_then(toml::Value::as_str);
-    let key = text("sort_key").unwrap_or("name").to_owned();
-    let dir = text("sort_dir").unwrap_or("ascending").to_owned();
+    let sort_value = |key: &str, old_default: &str| match arrangement.get(key) {
+        None => Some(old_default.to_owned()),
+        Some(value) => value.as_str().map(str::to_owned),
+    };
+    let (Some(key), Some(dir)) = (
+        sort_value("sort_key", "name"),
+        sort_value("sort_dir", "ascending"),
+    ) else {
+        return;
+    };
     if key == "name" && dir == "ascending" {
         arrangement.insert("sort_key".to_owned(), "modified".into());
         arrangement.insert("sort_dir".to_owned(), "descending".into());
@@ -883,6 +895,19 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// (the process umask does not narrow it): the GTK bookmarks keep the mode
 /// the user's file has.
 pub(crate) fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_guarded(path, bytes, mode, || Ok(true)).map(drop)
+}
+
+/// [`write_atomic_with_mode`] that asks `still_current` right before the
+/// rename and gives the write up (removing the temporary file, returning
+/// `false`) when it answers `false`: the caller found the target changed by
+/// someone else since it read it.
+pub(crate) fn write_atomic_guarded(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    still_current: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
     let target = write_target(path)?;
     let dir = target
         .parent()
@@ -901,9 +926,12 @@ pub(crate) fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io
         out.set_permissions(std::fs::Permissions::from_mode(mode))?;
         out.write_all(bytes)?;
         out.sync_all()?;
-        std::fs::rename(&tmp, &target)
+        if !still_current()? {
+            return Ok(false);
+        }
+        std::fs::rename(&tmp, &target).map(|()| true)
     })();
-    if written.is_err() {
+    if !matches!(written, Ok(true)) {
         if let Err(error) = std::fs::remove_file(&tmp) {
             log::debug!("cannot remove {}: {error}", tmp.display());
         }
@@ -914,7 +942,7 @@ pub(crate) fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io
     {
         log::debug!("cannot sync {}: {error}", target.display());
     }
-    Ok(())
+    Ok(true)
 }
 
 // --- restoring the session ----------------------------------------------------

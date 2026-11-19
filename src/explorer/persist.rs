@@ -565,7 +565,25 @@ impl Startup {
             match bookmarks::merge(path, &legacy_favorites) {
                 Ok(_) => {
                     legacy_favorites.clear();
-                    settings_rewrite = true;
+                    // Only now, with the bookmarks written, do the favorites
+                    // leave `settings.toml`, in this same step: were they left
+                    // for the first tick, a launch that dies before it would
+                    // merge them again and bring back one removed meanwhile.
+                    // A failed write leaves the file as it was and the first
+                    // tick retries it.
+                    settings_rewrite = match settings_path
+                        .as_deref()
+                        .map(|settings_path| settings::save_settings(settings_path, &settings))
+                    {
+                        Some(Ok(())) => false,
+                        Some(Err(error)) => {
+                            log::warn!(
+                                "cannot drop the moved favorites from the settings: {error}"
+                            );
+                            true
+                        }
+                        None => true,
+                    };
                 }
                 Err(error) => notices.push(format!(
                     "Could not move the favorites to the GTK bookmarks ({error}); \
@@ -1238,6 +1256,40 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_launch_after_the_move_never_brings_a_removed_favorite_back() {
+        let scratch = Scratch::new("bookmarks-interrupted");
+        let bookmarks = scratch.0.join("config/gtk-3.0/bookmarks");
+        let settings = scratch.0.join("config/settings.toml");
+        write(&bookmarks, "file:///srv/b\n");
+        write(
+            &settings,
+            "version = 1\nfavorites = [\"/srv/a\", \"/srv/b\"]\n[preferences]\ndefault_view = \"list\"\n",
+        );
+
+        // The launch moves the favorites and is killed before the first tick.
+        let first = load(&scratch.0, None);
+        assert_eq!(
+            favorite_paths(&first),
+            [PathBuf::from("/srv/b"), PathBuf::from("/srv/a")]
+        );
+        let text = std::fs::read_to_string(&settings).expect("reads");
+        assert!(
+            !text.contains("favorites") && text.contains("version = 2"),
+            "the legacy favorites left the settings in the same step: {text}"
+        );
+        assert!(text.contains("list"), "the other choices are kept: {text}");
+
+        // Meanwhile the user removes /srv/a in another program.
+        write(&bookmarks, "file:///srv/b\n");
+        let second = load(&scratch.0, None);
+        assert_eq!(favorite_paths(&second), [PathBuf::from("/srv/b")]);
+        assert_eq!(
+            std::fs::read_to_string(&bookmarks).expect("reads"),
+            "file:///srv/b\n"
+        );
+    }
+
+    #[test]
     fn favorites_stay_in_the_settings_when_the_bookmarks_cannot_be_written() {
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = Scratch::new("bookmarks-unwritable");
@@ -1259,6 +1311,12 @@ mod tests {
         }
         assert_eq!(startup.legacy_favorites, [PathBuf::from("/srv/a")]);
         assert_eq!(favorite_paths(&startup), [PathBuf::from("/srv/a")]);
+        assert!(
+            std::fs::read_to_string(scratch.0.join("config/settings.toml"))
+                .expect("reads")
+                .contains("favorites"),
+            "the settings keep what the bookmarks did not receive"
+        );
         assert!(
             startup.notices[0].contains("favorites"),
             "{:?}",
