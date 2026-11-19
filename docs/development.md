@@ -38,7 +38,7 @@ touch /tmp/fixture/docs/a.txt /tmp/fixture/docs/b.txt
 cargo run -- /tmp/fixture
 ```
 
-A path on the command line opens only that folder and does not touch your saved tabs. Your preferences and favorites are still read and written, so use a throwaway config when you need isolation:
+A path on the command line opens only that folder and does not touch your saved tabs. Your preferences are still read and written, and the favorites are the GTK bookmarks, so use a throwaway config when you need isolation:
 
 ```sh
 export XDG_CONFIG_HOME=$(mktemp -d) XDG_STATE_HOME=$(mktemp -d)

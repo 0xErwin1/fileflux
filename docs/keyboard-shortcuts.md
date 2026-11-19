@@ -17,7 +17,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Alt+↑ | Up one folder | |
 | Ctrl+R | Reload | |
 | Ctrl+I | Toggle the details panel | Same as Properties |
-| Ctrl+H | Show or hide hidden files | |
+| Ctrl+H | Show or hide hidden files | Dotfiles and the names in a folder's `.hidden` file. Hidden by default; showing them adds a "Hidden shown" chip |
 | ↑ ↓ ← → | Move the selection | In the order the list is sorted |
 | Home / End | First / last entry | |
 | Shift+↑ ↓ ← → | Extend the selection | From the anchor |

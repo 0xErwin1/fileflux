@@ -12,9 +12,11 @@
 //! matching the newest generation settles the state, so stale or failed
 //! scans never corrupt the committed location, history, selection or query.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -28,6 +30,7 @@ use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::settings::{
     self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
 };
+use fileflux::core::terminal::{self, Terminal, TerminalEnv};
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
@@ -46,10 +49,11 @@ use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
 use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
 use crate::explorer::devices::DeviceHub;
+use crate::explorer::favorites::{BookmarkSync, favorites_of};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{DialogQueue, MenuPage};
-use crate::explorer::ops::{UndoStack, pick_terminal};
+use crate::explorer::ops::{OpenAction, Severity, UndoStack, open_action};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
     session_tab, view_from_pref, view_to_pref,
@@ -59,6 +63,7 @@ use crate::explorer::sidebar::{Panel, PanelDrag};
 use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::tabs::{Affected, Placement, TabList};
+use crate::explorer::toasts;
 use crate::explorer::{entries, overlay, progress, sidebar, tabstrip, toolbar, util};
 
 /// Key context of the whole explorer window.
@@ -299,7 +304,10 @@ struct Loaded {
 /// [`load_location`] plus the derived data of [`Loaded`].
 fn load_indexed(location: &Location, trash_root: Option<&Path>) -> io::Result<Loaded> {
     let listing = load_location(location, trash_root)?;
-    let index = Arc::new(ArrangeIndex::build(&listing.entries));
+    let index = Arc::new(ArrangeIndex::build_hiding(
+        &listing.entries,
+        &listing.hidden_names,
+    ));
     let snapshot = Arc::new(listing.entries.clone());
     let folder_label = util::folder_counts_label(&listing.entries);
     Ok(Loaded {
@@ -330,57 +338,10 @@ const ARRANGE_HINT_DELAY: Duration = Duration::from_millis(150);
 /// itself sleeps in the kernel; this only drains its channel.
 const WATCH_STEP: Duration = Duration::from_millis(100);
 
-/// The width of one toast card (Bolt's `Feedback::TOAST_WIDTH`), under the
-/// 520 px cap the design allows.
-const TOAST_CARD_WIDTH: f32 = 440.0;
-/// The inset Bolt's toast host keeps from the top and right of the region it
-/// is mounted in; the stack is shifted back by it to sit where it is wanted.
-const TOAST_HOST_INSET: f32 = 16.0;
-/// How far under the toolbar's bottom edge the first toast starts.
-const TOAST_DROP: f32 = 4.0;
 /// The folder subbar's height.
 const SUBBAR_HEIGHT: f32 = 44.0;
 /// The subbar's horizontal padding.
 const SUBBAR_PADDING: f32 = 20.0;
-/// What the Sort, Filter and New folder buttons (and their gaps) take on the
-/// subbar's right; the Trash view's Empty Trash is a little wider.
-const SUBBAR_ACTIONS_RESERVE: f32 = 312.0;
-const SUBBAR_TRASH_ACTIONS_RESERVE: f32 = 332.0;
-
-/// Where the toast stack sits in the document island.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToastBand {
-    /// Top-centered over the subbar's empty middle band, just under the
-    /// toolbar.
-    Subbar,
-    /// Top-centered right under the subbar: the middle band is taken.
-    BelowSubbar,
-}
-
-/// What the subbar's title and meta take on its left, estimated from their
-/// character counts (16 px bold title, 12 px mono meta).
-pub(crate) fn subbar_left_reserve(title_chars: usize, meta_chars: usize) -> f32 {
-    SUBBAR_PADDING + title_chars as f32 * 9.0 + 10.0 + meta_chars as f32 * 7.4
-}
-
-/// Whether a centered toast card fits the subbar's middle band: the island
-/// must leave both sides (the larger of the two reserves, as the card is
-/// centered) free next to the card, and no filter chips may live there.
-/// Otherwise the stack drops under the subbar, so it never covers Sort,
-/// Filter, New folder or Empty Trash.
-pub(crate) fn toast_band(
-    island_width: f32,
-    left_reserve: f32,
-    right_reserve: f32,
-    has_chips: bool,
-) -> ToastBand {
-    let side = left_reserve.max(right_reserve);
-    if has_chips || island_width < TOAST_CARD_WIDTH + 2.0 * side {
-        ToastBand::BelowSubbar
-    } else {
-        ToastBand::Subbar
-    }
-}
 
 /// Below this viewport width the sidebar parks behind the sidebar toggle,
 /// so path, search and view stay reachable.
@@ -636,8 +597,14 @@ pub(crate) struct Explorer {
     next_tab_id: TabId,
     /// The home directory, when known: `~` in typed paths, new tabs.
     pub(crate) home: Option<PathBuf>,
-    /// The favorites, shared by every tab and saved with the settings.
+    /// The favorites, shared by every tab: the GTK bookmarks file's local
+    /// entries (see [`crate::explorer::favorites`]).
     pub(crate) favorites: Favorites,
+    /// Favorites still in `settings.toml` because they could not move to the
+    /// bookmarks file; empty once they did.
+    pub(crate) legacy_favorites: Vec<PathBuf>,
+    /// The bookmarks file and its watch.
+    pub(crate) bookmarks: BookmarkSync,
     /// Sidebar discovery, arriving off the UI thread at startup.
     pub(crate) places: Option<Places>,
     /// Why the sidebar could not be discovered, when it could not.
@@ -718,15 +685,22 @@ pub(crate) struct Explorer {
     pub(crate) pastes: HashMap<u64, PasteHandle>,
     /// Bolt's toast stack: operation summaries, with Undo.
     pub(crate) toast_host: Entity<ToastHost>,
-    /// The terminal "Open terminal here" runs, when one exists.
-    pub(crate) terminal: Option<PathBuf>,
+    /// The open toasts, oldest first, so the stack can be held to
+    /// [`toasts::MAX_VISIBLE`].
+    pub(crate) toast_ids: RefCell<Vec<(u64, Severity)>>,
+    /// The toast stack's measured height, for placing it (see
+    /// [`Explorer::render_toasts`]).
+    toast_stack_height: Rc<Cell<f32>>,
+    /// The terminal "Open in terminal" runs, once found (off the UI thread)
+    /// and when the machine has one.
+    pub(crate) terminal: Option<Terminal>,
     /// The one watcher thread every tab's folders are watched through;
     /// `None` when inotify is unavailable (tabs then refresh on activation).
-    hub: Option<WatchHub>,
+    pub(super) hub: Option<WatchHub>,
     /// What the watcher thread reported, drained by [`Self::pump_watch_events`].
     watch_events: Option<Receiver<(PathBuf, FolderEvent)>>,
     /// Per-folder debounce of the change events, shared by every tab on it.
-    folder_debounce: HashMap<PathBuf, Debounce>,
+    pub(super) folder_debounce: HashMap<PathBuf, Debounce>,
     /// The retained loop that drains the watcher channel.
     _watch_pump: Option<Task<()>>,
     /// The machine's devices and the actions on them: the Devices section.
@@ -778,6 +752,8 @@ impl Explorer {
         let Startup {
             preferences,
             favorites,
+            legacy_favorites,
+            bookmarks_path,
             restored,
             persistence,
             notices,
@@ -838,16 +814,13 @@ impl Explorer {
         cx.set_global(ToastGlobal {
             host: toast_host.clone(),
         });
-        let terminal = pick_terminal(
-            std::env::var_os("TERMINAL").as_deref(),
-            std::env::var_os("PATH").as_deref(),
-        );
-
         let mut this = Self {
             tabs: TabList::new(first),
             next_tab_id: 1,
             home,
-            favorites: Favorites::from_paths(favorites),
+            favorites: favorites_of(favorites, &legacy_favorites),
+            legacy_favorites,
+            bookmarks: BookmarkSync::new(bookmarks_path),
             places: None,
             sidebar_error: None,
             // Known from the environment at once, so Del has a Trash even
@@ -887,7 +860,9 @@ impl Explorer {
             clipboard_text: None,
             pastes: HashMap::new(),
             toast_host,
-            terminal,
+            toast_ids: RefCell::new(Vec::new()),
+            toast_stack_height: Rc::new(Cell::new(0.0)),
+            terminal: None,
             hub,
             watch_events,
             folder_debounce: HashMap::new(),
@@ -910,6 +885,22 @@ impl Explorer {
             }
         }));
 
+        // The terminal lookup reads `.desktop` files: off the UI thread. The
+        // menus offer "Open in terminal" once it has answered.
+        let terminal_task = cx
+            .background_executor()
+            .spawn(async move { terminal::resolve(&TerminalEnv::from_process()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let found = terminal_task.await;
+            if let Err(error) = this.update_in(cx, |this, _window, cx| {
+                this.terminal = found;
+                cx.notify();
+            }) {
+                log::debug!("the explorer closed before the terminal was found: {error}");
+            }
+        })
+        .detach();
+
         // The sidebar discovery reads the user-dirs configuration and the
         // mount table: blocking work that belongs off the UI thread.
         let discover_task = cx.background_executor().spawn(async move { discover() });
@@ -923,6 +914,7 @@ impl Explorer {
         })
         .detach();
 
+        this.attach_bookmark_watch();
         this.sync_window_title(window);
         this.navigate(Transition::Visit(initial), window, cx);
         // The rest of a restored session opens behind the first tab, in
@@ -949,7 +941,7 @@ impl Explorer {
         let size = window.bounds().size;
         let settings = Settings {
             version: SETTINGS_VERSION,
-            favorites: self.favorites.list().to_vec(),
+            favorites: self.legacy_favorites.clone(),
             preferences: Preferences {
                 view: view_to_pref(active.state.view()),
                 arrangement: arrangement_to_prefs(active.state.arrangement()),
@@ -1378,6 +1370,7 @@ impl Explorer {
         }
         for path in gone {
             self.folder_debounce.remove(&path);
+            self.bookmarks_folder_gone(&path, cx);
             let ids: Vec<TabId> = self
                 .tabs
                 .iter()
@@ -1396,6 +1389,7 @@ impl Explorer {
             .collect();
         for path in due {
             self.folder_debounce.remove(&path);
+            self.bookmarks_folder_changed(&path, cx);
             let active = self.active_id();
             let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
             for id in ids {
@@ -1948,15 +1942,16 @@ impl Explorer {
         self.open_path(&path, window, cx);
     }
 
-    /// Opens one entry: a real directory navigates; a file, symlink or
-    /// broken link opens with the default application (`xdg-open`, see
-    /// [`Explorer::open_file`]). A symlinked directory is not followed
-    /// either: the explorer navigates entry paths as scanned.
+    /// Opens one entry: a directory, or a symlink to one, navigates (to the
+    /// path as scanned, so the link stays in the path bar); a file, a link to
+    /// a file or a broken link opens with the default application
+    /// (`xdg-open`, see [`Explorer::open_file`]); see
+    /// [`crate::explorer::ops::open_action`].
     pub(crate) fn open_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.tab().snapshot.iter().find(|entry| entry.path == path) else {
             return;
         };
-        if entry.is_directory() && !entry.is_symlink {
+        if open_action(entry) == OpenAction::Navigate {
             self.navigate(
                 Transition::Visit(Location::Directory(entry.path.clone())),
                 window,
@@ -1970,8 +1965,8 @@ impl Explorer {
 
     /// Toggles the favorites membership of the current directory.
     pub(crate) fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
-        self.favorites.toggle(self.tabs.active().state.current());
-        cx.notify();
+        let current = self.tabs.active().state.current().clone();
+        self.toggle_favorite_of(&current, cx);
     }
 
     /// The width the content island can use, as the **first-frame estimate**
@@ -2075,8 +2070,7 @@ impl Explorer {
     }
 
     /// Middle-click or the menu on an entry: a real directory opens in a
-    /// background tab; files and symlinks (which `open_path` does not
-    /// follow either) do nothing.
+    /// background tab; files and symlinks do nothing.
     pub(crate) fn open_path_in_new_tab(
         &mut self,
         path: &Path,
@@ -2473,6 +2467,7 @@ impl Render for Explorer {
             }))
             .child(middle)
             .child(self.render_statusbar(cx))
+            .child(self.render_toasts(window, cx))
             .children(overlays)
             .children(cards)
             .children(self.panel_drag.is_some().then(|| {
@@ -2543,7 +2538,7 @@ impl Explorer {
             .h_full()
             .children(tabstrip::render(self, cx))
             .child(toolbar::render(self, cx))
-            .child(self.render_subbar(window, cx))
+            .child(self.render_subbar(cx))
             .children(self.render_scope_line(cx))
             .child(
                 div()
@@ -2591,11 +2586,11 @@ impl Explorer {
 
     /// The folder subbar under the toolbar: the current folder's title and
     /// its mono "4 folders · 7 files" meta.
-    fn render_subbar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
+    fn render_subbar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let colors = bolt::colors(cx);
         let meta = if self.tab().state.is_loading() {
             String::new()
-        } else if self.tab().state.is_filtering() {
+        } else if self.tab().state.shows_fewer_than_listed() {
             util::filtered_counts_label(
                 self.tab().state.visible_shared().len(),
                 self.tab().state.listing().entries.len(),
@@ -2603,7 +2598,6 @@ impl Explorer {
         } else {
             self.tab().folder_label.clone()
         };
-        let toasts = self.render_toasts(window, &meta);
         div()
             .id("explorer-subbar")
             .relative()
@@ -2613,7 +2607,6 @@ impl Explorer {
             .items_center()
             .gap(px(10.0))
             .px(px(SUBBAR_PADDING))
-            .child(toasts)
             .child(
                 div()
                     .id("explorer-subbar-title")
@@ -2678,50 +2671,36 @@ impl Explorer {
             })
     }
 
-    /// The toast stack: top-centered in the document island, starting just
-    /// under the toolbar over the subbar's empty middle band, and growing
-    /// downward. It drops under the subbar when the band is not free (see
-    /// [`toast_band`]). `meta` is the subbar's meta text, which sizes the
-    /// band the title takes.
-    fn render_toasts(&self, window: &Window, meta: &str) -> impl IntoElement {
-        let island_width = f32::from(window.viewport_size().width) - self.shell_width(window);
-        let actions = if self.in_trash() {
-            SUBBAR_TRASH_ACTIONS_RESERVE
-        } else {
-            SUBBAR_ACTIONS_RESERVE
-        };
-        let band = toast_band(
-            island_width,
-            subbar_left_reserve(
-                self.current_label().chars().count().min(32),
-                meta.chars().count(),
-            ),
-            actions,
-            !self.tab().state.arrangement().filters.chips().is_empty(),
+    /// The toast stack: bottom-right, above the status bar, growing upward
+    /// (see [`toasts`]). Bolt's host draws top-down from its parent's top
+    /// edge, so the zero-height wrapper is placed from the stack's measured
+    /// height; the measure settles within a frame of a toast appearing or
+    /// closing.
+    fn render_toasts(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+        let top = toasts::stack_top(
+            f32::from(window.viewport_size().height),
+            self.toast_stack_height.get(),
         );
-        let top = match band {
-            ToastBand::Subbar => TOAST_DROP - TOAST_HOST_INSET,
-            ToastBand::BelowSubbar => SUBBAR_HEIGHT + TOAST_DROP - TOAST_HOST_INSET,
-        };
+        let measured = Rc::clone(&self.toast_stack_height);
+        let explorer = cx.entity_id();
         deferred(
             div()
                 .absolute()
                 .top(px(top))
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
-                .child(
-                    // Bolt's host stacks from the top right of its parent
-                    // (inset 16 px): a zero-height column as wide as card
-                    // plus insets centers it.
-                    div()
-                        .relative()
-                        .flex_none()
-                        .h_0()
-                        .w(px(TOAST_CARD_WIDTH + 2.0 * TOAST_HOST_INSET))
-                        .child(self.toast_host.clone()),
-                ),
+                .right(px(toasts::MARGIN - toasts::HOST_INSET))
+                .flex_none()
+                .h_0()
+                .w(px(toasts::CARD_WIDTH + 2.0 * toasts::HOST_INSET))
+                .on_children_prepainted(move |bounds, _window, cx| {
+                    let height = bounds
+                        .first()
+                        .map_or(0.0, |bounds| f32::from(bounds.size.height));
+                    if (measured.get() - height).abs() > 0.5 {
+                        measured.set(height);
+                        cx.notify(explorer);
+                    }
+                })
+                .child(self.toast_host.clone()),
         )
     }
 
@@ -2794,7 +2773,7 @@ impl Explorer {
         let shown = self
             .tab()
             .state
-            .is_filtering()
+            .shows_fewer_than_listed()
             .then(|| self.tab().state.visible_shared().len());
         let selection = self.tab().state.selection();
         let mut count_text = util::status_label(
@@ -2985,41 +2964,6 @@ pub(crate) fn path_argument_message(argument: &PathArgument) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A wide island with nothing in the subbar's middle band puts the
-    /// toasts in the subbar; anything tighter drops them under it.
-    #[test]
-    fn toasts_sit_in_the_subbar_only_when_its_middle_band_is_free() {
-        let wide = 2.0 * 340.0 + TOAST_CARD_WIDTH;
-        assert_eq!(toast_band(wide, 200.0, 340.0, false), ToastBand::Subbar);
-        assert_eq!(
-            toast_band(wide - 1.0, 200.0, 340.0, false),
-            ToastBand::BelowSubbar,
-            "one pixel short of the free band"
-        );
-        assert_eq!(
-            toast_band(900.0, 200.0, 340.0, false),
-            ToastBand::BelowSubbar
-        );
-        // A long folder name eats the left side of the band.
-        assert_eq!(
-            toast_band(wide, 500.0, 340.0, false),
-            ToastBand::BelowSubbar
-        );
-        // Filter chips live in the middle band: never cover them.
-        assert_eq!(
-            toast_band(4000.0, 200.0, 340.0, true),
-            ToastBand::BelowSubbar
-        );
-    }
-
-    /// The left reserve grows with the folder title and its meta text and
-    /// never goes below the subbar's own padding.
-    #[test]
-    fn the_subbar_left_reserve_grows_with_its_text() {
-        assert!(subbar_left_reserve(4, 22) < subbar_left_reserve(30, 22));
-        assert!(subbar_left_reserve(0, 0) >= 20.0);
-    }
 
     /// The finding: a successful edited-path submission reseeds the path
     /// field — even while it stays focused — so a second Enter reloads the

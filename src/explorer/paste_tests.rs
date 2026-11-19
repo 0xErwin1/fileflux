@@ -191,6 +191,7 @@ fn target(selected: usize, can_paste: bool, folder_selected: bool) -> MenuTarget
         can_paste,
         folder_selected,
         single_file: false,
+        folder_favorite: false,
     }
 }
 
@@ -267,6 +268,7 @@ fn the_trash_view_never_offers_the_clipboard() {
             can_paste: true,
             folder_selected: false,
             single_file: false,
+            folder_favorite: false,
         });
         for command in [
             MenuCommand::Cut,

@@ -332,6 +332,7 @@ fn target(in_trash: bool, selected: usize, folder_is_empty: bool, terminal: bool
         can_paste: false,
         folder_selected: false,
         single_file: false,
+        folder_favorite: false,
     }
 }
 
@@ -389,7 +390,7 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "Sort by",
             "Filter",
             "-",
-            "Open terminal here",
+            "Open in terminal",
             "Copy folder path"
         ]
     );
@@ -411,7 +412,7 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "-",
             "Copy folder path"
         ],
-        "no dead 'Open terminal here' item"
+        "no dead 'Open in terminal' item"
     );
 }
 
@@ -434,6 +435,7 @@ fn a_sidebar_row_menu_offers_open_tab_favorite_copy_and_properties() {
     let rows = sidebar_menu_rows(&SidebarTarget {
         trash: false,
         favorite: false,
+        terminal: false,
     });
     assert_eq!(
         flat(&rows),
@@ -461,6 +463,7 @@ fn a_favorite_row_offers_remove_instead_of_add() {
     let rows = sidebar_menu_rows(&SidebarTarget {
         trash: false,
         favorite: true,
+        terminal: false,
     });
     assert_eq!(
         flat(&rows),
@@ -479,12 +482,131 @@ fn a_favorite_row_offers_remove_instead_of_add() {
 }
 
 #[test]
+fn a_sidebar_row_offers_open_in_terminal_only_when_a_terminal_exists() {
+    let rows = sidebar_menu_rows(&SidebarTarget {
+        trash: false,
+        favorite: false,
+        terminal: true,
+    });
+    assert_eq!(
+        flat(&rows),
+        [
+            "Open",
+            "Open in new tab",
+            "Open in terminal",
+            "-",
+            "Add to favorites",
+            "Copy path",
+            "-",
+            "Properties"
+        ]
+    );
+    assert!(item(&rows, MenuCommand::OpenTerminal).is_some());
+}
+
+#[test]
+fn a_single_selected_folder_offers_favorites_and_a_terminal_in_its_menu() {
+    let folder = MenuTarget {
+        folder_selected: true,
+        ..target(false, 1, false, true)
+    };
+    let rows = menu_rows(&folder);
+    assert_eq!(
+        flat(&rows),
+        [
+            "Open",
+            "Open in new tab",
+            "Add to favorites",
+            "Open in terminal",
+            "-",
+            "Cut",
+            "Copy",
+            "Paste into folder",
+            "-",
+            "Rename",
+            "Copy path",
+            "-",
+            "Properties",
+            "Move to Trash",
+            "Delete permanently…"
+        ]
+    );
+    assert!(item(&rows, MenuCommand::AddFavorite).is_some_and(|row| row.enabled));
+    let favorite = MenuTarget {
+        folder_favorite: true,
+        ..folder
+    };
+    let rows = menu_rows(&favorite);
+    assert_eq!(
+        flat(&rows).get(2).map(String::as_str),
+        Some("Remove from favorites")
+    );
+    assert!(item(&rows, MenuCommand::AddFavorite).is_none());
+
+    // No terminal on the machine: the row is left out, favorites stay.
+    let without = menu_rows(&MenuTarget {
+        terminal: false,
+        ..folder
+    });
+    assert!(item(&without, MenuCommand::OpenTerminal).is_none());
+    assert!(item(&without, MenuCommand::AddFavorite).is_some());
+}
+
+#[test]
+fn favorites_and_terminal_never_show_for_files_selections_or_the_trash() {
+    let offers = |target: MenuTarget| {
+        let rows = menu_rows(&target);
+        (
+            item(&rows, MenuCommand::AddFavorite).is_some()
+                || item(&rows, MenuCommand::RemoveFavorite).is_some(),
+            item(&rows, MenuCommand::OpenTerminal).is_some(),
+        )
+    };
+    let folder = MenuTarget {
+        folder_selected: true,
+        ..target(false, 1, false, true)
+    };
+    assert_eq!(offers(folder), (true, true));
+    assert_eq!(
+        offers(target(false, 1, false, true)),
+        (false, false),
+        "a file or link"
+    );
+    assert_eq!(
+        offers(MenuTarget {
+            single_file: true,
+            ..target(false, 1, false, true)
+        }),
+        (false, false)
+    );
+    assert_eq!(
+        offers(target(false, 3, false, true)),
+        (false, false),
+        "several"
+    );
+    assert_eq!(
+        offers(MenuTarget {
+            in_trash: true,
+            ..folder
+        }),
+        (false, false),
+        "the Trash view"
+    );
+    assert_eq!(
+        offers(target(false, 0, false, true)),
+        (false, true),
+        "empty space"
+    );
+}
+
+#[test]
 fn the_sidebar_trash_row_offers_open_new_tab_and_empty_trash_only() {
     // A favorite flag is meaningless for the Trash: it is never favorited.
     for favorite in [false, true] {
         let rows = sidebar_menu_rows(&SidebarTarget {
             trash: true,
             favorite,
+            terminal: true,
         });
         assert_eq!(
             flat(&rows),
@@ -646,47 +768,6 @@ fn a_file_on_the_home_device_goes_to_the_home_trash() -> TestResult {
     let target = (ctx.target_for)(&file)?;
     assert_eq!(target.root, scratch.trash());
     assert_eq!(target.kind, TrashKind::Home);
-    Ok(())
-}
-
-// --- terminal ------------------------------------------------------------------
-
-fn executable(dir: &Path, name: &str, mode: u32) -> io::Result<PathBuf> {
-    let path = dir.join(name);
-    fs::write(&path, "#!/bin/sh\n")?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
-    Ok(path)
-}
-
-#[test]
-fn the_terminal_is_terminal_then_xdg_terminal_exec_and_must_exist() -> TestResult {
-    let scratch = Scratch::new("terminal")?;
-    let bin = scratch.dir("bin")?;
-    let kitty = executable(&bin, "kitty", 0o755)?;
-    let exec = executable(&bin, "xdg-terminal-exec", 0o755)?;
-    executable(&bin, "plain", 0o644)?;
-    let path_var = bin.as_os_str();
-
-    assert_eq!(
-        pick_terminal(Some(OsStr::new("kitty")), Some(path_var)),
-        Some(kitty)
-    );
-    assert_eq!(
-        pick_terminal(Some(OsStr::new("missing")), Some(path_var)),
-        Some(exec.clone()),
-        "an unusable $TERMINAL falls through"
-    );
-    assert_eq!(
-        pick_terminal(Some(OsStr::new("plain")), Some(path_var)),
-        Some(exec.clone()),
-        "a non-executable file is not a terminal"
-    );
-    assert_eq!(
-        pick_terminal(Some(OsStr::new("")), Some(path_var)),
-        Some(exec)
-    );
-    assert_eq!(pick_terminal(None, Some(scratch.0.as_os_str())), None);
-    assert_eq!(pick_terminal(None, None), None);
     Ok(())
 }
 
@@ -2233,6 +2314,42 @@ fn rename_seed_refuses_every_control_character() {
         assert!(rename_seed(OsStr::new(name)).is_err(), "{name:?}");
     }
     assert!(rename_seed(OsStr::new("zz\u{2028}line")).is_ok());
+}
+
+// --- activating an entry ---------------------------------------------------------
+
+#[test]
+fn enter_navigates_into_a_real_folder_and_a_symlink_to_one() -> TestResult {
+    let scratch = Scratch::new("activate")?;
+    let target = scratch.dir("target")?;
+    scratch.file("target/inside.txt", "x")?;
+    scratch.file("plain.txt", "x")?;
+    unix_fs::symlink(&target, scratch.0.join("to-dir"))?;
+    unix_fs::symlink(scratch.0.join("plain.txt"), scratch.0.join("to-file"))?;
+    unix_fs::symlink(scratch.0.join("nothing-here"), scratch.0.join("broken"))?;
+
+    let listing = fileflux::core::fs::read_directory(&scratch.0)?;
+    let action = |name: &str| {
+        listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(open_action)
+    };
+    assert_eq!(action("target"), Some(OpenAction::Navigate));
+    assert_eq!(
+        action("to-dir"),
+        Some(OpenAction::Navigate),
+        "a link to a folder goes into it, not to xdg-open"
+    );
+    assert_eq!(action("plain.txt"), Some(OpenAction::External));
+    assert_eq!(action("to-file"), Some(OpenAction::External));
+    assert_eq!(
+        action("broken"),
+        Some(OpenAction::External),
+        "nothing to enter"
+    );
+    Ok(())
 }
 
 // --- opening images in the viewer --------------------------------------------------

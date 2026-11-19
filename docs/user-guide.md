@@ -17,6 +17,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Sort and filter](#sort-and-filter)
 - [Tabs](#tabs)
 - [Selection](#selection)
+- [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks)
 - [Open, Open with and terminal](#open-open-with-and-terminal)
 - [File operations](#file-operations)
 - [Trash](#trash)
@@ -73,7 +74,7 @@ Fileflux always starts in Bolt's dark palette; there is no theme toggle.
 | Breadcrumbs | Each segment navigates. Long paths collapse their leading segments |
 | Path field | Click the bar's empty space or press Ctrl+L. Enter navigates to an absolute, relative or `~/…` path (no shell evaluation). Escape or leaving the field restores the committed path. An invalid or missing path reports an error and changes nothing |
 | History | Alt+←, Alt+→ and Alt+↑ (back, forward, up). A failed load changes nothing |
-| Favorites | The toolbar star adds or removes the current folder. The Trash cannot be a favorite |
+| Favorites | Your GTK bookmarks (`~/.config/gtk-3.0/bookmarks`, shared with Nautilus and Thunar). The toolbar star, a folder's context menu and a sidebar row's menu add or remove one; an edit made by another program shows live. The Trash cannot be a favorite. See [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks) |
 
 Non-UTF-8 file names keep their exact bytes for navigation; lossy text appears only in what is displayed.
 
@@ -100,9 +101,9 @@ Use the subbar's **Sort** and **Filter** buttons, the same two pages in the empt
 
 | Control | Behavior |
 |---|---|
-| Sort | **Name, Size, Modified, Type**, ascending or descending. *Type* orders by category, then extension, then name. **Folders first** (default on) groups folders before files. **Natural number order** (default on) puts `IMG_2` before `IMG_10`. A missing size or time sorts lowest |
+| Sort | **Name, Size, Modified, Type**, ascending or descending; the default is **Modified, descending** (newest first). *Type* orders by category, then extension, then name. **Folders first** (default on) groups folders before files. **Natural number order** (default on) puts `IMG_2` before `IMG_10`. A missing size or time sorts lowest |
 | Type | Multi-select chips: Folders, Images, Videos, Audio, Documents, Archives, Code, Other, decided by extension. None selected means all |
-| Hidden files | Ctrl+H, or *Show hidden files* in the Filter menu. Hidden files are shown by default |
+| Hidden files | Ctrl+H, or *Show hidden files* in the Filter menu. **Hidden by default**: names starting with a dot and the names listed one per line in the folder's `.hidden` file (Nautilus and Thunar's convention). No chip in the default state; showing them adds a **Hidden shown ×** chip. While some are hidden the counts read "5 of 8 items" |
 | Modified | Today, Last 7 days, Last 30 days, This year, Older (before the last 30 days). One choice or none. Files with an unknown time never match |
 | Size | < 1 MB, 1–100 MB, 100 MB–1 GB, > 1 GB. One choice or none. Files with an unknown size never match |
 | Folders and ranges | A size range never applies to folders. A date range applies to folders only when **Folders is the only type chip selected**; otherwise folders pass it |
@@ -144,12 +145,21 @@ Each tab keeps its own location, history, selection, view, sort, filter text, sc
 
 A selected entry that the filter hides stays selected, but operations act only on the entries that are visible.
 
+## Favorites and GTK bookmarks
+
+The sidebar's Favorites are the local lines of `$XDG_CONFIG_HOME/gtk-3.0/bookmarks` (default `~/.config/gtk-3.0/bookmarks`), the file Nautilus, Thunar, Nemo and the GTK file chooser share.
+
+- A line is `file:///percent-encoded/path Optional Label`. The sidebar shows the label when there is one, else the folder name.
+- `sftp://`, `smb://` and other lines, comments and blank lines are kept untouched and not shown. Adding appends one line, removing drops only that folder's lines; order, labels and line endings stay.
+- Changes are written atomically (a temporary file renamed over the original, through a symlink, keeping the file's permissions) after re-reading the file, so an edit made by another program meanwhile is not lost. An external edit shows in the sidebar live.
+- Older versions kept favorites in `settings.toml`: the first run moves them into the bookmarks and saves the settings without them. If the bookmarks cannot be written they stay in `settings.toml` and are retried at the next launch.
+
 ## Open, Open with and terminal
 
-- **Open** (double click or Enter): folders navigate. Images open the [image viewer](#image-viewer). Other files, symlinks and broken links open with the default application (`xdg-open <path>`, detached, no shell); a failure to start it appears in the status bar. Trash entries are not opened: restore them first.
+- **Open** (double click or Enter): folders navigate. Images open the [image viewer](#image-viewer). A symlink to a folder is entered like the folder. Files, links to files and broken links open with the default application (`xdg-open <path>`, detached, no shell); a failure to start it appears in the status bar. Trash entries are not opened: restore them first.
 - **Open with…** (context menu, one selected file; not folders, not in the Trash): lists the default application first, then every other application whose `.desktop` file declares the file's MIME type. Up/Down choose, Enter or a click opens. The MIME type comes from `xdg-mime query filetype` (the extension is the fallback). Applications are found in `$XDG_DATA_HOME/applications` and each `$XDG_DATA_DIRS/applications`; hidden entries, terminal applications and ones that take no file are not listed. The program is started without a shell, detached, in the file's folder. If nothing handles the type, a toast says so.
-- **Open terminal here** (context menu on empty space): runs `$TERMINAL`, else `xdg-terminal-exec`, in the shown folder. The item is omitted when neither exists.
-- **Open in viewer** (context menu, one selected image) and **Open in new tab** (selected folder).
+- **Open in terminal** (context menu on one selected folder, on a sidebar row and on empty space): starts your terminal in that folder (the shown folder on empty space), with no shell. The terminal is the first that exists of: `$TERMINAL`, `xdg-terminal-exec`, the desktop ids in `xdg-terminals.list`, a desktop entry with `Categories=TerminalEmulator` (known terminals first), then ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, kgx, konsole, xfce4-terminal, xterm. Terminals that ignore the working directory of the process get their own argument (`--working-directory`, `--directory`, `--workdir`, `start --cwd`). The item is omitted when no terminal is found.
+- **Open in viewer** (context menu, one selected image), and **Open in new tab**, **Add to favorites** / **Remove from favorites** (selected folder, not in the Trash).
 
 ## File operations
 
@@ -230,7 +240,7 @@ Drag selected entries from the grid or the list (dragging an unselected entry se
 
 An operation that runs longer than about 400 ms shows a card at the bottom right (title, bar, "N of M items", current item, **Cancel**; several stack) and a status-bar indicator, and ends in a summary toast. Cancelling stops before the next item; what was done stays done. Copy and move cards add bytes, speed and ETA.
 
-Toasts stack at the top center of the folder area, below the toolbar, so they never cover Sort, Filter, New folder or Empty Trash.
+Toasts stack in the **bottom-right corner** of the window, above the status bar, and grow upward, so they never cover the subbar buttons or the middle of the grid. Info and success toasts close after 3 s, a toast with **Undo** after 6 s, errors and warnings after 8 s (or at once with the close button). The timer pauses while the pointer is on a toast. At most 3 show at once: a new one closes the oldest (an error last).
 
 ## Details panel
 
@@ -269,7 +279,7 @@ The script writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mi
 
 ## Sidebar
 
-Right-click a row of Places, Favorites or Devices: **Open**, **Open in new tab**, **Add to favorites** / **Remove from favorites**, **Copy path** and **Properties** (opens the folder with the details panel shown). The **Home Trash** row offers Open, Open in new tab and **Empty Trash…**, which asks first. Devices have extra actions: see [Devices](devices.md).
+Right-click a row of Places, Favorites or Devices: **Open**, **Open in new tab**, **Open in terminal**, **Add to favorites** / **Remove from favorites**, **Copy path** and **Properties** (opens the folder with the details panel shown). The **Home Trash** row offers Open, Open in new tab and **Empty Trash…**, which asks first. Devices have extra actions: see [Devices](devices.md).
 
 ## Current scope
 

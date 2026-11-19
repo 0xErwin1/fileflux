@@ -21,7 +21,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::ops::Range;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1264,7 +1264,8 @@ pub(crate) struct MenuTarget {
     pub(crate) selected: usize,
     /// Whether the shown folder has no entries at all.
     pub(crate) folder_is_empty: bool,
-    /// Whether a terminal can be opened (see [`pick_terminal`]).
+    /// Whether a terminal can be opened (see
+    /// [`fileflux::core::terminal::resolve`]).
     pub(crate) terminal: bool,
     /// Whether the clipboard holds something to paste.
     pub(crate) can_paste: bool,
@@ -1273,6 +1274,29 @@ pub(crate) struct MenuTarget {
     /// Exactly one entry is selected and it is not a folder: "Open with…"
     /// applies.
     pub(crate) single_file: bool,
+    /// The one selected folder is a favorite already.
+    pub(crate) folder_favorite: bool,
+}
+
+/// What Enter or a double click does to one entry.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenAction {
+    /// Go into the folder.
+    Navigate,
+    /// Hand it to the default application.
+    External,
+}
+
+/// A folder, and a symlink that points to one, is entered; a file, a link to
+/// a file and a broken link open with the default application. The scan
+/// resolved a link's kind through its target, so `is_directory` already
+/// covers the link to a folder.
+pub(crate) fn open_action(entry: &Entry) -> OpenAction {
+    if entry.is_directory() {
+        OpenAction::Navigate
+    } else {
+        OpenAction::External
+    }
 }
 
 /// What opening one entry's file does.
@@ -1374,6 +1398,24 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
                 None,
                 false,
             ));
+            rows.push(if target.folder_favorite {
+                item(
+                    MenuCommand::RemoveFavorite,
+                    "Remove from favorites",
+                    None,
+                    false,
+                )
+            } else {
+                item(MenuCommand::AddFavorite, "Add to favorites", None, false)
+            });
+            if target.terminal {
+                rows.push(item(
+                    MenuCommand::OpenTerminal,
+                    "Open in terminal",
+                    None,
+                    false,
+                ));
+            }
         }
         if target.single_file {
             rows.push(item(
@@ -1429,7 +1471,7 @@ pub(crate) fn menu_rows(target: &MenuTarget) -> Vec<MenuRow> {
     if target.terminal {
         rows.push(item(
             MenuCommand::OpenTerminal,
-            "Open terminal here",
+            "Open in terminal",
             None,
             false,
         ));
@@ -1460,6 +1502,8 @@ pub(crate) struct SidebarTarget {
     pub(crate) trash: bool,
     /// The row's folder is already a favorite.
     pub(crate) favorite: bool,
+    /// Whether a terminal can be opened.
+    pub(crate) terminal: bool,
 }
 
 /// The menu of a sidebar row. Every row opens in place or in a new tab; a
@@ -1475,12 +1519,18 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
     let mut rows = vec![
         item(MenuCommand::Open, "Open", false),
         item(MenuCommand::OpenInNewTab, "Open in new tab", false),
-        MenuRow::Separator,
     ];
     if target.trash {
-        rows.push(item(MenuCommand::EmptyTrash, "Empty Trash\u{2026}", true));
+        rows.extend([
+            MenuRow::Separator,
+            item(MenuCommand::EmptyTrash, "Empty Trash\u{2026}", true),
+        ]);
         return rows;
     }
+    if target.terminal {
+        rows.push(item(MenuCommand::OpenTerminal, "Open in terminal", false));
+    }
+    rows.push(MenuRow::Separator);
     rows.push(if target.favorite {
         item(MenuCommand::RemoveFavorite, "Remove from favorites", false)
     } else {
@@ -1990,35 +2040,6 @@ pub(crate) fn open_with_command(path: &Path, app: &App) -> Result<OpenWithComman
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
     })
-}
-
-// --- terminal ----------------------------------------------------------------------
-
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-/// An executable named `name` (a bare name is looked up in `path_var`).
-fn resolve_program(name: &OsStr, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    if name.is_empty() {
-        return None;
-    }
-    let direct = Path::new(name);
-    if direct.components().count() > 1 {
-        return is_executable(direct).then(|| direct.to_path_buf());
-    }
-    std::env::split_paths(path_var?)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-/// The terminal "Open terminal here" runs: `$TERMINAL` when it names an
-/// existing executable, else `xdg-terminal-exec`; `None` when neither
-/// exists (the menu then omits the item).
-pub(crate) fn pick_terminal(terminal: Option<&OsStr>, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    terminal
-        .and_then(|name| resolve_program(name, path_var))
-        .or_else(|| resolve_program(OsStr::new("xdg-terminal-exec"), path_var))
 }
 
 #[cfg(test)]

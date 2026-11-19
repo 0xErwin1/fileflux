@@ -3,9 +3,11 @@
 //!
 //! Rows show the name only and navigate on click; the full path is the
 //! row's tooltip and the active row shows the 2 px tint bar of the
-//! reference design. Favorites are saved in the settings file and
-//! are added and removed for the current directory with the toolbar's star
-//! button; the virtual Trash is never favorited. Devices add a 3 px usage
+//! reference design. Favorites are the GTK bookmarks (see
+//! [`super::favorites`]), shown with their label when the bookmark has one;
+//! they are added and removed for the current directory with the toolbar's
+//! star button, from a folder's context menu and from a sidebar row's menu;
+//! the virtual Trash is never favorited. Devices add a 3 px usage
 //! meter and a "free of" line only when `statvfs` answered; nothing is
 //! invented otherwise.
 
@@ -163,7 +165,7 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
 fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let mut section = div().flex_none().flex().flex_col();
     section = section.child(section_label("favorites-label", "Favorites", cx));
-    if this.favorites.list().is_empty() {
+    if this.favorites.bookmarks().is_empty() {
         let colors = bolt::colors(cx);
         return section.child(
             div()
@@ -181,13 +183,11 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
                 .child("Star a folder to pin it here."),
         );
     }
-    for (index, path) in this.favorites.list().iter().enumerate() {
+    for (index, bookmark) in this.favorites.bookmarks().iter().enumerate() {
+        let path = &bookmark.path;
         section = section.child(nav_row(
             format!("favorite-{index}"),
-            &path.file_name().map_or_else(
-                || path.to_string_lossy().into_owned(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
+            &bookmark.display_name(),
             path.to_string_lossy().into_owned(),
             gpui_kit_assets::IconName::Star,
             &Location::Directory(path.clone()),

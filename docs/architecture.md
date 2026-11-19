@@ -32,7 +32,9 @@ One package, one library and one binary.
 | `ops` | Create, rename, copy, move: never overwrite silently, never follow symlinks for copy or move, never delete a source before its replacement is verified |
 | `trash` | The freedesktop Trash: list, trash, restore, empty |
 | `watch` | inotify through `rustix`: the folder `WatchHub` and the device `DeviceWatcher` |
-| `settings` | `settings.toml` and `session.toml`: tolerant loading, atomic saving, merging |
+| `settings` | `settings.toml` and `session.toml`: tolerant loading, version migration, atomic saving, merging |
+| `bookmarks` | The GTK bookmarks file as the favorites: parsing, labels, order-preserving atomic edits |
+| `terminal` | "Open in terminal": the xdg-terminal-exec lookup and the command per terminal (no shell) |
 | `apps` | "Open with…": `.desktop` discovery and `Exec=` parsing (no shell) |
 | `images`, `kinds` | Which files are images; the file categories used by sort and filter |
 
@@ -43,7 +45,7 @@ One package, one library and one binary.
 | State and arrangement | `state`, `entries`, `arrange`, `arrange_menu` |
 | Operations | `actions`, `ops`, `paste`, `clipboard`, `dnd`, `progress` |
 | Chrome | `view`, `toolbar`, `tabstrip`, `tabs`, `sidebar`, `table`, `inspector`, `overlay` |
-| Devices and persistence | `devices`, `persist` |
+| Devices and persistence | `devices`, `persist`, `favorites` (the bookmarks watch), `toasts` (timeouts, stack limit, placement) |
 
 ## Threading model
 

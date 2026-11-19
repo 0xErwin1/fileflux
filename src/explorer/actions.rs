@@ -40,12 +40,8 @@ use super::ops::{SidebarTarget, menu_title, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
 use super::state::Transition;
 use super::tabs::{Affected, Placement, tabs_to_refresh};
+use super::toasts::{make_room, toast_timeout};
 use super::view::{Explorer, OpContext, TabId};
-
-/// How long a toast with an Undo button waits before it goes away.
-const UNDO_TOAST: Duration = Duration::from_secs(8);
-/// How long an error toast stays.
-const ERROR_TOAST: Duration = Duration::from_secs(12);
 
 /// The inline rename in progress.
 pub(crate) struct Renaming {
@@ -360,19 +356,21 @@ impl Explorer {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
-        let mut toast = match notice.severity {
+        let severity = notice.severity;
+        let mut toast = match severity {
             Severity::Success => Toast::success(notice.text),
             Severity::Info => Toast::info(notice.text),
             Severity::Warning => Toast::warning(notice.text),
-            Severity::Error => Toast::error(notice.text).auto_dismiss_after(ERROR_TOAST),
-        };
+            Severity::Error => Toast::error(notice.text),
+        }
+        .auto_dismiss_after(toast_timeout(severity, undo_id.is_some()));
         if !details.is_empty() {
             toast = toast.details(details.join("\n")).collapsible();
         }
         if let Some(id) = undo_id {
             let weak = cx.entity().downgrade();
             let handle: AnyWindowHandle = window.window_handle();
-            toast = toast.auto_dismiss_after(UNDO_TOAST).action(
+            toast = toast.action(
                 ToastAction::new(format!("explorer-undo-{id}"), "Undo")
                     .primary()
                     .dismisses()
@@ -398,10 +396,23 @@ impl Explorer {
         }
         // Ids only grow, so a different newest id is this toast; the same
         // one means the host dropped it (throttled).
-        let before = self.toast_host.read(cx).latest_toast_id();
+        let mut open = self.toast_ids.borrow_mut();
+        let host = self.toast_host.clone();
+        open.retain(|(id, _)| host.read(cx).toast_controls(*id).is_some());
+        for id in make_room(&open) {
+            host.update(cx, |host, cx| host.dismiss(id, cx));
+            open.retain(|(known, _)| *known != id);
+        }
+        let before = host.read(cx).latest_toast_id();
         toast.push(cx);
-        let after = self.toast_host.read(cx).latest_toast_id();
-        if after == before { None } else { after }
+        let after = host.read(cx).latest_toast_id();
+        if after == before {
+            return None;
+        }
+        if let Some(id) = after {
+            open.push((id, severity));
+        }
+        after
     }
 
     /// A plain message toast.
@@ -1016,6 +1027,10 @@ impl Explorer {
             can_paste: self.can_paste(cx),
             folder_selected: matches!(selected.as_slice(), [(_, true)]),
             single_file: matches!(selected.as_slice(), [(_, false)]),
+            folder_favorite: matches!(
+                selected.as_slice(),
+                [(path, true)] if self.favorites.contains(&Location::Directory(path.clone()))
+            ),
         };
         let mut rows = menu_rows(&target);
         let names: Vec<String> = self
@@ -1063,6 +1078,7 @@ impl Explorer {
         let mut rows = sidebar_menu_rows(&SidebarTarget {
             trash: location == Location::Trash,
             favorite: self.favorites.contains(&location),
+            terminal: self.terminal.is_some(),
         });
         if let Some(actions) = device
             .as_deref()
@@ -1253,7 +1269,15 @@ impl Explorer {
             return self.run_device_command(command, device, window, cx);
         }
         match command {
-            MenuCommand::AddFavorite | MenuCommand::RemoveFavorite => {}
+            MenuCommand::AddFavorite | MenuCommand::RemoveFavorite => {
+                if let Some(folder) = self.single_selected_folder() {
+                    self.set_favorite(
+                        &Location::Directory(folder),
+                        command == MenuCommand::AddFavorite,
+                        cx,
+                    );
+                }
+            }
             MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
             MenuCommand::Arrange(_) | MenuCommand::Page(_) => {}
             MenuCommand::Open => self.open_selected(window, cx),
@@ -1270,7 +1294,10 @@ impl Explorer {
             MenuCommand::DeletePermanently => self.delete_selected(window, cx),
             MenuCommand::NewFolder => self.create_new(NewKind::Folder, window, cx),
             MenuCommand::NewFile => self.create_new(NewKind::File, window, cx),
-            MenuCommand::OpenTerminal => self.open_terminal(window, cx),
+            MenuCommand::OpenTerminal => {
+                let folder = self.single_selected_folder();
+                self.open_terminal(folder, cx);
+            }
             MenuCommand::CopyFolderPath => self.copy_folder_path(window, cx),
             MenuCommand::Restore => self.restore_selected(window, cx),
             MenuCommand::EmptyTrash => self.request_empty_trash(window, cx),
@@ -1302,14 +1329,8 @@ impl Explorer {
             MenuCommand::OpenInNewTab => {
                 self.open_tab(location, Placement::Background, window, cx);
             }
-            MenuCommand::AddFavorite if !self.favorites.contains(&location) => {
-                self.favorites.toggle(&location);
-                cx.notify();
-            }
-            MenuCommand::RemoveFavorite if self.favorites.contains(&location) => {
-                self.favorites.toggle(&location);
-                cx.notify();
-            }
+            MenuCommand::AddFavorite => self.set_favorite(&location, true, cx),
+            MenuCommand::RemoveFavorite => self.set_favorite(&location, false, cx),
             MenuCommand::CopyPath => {
                 if let Location::Directory(path) = &location {
                     cx.write_to_clipboard(ClipboardItem::new_string(
@@ -1326,6 +1347,11 @@ impl Explorer {
                 self.navigate(Transition::Visit(location), window, cx);
                 self.inspector_open = true;
                 cx.notify();
+            }
+            MenuCommand::OpenTerminal => {
+                if let Location::Directory(folder) = location {
+                    self.open_terminal(Some(folder), cx);
+                }
             }
             MenuCommand::EmptyTrash => self.request_empty_trash_anywhere(window, cx),
             _ => {}
@@ -1562,18 +1588,31 @@ impl Explorer {
         }
     }
 
-    /// "Open terminal here": `$TERMINAL` or `xdg-terminal-exec`, started in
-    /// the shown folder.
-    fn open_terminal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(program), Location::Directory(dir)) =
-            (self.terminal.clone(), self.tab().state.current().clone())
-        else {
+    /// The one selected entry when it is a real folder (not a link to one).
+    fn single_selected_folder(&self) -> Option<PathBuf> {
+        match self.selected_with_kind().as_slice() {
+            [(path, true)] => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// "Open in terminal": the resolved terminal (see
+    /// [`fileflux::core::terminal`]) started in `folder`, else in the shown
+    /// folder. The Trash is no folder to open.
+    fn open_terminal(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(terminal) = self.terminal.clone() else {
             return;
         };
+        let folder = match (folder, self.tab().state.current()) {
+            (Some(folder), _) => folder,
+            (None, Location::Directory(folder)) => folder.clone(),
+            (None, Location::Trash) => return,
+        };
+        let command = terminal.command(&folder);
         self.launch(
-            program,
-            Vec::new(),
-            Some(dir),
+            command.program,
+            command.args,
+            Some(command.cwd),
             "Could not open a terminal".to_owned(),
             cx,
         );

@@ -12,16 +12,29 @@ Fileflux remembers your preferences, favorites and open tabs in two small TOML f
 
 | File | Location | Holds |
 |---|---|---|
-| `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Favorites, and preferences: default view (grid or list), default sort and filters (hidden files, folders first, natural order, categories, date and size), sidebar and details panel widths, whether the sidebar starts collapsed, whether the details panel is open, and the window size |
+| `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Preferences: default view (grid or list), default sort and filters (sort, hidden files, folders first, natural order, categories, date and size), sidebar and details panel widths, whether the sidebar starts collapsed, whether the details panel is open, and the window size |
 | `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder or Trash, view, sort and filters of each) and which one is active |
 
 Both files are created with mode `0600` because they list your folders.
+
+Favorites are **not** in `settings.toml`: they are the lines of the GTK bookmarks file, `$XDG_CONFIG_HOME/gtk-3.0/bookmarks` (default `~/.config/gtk-3.0/bookmarks`), shared with Nautilus, Thunar and the GTK file chooser. See [Favorites and GTK bookmarks](user-guide.md#favorites-and-gtk-bookmarks).
+
+## Defaults and migration
+
+The defaults are **Modified, descending** (folders first, natural order) with **hidden files hidden** (dotfiles and the names in a folder's `.hidden` file). Both files are `version = 2`.
+
+A version 1 file is migrated when it is read, and rewritten as version 2 at the next save:
+
+- A saved sort of *Name, ascending* (the old default) becomes *Modified, descending*, and a saved `hide_hidden = false` (the old default) becomes `true`. This applies to the preferences in `settings.toml` and to each tab in `session.toml`.
+- Any other saved choice is kept: Name descending, Size, Type, a filter, hidden files shown by a tab you changed, and so on. A key the file omits takes the new default.
+- The version 1 `favorites` list is moved into the GTK bookmarks once: the missing ones are appended in order, then `settings.toml` is saved without them. If the bookmarks cannot be written, the favorites stay in `settings.toml` and the move is retried at the next launch.
+- A file written by a newer version is never migrated or overwritten.
 
 ## What is saved and when
 
 - **The default view, sort and filters are the active tab's.** A new tab already starts from the tab it was opened from, so whatever the active tab shows is saved as the default for the next launch. Per-folder memory is not implemented.
 - **Restoring.** Starting `fileflux` without a path reopens the saved tabs, in order, with the saved one active. Startup never checks the folders on the UI thread: each tab opens as saved and loads in the background. A tab whose folder no longer exists then switches to its nearest existing parent (home if none), with a status-bar notice.
-- **A path on the command line wins.** `fileflux ~/x` opens only that folder and neither reads nor overwrites the saved session, so a quick launch never replaces the tabs of your last regular run. Preferences and favorites are still loaded and saved.
+- **A path on the command line wins.** `fileflux ~/x` opens only that folder and neither reads nor overwrites the saved session, so a quick launch never replaces the tabs of your last regular run. Preferences are still loaded and saved.
 - **Autosave.** A change is written once it has stayed unchanged for about 500 ms, so a drag or a burst of clicks is one write.
 
 ## Safe to break
@@ -48,9 +61,8 @@ If `settings.toml` or `session.toml` is a symlink (for example from a dotfile ma
 
 Each instance saves on its own. Before writing `settings.toml`, Fileflux re-reads it:
 
-- Favorites another instance added since this one loaded are kept (a union; what either instance removed stays removed).
-- Every other setting is this instance's (the last writer wins).
-- A favorite added elsewhere shows in this window after the next launch.
+- Every setting is this instance's (the last writer wins).
+- Favorites are not part of this file, so they are not merged: every instance shares the GTK bookmarks file, each change re-reads it before writing, and an edit made elsewhere shows in this window live.
 - The session is not merged: the tabs of the last instance to save are the ones restored.
 - If the file was meanwhile changed to something invalid or to a newer version, it is left untouched and the save reports a notice.
 
