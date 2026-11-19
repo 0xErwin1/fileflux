@@ -24,7 +24,6 @@ use bolt::controls::{Button, InputEvent, InputState};
 use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
-use fileflux::core::devices::path_uses_mounts;
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::settings::{
     self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
@@ -46,10 +45,10 @@ use gpui_component::tooltip::Tooltip;
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
 use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
-use crate::explorer::devices::DeviceHub;
+use crate::explorer::devices::{DeviceHub, refusal};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
-use crate::explorer::ops::{DialogQueue, MenuPage};
+use crate::explorer::ops::{DialogQueue, MenuPage, Severity};
 use crate::explorer::ops::{UndoStack, pick_terminal};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
@@ -1089,6 +1088,32 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Scan> {
+        // A device that is being ejected is not entered. A folder that is
+        // visited may reach it through a symlink, which is resolved off the
+        // UI thread: its scan starts a moment later and is not returned.
+        if self.devices.is_draining()
+            && let Some(Location::Directory(path)) = self.tab().state.target_of(&transition)
+        {
+            if matches!(transition, Transition::Visit(_)) {
+                self.when_not_ejecting(vec![path], window, cx, move |this, window, cx| {
+                    this.navigate_now(transition, window, cx);
+                });
+                return None;
+            }
+            if let Some(text) = refusal(self.devices.draining(), &[path]) {
+                self.say(Severity::Info, text, window, cx);
+                return None;
+            }
+        }
+        self.navigate_now(transition, window, cx)
+    }
+
+    fn navigate_now(
+        &mut self,
+        transition: Transition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Scan> {
         self.settings_notice = None;
         let scan = self.tab_mut().state.begin(transition);
         self.start_scan(scan.clone(), window, cx);
@@ -1395,21 +1420,32 @@ impl Explorer {
         }
     }
 
-    /// Lets go of every watch on a folder under `mounts`, so an inotify watch
-    /// cannot keep a mount busy.
-    pub(crate) fn release_watches_under(&mut self, mounts: &[PathBuf]) {
+    /// The folders under a watch right now, as the watches name them.
+    pub(crate) fn watched_paths(&self) -> Vec<PathBuf> {
+        let held = self
+            .tabs
+            .iter()
+            .flat_map(|tab| [&tab.watch.committed, &tab.watch.target])
+            .flatten()
+            .map(|handle| handle.path().to_path_buf());
+        held.chain(self.folder_debounce.keys().cloned()).collect()
+    }
+
+    /// Lets go of the watches on `doomed` (see [`Self::watched_paths`]), so
+    /// an inotify watch cannot keep a mount busy.
+    pub(crate) fn release_watches(&mut self, doomed: &[PathBuf]) {
         for tab in self.tabs.iter_mut() {
             for slot in [&mut tab.watch.committed, &mut tab.watch.target] {
                 if slot
                     .as_ref()
-                    .is_some_and(|handle| path_uses_mounts(handle.path(), mounts))
+                    .is_some_and(|handle| doomed.iter().any(|path| path == handle.path()))
                 {
                     *slot = None;
                 }
             }
         }
         self.folder_debounce
-            .retain(|path, _| !path_uses_mounts(path, mounts));
+            .retain(|path, _| !doomed.contains(path));
     }
 
     /// The watcher thread died: drop the hub and every hold, so tabs go back
@@ -1988,6 +2024,23 @@ impl Explorer {
     /// and the active tab keeps the keyboard. The new tab starts with the
     /// presentation (view and sort) of the tab it was opened from.
     pub(crate) fn open_tab(
+        &mut self,
+        location: Location,
+        placement: Placement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A device that is being ejected is not opened in a new tab either.
+        let Location::Directory(path) = &location else {
+            return self.open_tab_checked(location, placement, window, cx);
+        };
+        let path = path.clone();
+        self.when_not_ejecting(vec![path], window, cx, move |this, window, cx| {
+            this.open_tab_checked(location, placement, window, cx);
+        });
+    }
+
+    fn open_tab_checked(
         &mut self,
         location: Location,
         placement: Placement,

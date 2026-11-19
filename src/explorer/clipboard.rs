@@ -158,6 +158,23 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Nothing is read from or written to a device that is being ejected.
+        let mut touched = sources.clone();
+        touched.push(dest.clone());
+        self.when_not_ejecting(touched, window, cx, move |this, window, cx| {
+            this.run_paste(sources, dest, mode, generation, window, cx);
+        });
+    }
+
+    fn run_paste(
+        &mut self,
+        sources: Vec<std::path::PathBuf>,
+        dest: std::path::PathBuf,
+        mode: ClipMode,
+        generation: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match plan_paste(mode, &sources, &dest) {
             PastePlan::Nothing(notice) => {
                 self.push_toast(notice, &[], None, window, cx);

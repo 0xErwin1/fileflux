@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use fileflux::core::Location;
 use fileflux::core::devices::{
     BlockNode, Device, DeviceError, DevicePlan, DeviceState, devices, eject_plan, fallback_target,
-    find_tool, list_blocks, mount, path_uses_mounts, run_plan, unmount_plan,
+    find_tool, list_blocks, mount, path_is_on_mounts, path_uses_mounts, real_location,
+    run_power_off, run_unmount, unmount_plan,
 };
 use fileflux::core::places::{Volume, discover_volumes};
 use gpui::{ClipboardItem, Context, Window};
@@ -170,13 +171,50 @@ pub(crate) fn unlisted_volumes(volumes: &[Volume], devices: &[Device]) -> Vec<Vo
 }
 
 /// The ids of the running operations (id, paths they touch) that use one
-/// of `mounts`.
+/// of `mounts`, by real location: a destination reached through a symlink,
+/// or one that does not exist yet, counts. Reads the filesystem: call it off
+/// the UI thread.
 pub(crate) fn busy_ops(running: &[(u64, Vec<PathBuf>)], mounts: &[PathBuf]) -> Vec<u64> {
     running
         .iter()
-        .filter(|(_, paths)| paths.iter().any(|path| path_uses_mounts(path, mounts)))
+        .filter(|(_, paths)| paths.iter().any(|path| path_is_on_mounts(path, mounts)))
         .map(|(id, _)| *id)
         .collect()
+}
+
+/// Whether the plan may still unmount: `Err` with the reason when an
+/// operation that touches its mounts is running now. The plan checks this
+/// right before every unmount, because the operations it waited for are not
+/// the only ones that can exist by then.
+pub(crate) fn recheck(running: &[(u64, Vec<PathBuf>)], plan: &DevicePlan) -> Result<(), String> {
+    match busy_ops(running, &plan.mounts()).len() {
+        0 => Ok(()),
+        1 => Err("an operation started using it".to_owned()),
+        count => Err(format!("{count} operations started using it")),
+    }
+}
+
+/// The toast that refuses new work on a device being unmounted or ejected,
+/// when any of `paths` (real locations, or plain text for a first quick
+/// look) lies on one of the `draining` plans' mounts.
+pub(crate) fn refusal<'a>(
+    draining: impl IntoIterator<Item = &'a DevicePlan>,
+    paths: &[PathBuf],
+) -> Option<String> {
+    draining.into_iter().find_map(|plan| {
+        let mounts = plan.mounts();
+        paths
+            .iter()
+            .any(|path| path_uses_mounts(path, &mounts))
+            .then(|| {
+                let verb = if plan.power_off.is_some() {
+                    "ejected"
+                } else {
+                    "unmounted"
+                };
+                format!("{} is being {verb}", plan.label)
+            })
+    })
 }
 
 /// The tabs (id, shown folder, folder being opened) that have to leave
@@ -191,15 +229,86 @@ pub(crate) fn tabs_to_move(
             [opening, shown]
                 .into_iter()
                 .flatten()
-                .find(|path| path_uses_mounts(path, mounts))
+                .find(|path| path_is_on_mounts(path, mounts))
                 .map(|path| (*id, path.clone()))
         })
         .collect()
 }
 
+/// Where every tab that has to leave `mounts` goes: (tab, folder it leaves,
+/// folder it moves to). Reads the filesystem: call it off the UI thread.
+pub(crate) fn plan_tab_moves(
+    tabs: &[(TabId, Option<PathBuf>, Option<PathBuf>)],
+    mounts: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<(TabId, PathBuf, PathBuf)> {
+    tabs_to_move(tabs, mounts)
+        .into_iter()
+        .map(|(id, leaving)| {
+            let target = fallback_target(&leaving, mounts, home, Path::exists);
+            (id, leaving, target)
+        })
+        .collect()
+}
+
+/// What a tab shows while its device is being unmounted. The outcome is not
+/// known yet: [`moved_notice`] or [`failed_notice`] replace it.
+pub(crate) fn leaving_notice(label: &str) -> String {
+    format!("Unmounting {label}\u{2026}")
+}
+
 /// The notice a tab shows after it left an unmounted device.
 pub(crate) fn moved_notice(label: &str, target: &Path) -> String {
     format!("{label} was unmounted; showing {}", target.display())
+}
+
+/// The notice a tab that left the device keeps when the unmount failed. The
+/// tab stays where it went: moving it back would put an inotify watch on
+/// the device again, and the user already chose to leave it.
+pub(crate) fn failed_notice(label: &str, reason: &str) -> String {
+    format!("Could not unmount {label}; {reason}")
+}
+
+/// The toast a finished plan ends with. "Can be removed safely" only when
+/// every step ran, the power-off included.
+pub(crate) fn plan_notice(
+    plan: &DevicePlan,
+    result: &Result<(), DeviceError>,
+) -> (Severity, String) {
+    let eject = plan.power_off.is_some();
+    match result {
+        Ok(()) if eject => (
+            Severity::Success,
+            format!("{} can be removed safely", plan.label),
+        ),
+        Ok(()) => (Severity::Success, format!("Unmounted {}", plan.label)),
+        Err(error) => {
+            let verb = if eject { "eject" } else { "unmount" };
+            (
+                Severity::Error,
+                format!("Could not {verb} {}: {error}", plan.label),
+            )
+        }
+    }
+}
+
+/// The toast of "wait and eject" while operations still use the device;
+/// `None` when none does and the plan just starts.
+pub(crate) fn queued_notice(plan: &DevicePlan, count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let verb = if plan.power_off.is_some() {
+        "eject"
+    } else {
+        "unmount"
+    };
+    Some(format!(
+        "Will {verb} {} when {count} operation{} finish{}",
+        plan.label,
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "es" } else { "" },
+    ))
 }
 
 /// Whether the device list is re-read now: never while a read is running,
@@ -258,6 +367,10 @@ pub(crate) struct DeviceHub {
     pub(crate) working: HashMap<PathBuf, &'static str>,
     /// Unmounts and ejects waiting for running operations to end.
     pub(crate) pending: Vec<DevicePlan>,
+    /// Unmounts and ejects running now.
+    pub(crate) active: Vec<DevicePlan>,
+    /// Whether the queued plans are being checked against the operations.
+    pub(crate) checking: bool,
     pub(crate) last_poll: Option<Instant>,
     pub(crate) polling: bool,
 }
@@ -282,6 +395,17 @@ impl DeviceHub {
         } else {
             None
         }
+    }
+
+    /// Whether a device is going away: a plan is queued or running.
+    pub(crate) fn is_draining(&self) -> bool {
+        !self.pending.is_empty() || !self.active.is_empty()
+    }
+
+    /// The plans of devices that are going away, queued or running: no new
+    /// work may start on their mounts.
+    pub(crate) fn draining(&self) -> impl Iterator<Item = &DevicePlan> {
+        self.pending.iter().chain(&self.active)
     }
 
     /// The device with block node `path`.
@@ -538,83 +662,180 @@ impl Explorer {
     }
 
     /// The running operations (id, paths they touch).
-    fn running_touches(&self) -> Vec<(u64, Vec<PathBuf>)> {
+    pub(crate) fn running_touches(&self) -> Vec<(u64, Vec<PathBuf>)> {
         self.op_contexts
             .iter()
             .map(|(id, context)| (*id, context.touches.clone()))
             .collect()
     }
 
+    /// Runs `then`, unless `paths` are on a device that is being unmounted
+    /// or ejected: then it says so and does nothing. Nothing is checked
+    /// while no device is going away, so the usual case stays immediate.
+    ///
+    /// The paths are compared as written first, then by real location (a
+    /// symlink into the device counts), which reads the filesystem and so
+    /// runs off the UI thread. The answer is applied only after checking
+    /// again against the devices going away at that moment.
+    pub(crate) fn when_not_ejecting(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if !self.devices.is_draining() {
+            return then(self, window, cx);
+        }
+        if let Some(text) = refusal(self.devices.draining(), &paths) {
+            return self.say(Severity::Info, text, window, cx);
+        }
+        let real = cx.background_executor().spawn(async move {
+            paths
+                .iter()
+                .map(|path| real_location(path))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let real = real.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                match refusal(this.devices.draining(), &real) {
+                    Some(text) => this.say(Severity::Info, text, window, cx),
+                    None => then(this, window, cx),
+                }
+            }) {
+                log::debug!("the explorer closed before a device check ended: {error}");
+            }
+        })
+        .detach();
+    }
+
     /// Unmounting while an operation writes there can corrupt data: asks
-    /// first when any uses the device, else goes ahead.
+    /// first when any uses the device, else goes ahead. The check reads the
+    /// filesystem, so it runs off the UI thread.
     fn request_device_plan(
         &mut self,
         plan: DevicePlan,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let busy = busy_ops(&self.running_touches(), &plan.mounts());
-        if busy.is_empty() {
-            return self.run_device_plan(plan, window, cx);
-        }
-        let titles: Vec<String> = busy
-            .iter()
-            .filter_map(|id| self.progress.title(*id).map(str::to_owned))
-            .collect();
-        self.open_dialog(
-            DialogKind::DeviceBusy {
-                label: plan.label.clone(),
-                count: busy.len(),
-                eject: plan.power_off.is_some(),
-            },
-            &titles,
-            DialogAction::DeviceWhenIdle(plan),
-            window,
-            cx,
-        );
+        let running = self.running_touches();
+        let mounts = plan.mounts();
+        let busy = cx
+            .background_executor()
+            .spawn(async move { busy_ops(&running, &mounts) });
+        cx.spawn_in(window, async move |this, cx| {
+            let busy = busy.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                if busy.is_empty() {
+                    return this.run_device_plan(plan, window, cx);
+                }
+                let titles: Vec<String> = busy
+                    .iter()
+                    .filter_map(|id| this.progress.title(*id).map(str::to_owned))
+                    .collect();
+                this.open_dialog(
+                    DialogKind::DeviceBusy {
+                        label: plan.label.clone(),
+                        count: busy.len(),
+                        eject: plan.power_off.is_some(),
+                    },
+                    &titles,
+                    DialogAction::DeviceWhenIdle(plan),
+                    window,
+                    cx,
+                );
+            }) {
+                log::debug!("the explorer closed before a device check ended: {error}");
+            }
+        })
+        .detach();
     }
 
-    /// "Wait and eject": the plan starts once nothing uses the device.
+    /// "Wait and eject": from now on the device is draining, and the plan
+    /// starts once nothing uses it (at once when nothing does).
     pub(crate) fn queue_device_plan(
         &mut self,
         plan: DevicePlan,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let count = busy_ops(&self.running_touches(), &plan.mounts()).len();
-        let verb = if plan.power_off.is_some() {
-            "eject"
-        } else {
-            "unmount"
-        };
-        let text = format!(
-            "Will {verb} {} when {count} operation{} finish{}",
-            plan.label,
-            if count == 1 { "" } else { "s" },
-            if count == 1 { "es" } else { "" },
-        );
-        if queue_plan(&mut self.devices.pending, plan) {
-            self.say(Severity::Info, text, window, cx);
-        }
-    }
-
-    fn start_ready_plans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.devices.pending.is_empty() {
+        if !queue_plan(&mut self.devices.pending, plan.clone()) {
             return;
         }
         let running = self.running_touches();
-        let ready = take_ready(&mut self.devices.pending, |mounts| {
-            !busy_ops(&running, mounts).is_empty()
-        });
-        for plan in ready {
-            self.run_device_plan(plan, window, cx);
-        }
+        let mounts = plan.mounts();
+        let count = cx
+            .background_executor()
+            .spawn(async move { busy_ops(&running, &mounts).len() });
+        cx.spawn_in(window, async move |this, cx| {
+            let count = count.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                match queued_notice(&plan, count) {
+                    Some(text) => this.say(Severity::Info, text, window, cx),
+                    None => {
+                        // Idle already: start unless the tick got there first.
+                        let before = this.devices.pending.len();
+                        this.devices.pending.retain(|queued| queued != &plan);
+                        if this.devices.pending.len() < before {
+                            this.run_device_plan(plan, window, cx);
+                        }
+                    }
+                }
+            }) {
+                log::debug!("the explorer closed before a device check ended: {error}");
+            }
+        })
+        .detach();
     }
 
-    /// The tabs that show, or are opening, a folder under `mounts`.
-    fn tabs_on(&self, mounts: &[PathBuf]) -> Vec<(TabId, PathBuf)> {
-        let snapshot: Vec<_> = self
-            .tabs
+    /// Starts the queued plans whose operations have ended. The check reads
+    /// the filesystem, so it runs off the UI thread, one at a time.
+    fn start_ready_plans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.devices.pending.is_empty() || self.devices.checking {
+            return;
+        }
+        self.devices.checking = true;
+        let running = self.running_touches();
+        let waiting: Vec<Vec<PathBuf>> = self
+            .devices
+            .pending
+            .iter()
+            .map(DevicePlan::mounts)
+            .collect();
+        let idle = cx.background_executor().spawn(async move {
+            waiting
+                .into_iter()
+                .map(|mounts| {
+                    let free = busy_ops(&running, &mounts).is_empty();
+                    (mounts, free)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let idle = idle.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                this.devices.checking = false;
+                // A plan queued while the check ran was not looked at: it
+                // waits for the next one.
+                let ready = take_ready(&mut this.devices.pending, |mounts| {
+                    !idle
+                        .iter()
+                        .any(|(checked, free)| checked == mounts && *free)
+                });
+                for plan in ready {
+                    this.run_device_plan(plan, window, cx);
+                }
+            }) {
+                log::debug!("the explorer closed before a device check ended: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// The tabs as (id, shown folder, folder being opened).
+    fn tab_snapshot(&self) -> Vec<(TabId, Option<PathBuf>, Option<PathBuf>)> {
+        self.tabs
             .iter()
             .map(|tab| {
                 (
@@ -623,32 +844,14 @@ impl Explorer {
                     tab.state.pending_directory().map(Path::to_path_buf),
                 )
             })
-            .collect();
-        tabs_to_move(&snapshot, mounts)
+            .collect()
     }
 
-    /// Moves every tab off `mounts` to the nearest ancestor outside them,
-    /// with the usual notice.
-    fn move_tabs_off(
-        &mut self,
-        mounts: &[PathBuf],
-        label: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for (id, leaving) in self.tabs_on(mounts) {
-            let target = fallback_target(&leaving, mounts, self.home.as_deref(), Path::exists);
-            let notice = moved_notice(label, &target);
-            let scan = self
-                .tabs
-                .by_id_mut(id)
-                .and_then(|tab| tab.state.begin_fallback(target, notice));
-            self.start_scan_in(id, scan, window, cx);
-        }
-    }
-
-    /// Runs the plan: the tabs leave and their watches are released first,
-    /// then `udisksctl` runs off the UI thread.
+    /// Runs the plan. From the moment it starts the device is draining. The
+    /// tabs leave and their watches are released first; then, before every
+    /// unmount, the running operations are checked once more and the plan
+    /// stops if one uses the device. `udisksctl` and every read of the
+    /// filesystem run off the UI thread.
     fn run_device_plan(&mut self, plan: DevicePlan, window: &mut Window, cx: &mut Context<Self>) {
         let Some(udisksctl) = self.devices.udisksctl.clone() else {
             return;
@@ -670,34 +873,118 @@ impl Explorer {
             };
             self.devices.working.insert(key.clone(), word);
         }
-        let mounts = plan.mounts();
-        self.move_tabs_off(&mounts, &plan.label, window, cx);
+        self.devices.active.push(plan.clone());
+        let home = self.home.clone();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            // The fallback scans end within a moment; an inotify watch on the
-            // device would keep it busy, so wait for the tabs to be gone.
-            for _ in 0..TAB_WAIT_STEPS {
-                let clear = this
-                    .update_in(cx, |this, _window, _cx| this.tabs_on(&mounts).is_empty())
-                    .unwrap_or(true);
-                if clear {
-                    break;
+            let mounts = plan.mounts();
+            let mut moved: Vec<(TabId, PathBuf)> = Vec::new();
+            let mut unmounted = false;
+            let outcome: Option<Result<(), DeviceError>> = async {
+                // The tabs on the device leave it.
+                let tabs = this.update_in(cx, |this, _, _| this.tab_snapshot()).ok()?;
+                let leaving = cx
+                    .background_executor()
+                    .spawn({
+                        let mounts = mounts.clone();
+                        async move { plan_tab_moves(&tabs, &mounts, home.as_deref()) }
+                    })
+                    .await;
+                this.update_in(cx, |this, window, cx| {
+                    for (id, _, target) in &leaving {
+                        let scan = this.tabs.by_id_mut(*id).and_then(|tab| {
+                            tab.state
+                                .begin_fallback(target.clone(), leaving_notice(&plan.label))
+                        });
+                        this.start_scan_in(*id, scan, window, cx);
+                    }
+                })
+                .ok()?;
+                moved = leaving
+                    .into_iter()
+                    .map(|(id, _, target)| (id, target))
+                    .collect();
+                // The fallback scans end within a moment; wait for the tabs
+                // to be gone.
+                for _ in 0..TAB_WAIT_STEPS {
+                    let tabs = this.update_in(cx, |this, _, _| this.tab_snapshot()).ok()?;
+                    let still = cx
+                        .background_executor()
+                        .spawn({
+                            let mounts = mounts.clone();
+                            async move { !tabs_to_move(&tabs, &mounts).is_empty() }
+                        })
+                        .await;
+                    if !still {
+                        break;
+                    }
+                    cx.background_executor().timer(TAB_WAIT_STEP).await;
                 }
-                cx.background_executor().timer(TAB_WAIT_STEP).await;
+                // An inotify watch on the device would keep it busy.
+                let watched = this.update_in(cx, |this, _, _| this.watched_paths()).ok()?;
+                let doomed = cx
+                    .background_executor()
+                    .spawn({
+                        let mounts = mounts.clone();
+                        async move {
+                            watched
+                                .into_iter()
+                                .filter(|path| path_is_on_mounts(path, &mounts))
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .await;
+                this.update_in(cx, |this, _, _| this.release_watches(&doomed))
+                    .ok()?;
+                for step in &plan.unmount {
+                    // Anything that started since the plan was asked for.
+                    let running = this
+                        .update_in(cx, |this, _, _| this.running_touches())
+                        .ok()?;
+                    let checked = cx
+                        .background_executor()
+                        .spawn({
+                            let plan = plan.clone();
+                            async move { recheck(&running, &plan) }
+                        })
+                        .await;
+                    if let Err(reason) = checked {
+                        return Some(Err(DeviceError::Failed { reason }));
+                    }
+                    let step = step.clone();
+                    let program = udisksctl.clone();
+                    let done = cx
+                        .background_executor()
+                        .spawn(async move { run_unmount(&program, &step) })
+                        .await;
+                    if let Err(error) = done {
+                        return Some(Err(error));
+                    }
+                }
+                unmounted = true;
+                if let Some(disk) = plan.power_off.clone() {
+                    let program = udisksctl.clone();
+                    let done = cx
+                        .background_executor()
+                        .spawn(async move { run_power_off(&program, &disk) })
+                        .await;
+                    return Some(done);
+                }
+                Some(Ok(()))
             }
-            if this
-                .update_in(cx, |this, _window, _cx| this.release_watches_under(&mounts))
-                .is_err()
-            {
+            .await;
+            let Some(result) = outcome else {
                 return;
-            }
-            let to_run = plan.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { run_plan(&udisksctl, &to_run) })
-                .await;
+            };
             if let Err(error) = this.update_in(cx, |this, window, cx| {
-                this.finish_device_plan(&plan, key.as_deref(), result, window, cx);
+                this.finish_device_plan(
+                    &plan,
+                    key.as_deref(),
+                    result,
+                    (&moved, unmounted),
+                    window,
+                    cx,
+                );
             }) {
                 log::debug!("the explorer closed before a device action finished: {error}");
             }
@@ -710,32 +997,33 @@ impl Explorer {
         plan: &DevicePlan,
         key: Option<&Path>,
         result: Result<(), DeviceError>,
+        (moved, unmounted): (&[(TabId, PathBuf)], bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(key) = key {
             self.devices.working.remove(key);
         }
+        if let Some(at) = self.devices.active.iter().position(|active| active == plan) {
+            self.devices.active.remove(at);
+        }
         // Show the new state at once instead of at the next poll.
         self.devices.last_poll = None;
-        let eject = plan.power_off.is_some();
-        match result {
-            Ok(()) if eject => {
-                let text = format!("{} can be removed safely", plan.label);
-                self.say(Severity::Success, text, window, cx);
-            }
-            Ok(()) => self.say(
-                Severity::Success,
-                format!("Unmounted {}", plan.label),
-                window,
-                cx,
-            ),
-            Err(error) => {
-                let verb = if eject { "eject" } else { "unmount" };
-                let text = format!("Could not {verb} {}: {error}", plan.label);
-                self.say(Severity::Error, text, window, cx);
+        // The tabs that left say how it ended, unless the user went elsewhere.
+        for (id, target) in moved {
+            let text = match (&result, unmounted) {
+                (_, true) => moved_notice(&plan.label, target),
+                (Err(error), false) => failed_notice(&plan.label, &error.to_string()),
+                (Ok(()), false) => continue,
+            };
+            if let Some(tab) = self.tabs.by_id_mut(*id)
+                && tab.state.current() == &Location::Directory(target.clone())
+            {
+                tab.state.set_notice(text);
             }
         }
+        let (severity, text) = plan_notice(plan, &result);
+        self.say(severity, text, window, cx);
         cx.notify();
     }
 }
@@ -754,6 +1042,10 @@ mod tests {
     }
 
     fn device(state: DeviceState, ejectable: bool) -> Device {
+        let mounts = match &state {
+            DeviceState::Mounted(mount) => vec![mount.clone()],
+            _ => Vec::new(),
+        };
         Device {
             path: p("/dev/sdb1"),
             disk: p("/dev/sdb"),
@@ -761,6 +1053,7 @@ mod tests {
             fstype: Some("vfat".to_owned()),
             size: 15_000_000_000,
             state,
+            mounts,
             ejectable,
         }
     }
@@ -784,7 +1077,7 @@ mod tests {
             label: label.to_owned(),
             unmount: vec![UnmountStep {
                 device: p("/dev/sdb1"),
-                mount: p(mount),
+                mounts: vec![p(mount)],
             }],
             power_off: Some(p("/dev/sdb")),
         }
@@ -1089,6 +1382,37 @@ mod tests {
     // --- tabs -----------------------------------------------------------------
 
     #[test]
+    fn a_paste_through_a_symlink_into_the_device_is_busy() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = std::env::temp_dir().join(format!("ff-busy-link-{}", std::process::id()));
+        let mount = root.join("media/USB");
+        std::fs::create_dir_all(&mount)?;
+        let link = root.join("usblink");
+        std::os::unix::fs::symlink(&mount, &link)?;
+        let busy = busy_ops(
+            &[(7, vec![p("/home/u/src"), link.clone()])],
+            std::slice::from_ref(&mount),
+        );
+        let tabs = tabs_to_move(
+            &[(1, Some(link.clone()), None)],
+            std::slice::from_ref(&mount),
+        );
+        std::fs::remove_file(&link)?;
+        std::fs::remove_dir(&mount)?;
+        assert_eq!(
+            busy,
+            [7],
+            "a copy into a symlink to the mount writes on the device"
+        );
+        assert_eq!(
+            tabs.len(),
+            1,
+            "a tab shown through a symlink must leave the device"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tabs_on_the_device_move_including_one_still_opening_it() {
         let mounts = [p("/run/media/u/USB")];
         let tabs = vec![
@@ -1114,6 +1438,153 @@ mod tests {
             moved_notice("KINGSTON", Path::new("/run/media/u")),
             "KINGSTON was unmounted; showing /run/media/u"
         );
+    }
+
+    // --- draining: new work on a device that is going away ----------------------
+
+    #[test]
+    fn work_on_a_device_being_ejected_is_refused_by_name() {
+        let eject = plan("KINGSTON", "/run/media/u/USB");
+        let unmount = DevicePlan {
+            power_off: None,
+            ..plan("DATA", "/run/media/u/DATA")
+        };
+        let draining = [eject, unmount];
+        // Reading from it, writing into it, creating in it: all touched paths.
+        assert_eq!(
+            refusal(&draining, &[p("/home/u/a"), p("/run/media/u/USB/dir")]),
+            Some("KINGSTON is being ejected".to_owned())
+        );
+        assert_eq!(
+            refusal(&draining, &[p("/run/media/u/DATA")]),
+            Some("DATA is being unmounted".to_owned())
+        );
+        assert_eq!(
+            refusal(&draining, &[p("/run/media/u/USB2/x"), p("/home/u")]),
+            None
+        );
+        assert_eq!(refusal(&[], &[p("/run/media/u/USB/dir")]), None);
+        // Every mount point of the device counts, not only the first.
+        let two = DevicePlan {
+            unmount: vec![UnmountStep {
+                device: p("/dev/sdb1"),
+                mounts: vec![p("/run/media/u/A"), p("/mnt/bind")],
+            }],
+            ..plan("TWO", "/unused")
+        };
+        assert_eq!(
+            refusal(std::slice::from_ref(&two), &[p("/mnt/bind/x")]),
+            Some("TWO is being ejected".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_hub_drains_what_is_queued_and_what_is_running() {
+        let mut hub = DeviceHub::default();
+        assert!(!hub.is_draining());
+        hub.pending.push(plan("A", "/m/a"));
+        assert!(hub.is_draining());
+        hub.pending.clear();
+        hub.active.push(plan("B", "/m/b"));
+        assert!(hub.is_draining());
+        hub.pending.push(plan("A", "/m/a"));
+        let labels: Vec<&str> = hub.draining().map(|plan| plan.label.as_str()).collect();
+        assert_eq!(labels, ["A", "B"]);
+    }
+
+    #[test]
+    fn the_plan_stops_before_unmounting_when_an_operation_started_using_the_device() {
+        let eject = plan("KINGSTON", "/run/media/u/USB");
+        let none: Vec<(u64, Vec<PathBuf>)> = vec![(1, vec![p("/home/u/a")])];
+        assert_eq!(recheck(&none, &eject), Ok(()));
+        assert_eq!(recheck(&[], &eject), Ok(()));
+        let one = vec![(2, vec![p("/home/u/a"), p("/run/media/u/USB/x")])];
+        assert_eq!(
+            recheck(&one, &eject),
+            Err("an operation started using it".to_owned())
+        );
+        let two = vec![
+            (2, vec![p("/run/media/u/USB/x")]),
+            (3, vec![p("/run/media/u/USB")]),
+        ];
+        assert_eq!(
+            recheck(&two, &eject),
+            Err("2 operations started using it".to_owned())
+        );
+    }
+
+    #[test]
+    fn removed_safely_only_after_every_step_including_the_power_off() {
+        let eject = plan("KINGSTON", "/run/media/u/USB");
+        assert_eq!(
+            plan_notice(&eject, &Ok(())),
+            (
+                Severity::Success,
+                "KINGSTON can be removed safely".to_owned()
+            )
+        );
+        let failed = DeviceError::Failed {
+            reason: "target is busy".to_owned(),
+        };
+        let (severity, text) = plan_notice(&eject, &Err(failed.clone()));
+        assert_eq!(severity, Severity::Error);
+        assert_eq!(text, "Could not eject KINGSTON: target is busy");
+        assert!(!text.contains("safely"));
+        let unmount = DevicePlan {
+            power_off: None,
+            ..eject
+        };
+        assert_eq!(
+            plan_notice(&unmount, &Ok(())),
+            (Severity::Success, "Unmounted KINGSTON".to_owned())
+        );
+        assert_eq!(
+            plan_notice(&unmount, &Err(failed)).1,
+            "Could not unmount KINGSTON: target is busy"
+        );
+    }
+
+    #[test]
+    fn tabs_that_left_a_device_that_stayed_mounted_say_so() {
+        assert_eq!(
+            failed_notice("KINGSTON", "target is busy"),
+            "Could not unmount KINGSTON; target is busy"
+        );
+        assert!(!failed_notice("K", "x").contains("was unmounted"));
+        assert_eq!(leaving_notice("KINGSTON"), "Unmounting KINGSTON\u{2026}");
+    }
+
+    #[test]
+    fn wait_and_eject_never_promises_zero_operations() {
+        let eject = plan("KINGSTON", "/run/media/u/USB");
+        assert_eq!(queued_notice(&eject, 0), None);
+        assert_eq!(
+            queued_notice(&eject, 1),
+            Some("Will eject KINGSTON when 1 operation finishes".to_owned())
+        );
+        assert_eq!(
+            queued_notice(&eject, 3),
+            Some("Will eject KINGSTON when 3 operations finish".to_owned())
+        );
+    }
+
+    #[test]
+    fn tab_moves_name_where_each_tab_goes_past_a_symlink() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = std::env::temp_dir().join(format!("ff-tab-link-{}", std::process::id()));
+        let mount = root.join("media/USB");
+        std::fs::create_dir_all(mount.join("sub"))?;
+        let link = root.join("usblink");
+        std::os::unix::fs::symlink(&mount, &link)?;
+        let tabs = vec![
+            (1, Some(link.join("sub")), None),
+            (2, Some(root.clone()), None),
+        ];
+        let moves = plan_tab_moves(&tabs, std::slice::from_ref(&mount), None);
+        std::fs::remove_file(&link)?;
+        std::fs::remove_dir_all(&root)?;
+        assert_eq!(moves, [(1, root.join("usblink/sub"), root)]);
+        Ok(())
     }
 
     // --- polling and queue ----------------------------------------------------

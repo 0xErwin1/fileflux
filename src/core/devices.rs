@@ -17,6 +17,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 /// Why a device lookup or action failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceError {
@@ -89,7 +91,11 @@ pub struct Device {
     pub fstype: Option<String>,
     pub size: u64,
     pub state: DeviceState,
-    /// The disk is removable or hot-pluggable: it can be powered off.
+    /// Every mount point of the filesystem (a bind or subvolume mount adds
+    /// one); the first is the one in [`DeviceState::Mounted`].
+    pub mounts: Vec<PathBuf>,
+    /// The disk is removable or hot-pluggable, and holds nothing of the
+    /// running system: it can be powered off.
     pub ejectable: bool,
 }
 
@@ -119,11 +125,24 @@ impl Device {
     }
 }
 
-/// One unmount step of a [`DevicePlan`].
+/// One unmount step of a [`DevicePlan`]: `udisksctl` unmounts the device
+/// wherever it is mounted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnmountStep {
     pub device: PathBuf,
-    pub mount: PathBuf,
+    /// Every mount point the step takes away.
+    pub mounts: Vec<PathBuf>,
+}
+
+impl UnmountStep {
+    /// How deep the deepest of its mounts is.
+    fn depth(&self) -> usize {
+        self.mounts
+            .iter()
+            .map(|mount| mount.components().count())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// What an unmount or eject does, in order.
@@ -140,7 +159,10 @@ pub struct DevicePlan {
 impl DevicePlan {
     /// Every mount point the plan takes away.
     pub fn mounts(&self) -> Vec<PathBuf> {
-        self.unmount.iter().map(|step| step.mount.clone()).collect()
+        self.unmount
+            .iter()
+            .flat_map(|step| step.mounts.iter().cloned())
+            .collect()
     }
 }
 
@@ -150,264 +172,50 @@ fn under_media_root(path: &Path) -> bool {
 
 // --- lsblk parsing ----------------------------------------------------------
 
-/// The JSON values `lsblk` prints. Numbers keep their text: sizes are exact
-/// integers and some versions print them as strings anyway.
-#[derive(Clone, Debug, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Number(String),
-    Text(String),
-    Array(Vec<Json>),
-    Object(Vec<(String, Json)>),
+/// The text under `key`, unless it is missing, not text or empty.
+fn text(node: &Value, key: &str) -> Option<String> {
+    node.get(key)?
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
-impl Json {
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Json::Object(fields) => fields
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value),
-            _ => None,
-        }
-    }
-
-    fn text(&self, key: &str) -> Option<String> {
-        match self.get(key)? {
-            Json::Text(text) if !text.is_empty() => Some(text.clone()),
-            _ => None,
-        }
-    }
-
-    fn number(&self, key: &str) -> Option<u64> {
-        match self.get(key)? {
-            Json::Number(text) | Json::Text(text) => text.trim().parse().ok(),
-            _ => None,
-        }
-    }
-
-    fn flag(&self, key: &str) -> bool {
-        match self.get(key) {
-            Some(Json::Bool(value)) => *value,
-            Some(Json::Number(text) | Json::Text(text)) => matches!(text.trim(), "1" | "true"),
-            _ => false,
-        }
+/// The integer under `key`. Sizes are exact integers, and some `lsblk`
+/// versions print them as strings anyway.
+fn number(node: &Value, key: &str) -> Option<u64> {
+    match node.get(key)? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
     }
 }
 
-/// How deep the JSON may nest before it is refused.
-const MAX_DEPTH: usize = 64;
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl Reader<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.at).copied()
-    }
-
-    fn skip_space(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.at += 1;
-        }
-    }
-
-    fn eat(&mut self, byte: u8) -> bool {
-        if self.peek() == Some(byte) {
-            self.at += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn expect(&mut self, byte: u8) -> Result<(), String> {
-        if self.eat(byte) {
-            Ok(())
-        } else {
-            Err(format!(
-                "expected '{}' at byte {}",
-                char::from(byte),
-                self.at
-            ))
-        }
-    }
-
-    fn literal(&mut self, word: &str, value: Json) -> Result<Json, String> {
-        let end = self.at + word.len();
-        if self.bytes.get(self.at..end) == Some(word.as_bytes()) {
-            self.at = end;
-            Ok(value)
-        } else {
-            Err(format!("unexpected text at byte {}", self.at))
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_DEPTH {
-            return Err("nested too deeply".to_owned());
-        }
-        self.skip_space();
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(Json::Text),
-            Some(b't') => self.literal("true", Json::Bool(true)),
-            Some(b'f') => self.literal("false", Json::Bool(false)),
-            Some(b'n') => self.literal("null", Json::Null),
-            Some(byte) if byte == b'-' || byte.is_ascii_digit() => Ok(self.number()),
-            Some(_) => Err(format!("unexpected character at byte {}", self.at)),
-            None => Err("unexpected end of input".to_owned()),
-        }
-    }
-
-    fn number(&mut self) -> Json {
-        let start = self.at;
-        while self.peek().is_some_and(|byte| {
-            byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E')
-        }) {
-            self.at += 1;
-        }
-        let text = self.bytes.get(start..self.at).unwrap_or_default();
-        Json::Number(String::from_utf8_lossy(text).into_owned())
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, String> {
-        self.expect(b'[')?;
-        let mut items = Vec::new();
-        self.skip_space();
-        if self.eat(b']') {
-            return Ok(Json::Array(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_space();
-            if self.eat(b',') {
-                continue;
-            }
-            self.expect(b']')?;
-            return Ok(Json::Array(items));
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Json, String> {
-        self.expect(b'{')?;
-        let mut fields = Vec::new();
-        self.skip_space();
-        if self.eat(b'}') {
-            return Ok(Json::Object(fields));
-        }
-        loop {
-            self.skip_space();
-            let key = self.string()?;
-            self.skip_space();
-            self.expect(b':')?;
-            fields.push((key, self.value(depth + 1)?));
-            self.skip_space();
-            if self.eat(b',') {
-                continue;
-            }
-            self.expect(b'}')?;
-            return Ok(Json::Object(fields));
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let digits = self
-            .bytes
-            .get(self.at..self.at + 4)
-            .and_then(|digits| std::str::from_utf8(digits).ok())
-            .and_then(|digits| u32::from_str_radix(digits, 16).ok())
-            .ok_or_else(|| format!("bad \\u escape at byte {}", self.at))?;
-        self.at += 4;
-        Ok(digits)
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.expect(b'"')?;
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            let byte = self.peek().ok_or("unterminated string")?;
-            self.at += 1;
-            match byte {
-                b'"' => break,
-                b'\\' => {
-                    let escape = self.peek().ok_or("unterminated escape")?;
-                    self.at += 1;
-                    let ch = match escape {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'/' => '/',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'u' => {
-                            let first = self.hex4()?;
-                            let code = if (0xD800..0xDC00).contains(&first)
-                                && self.bytes.get(self.at..self.at + 2) == Some(b"\\u")
-                            {
-                                self.at += 2;
-                                let second = self.hex4()?;
-                                0x10000 + ((first - 0xD800) << 10) + second.wrapping_sub(0xDC00)
-                            } else {
-                                first
-                            };
-                            char::from_u32(code).unwrap_or('\u{fffd}')
-                        }
-                        other => return Err(format!("bad escape '\\{}'", char::from(other))),
-                    };
-                    let mut buffer = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
-                }
-                other => out.push(other),
-            }
-        }
-        String::from_utf8(out).map_err(|_| "the text is not UTF-8".to_owned())
+/// A boolean column: `true`/`false` on current util-linux, `"1"`/`"0"`
+/// strings on older versions.
+fn flag(node: &Value, key: &str) -> bool {
+    match node.get(key) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(number)) => number.as_u64() == Some(1),
+        Some(Value::String(text)) => matches!(text.trim(), "1" | "true"),
+        _ => false,
     }
 }
 
-fn parse_json(text: &str) -> Result<Json, String> {
-    let mut reader = Reader {
-        bytes: text.as_bytes(),
-        at: 0,
-    };
-    let value = reader.value(0)?;
-    reader.skip_space();
-    if reader.at != reader.bytes.len() {
-        return Err(format!(
-            "unexpected text after the value at byte {}",
-            reader.at
-        ));
-    }
-    Ok(value)
-}
-
-fn node_from(json: &Json) -> Result<BlockNode, DeviceError> {
-    if !matches!(json, Json::Object(_)) {
+fn node_from(json: &Value) -> Result<BlockNode, DeviceError> {
+    if !json.is_object() {
         return Err(DeviceError::Parse("a device is not an object".to_owned()));
     }
-    let name = json
-        .text("name")
-        .ok_or_else(|| DeviceError::Parse("a device has no name".to_owned()))?;
-    let path = json
-        .text("path")
-        .map_or_else(|| Path::new("/dev").join(&name), PathBuf::from);
+    let name =
+        text(json, "name").ok_or_else(|| DeviceError::Parse("a device has no name".to_owned()))?;
+    let path = text(json, "path").map_or_else(|| Path::new("/dev").join(&name), PathBuf::from);
     // `mountpoints` (an array, null for none) on current util-linux, the
     // single `mountpoint` string on older versions.
     let raw: Vec<String> = match (json.get("mountpoints"), json.get("mountpoint")) {
-        (Some(Json::Array(items)), _) => items
+        (Some(Value::Array(items)), _) => items
             .iter()
-            .filter_map(|item| match item {
-                Json::Text(text) => Some(text.clone()),
-                _ => None,
-            })
+            .filter_map(|item| item.as_str().map(str::to_owned))
             .collect(),
-        (_, Some(Json::Text(text))) => vec![text.clone()],
+        (_, Some(Value::String(mount))) => vec![mount.clone()],
         _ => Vec::new(),
     };
     let swap_active = raw.iter().any(|mount| mount == "[SWAP]");
@@ -417,31 +225,32 @@ fn node_from(json: &Json) -> Result<BlockNode, DeviceError> {
         .map(PathBuf::from)
         .collect();
     let children = match json.get("children") {
-        Some(Json::Array(items)) => items.iter().map(node_from).collect::<Result<_, _>>()?,
+        Some(Value::Array(items)) => items.iter().map(node_from).collect::<Result<_, _>>()?,
         _ => Vec::new(),
     };
     Ok(BlockNode {
         name,
         path,
-        label: json.text("label"),
-        fstype: json.text("fstype"),
-        size: json.number("size").unwrap_or(0),
+        label: text(json, "label"),
+        fstype: text(json, "fstype"),
+        size: number(json, "size").unwrap_or(0),
         mountpoints,
         swap_active,
-        removable: json.flag("rm"),
-        hotplug: json.flag("hotplug"),
-        kind: json.text("type").unwrap_or_default(),
-        parent: json.text("pkname"),
-        uuid: json.text("uuid"),
+        removable: flag(json, "rm"),
+        hotplug: flag(json, "hotplug"),
+        kind: text(json, "type").unwrap_or_default(),
+        parent: text(json, "pkname"),
+        uuid: text(json, "uuid"),
         children,
     })
 }
 
 /// Parses `lsblk -J` output into the device tree.
 pub fn parse_lsblk(json: &str) -> Result<Vec<BlockNode>, DeviceError> {
-    let root = parse_json(json).map_err(DeviceError::Parse)?;
+    let root: Value =
+        serde_json::from_str(json).map_err(|error| DeviceError::Parse(error.to_string()))?;
     match root.get("blockdevices") {
-        Some(Json::Array(items)) => items.iter().map(node_from).collect(),
+        Some(Value::Array(items)) => items.iter().map(node_from).collect(),
         _ => Err(DeviceError::Parse(
             "there is no \"blockdevices\" list".to_owned(),
         )),
@@ -450,8 +259,10 @@ pub fn parse_lsblk(json: &str) -> Result<Vec<BlockNode>, DeviceError> {
 
 // --- filtering and planning ---------------------------------------------------
 
-/// Mount points of the running system. A disk with any of them below it is
-/// the system's: nothing on it is offered, mounted or not.
+/// Mount points of the running system. A partition with any of them below
+/// it (or an active swap) is the system's: it is not offered, and its disk
+/// cannot be ejected. The other partitions of that disk (a dual-boot data
+/// or Windows partition) are listed and can be mounted.
 const SYSTEM_MOUNTS: [&str; 10] = [
     "/boot", "/efi", "/usr", "/var", "/nix", "/etc", "/home", "/opt", "/swap", "/root",
 ];
@@ -460,10 +271,12 @@ fn is_system_mount(path: &Path) -> bool {
     path == Path::new("/") || SYSTEM_MOUNTS.iter().any(|root| path.starts_with(root))
 }
 
+fn is_system_itself(node: &BlockNode) -> bool {
+    node.swap_active || node.mountpoints.iter().any(|mount| is_system_mount(mount))
+}
+
 fn holds_system(node: &BlockNode) -> bool {
-    node.swap_active
-        || node.mountpoints.iter().any(|mount| is_system_mount(mount))
-        || node.children.iter().any(holds_system)
+    is_system_itself(node) || node.children.iter().any(holds_system)
 }
 
 /// Loop, RAM, zram and optical devices are not storage to manage here.
@@ -503,6 +316,13 @@ fn size_label(size: u64) -> String {
 }
 
 fn collect_devices(node: &BlockNode, disk: &BlockNode, out: &mut Vec<Device>) {
+    // A partition that holds the running system, and the container (LUKS)
+    // above it, are not offered; its siblings still are. The disk itself is
+    // only a parent here: it is skipped when it is a system filesystem.
+    let is_disk = std::ptr::eq(node, disk);
+    if is_system_itself(node) || (!is_disk && holds_system(node)) {
+        return;
+    }
     if !node.children.is_empty() {
         // A container with something below it (partitions, an unlocked
         // volume) is not itself a filesystem.
@@ -540,18 +360,21 @@ fn collect_devices(node: &BlockNode, disk: &BlockNode, out: &mut Vec<Device>) {
         fstype: Some(fstype.to_owned()),
         size: node.size,
         state,
-        ejectable: is_ejectable_disk(disk) || node.removable || node.hotplug,
+        mounts: node.mountpoints.clone(),
+        ejectable: !holds_system(disk)
+            && (is_ejectable_disk(disk) || node.removable || node.hotplug),
     });
 }
 
-/// The mountable filesystems on non-system disks, in tree order: mounted
-/// and unmounted partitions, and encrypted containers as [`DeviceState::Locked`].
-/// Swap, RAID/LVM members, loop and zram devices, empty readers and every
-/// disk that holds a system mount are left out.
+/// The mountable filesystems, in tree order: mounted and unmounted
+/// partitions, and encrypted containers as [`DeviceState::Locked`]. Swap,
+/// RAID/LVM members, loop and zram devices, empty readers and the partitions
+/// that hold a system mount or swap are left out; the rest of a system disk
+/// stays listed, mountable but never ejectable.
 pub fn devices(nodes: &[BlockNode]) -> Vec<Device> {
     let mut out = Vec::new();
     for disk in nodes {
-        if is_virtual(disk) || holds_system(disk) {
+        if is_virtual(disk) {
             continue;
         }
         collect_devices(disk, disk, &mut out);
@@ -563,7 +386,7 @@ pub fn devices(nodes: &[BlockNode]) -> Vec<Device> {
 pub fn device_for_mount<'a>(devices: &'a [Device], mount: &Path) -> Option<&'a Device> {
     devices
         .iter()
-        .find(|device| device.mount_point() == Some(mount))
+        .find(|device| device.mounts.iter().any(|at| at == mount))
 }
 
 /// Unmounting just `device`; `None` when that is not the session's to do.
@@ -573,17 +396,21 @@ pub fn unmount_plan(device: &Device) -> Option<DevicePlan> {
         label: device.label.clone(),
         unmount: vec![UnmountStep {
             device: device.path.clone(),
-            mount: mount.to_path_buf(),
+            mounts: if device.mounts.is_empty() {
+                vec![mount.to_path_buf()]
+            } else {
+                device.mounts.clone()
+            },
         }],
         power_off: None,
     })
 }
 
 fn mounted_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
-    if let Some(mount) = node.mountpoints.first() {
+    if !node.mountpoints.is_empty() {
         out.push(UnmountStep {
             device: node.path.clone(),
-            mount: mount.clone(),
+            mounts: node.mountpoints.clone(),
         });
     }
     for child in &node.children {
@@ -593,16 +420,22 @@ fn mounted_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
 
 /// Unmounting every mounted filesystem of `disk`, deepest mount first, then
 /// powering it off. `None` for anything that is not a removable,
-/// non-system, non-virtual whole disk in `nodes`.
+/// non-system, non-virtual whole disk in `nodes` that holds at least one
+/// filesystem (an empty card reader has nothing to eject).
 pub fn eject_plan(nodes: &[BlockNode], disk: &Path, label: &str) -> Option<DevicePlan> {
     let node = nodes.iter().find(|node| node.path == disk)?;
     if is_virtual(node) || holds_system(node) || !is_ejectable_disk(node) {
         return None;
     }
+    let mut filesystems = Vec::new();
+    collect_devices(node, node, &mut filesystems);
+    if filesystems.is_empty() {
+        return None;
+    }
     let mut unmount = Vec::new();
     mounted_below(node, &mut unmount);
     // Stable: equally deep mounts keep their tree order.
-    unmount.sort_by_key(|step| std::cmp::Reverse(step.mount.components().count()));
+    unmount.sort_by_key(|step| std::cmp::Reverse(step.depth()));
     Some(DevicePlan {
         label: label.to_owned(),
         unmount,
@@ -610,13 +443,53 @@ pub fn eject_plan(nodes: &[BlockNode], disk: &Path, label: &str) -> Option<Devic
     })
 }
 
-/// Whether `path` lies on one of the `mounts`.
+/// Whether the text of `path` lies below one of the `mounts`. Symlinks are
+/// not looked through: [`path_is_on_mounts`] does that.
 pub fn path_uses_mounts(path: &Path, mounts: &[PathBuf]) -> bool {
     mounts.iter().any(|mount| path.starts_with(mount))
 }
 
+/// Where `path` really is: its nearest existing ancestor with symlinks and
+/// `..` resolved, followed by the part that does not exist yet (a paste
+/// destination, a folder about to be created). Reads the filesystem, so it
+/// may block on a hung device: call it off the UI thread.
+pub fn real_location(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        let Ok(mut real) = std::fs::canonicalize(ancestor) else {
+            continue;
+        };
+        let rest = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+        for part in rest.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    real.pop();
+                }
+                std::path::Component::Normal(name) => real.push(name),
+                _ => {}
+            }
+        }
+        return real;
+    }
+    path.to_path_buf()
+}
+
+/// Whether `path` is on one of the `mounts` by real location: through
+/// symlinks, `..` and a destination that does not exist yet, not only by its
+/// text. Reads the filesystem: call it off the UI thread.
+pub fn path_is_on_mounts(path: &Path, mounts: &[PathBuf]) -> bool {
+    if path_uses_mounts(path, mounts) {
+        return true;
+    }
+    let real = real_location(path);
+    mounts
+        .iter()
+        .any(|mount| real.starts_with(real_location(mount)))
+}
+
 /// The folder a tab on `location` moves to before `mounts` go away: the
-/// nearest existing ancestor outside every mount, else `home`, else `/`.
+/// nearest existing ancestor outside every mount (by real location, so an
+/// ancestor that is a symlink into the device is skipped), else `home`, else
+/// `/`. Reads the filesystem: call it off the UI thread.
 pub fn fallback_target(
     location: &Path,
     mounts: &[PathBuf],
@@ -625,7 +498,7 @@ pub fn fallback_target(
 ) -> PathBuf {
     location
         .ancestors()
-        .find(|ancestor| !path_uses_mounts(ancestor, mounts) && exists(ancestor))
+        .find(|ancestor| !path_is_on_mounts(ancestor, mounts) && exists(ancestor))
         .map(Path::to_path_buf)
         .or_else(|| home.map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -633,26 +506,29 @@ pub fn fallback_target(
 
 // --- udisksctl ----------------------------------------------------------------
 
+/// `<verb> --block-device=<path> --no-user-interaction`: the path is glued
+/// to the option, so a name that starts with a dash is never read as one.
 fn udisks_args(verb: &str, device: &Path) -> Vec<OsString> {
+    let mut block_device = OsString::from("--block-device=");
+    block_device.push(device);
     vec![
         OsString::from(verb),
-        OsString::from("-b"),
-        device.as_os_str().to_owned(),
+        block_device,
         OsString::from("--no-user-interaction"),
     ]
 }
 
-/// `udisksctl mount -b <device> --no-user-interaction`.
+/// `udisksctl mount --block-device=<device> --no-user-interaction`.
 pub fn mount_args(device: &Path) -> Vec<OsString> {
     udisks_args("mount", device)
 }
 
-/// `udisksctl unmount -b <device> --no-user-interaction`.
+/// `udisksctl unmount --block-device=<device> --no-user-interaction`.
 pub fn unmount_args(device: &Path) -> Vec<OsString> {
     udisks_args("unmount", device)
 }
 
-/// `udisksctl power-off -b <disk> --no-user-interaction`.
+/// `udisksctl power-off --block-device=<disk> --no-user-interaction`.
 pub fn power_off_args(disk: &Path) -> Vec<OsString> {
     udisks_args("power-off", disk)
 }
@@ -864,26 +740,39 @@ pub fn mount(udisksctl: &Path, device: &Path) -> Result<PathBuf, DeviceError> {
     }
 }
 
-/// Runs `plan`: its unmounts in order, then the power-off. A device that is
-/// already unmounted counts as done. The first failure stops the plan.
+/// Unmounts one device. A device that is already unmounted counts as done.
+pub fn run_unmount(udisksctl: &Path, step: &UnmountStep) -> Result<(), DeviceError> {
+    let output = run_tool(udisksctl, &unmount_args(&step.device), UDISKS_TIMEOUT)?;
+    let already = output.stderr.contains("NotMounted") || output.stderr.contains("is not mounted");
+    if output.success || already {
+        Ok(())
+    } else {
+        Err(DeviceError::Failed {
+            reason: failure_reason(&output.stderr),
+        })
+    }
+}
+
+/// Powers `disk` off.
+pub fn run_power_off(udisksctl: &Path, disk: &Path) -> Result<(), DeviceError> {
+    let output = run_tool(udisksctl, &power_off_args(disk), UDISKS_TIMEOUT)?;
+    if output.success {
+        Ok(())
+    } else {
+        Err(DeviceError::Failed {
+            reason: failure_reason(&output.stderr),
+        })
+    }
+}
+
+/// Runs `plan`: its unmounts in order, then the power-off. The first
+/// failure stops the plan.
 pub fn run_plan(udisksctl: &Path, plan: &DevicePlan) -> Result<(), DeviceError> {
     for step in &plan.unmount {
-        let output = run_tool(udisksctl, &unmount_args(&step.device), UDISKS_TIMEOUT)?;
-        let already =
-            output.stderr.contains("NotMounted") || output.stderr.contains("is not mounted");
-        if !output.success && !already {
-            return Err(DeviceError::Failed {
-                reason: failure_reason(&output.stderr),
-            });
-        }
+        run_unmount(udisksctl, step)?;
     }
     if let Some(disk) = &plan.power_off {
-        let output = run_tool(udisksctl, &power_off_args(disk), UDISKS_TIMEOUT)?;
-        if !output.success {
-            return Err(DeviceError::Failed {
-                reason: failure_reason(&output.stderr),
-            });
-        }
+        run_power_off(udisksctl, disk)?;
     }
     Ok(())
 }
@@ -1020,6 +909,12 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn two_high_surrogates_never_panic() {
+        let json = r#"{"blockdevices":[{"name":"sdb1","label":"\ud83d\ud83d","type":"part"}]}"#;
+        assert!(std::panic::catch_unwind(|| parse_lsblk(json)).is_ok());
+    }
+
     // --- filtering ----------------------------------------------------------
 
     #[test]
@@ -1049,12 +944,37 @@ mod tests {
     }
 
     #[test]
-    fn system_disks_swap_loop_zram_and_empty_readers_are_left_out() {
+    fn system_partitions_swap_loop_zram_and_empty_readers_are_left_out() {
         let found = devices(&parsed());
+        // The system partitions of nvme0n1 (/boot, the unlocked root and its
+        // LUKS parent) are hidden; its recovery partition is not.
         assert_eq!(
             paths(&found),
-            ["/dev/sdb1", "/dev/sdb2", "/dev/sdc1", "/dev/sdd2"]
+            [
+                "/dev/sdb1",
+                "/dev/sdb2",
+                "/dev/sdc1",
+                "/dev/sdd2",
+                "/dev/nvme0n1p3"
+            ]
         );
+    }
+
+    #[test]
+    fn dual_boot_partitions_of_the_system_disk_mount_but_never_eject() {
+        let found = devices(&parsed());
+        let windows = find(&found, "/dev/nvme0n1p3");
+        assert!(windows.is_some_and(|d| d.can_mount() && !d.can_eject()));
+        assert_eq!(
+            eject_plan(&parsed(), Path::new("/dev/nvme0n1"), "x"),
+            None,
+            "the system disk is never powered off"
+        );
+    }
+
+    #[test]
+    fn an_empty_card_reader_has_nothing_to_eject() {
+        assert_eq!(eject_plan(&parsed(), Path::new("/dev/sda"), "Reader"), None);
     }
 
     #[test]
@@ -1093,17 +1013,48 @@ mod tests {
     }
 
     #[test]
-    fn a_system_mount_on_an_external_disk_hides_the_whole_disk() {
+    fn a_system_mount_on_an_external_disk_hides_only_that_partition_and_pins_the_disk() {
         let mut nodes = parsed();
         if let Some(part) = nodes.get_mut(1).and_then(|disk| disk.children.get_mut(0)) {
             part.mountpoints = vec![PathBuf::from("/home")];
         }
         let found = devices(&nodes);
-        assert!(
-            paths(&found)
-                .iter()
-                .all(|path| !path.starts_with("/dev/sdb"))
+        assert_eq!(find(&found, "/dev/sdb1"), None);
+        let other = find(&found, "/dev/sdb2");
+        assert!(other.is_some_and(|d| d.can_mount() && !d.can_eject()));
+        assert_eq!(eject_plan(&nodes, Path::new("/dev/sdb"), "x"), None);
+    }
+
+    #[test]
+    fn every_mount_point_of_a_device_is_known() {
+        let mut nodes = parsed();
+        if let Some(part) = nodes.get_mut(1).and_then(|disk| disk.children.get_mut(0)) {
+            part.mountpoints = vec![
+                PathBuf::from("/run/media/iperez/KINGSTON"),
+                PathBuf::from("/mnt/bind"),
+            ];
+        }
+        let found = devices(&nodes);
+        let device = find(&found, "/dev/sdb1");
+        assert_eq!(
+            device.map(|d| d.mounts.clone()),
+            Some(vec![
+                PathBuf::from("/run/media/iperez/KINGSTON"),
+                PathBuf::from("/mnt/bind")
+            ])
         );
+        let plan = device.and_then(unmount_plan);
+        assert_eq!(
+            plan.map(|p| p.mounts()),
+            Some(vec![
+                PathBuf::from("/run/media/iperez/KINGSTON"),
+                PathBuf::from("/mnt/bind")
+            ])
+        );
+        let eject = eject_plan(&nodes, Path::new("/dev/sdb"), "K");
+        assert_eq!(eject.map(|p| p.mounts().len()), Some(2));
+        let at = device_for_mount(&found, Path::new("/mnt/bind"));
+        assert_eq!(at.map(|d| d.path.clone()), Some(PathBuf::from("/dev/sdb1")));
     }
 
     #[test]
@@ -1145,7 +1096,7 @@ mod tests {
                 label: "KINGSTON".to_owned(),
                 unmount: vec![UnmountStep {
                     device: PathBuf::from("/dev/sdb1"),
-                    mount: PathBuf::from("/run/media/iperez/KINGSTON"),
+                    mounts: vec![PathBuf::from("/run/media/iperez/KINGSTON")],
                 }],
                 power_off: None,
             })
@@ -1173,11 +1124,11 @@ mod tests {
                 unmount: vec![
                     UnmountStep {
                         device: PathBuf::from("/dev/sdb1"),
-                        mount: PathBuf::from("/run/media/iperez/KINGSTON"),
+                        mounts: vec![PathBuf::from("/run/media/iperez/KINGSTON")],
                     },
                     UnmountStep {
                         device: PathBuf::from("/dev/sdb2"),
-                        mount: PathBuf::from("/run/media/iperez/second"),
+                        mounts: vec![PathBuf::from("/run/media/iperez/second")],
                     },
                 ],
                 power_off: Some(PathBuf::from("/dev/sdb")),
@@ -1243,6 +1194,48 @@ mod tests {
     }
 
     #[test]
+    fn a_path_is_on_a_mount_through_symlinks_and_not_yet_existing_parts() -> TestResult {
+        let fixture = Fixture::new()?;
+        let mount = fixture.0.join("media/USB");
+        fs::create_dir_all(&mount)?;
+        let link = fixture.0.join("usblink");
+        std::os::unix::fs::symlink(&mount, &link)?;
+        let mounts = [mount.clone()];
+        assert!(path_is_on_mounts(&link, &mounts));
+        assert!(path_is_on_mounts(&link.join("new/dir"), &mounts));
+        assert!(path_is_on_mounts(&mount.join("x/../y"), &mounts));
+        assert!(path_is_on_mounts(
+            &fixture.0.join("media/other/../USB/a"),
+            &mounts
+        ));
+        assert!(!path_is_on_mounts(&fixture.0.join("media"), &mounts));
+        assert!(!path_is_on_mounts(&fixture.0.join("media/USB2/a"), &mounts));
+        assert!(!path_is_on_mounts(Path::new("/home/u/src"), &mounts));
+        assert_eq!(
+            real_location(&link.join("new")),
+            real_location(&mount).join("new")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tab_behind_a_symlink_falls_back_past_it() -> TestResult {
+        let fixture = Fixture::new()?;
+        let mount = fixture.0.join("media/USB");
+        fs::create_dir_all(mount.join("sub"))?;
+        let link = fixture.0.join("usblink");
+        std::os::unix::fs::symlink(&mount, &link)?;
+        let target = fallback_target(
+            &link.join("sub"),
+            std::slice::from_ref(&mount),
+            Some(Path::new("/home/u")),
+            Path::exists,
+        );
+        assert_eq!(target, fixture.0);
+        Ok(())
+    }
+
+    #[test]
     fn a_tab_moves_to_the_nearest_existing_ancestor_outside_the_mount() {
         let mounts = [PathBuf::from("/run/media/u/USB")];
         let all = |_: &Path| true;
@@ -1304,8 +1297,7 @@ mod tests {
             mount_args(Path::new("/dev/sdb2")),
             [
                 os("mount"),
-                os("-b"),
-                os("/dev/sdb2"),
+                os("--block-device=/dev/sdb2"),
                 os("--no-user-interaction")
             ]
         );
@@ -1313,8 +1305,7 @@ mod tests {
             unmount_args(Path::new("/dev/sdb2")),
             [
                 os("unmount"),
-                os("-b"),
-                os("/dev/sdb2"),
+                os("--block-device=/dev/sdb2"),
                 os("--no-user-interaction")
             ]
         );
@@ -1322,14 +1313,21 @@ mod tests {
             power_off_args(Path::new("/dev/sdb")),
             [
                 os("power-off"),
-                os("-b"),
-                os("/dev/sdb"),
+                os("--block-device=/dev/sdb"),
                 os("--no-user-interaction")
             ]
         );
-        // A hostile device name stays one argument.
+        // A hostile device name stays one argument, glued to the option so
+        // a leading dash is never an option of its own.
         let evil = Path::new("/dev/sdb; rm -rf ~");
-        assert_eq!(mount_args(evil).get(2), Some(&os("/dev/sdb; rm -rf ~")));
+        assert_eq!(
+            mount_args(evil).get(1),
+            Some(&os("--block-device=/dev/sdb; rm -rf ~"))
+        );
+        assert_eq!(
+            unmount_args(Path::new("--help")).get(1),
+            Some(&os("--block-device=--help"))
+        );
     }
 
     #[test]
@@ -1557,7 +1555,7 @@ mod tests {
         assert_eq!(mount(&ctl, Path::new("/dev/sdb2"))?, target);
         assert_eq!(
             fs::read_to_string(&log)?,
-            "mount -b /dev/sdb2 --no-user-interaction\n"
+            "mount --block-device=/dev/sdb2 --no-user-interaction\n"
         );
         Ok(())
     }
@@ -1597,11 +1595,11 @@ mod tests {
             unmount: vec![
                 UnmountStep {
                     device: PathBuf::from("/dev/sdb1"),
-                    mount: PathBuf::from("/run/media/u/A"),
+                    mounts: vec![PathBuf::from("/run/media/u/A")],
                 },
                 UnmountStep {
                     device: PathBuf::from("/dev/sdb2"),
-                    mount: PathBuf::from("/run/media/u/B"),
+                    mounts: vec![PathBuf::from("/run/media/u/B")],
                 },
             ],
             power_off: Some(PathBuf::from("/dev/sdb")),
@@ -1616,7 +1614,7 @@ mod tests {
         run_plan(&ctl, &plan())?;
         assert_eq!(
             fs::read_to_string(&log)?,
-            "unmount -b /dev/sdb1 --no-user-interaction\nunmount -b /dev/sdb2 --no-user-interaction\npower-off -b /dev/sdb --no-user-interaction\n"
+            "unmount --block-device=/dev/sdb1 --no-user-interaction\nunmount --block-device=/dev/sdb2 --no-user-interaction\npower-off --block-device=/dev/sdb --no-user-interaction\n"
         );
         Ok(())
     }
@@ -1640,7 +1638,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&log)?,
-            "unmount -b /dev/sdb1 --no-user-interaction\n",
+            "unmount --block-device=/dev/sdb1 --no-user-interaction\n",
             "nothing after the failure runs"
         );
         Ok(())

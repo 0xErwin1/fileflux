@@ -186,15 +186,19 @@ impl Explorer {
         let ctx = self.job_ctx();
         let affected = Affected::of_job(&job);
         let touches = job_paths(&job, &ctx.trash_root);
-        self.start_work(
-            title,
-            Unit::Items,
-            cancellable,
-            (affected, touches),
-            move |sink| super::ops::run_job(job, &ctx, &sink),
-            window,
-            cx,
-        );
+        let title = title.into();
+        // Nothing starts on a device that is being ejected.
+        self.when_not_ejecting(touches.clone(), window, cx, move |this, window, cx| {
+            this.start_work(
+                title,
+                Unit::Items,
+                cancellable,
+                (affected, touches),
+                move |sink| super::ops::run_job(job, &ctx, &sink),
+                window,
+                cx,
+            );
+        });
     }
 
     /// Runs `work` on the background executor with the progress sink of a

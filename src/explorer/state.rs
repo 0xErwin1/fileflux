@@ -331,6 +331,20 @@ impl ExplorerState {
         self.begin_scan(transition, false, None)
     }
 
+    /// The location `transition` would navigate to, without navigating:
+    /// `None` when it would go nowhere (no history to step through, no
+    /// parent).
+    pub(crate) fn target_of(&self, transition: &Transition) -> Option<Location> {
+        let mut candidate = self.nav.clone();
+        let moved = match transition {
+            Transition::Visit(location) => return Some(location.clone()),
+            Transition::Back => candidate.back(),
+            Transition::Forward => candidate.forward(),
+            Transition::Up => candidate.up(),
+        };
+        moved.then(|| candidate.current().clone())
+    }
+
     /// A background re-read of the shown folder after the watcher saw a
     /// change. `None` while another scan is pending (it must not be
     /// cancelled) and for the Trash, which is not watched.
@@ -2172,6 +2186,23 @@ mod tests {
         assert_eq!(state.current(), &dir("/fixture"));
         assert_eq!(state.notice(), Some("gone"), "the commit keeps the message");
         assert!(state.selection().is_empty(), "a folder change clears it");
+        Ok(())
+    }
+
+    #[test]
+    fn the_target_of_a_transition_is_known_without_navigating() -> TestResult {
+        let mut state = state();
+        assert_eq!(
+            state.target_of(&Transition::Visit(dir("/elsewhere"))),
+            Some(dir("/elsewhere"))
+        );
+        assert_eq!(state.target_of(&Transition::Back), None);
+        let scan = visit_scan(&mut state, "/fixture/a")?;
+        assert!(state.commit(scan, listing(&[])));
+        assert_eq!(state.target_of(&Transition::Back), Some(dir("/fixture")));
+        assert_eq!(state.target_of(&Transition::Up), Some(dir("/fixture")));
+        assert_eq!(state.target_of(&Transition::Forward), None);
+        assert_eq!(state.current(), &dir("/fixture/a"), "nothing navigated");
         Ok(())
     }
 
