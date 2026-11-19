@@ -18,6 +18,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, Size};
 
+use super::dnd;
 use super::entries::{TILE_GAP, TILE_HEIGHT, TILE_WIDTH};
 use super::panes::Side;
 use super::state::SelectionSnapshot;
@@ -238,6 +239,16 @@ impl Viewport {
     }
 }
 
+/// The entry a left press landed on, kept until the button goes up so a
+/// release before the drag threshold can act as the click it was.
+#[derive(Clone, Debug)]
+pub(crate) struct EntryPress {
+    path: PathBuf,
+    was_selected: bool,
+    click_count: usize,
+    modifiers: gpui::Modifiers,
+}
+
 impl Explorer {
     /// The focused pane's rows: their window rectangle, scroll offset and
     /// layout, once the entries area has been drawn.
@@ -296,7 +307,20 @@ impl Explorer {
             return;
         }
         let (x, y) = viewport.to_content(pointer);
-        if entry_at(layout, self.tab().state.visible_shared().len(), x, y).is_some() {
+        let visible = self.tab().state.visible_shared();
+        if let Some(index) = entry_at(layout, visible.len(), x, y) {
+            // An entry: its own click and drag run; remember the press so a
+            // drag that never left the threshold can still act as a click.
+            self.entry_press = visible
+                .get(index)
+                .and_then(|&entry| self.tab().snapshot.get(entry))
+                .map(|entry| EntryPress {
+                    path: entry.path.clone(),
+                    was_selected: self.tab().state.selection().contains(&entry.path),
+                    click_count: event.click_count,
+                    modifiers: event.modifiers,
+                });
+            dnd::press_gate(event.position, cx);
             return;
         }
         self.entries_focus().focus(window, cx);
@@ -310,6 +334,23 @@ impl Explorer {
             active: false,
             _scroll: None,
         });
+    }
+
+    /// An entry drag left the drag threshold: an unselected entry is
+    /// selected alone now, as its click would have.
+    fn entry_drag_armed(&mut self, cx: &mut Context<Self>) {
+        let Some(press) = self
+            .entry_press
+            .as_mut()
+            .filter(|press| !press.was_selected)
+        else {
+            return;
+        };
+        // Selected from now on, so the next move does nothing.
+        press.was_selected = true;
+        let path = press.path.clone();
+        self.tab_mut().state.select_only(&path);
+        cx.notify();
     }
 
     /// The pointer moved anywhere in the window (see the measuring canvas).
@@ -478,18 +519,43 @@ impl Band {
 pub(crate) fn listen(weak: &gpui::WeakEntity<Explorer>, side: Side, window: &mut Window) {
     let moves = weak.clone();
     window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-        if phase == gpui::DispatchPhase::Capture
-            && let Err(error) = moves.update(cx, |this, cx| this.rubber_move(side, event, cx))
+        if phase != gpui::DispatchPhase::Capture {
+            return;
+        }
+        if cx.has_active_drag()
+            && dnd::observe_gate(event.position, cx).is_armed()
+            && let Err(error) = moves.update(cx, |this, cx| this.entry_drag_armed(cx))
         {
+            log::debug!("the entries area outlived its explorer: {error}");
+        }
+        if let Err(error) = moves.update(cx, |this, cx| this.rubber_move(side, event, cx)) {
             log::debug!("the entries area outlived its explorer: {error}");
         }
     });
     let ups = weak.clone();
-    window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-        if phase == gpui::DispatchPhase::Capture
-            && event.button == MouseButton::Left
-            && let Err(error) = ups.update(cx, |this, cx| this.rubber_release(side, cx))
+    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+        if phase != gpui::DispatchPhase::Capture || event.button != MouseButton::Left {
+            return;
+        }
+        let gate = dnd::finish_gate(event.position, cx);
+        let press = ups
+            .update(cx, |this, _| this.entry_press.take())
+            .ok()
+            .flatten();
+        if dnd::release_is_plain_click(gate, cx.has_active_drag())
+            && let Some(press) = press
         {
+            // Released before the drag threshold: the click it was.
+            super::entries::handle_entry_click(
+                &ups,
+                press.path,
+                press.click_count,
+                press.modifiers,
+                window,
+                cx,
+            );
+        }
+        if let Err(error) = ups.update(cx, |this, cx| this.rubber_release(side, cx)) {
             log::debug!("the entries area outlived its explorer: {error}");
         }
     });

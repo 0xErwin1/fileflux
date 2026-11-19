@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Dragging entries now needs the pointer to move 8 px from the press (the desktop's drag threshold, GPUI's own is 2 px). Before that the drag is inert: no preview, no drop-target highlight, no drop and no selection change, and releasing there acts as the click it was, so a slight slip while clicking can no longer move a file. The rubber band uses the same threshold to tell a drag from a click on empty space.
+
 ### Added
 
 - Rubber-band selection: drag on the empty space of the folder pane, in the grid or the list and in both panes, to select the entries a rectangle covers, live. Ctrl toggles and Shift adds against the selection from before the drag, the pane scrolls while the pointer rests near or beyond the top or bottom edge, Escape cancels and restores the earlier selection, and a plain click on empty space still clears the selection. Hit testing is layout arithmetic, so it stays fast on huge folders.

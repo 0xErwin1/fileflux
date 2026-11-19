@@ -26,6 +26,7 @@ use gpui_component::ActiveTheme as _;
 
 use super::icon;
 use super::ops::paste::ClipMode;
+use super::rubber::past_threshold;
 use super::view::Explorer;
 
 /// Where the dragged paths come from.
@@ -171,6 +172,86 @@ pub(crate) fn preview_text(paths: &[PathBuf]) -> String {
     }
 }
 
+/// Where a press on an entry stands on its way to becoming a drag. GPUI
+/// starts a drag after 2 px; Fileflux keeps it inert (no preview, no target
+/// highlight, no drop, no selection change) until the pointer has moved
+/// `rubber::DRAG_THRESHOLD` from the press, the desktop default.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum DragGate {
+    /// No entry press is being tracked.
+    #[default]
+    Idle,
+    /// An entry was pressed at this window position and the pointer has not
+    /// left the threshold yet.
+    Pressed((f32, f32)),
+    /// The pointer left the threshold: this is a real drag from now on.
+    Armed,
+}
+
+impl DragGate {
+    /// The gate after the pointer was seen at `pointer`: once armed it
+    /// stays armed, so moving back to the press never disarms a drag.
+    pub(crate) fn observe(self, pointer: (f32, f32)) -> Self {
+        match self {
+            DragGate::Pressed(press) if past_threshold(press, pointer) => DragGate::Armed,
+            other => other,
+        }
+    }
+
+    /// Whether the drag may show, highlight and drop. An untracked drag
+    /// (no press seen) is never held back.
+    pub(crate) fn is_armed(self) -> bool {
+        !matches!(self, DragGate::Pressed(_))
+    }
+}
+
+/// Whether releasing the button ends a drag that never left the threshold:
+/// that release is a plain click on the pressed entry.
+pub(crate) fn release_is_plain_click(gate: DragGate, drag_active: bool) -> bool {
+    drag_active && matches!(gate, DragGate::Pressed(_))
+}
+
+/// The window's one drag gate, shared by every drag source and target
+/// (they run inside GPUI callbacks that cannot reach the explorer).
+#[derive(Clone, Default)]
+struct GateCell(std::rc::Rc<std::cell::Cell<DragGate>>);
+
+impl gpui::Global for GateCell {}
+
+fn gate_cell(cx: &mut App) -> std::rc::Rc<std::cell::Cell<DragGate>> {
+    std::rc::Rc::clone(&cx.default_global::<GateCell>().0)
+}
+
+fn point_of(position: Point<Pixels>) -> (f32, f32) {
+    (f32::from(position.x), f32::from(position.y))
+}
+
+/// Starts tracking a press on an entry at `position`.
+pub(crate) fn press_gate(position: Point<Pixels>, cx: &mut App) {
+    gate_cell(cx).set(DragGate::Pressed(point_of(position)));
+}
+
+/// Stops tracking, returning the gate as of the pointer at `position`.
+pub(crate) fn finish_gate(position: Point<Pixels>, cx: &mut App) -> DragGate {
+    let cell = gate_cell(cx);
+    let gate = cell.get().observe(point_of(position));
+    cell.set(DragGate::Idle);
+    gate
+}
+
+/// Looks at the pointer at `position`, latching the gate when it armed.
+pub(crate) fn observe_gate(position: Point<Pixels>, cx: &mut App) -> DragGate {
+    let cell = gate_cell(cx);
+    let gate = cell.get().observe(point_of(position));
+    cell.set(gate);
+    gate
+}
+
+/// Whether an entry drag may show, highlight and drop right now.
+fn drag_armed(window: &Window, cx: &mut App) -> bool {
+    observe_gate(window.mouse_position(), cx).is_armed()
+}
+
 // --- gpui glue -----------------------------------------------------------------------------
 
 /// The payload of a drag that started on one of this window's entries.
@@ -193,7 +274,11 @@ pub(crate) struct DragPreview {
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Inert until the pointer left the drag threshold.
+        if !drag_armed(window, cx) {
+            return div();
+        }
         let colors = bolt::colors(cx);
         let tint = ChromeColors::tint(cx.theme());
         div()
@@ -224,8 +309,10 @@ impl Render for DragPreview {
 }
 
 /// Makes `element` start a drag of the selection when it is selected, else
-/// of the entry alone (which is then selected alone, like a click would).
-/// `selection` is the visible selection of this frame.
+/// of the entry alone. The drag stays inert until the pointer left the drag
+/// threshold (see [`DragGate`]); only then is an unselected entry selected
+/// alone, like a click would. `selection` is the visible selection of this
+/// frame.
 pub(crate) fn drag_source<E: StatefulInteractiveElement>(
     element: E,
     path: PathBuf,
@@ -240,21 +327,12 @@ pub(crate) fn drag_source<E: StatefulInteractiveElement>(
     } else {
         Arc::new(vec![path.clone()])
     };
-    let weak = weak.clone();
     let payload_explorer = weak.clone();
     let dragged_path = path.clone();
     element
         .on_drag(
             DraggedEntries { paths },
             move |dragged, grab, _window, cx| {
-                if !selected
-                    && let Err(error) = weak.update(cx, |this, cx| {
-                        this.tab_mut().state.select_only(&path);
-                        cx.notify();
-                    })
-                {
-                    log::debug!("the dragged row outlived its explorer: {error}");
-                }
                 let one = dragged.paths.len() == 1;
                 let preview = DragPreview {
                     text: preview_text(&dragged.paths),
@@ -357,15 +435,19 @@ where
     let wash = theme.list_active;
     let accepts = {
         let target = target.clone();
-        move |value: &dyn Any, _window: &mut Window, _cx: &mut App| {
+        move |value: &dyn Any, window: &mut Window, cx: &mut App| {
             dragged_paths(value).is_some_and(|(origin, paths)| {
-                check_drop(origin, paths, &target) == DropCheck::Accept
+                (origin == DragOrigin::External || drag_armed(window, cx))
+                    && check_drop(origin, paths, &target) == DropCheck::Accept
             })
         }
     };
     let on_internal = {
         let (weak, target) = (weak.clone(), target.clone());
         move |dragged: &DraggedEntries, window: &mut Window, cx: &mut App| {
+            if !drag_armed(window, cx) {
+                return;
+            }
             let paths = dragged.paths.to_vec();
             drop_on(
                 &weak,
@@ -393,8 +475,12 @@ where
     };
     element
         .can_drop(accepts)
-        .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.bg(wash).border_1().border_color(tint)
+        .drag_over::<DraggedEntries>(move |style, _, window, cx| {
+            if drag_armed(window, cx) {
+                style.bg(wash).border_1().border_color(tint)
+            } else {
+                style
+            }
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
             style.bg(wash).border_1().border_color(tint)
@@ -453,6 +539,44 @@ impl Explorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_press_stays_inert_until_the_pointer_leaves_the_threshold() {
+        let press = (200.0, 300.0);
+        let gate = DragGate::Pressed(press);
+        assert!(!gate.is_armed());
+        // GPUI itself would start the drag at 2 px; the gate does not.
+        assert!(!gate.observe((203.0, 300.0)).is_armed());
+        assert!(!gate.observe((207.0, 300.0)).is_armed());
+        assert_eq!(gate.observe((203.0, 300.0)), gate, "nothing latched yet");
+        assert_eq!(gate.observe((208.0, 300.0)), DragGate::Armed);
+        assert!(gate.observe((200.0, 308.0)).is_armed());
+    }
+
+    #[test]
+    fn an_armed_drag_stays_armed_when_the_pointer_comes_back() {
+        let armed = DragGate::Pressed((0.0, 0.0)).observe((50.0, 0.0));
+        assert_eq!(armed.observe((1.0, 0.0)), DragGate::Armed);
+    }
+
+    #[test]
+    fn a_drag_nobody_pressed_for_is_not_held_back() {
+        assert!(DragGate::Idle.is_armed());
+        assert_eq!(DragGate::Idle.observe((9.0, 9.0)), DragGate::Idle);
+        assert!(DragGate::Armed.is_armed());
+    }
+
+    #[test]
+    fn only_a_release_before_the_threshold_is_a_plain_click() {
+        let pressed = DragGate::Pressed((1.0, 1.0));
+        assert!(release_is_plain_click(pressed, true));
+        assert!(
+            !release_is_plain_click(pressed, false),
+            "no drag started: GPUI's own click handles it"
+        );
+        assert!(!release_is_plain_click(DragGate::Armed, true));
+        assert!(!release_is_plain_click(DragGate::Idle, true));
+    }
 
     fn p(path: &str) -> PathBuf {
         PathBuf::from(path)

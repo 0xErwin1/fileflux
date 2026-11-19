@@ -818,6 +818,8 @@ pub(crate) struct Explorer {
     pub(crate) devices: DeviceHub,
     /// The rubber-band press in flight, if any (see [`rubber`]).
     pub(crate) rubber_band: Option<rubber::Band>,
+    /// The entry the left button went down on, until it goes up.
+    pub(crate) entry_press: Option<rubber::EntryPress>,
 }
 
 impl Focusable for Explorer {
@@ -1024,6 +1026,7 @@ impl Explorer {
             _watch_pump: None,
             devices: DeviceHub::from_env(),
             rubber_band: None,
+            entry_press: None,
         };
         this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {

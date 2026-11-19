@@ -260,7 +260,7 @@ When an item already exists in the destination, a modal asks "“report.pdf” a
 
 ## Drag and drop
 
-Drag selected entries from the grid or the list (dragging an unselected entry selects it alone first). The preview shows the icon and name, or "N items". A drop is a paste with explicit sources, so it uses the same conflict dialog, progress card and undo as Ctrl+V.
+Drag selected entries from the grid or the list (dragging an unselected entry selects it alone first). A drag starts only once the pointer has moved 8 px from where you pressed, the desktop's usual threshold: before that there is no preview, no target lights up, nothing can be dropped and the selection does not change, and releasing there is just a click. A slip of the hand while clicking never moves a file. The preview shows the icon and name, or "N items". A drop is a paste with explicit sources, so it uses the same conflict dialog, progress card and undo as Ctrl+V.
 
 - **Targets:** a folder tile or row, a sidebar Places, Favorites or Devices row, a breadcrumb segment, and the empty space of the shown folder. A valid target gets a selection wash and a tint border; invalid targets (the dragged item itself, anything inside it, a file, the Trash view) show nothing and refuse the drop.
 - **Action:** by default a drop **moves on the same device and copies across devices**. Hold **Ctrl** to copy or **Shift** to move (Ctrl wins).
