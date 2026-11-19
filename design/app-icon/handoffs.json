@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "chosen": "01-chamfer-folder.html",
+  "handoffs": {
+    "01-chamfer-folder.html": {
+      "status": "implemented",
+      "queued": false,
+      "sentAt": "2026-11-19T12:27:24.181Z",
+      "startedAt": "2026-11-19T12:27:31.699Z",
+      "implementedAt": "2026-11-19T12:27:40.726Z",
+      "feature": "odd/tasks/app-icon.md",
+      "note": "Implemented in bd97bd1: assets/icon/fileflux.svg (full mark, paths identical to the artboard), fileflux-small.svg (16/32 px mark), PNGs 16-256, Icon=fileflux in the desktop entry, installed by the flake, nightly tarball and prebuilt package. Colors are system.md tokens: panel, line-2, tint, info."
+    }
+  }
+}
