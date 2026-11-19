@@ -1418,6 +1418,9 @@ pub(crate) struct ArrangeCache {
     /// Bumped by every job that begins; outputs compare against it.
     generation: u64,
     pending: Option<(u64, ArrangeInputs)>,
+    /// The order of the entries a listing had before more were appended
+    /// ([`Self::grow`]): shown while the job for the longer listing runs.
+    grown_from: Option<Arc<Vec<usize>>>,
 }
 
 impl ArrangeCache {
@@ -1427,6 +1430,21 @@ impl ArrangeCache {
     pub(crate) fn reset(&mut self, epoch: u64, index: Option<Arc<ArrangeIndex>>) {
         self.index = index.map(|index| (epoch, index));
         self.shown = None;
+        self.warm = Warm::default();
+        self.pending = None;
+        self.grown_from = None;
+    }
+
+    /// Entries were appended to the listing (streamed search results): the
+    /// index and the partial results are dropped, but the order of the
+    /// entries that were there stays on screen — their indices still name
+    /// the same entries — until the job for the longer listing lands, so a
+    /// growing list does not flash empty.
+    pub(crate) fn grow(&mut self) {
+        if let Some(shown) = self.shown.take() {
+            self.grown_from = Some(shown.indices);
+        }
+        self.index = None;
         self.warm = Warm::default();
         self.pending = None;
     }
@@ -1503,6 +1521,7 @@ impl ArrangeCache {
             return false;
         }
         self.shown = Some(output);
+        self.grown_from = None;
         true
     }
 
@@ -1519,6 +1538,7 @@ impl ArrangeCache {
                 .as_ref()
                 .filter(|shown| shown.inputs.epoch == inputs.epoch)
                 .map(|shown| Arc::clone(&shown.indices))
+                .or_else(|| self.grown_from.clone())
                 .unwrap_or_default();
         }
         let index = self.index_for(inputs.epoch, entries);

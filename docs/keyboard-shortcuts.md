@@ -13,6 +13,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Alt+1 … Alt+9 | Jump to tab 1–9 | Nothing happens when there is no such tab |
 | Ctrl+L | Edit the path | Enter navigates; Escape restores |
 | Ctrl+F | Search file names | Current folder only; Escape clears |
+| Ctrl+Shift+F | Search in subfolders | Turns on *Search in subfolders* and focuses the search field; see [Search in subfolders](user-guide.md#search-in-subfolders) |
 | Alt+← / Alt+→ | Back / Forward | |
 | Alt+↑ | Up one folder | |
 | Ctrl+R | Reload | |
@@ -34,7 +35,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Menu / Shift+F10 | Open the context menu | |
 | Escape | Cancel or clear | See below |
 
-**Escape** does the nearest useful thing: it restores the path field or clears the search and returns the keyboard to the entries; it cancels an inline rename, an open menu, a dialog or a drag; elsewhere it clears the selection.
+**Escape** does the nearest useful thing: it restores the path field or clears the search and returns the keyboard to the entries (in a subfolder search it first stops the search that is still running and keeps what it found; pressed again it leaves the search); it cancels an inline rename, an open menu, a dialog or a drag; elsewhere it clears the selection.
 
 Inside a context menu, ↑ ↓ move, Enter confirms and Escape closes. Inside a dialog, ↑ ↓ move the focus and Escape cancels.
 

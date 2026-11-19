@@ -28,6 +28,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Details panel](#details-panel)
 - [Thumbnails](#thumbnails)
 - [Image viewer](#image-viewer)
+- [Search in subfolders](#search-in-subfolders)
 - [Recent files](#recent-files)
 - [Sidebar](#sidebar)
 - [Current scope](#current-scope)
@@ -109,7 +110,7 @@ Use the subbar's **Sort** and **Filter** buttons, the same two pages in the empt
 | Modified | Today, Last 7 days, Last 30 days, This year, Older (before the last 30 days). One choice or none. Files with an unknown time never match |
 | Size | < 1 MB, 1–100 MB, 100 MB–1 GB, > 1 GB. One choice or none. Files with an unknown size never match |
 | Folders and ranges | A size range never applies to folders. A date range applies to folders only when **Folders is the only type chip selected**; otherwise folders pass it |
-| Search | Ctrl+F filters names in the current folder: case-insensitive, nonrecursive, with a live "n of m" count. No matches is distinct from an empty folder |
+| Search | Ctrl+F filters names in the current folder: case-insensitive, nonrecursive, with a live "n of m" count. No matches is distinct from an empty folder. For subfolders use [Search in subfolders](#search-in-subfolders) (Ctrl+Shift+F) |
 | Combining | Every filter and the search combine with AND |
 
 Each active filter is a removable chip next to the folder title, with **Clear all** when there are several. While anything filters, the subbar, status bar and details panel read "N of M items". **New folder** and **New file** clear the search and filters so the new item is visible.
@@ -285,6 +286,22 @@ scripts/install-desktop.sh --uninstall      # undo exactly what was installed
 
 The script writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list`, and `--uninstall` restores the defaults it replaced.
 
+## Search in subfolders
+
+The search box normally filters the folder you are in. The toggle next to it (a folder with a magnifier, tooltip *Search in subfolders*) or **Ctrl+Shift+F** makes it search the folder **and every folder under it** by file name instead. The box then reads "Search subfolders…".
+
+- **Typing** starts the search about 200 ms after you stop; each new query replaces the running one. **Enter** starts it at once and moves the keyboard to the results.
+- **Matching** is a case-insensitive substring of the displayed name, the rule of the folder filter. Folders match too.
+- **Results stream in**, shallowest folders first, into a results view that shows each match with the folder it lives in (under the tile, after the name in the list, and in the status bar and details panel for the selection). Sort and filters apply as in any folder; the natural-order sort too.
+- **Status bar:** "12 found · searching…" while the walk runs, "12 found" when it ends, "10,000 found (stopped at 10,000)" at the cap, and "12 found · stopped" after Escape. Folders that could not be read (permissions) are counted and reported at the end; the search goes on without them.
+- **What is searched:** hidden files and folders are skipped while they are hidden (Ctrl+H includes them and searches again), the same rule as browsing, including a folder's `.hidden` file. Symbolic links to folders are never followed (a link that matches by name is a result, but nothing is searched through it), so a link loop cannot trap the search, and folders on other filesystems (mounted drives, network shares) are not entered. The search never changes anything on disk.
+- **Cap:** at most 10,000 matches. Narrow the query to find the rest.
+- **Stopping:** Escape stops a running search and keeps what it found; clearing the box, Escape again, or navigating anywhere ends it and returns to the folder. Turning the toggle off returns to the folder.
+- **Using a result:** Enter opens it (a folder result navigates into it), and **Open containing folder** in the context menu goes to its folder with the file selected. Rename, copy, cut, Move to Trash, Delete permanently and Undo work on the selected results, and the search runs again afterwards so the list stays true. Results are a read-only view: nothing can be created, pasted or dropped into it.
+- **Tabs and history:** a search is one history entry however often you refine it; Back returns to the folder (and Forward to the search, which runs again). Its breadcrumb is the folder plus a "Search “query”" segment. **A search tab is not saved in the session**: the tab comes back on the folder it searched, with an empty box.
+
+Content search (text inside files) is not implemented; this searches names only.
+
 ## Recent files
 
 The sidebar's Places section has a **Recent** row. It lists up to 200 files that applications opened, newest first, from the freedesktop `recently-used.xbel` (`$XDG_DATA_HOME/recently-used.xbel`, else `~/.local/share/recently-used.xbel`). The view is read-only and updates live when that file changes. Missing files and non-local entries (`sftp://`, `smb://`) are skipped. The Modified column shows when each file was last used. Enter opens a file as usual, and the context menu's **Open containing folder** goes to its folder with the file selected. Nothing can be created, pasted or dropped into Recent, and Fileflux never writes `recently-used.xbel`.
@@ -295,6 +312,7 @@ Right-click a row of Places, Favorites or Devices: **Open**, **Open in new tab**
 
 ## Current scope
 
+- Search matches file names only, not their content.
 - No dual-pane view; tabs cannot be reordered or dragged between windows.
 - The details panel previews image files only.
 - Modified dates are shown in UTC without a timezone database.

@@ -192,6 +192,7 @@ pub(crate) fn tab_label(location: &Location, home: Option<&Path>) -> String {
     match location {
         Location::Trash => "Trash".to_owned(),
         Location::Recent => "Recent".to_owned(),
+        Location::Search { query, .. } => format!("Search: {query}"),
         Location::Directory(path) if home == Some(path.as_path()) => "Home".to_owned(),
         Location::Directory(path) => path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
@@ -208,6 +209,9 @@ pub(crate) fn tab_tooltip(location: &Location, trash_root: Option<&Path>) -> Str
             |root| root.to_string_lossy().into_owned(),
         ),
         Location::Recent => "Recent files".to_owned(),
+        Location::Search { root, query } => {
+            format!("Search “{query}” in {}", root.to_string_lossy())
+        }
         Location::Directory(path) => path.to_string_lossy().into_owned(),
     }
 }
@@ -264,7 +268,13 @@ impl Affected {
     pub(crate) fn touches(&self, location: &Location) -> bool {
         match self {
             Self::Everything => true,
-            Self::Folders(folders) => folders.contains(location),
+            Self::Folders(folders) => match location {
+                // Search results are files of the folders under the root.
+                Location::Search { root, .. } => folders.iter().any(
+                    |folder| matches!(folder, Location::Directory(path) if path.starts_with(root)),
+                ),
+                _ => folders.contains(location),
+            },
         }
     }
 }
@@ -555,7 +565,35 @@ mod tests {
         assert_eq!(tab_tooltip(&Location::Trash, None), "Trash");
     }
 
+    #[test]
+    fn a_search_tab_names_the_query_and_the_folder() {
+        let search = Location::Search {
+            root: PathBuf::from("/home/me/docs"),
+            query: "report".to_owned(),
+        };
+        assert_eq!(tab_label(&search, None), "Search: report");
+        assert_eq!(
+            tab_tooltip(&search, None),
+            "Search \u{201c}report\u{201d} in /home/me/docs"
+        );
+    }
+
     // --- operation refresh fan-out -----------------------------------------------
+
+    #[test]
+    fn an_operation_in_a_searched_tree_refreshes_the_search() {
+        let search = Location::Search {
+            root: PathBuf::from("/home/me/docs"),
+            query: "a".to_owned(),
+        };
+        let inside = Affected::of_job(&Job::Trash(vec![PathBuf::from(
+            "/home/me/docs/deep/er/a.txt",
+        )]));
+        assert!(inside.touches(&search));
+        let elsewhere = Affected::of_job(&Job::Trash(vec![PathBuf::from("/home/me/pics/a.txt")]));
+        assert!(!elsewhere.touches(&search));
+        assert!(Affected::Everything.touches(&search));
+    }
 
     #[test]
     fn jobs_that_remove_or_rename_files_refresh_the_recent_view() {

@@ -102,14 +102,17 @@ pub(crate) fn render(
     }
 
     if narrow {
-        // The parked sidebar overlays the content island from the left.
+        // The parked sidebar overlays the content island from the left, in
+        // the place the docked sidebar has: the overlay is positioned inside
+        // the row that already ends above the status bar, so it spans that
+        // row exactly and the island keeps its cut corner.
         return Some(
             div()
                 .id("explorer-sidebar-overlay")
                 .absolute()
                 .left(IslandMetrics::GAP)
-                .top(IslandMetrics::GAP)
-                .bottom(px(46.0))
+                .top_0()
+                .bottom_0()
                 .w(px(this.sidebar_width))
                 // Every mouse event over the overlay stays on it: a click on
                 // a row never reaches the toolbar or the tiles below.
@@ -586,7 +589,7 @@ fn row_shell(
                 Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
                 Location::Trash => Some(DropTarget::Trash),
                 // Nothing is dropped into the list of recent files.
-                Location::Recent => None,
+                Location::Recent | Location::Search { .. } => None,
             };
             match target {
                 Some(target) => dnd::drop_target(row, target, &cx.entity().downgrade(), cx),

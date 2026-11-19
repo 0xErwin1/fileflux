@@ -18,7 +18,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use bolt::composites::{Island, StatusChip};
@@ -28,6 +29,7 @@ use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::recent;
+use fileflux::core::search::{SearchOptions, SearchSummary, search};
 use fileflux::core::settings::{
     self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
 };
@@ -61,7 +63,9 @@ use crate::explorer::persist::{
 };
 use crate::explorer::progress::Registry;
 use crate::explorer::sidebar::{Panel, PanelDrag};
-use crate::explorer::state::{ExplorerState, Favorites, PathArgument, Scan, Transition, View};
+use crate::explorer::state::{
+    ExplorerState, Favorites, PathArgument, Scan, SearchRun, Transition, View,
+};
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::tabs::{Affected, Placement, TabList};
 use crate::explorer::toasts;
@@ -83,6 +87,8 @@ actions!(
         FocusPath,
         /// Focuses the filename search field and selects its content.
         FocusSearch,
+        /// Turns on "Search in subfolders" and focuses the search field.
+        SearchSubfolders,
         /// Restores the path field or clears the search, and gives the
         /// focus back to the shell.
         CancelEdit,
@@ -207,6 +213,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-l", FocusPath, shell),
         KeyBinding::new("ctrl-f", FocusSearch, shell),
+        KeyBinding::new("ctrl-shift-f", SearchSubfolders, shell),
         KeyBinding::new("escape", CancelEdit, shell),
         KeyBinding::new("alt-left", NavigateBack, shell),
         KeyBinding::new("alt-right", NavigateForward, shell),
@@ -339,6 +346,8 @@ fn load_location(
             Some(file) => fileflux::core::recent::read_recent(file),
             None => Ok(Listing::default()),
         },
+        // The walk fills a search in afterwards (see `Explorer::start_walk`).
+        Location::Search { .. } => Ok(Listing::default()),
         Location::Trash => match trash_root {
             Some(root) => fileflux::core::trash::read_trash(root),
             None => Err(io::Error::new(
@@ -403,6 +412,13 @@ pub(crate) struct Tab {
     submitted_edit: Option<SubmittedEdit>,
     /// The current-folder filename search field.
     pub(crate) search_input: Entity<InputState>,
+    /// "Search in subfolders": typing in the search field searches the folder
+    /// and everything under it instead of filtering its listing.
+    pub(crate) deep_search: bool,
+    /// The wait before a typed query starts its search.
+    deep_debounce: Option<Task<()>>,
+    /// The running (or last) walk of this tab's search.
+    walk: Option<SearchWalk>,
     /// The details table's state entity: one per tab, so each tab keeps its
     /// own scroll offset; the delegate answers the tab's snapshot.
     pub(crate) table: Entity<TableState<EntryTableDelegate>>,
@@ -493,20 +509,15 @@ impl Tab {
             },
         );
 
-        // The search field filters its tab's folder on every keystroke.
+        // The search field filters its tab's folder on every keystroke, or
+        // searches its subfolders (see [`Explorer::search_text_changed`]).
         let search_events = cx.subscribe_in(
             &search_input,
             window,
-            move |this, _input, event: &InputEvent, _window, cx| {
-                if let InputEvent::Change = event {
-                    let Some(tab) = this.tabs.by_id_mut(id) else {
-                        return;
-                    };
-                    let text = tab.search_input.read(cx).value().to_string();
-                    tab.state.set_query(text);
-                    this.arrange_tab(id, cx);
-                    cx.notify();
-                }
+            move |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.search_text_changed(id, window, cx),
+                InputEvent::PressEnter { .. } => this.search_entered(id, window, cx),
+                InputEvent::Focus | InputEvent::Blur => {}
             },
         );
 
@@ -540,6 +551,9 @@ impl Tab {
             path_edit_revision: 0,
             submitted_edit: None,
             search_input,
+            deep_search: false,
+            deep_debounce: None,
+            walk: None,
             table,
             grid_scroll: UniformListScrollHandle::new(),
             scan_task: None,
@@ -558,6 +572,26 @@ impl Tab {
             _search_events: search_events,
             _table_events: table_events,
         }
+    }
+}
+
+/// How long typing waits before a subfolder search starts: a burst of
+/// keystrokes walks the folders once.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// How often the UI collects what the search thread found.
+const SEARCH_POLL: Duration = Duration::from_millis(50);
+
+/// The running search of one tab: dropping it cancels the walk (the thread
+/// notices the flag before its next entry) and stops collecting its batches.
+struct SearchWalk {
+    cancel: Arc<AtomicBool>,
+    _collector: Task<()>,
+}
+
+impl Drop for SearchWalk {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1090,6 +1124,7 @@ impl Explorer {
         match self.tab().state.current() {
             Location::Trash => "Home Trash".to_owned(),
             Location::Recent => "Recent".to_owned(),
+            Location::Search { query, .. } => format!("Search \u{201c}{query}\u{201d}"),
             Location::Directory(path) => {
                 if self
                     .places
@@ -1179,6 +1214,7 @@ impl Explorer {
             return;
         };
         let location = scan.location.clone();
+        let live = scan.live;
         let trash_root = self.trash_root.clone();
         let recent_file = self.recent_file.clone();
         let load = cx.background_executor().spawn(async move {
@@ -1194,6 +1230,10 @@ impl Explorer {
         });
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.scan_task = Some(task);
+            if !live {
+                // Navigating (or reloading) ends the search that was running.
+                tab.walk = None;
+            }
         }
         // From now on a change in the folder being read is not missed.
         self.sync_watches(id);
@@ -1321,6 +1361,16 @@ impl Explorer {
                     }
                 }
                 self.sync_search_input(id, window, cx);
+                // A search that just committed (empty) starts its walk.
+                let run = self
+                    .tabs
+                    .by_id_mut(id)
+                    .and_then(|tab| tab.state.start_search());
+                if run.is_some() {
+                    // Back or Forward into a search turns its mode on.
+                    self.set_deep_search(id, true, window, cx);
+                }
+                self.start_walk(id, run, cx);
                 self.after_listing_changed(id, window, cx);
                 // An operation that finished while this navigation was
                 // pending refreshes the folder now shown.
@@ -1383,7 +1433,9 @@ impl Explorer {
         let committed = match tab.state.current() {
             Location::Directory(path) => Some(path.clone()),
             Location::Recent => recent_dir.clone(),
-            Location::Trash => None,
+            // The Trash is not watched, nor are search results: a search
+            // runs again after an operation instead.
+            Location::Trash | Location::Search { .. } => None,
         };
         let target = tab
             .state
@@ -1637,7 +1689,7 @@ impl Explorer {
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
-        let trust_known = *tab.state.current() != Location::Recent;
+        let trust_known = !tab.state.current().lists_files_from_elsewhere();
         let displayed = tab.state.visible_shared();
         let (keep, todo) =
             entries::plan_thumbnails(&tab.snapshot, &displayed, &tab.thumbs, trust_known);
@@ -1795,7 +1847,12 @@ impl Explorer {
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
-        let committed = tab.state.query().to_owned();
+        // A search's box holds its query; a folder's box, the filter.
+        let committed = tab
+            .state
+            .search_query()
+            .unwrap_or_else(|| tab.state.query())
+            .to_owned();
         tab.search_input.update(cx, |input, cx| {
             let shown = input.value().to_string();
             if let Some(value) = search_field_resync(&committed, &shown) {
@@ -1882,14 +1939,299 @@ impl Explorer {
     /// clears the query — the full listing returns, the no-result state
     /// goes away — and gives the keyboard back to the entries area.
     pub(crate) fn clear_search_on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab_mut().state.clear_query();
         let id = self.active_id();
+        // A subfolder search that is still walking is stopped first, its
+        // results kept; Escape again clears the query and leaves it.
+        if self.stop_search(id, cx) {
+            self.entries_focus.focus(window, cx);
+            return;
+        }
+        if let Location::Search { root, .. } = self.tab().state.current().clone() {
+            self.tab().search_input.update(cx, |input, cx| {
+                input.set_value(String::new(), window, cx);
+            });
+            self.entries_focus.focus(window, cx);
+            self.navigate(Transition::Visit(Location::Directory(root)), window, cx);
+            return;
+        }
+        self.tab_mut().state.clear_query();
         self.arrange_tab(id, cx);
         self.tab().search_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
         self.entries_focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// The search field of tab `id` changed: the listing is filtered by it,
+    /// or — with "Search in subfolders" — the folder and everything under it
+    /// is searched once typing pauses (see [`SEARCH_DEBOUNCE`]); an emptied
+    /// field ends the search at once.
+    fn search_text_changed(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let text = tab.search_input.read(cx).value().to_string();
+        if !(tab.deep_search && tab.state.can_search_subfolders()) {
+            tab.state.set_query(text);
+            self.arrange_tab(id, cx);
+            cx.notify();
+            return;
+        }
+        if text.is_empty() {
+            tab.deep_debounce = None;
+            self.apply_deep_query(id, window, cx);
+            return;
+        }
+        tab.deep_debounce = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                this.apply_deep_query(id, window, cx);
+            }) {
+                log::debug!("the explorer closed before its search started: {error}");
+            }
+        }));
+    }
+
+    /// Enter in the search field: a subfolder search starts now, without
+    /// waiting out the debounce, and the keyboard moves to the results.
+    fn search_entered(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        if !(tab.deep_search && tab.state.can_search_subfolders()) {
+            return;
+        }
+        tab.deep_debounce = None;
+        self.apply_deep_query(id, window, cx);
+        if id == self.active_id() {
+            self.entries_focus.focus(window, cx);
+        }
+    }
+
+    /// Makes tab `id` search for what its field holds: a folder becomes the
+    /// search of it, a search is refined in place (one history entry), and an
+    /// emptied field leaves the search for its folder.
+    fn apply_deep_query(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let text = tab.search_input.read(cx).value().to_string();
+        match tab.state.current().clone() {
+            Location::Search { root, .. } if text.is_empty() => {
+                if id == self.active_id() {
+                    self.navigate(Transition::Visit(Location::Directory(root)), window, cx);
+                }
+            }
+            Location::Search { .. } => {
+                if let Some(run) = tab.state.refine_search(text) {
+                    self.refresh_results(id, false, cx);
+                    self.start_walk(id, Some(run), cx);
+                    if id == self.active_id() {
+                        self.sync_window_title(window);
+                    }
+                    cx.notify();
+                }
+            }
+            Location::Directory(_) if !text.is_empty() => {
+                let scan = tab.state.begin_search(text);
+                self.start_scan_in(id, scan, window, cx);
+            }
+            Location::Directory(_) | Location::Trash | Location::Recent => {}
+        }
+    }
+
+    /// Ctrl+Shift+F: "Search in subfolders" on, and the keyboard in the field.
+    pub(crate) fn search_subfolders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.active_id();
+        self.set_deep_search(id, true, window, cx);
+        self.focus_search(window, cx);
+    }
+
+    /// The toolbar toggle of "Search in subfolders".
+    pub(crate) fn toggle_deep_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.active_id();
+        let on = !self.tab().deep_search;
+        self.set_deep_search(id, on, window, cx);
+    }
+
+    /// Switches tab `id` between filtering the folder and searching its
+    /// subfolders for what the field holds. Off ends a running search and
+    /// returns to the folder; the field keeps its text as a filter.
+    fn set_deep_search(
+        &mut self,
+        id: TabId,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        if tab.deep_search == on {
+            return;
+        }
+        tab.deep_search = on;
+        tab.deep_debounce = None;
+        tab.search_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                if on {
+                    "Search subfolders\u{2026}"
+                } else {
+                    "Search this folder\u{2026}"
+                },
+                window,
+                cx,
+            );
+        });
+        let text = tab.search_input.read(cx).value().to_string();
+        if on {
+            // The text searches instead of filtering.
+            tab.state.clear_query();
+            self.arrange_tab(id, cx);
+            if !text.is_empty() {
+                self.apply_deep_query(id, window, cx);
+            }
+        } else if let Location::Search { root, .. } = tab.state.current().clone() {
+            tab.search_input.update(cx, |input, cx| {
+                input.set_value(String::new(), window, cx);
+            });
+            if id == self.active_id() {
+                self.navigate(Transition::Visit(Location::Directory(root)), window, cx);
+            }
+        } else {
+            tab.state.set_query(text);
+            self.arrange_tab(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Runs the walk of a search for tab `id`: on a thread of the background
+    /// executor, handing its matches to a collector that applies them to the
+    /// tab a few times a second. A walk that is no longer the tab's (see
+    /// [`ExplorerState::apply_search_batch`]) changes nothing, and dropping
+    /// the tab's [`SearchWalk`] cancels it.
+    fn start_walk(&mut self, id: TabId, run: Option<SearchRun>, cx: &mut Context<Self>) {
+        let Some(run) = run else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = channel();
+        let flag = Arc::clone(&cancel);
+        let generation = run.generation;
+        let walking = cx.background_executor().spawn(async move {
+            let mut options = SearchOptions::new(run.query);
+            options.hide_hidden = run.hide_hidden;
+            search(&run.root, &options, &flag, |batch| {
+                // Nobody collects any more: the search was dropped.
+                if sender.send(batch).is_err() {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            })
+        });
+        let collector = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SEARCH_POLL).await;
+                let mut batches = Vec::new();
+                let walk_ended = loop {
+                    match receiver.try_recv() {
+                        Ok(batch) => batches.push(batch),
+                        Err(TryRecvError::Empty) => break false,
+                        Err(TryRecvError::Disconnected) => break true,
+                    }
+                };
+                if walk_ended {
+                    let summary = walking.await;
+                    if let Err(error) = this.update(cx, |this, cx| {
+                        this.apply_search_results(id, generation, batches, Some(summary), cx);
+                    }) {
+                        log::debug!("the explorer closed before its search ended: {error}");
+                    }
+                    break;
+                }
+                if batches.is_empty() {
+                    continue;
+                }
+                if let Err(error) = this.update(cx, |this, cx| {
+                    this.apply_search_results(id, generation, batches, None, cx);
+                }) {
+                    log::debug!("the explorer closed during its search: {error}");
+                    break;
+                }
+            }
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.walk = Some(SearchWalk {
+                cancel,
+                _collector: collector,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Adds what the walk of `generation` found to tab `id`, and settles it
+    /// when it ended.
+    fn apply_search_results(
+        &mut self,
+        id: TabId,
+        generation: u64,
+        batches: Vec<Vec<fileflux::core::Entry>>,
+        summary: Option<SearchSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let mut changed = false;
+        for batch in batches {
+            changed |= tab.state.apply_search_batch(generation, batch);
+        }
+        let finished = summary.is_some_and(|summary| tab.state.finish_search(generation, summary));
+        if changed || finished {
+            self.refresh_results(id, finished, cx);
+        }
+        cx.notify();
+    }
+
+    /// Re-points tab `id`'s views at the results its state holds now. While
+    /// the walk goes on only the order is redone; when it ended the folder
+    /// item counts and thumbnails of the results are looked up too.
+    fn refresh_results(&mut self, id: TabId, finished: bool, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        tab.snapshot = Arc::new(tab.state.listing().entries.clone());
+        tab.folder_label = util::folder_counts_label(&tab.snapshot);
+        if finished {
+            self.start_child_counts(id, cx);
+            self.start_thumbnails(id, cx);
+        } else {
+            self.arrange_tab(id, cx);
+        }
+    }
+
+    /// Stops the running search of tab `id`, keeping what it found. `false`
+    /// when none was running.
+    pub(crate) fn stop_search(&mut self, id: TabId, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return false;
+        };
+        if !tab.state.stop_search() {
+            return false;
+        }
+        tab.walk = None;
+        cx.notify();
+        true
+    }
+
+    /// Searches again after a change that the shown results may not reflect
+    /// (the hidden-files rule, a finished operation).
+    pub(crate) fn restart_search_in(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let run = self
+            .tabs
+            .by_id_mut(id)
+            .and_then(|tab| tab.state.restart_search());
+        self.start_walk(id, run, cx);
     }
 
     /// Applies `event` to the parked sidebar overlay.
@@ -1909,6 +2251,11 @@ impl Explorer {
         if self.sidebar_overlay_open {
             self.close_sidebar_overlay(sidebar::OverlayEvent::Escape);
             cx.notify();
+            return;
+        }
+        // Escape stops a running search before anything else.
+        let id = self.active_id();
+        if self.stop_search(id, cx) {
             return;
         }
         if !self.tab().state.selection().is_empty() {
@@ -2294,6 +2641,7 @@ impl Explorer {
         if refresh && self.tab().watch.committed.is_none() {
             let scan = self.tab_mut().state.begin_op_refresh();
             self.start_scan_in(id, scan, window, cx);
+            self.restart_search_in(id, cx);
         }
         self.sync_window_title(window);
         if self.tab().path_editing {
@@ -2329,7 +2677,10 @@ impl SubmittedEdit {
 /// submits go through the raw-state resolver instead.
 fn committed_path_text(location: &Location) -> String {
     match location {
-        Location::Directory(path) => path.to_string_lossy().into_owned(),
+        // The path field of a search holds the folder searched.
+        Location::Directory(path) | Location::Search { root: path, .. } => {
+            path.to_string_lossy().into_owned()
+        }
         Location::Trash => "Trash".to_owned(),
         Location::Recent => "Recent".to_owned(),
     }
@@ -2423,6 +2774,9 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.focus_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchSubfolders, window, cx| {
+                this.search_subfolders(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CancelEdit, window, cx| {
                 this.cancel_edit(window, cx);
@@ -2690,7 +3044,18 @@ impl Explorer {
     /// or nothing.
     fn render_scope_line(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let colors = bolt::colors(cx);
-        let text = if self.tab().state.current() == &Location::Recent {
+        let text = if let Location::Search { root, query } = self.tab().state.current() {
+            let unreadable = self.tab().state.search_status().unreadable_dirs;
+            Some(format!(
+                "Names containing \u{201c}{query}\u{201d} in {} and its subfolders, shallowest first. Links and other drives are not entered{}. Open containing folder shows where a result lives.",
+                root.to_string_lossy(),
+                if unreadable > 0 {
+                    "; some folders could not be read"
+                } else {
+                    ""
+                }
+            ))
+        } else if self.tab().state.current() == &Location::Recent {
             Some(
                 "Recent \u{2014} files other applications opened, newest first. Open containing folder shows where one lives."
                     .to_owned(),
@@ -2726,7 +3091,10 @@ impl Explorer {
     /// its mono "4 folders · 7 files" meta.
     fn render_subbar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let colors = bolt::colors(cx);
-        let meta = if self.tab().state.is_loading() {
+        let meta = if self.tab().state.is_loading()
+            || (self.tab().state.search_status().searching
+                && self.tab().state.listing().entries.is_empty())
+        {
             String::new()
         } else if self.tab().state.shows_fewer_than_listed() {
             util::filtered_counts_label(
@@ -2801,7 +3169,7 @@ impl Explorer {
                 Button::new("explorer-new-folder", "New folder")
                     .primary()
                     .icon(crate::explorer::icon(gpui_kit_assets::IconName::FolderPlus))
-                    .disabled(self.tab().state.current() == &Location::Recent)
+                    .disabled(self.tab().state.current().lists_files_from_elsewhere())
                     .tooltip("New folder (Ctrl+Shift+N)")
                     .on_click(cx.listener(|this, _event, window, cx| {
                         this.create_new(crate::explorer::ops::NewKind::Folder, window, cx);
@@ -2895,7 +3263,7 @@ impl Explorer {
     fn free_space_label(&self) -> Option<String> {
         let places = self.places.as_ref()?;
         let path = match self.tab().state.current() {
-            Location::Directory(path) => path.as_path(),
+            Location::Directory(path) | Location::Search { root: path, .. } => path.as_path(),
             Location::Trash => places.trash_root.as_path(),
             Location::Recent => return None,
         };
@@ -2910,22 +3278,29 @@ impl Explorer {
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = bolt::colors(cx);
         let entries_count = self.tab().state.listing().entries.len();
-        let shown = self
-            .tab()
-            .state
-            .shows_fewer_than_listed()
-            .then(|| self.tab().state.visible_shared().len());
+        let searching_here = matches!(self.tab().state.current(), Location::Search { .. });
+        // The order of a long list of results is still being made: the
+        // results count as found until it lands, not as "0 of N".
+        let shown = (self.tab().state.shows_fewer_than_listed()
+            && !(searching_here && self.tab().state.is_arranging()))
+        .then(|| self.tab().state.visible_shared().len());
         let selection = self.tab().state.selection();
-        let mut count_text = util::status_label(
-            entries_count,
-            shown,
-            selection.len(),
-            self.tab().state.selected_size(),
-        );
+        let search_text = searching_here.then(|| {
+            util::search_status_label(entries_count, shown, self.tab().state.search_status())
+        });
+        let mut count_text = match &search_text {
+            Some(text) if selection.is_empty() => text.clone(),
+            _ => util::status_label(
+                entries_count,
+                shown,
+                selection.len(),
+                self.tab().state.selected_size(),
+            ),
+        };
         // A single selected Trash entry keeps its recorded origin; a Recent
         // one, its folder.
         let origin_word = if self.in_trash() { "from" } else { "in" };
-        if (self.in_trash() || self.tab().state.current() == &Location::Recent)
+        if (self.in_trash() || self.tab().state.current().lists_files_from_elsewhere())
             && let Some(path) = selection.iter().next().filter(|_| selection.len() == 1)
             && let Some(origin) = self
                 .tab()
@@ -3010,6 +3385,18 @@ impl Explorer {
                     .text_ellipsis()
                     .text_color(colors.muted)
                     .child(notice.to_owned()),
+            );
+        } else if let Some(text) = search_text.filter(|_| !selection.is_empty()) {
+            // The count on the left is the selection's; the search goes on.
+            status = status.child(
+                div()
+                    .id("explorer-status-search")
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(colors.muted)
+                    .child(text),
             );
         } else if let Some(notice) = &self.settings_notice {
             status = status.child(

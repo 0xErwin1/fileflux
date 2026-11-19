@@ -263,6 +263,9 @@ pub(crate) struct EntryTableDelegate {
     dragged: Option<Arc<Vec<PathBuf>>>,
     /// The selection is what an open context menu acts on.
     outlined: bool,
+    /// Each name is followed by the folder its entry lives in (search
+    /// results).
+    with_folder: bool,
     weak: WeakEntity<Explorer>,
 }
 
@@ -283,8 +286,16 @@ impl EntryTableDelegate {
             renaming: None,
             dragged: None,
             outlined: false,
+            with_folder: false,
             weak,
         }
+    }
+
+    /// Shows the folder of each entry after its name. `true` when it changed.
+    pub(crate) fn set_with_folder(&mut self, with_folder: bool) -> bool {
+        let changed = self.with_folder != with_folder;
+        self.with_folder = with_folder;
+        changed
     }
 
     /// Re-points the delegate at a new snapshot and its visible rows in
@@ -548,7 +559,27 @@ impl TableDelegate for EntryTableDelegate {
                         .child(super::overlay::renamer(&view, &self.weak, false, cx)),
                 )
                 .into_any_element(),
-            None => cell.child(text).into_any_element(),
+            None => {
+                let folder = self
+                    .with_folder
+                    .then(|| self.entry_at(row_ix))
+                    .flatten()
+                    .filter(|_| col_ix == 0)
+                    .and_then(|entry| entry.origin.as_deref())
+                    .map(|folder| folder.to_string_lossy().into_owned());
+                cell.child(text)
+                    .children(folder.map(|folder| {
+                        div()
+                            .min_w_0()
+                            .max_w(px(260.0))
+                            .pl(px(10.0))
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(colors.muted)
+                            .child(folder)
+                    }))
+                    .into_any_element()
+            }
         }
     }
 
@@ -684,6 +715,10 @@ pub(crate) fn render_list(
         delegate.set_dragged(dragged);
         delegate.set_outlined(outlined);
         let cut_changed = delegate.set_cut(explorer.clipboard.cut_paths());
+        let folder_changed = delegate.set_with_folder(matches!(
+            explorer.tab().state.current(),
+            fileflux::core::Location::Search { .. }
+        ));
         let renaming_changed = delegate.set_renaming(
             explorer
                 .renaming
@@ -700,6 +735,7 @@ pub(crate) fn render_list(
             || widths_changed
             || renaming_changed
             || cut_changed
+            || folder_changed
         {
             table.refresh(cx);
         }

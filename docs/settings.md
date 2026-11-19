@@ -13,7 +13,7 @@ Fileflux remembers your preferences, favorites and open tabs in two small TOML f
 | File | Location | Holds |
 |---|---|---|
 | `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Preferences: default view (grid or list), default sort and filters (sort, `hide_hidden`, folders first, natural order, categories, date and size), sidebar and details panel widths (`sidebar_width`, `details_width`; a file without `details_width` loads the default), whether the sidebar starts collapsed, whether the details panel is open, and the window size |
-| `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder or Trash, view, sort and filters of each) and which one is active |
+| `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder, Trash or Recent, view, sort and filters of each) and which one is active. A tab showing the results of a subfolder search is saved as the folder it searched: the query and results are not restored |
 
 Both files are created with mode `0600` because they list your folders.
 

@@ -169,6 +169,11 @@ pub(crate) fn session_tab(
         }
         Location::Trash => settings::SessionTab::trash(view, arrangement),
         Location::Recent => settings::SessionTab::recent(view, arrangement),
+        // A search is not restored: its tab comes back on the folder it
+        // searched, with the box empty.
+        Location::Search { root, .. } => {
+            settings::SessionTab::directory(root.clone(), view, arrangement)
+        }
     }
 }
 
@@ -738,6 +743,17 @@ mod tests {
             &Arrangement::default(),
         );
         assert_eq!(tab.path.as_deref(), Some(Path::new("/a")));
+    }
+
+    #[test]
+    fn a_search_tab_is_stored_as_the_folder_it_searches() {
+        let search = Location::Search {
+            root: PathBuf::from("/a/b"),
+            query: "report".to_owned(),
+        };
+        let tab = session_tab(&search, View::List, &Arrangement::default());
+        assert_eq!(tab.path.as_deref(), Some(Path::new("/a/b")));
+        assert!(!tab.trash && !tab.recent, "no query is stored");
     }
 
     fn settings_with(favorite: &str) -> Settings {

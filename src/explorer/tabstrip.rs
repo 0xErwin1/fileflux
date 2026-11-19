@@ -80,6 +80,7 @@ fn render_tab(
         Location::Trash => gpui_kit_assets::IconName::Trash,
         Location::Recent => gpui_kit_assets::IconName::Clock,
         Location::Directory(_) => gpui_kit_assets::IconName::Folder,
+        Location::Search { .. } => gpui_kit_assets::IconName::FolderSearch,
     };
     let close_group = group.clone();
     div()

@@ -93,7 +93,7 @@ impl Explorer {
     pub(crate) fn can_paste(&mut self, cx: &mut Context<Self>) -> bool {
         self.reconcile_clipboard(cx);
         !self.in_trash()
-            && *self.tab().state.current() != Location::Recent
+            && !self.tab().state.current().lists_files_from_elsewhere()
             && self.clipboard.get().is_some()
     }
 
@@ -107,6 +107,8 @@ impl Explorer {
         let Location::Directory(current) = self.tab().state.current().clone() else {
             let reason = if self.tab().state.current() == &Location::Recent {
                 "Can't paste into Recent. Open a folder to paste into"
+            } else if matches!(self.tab().state.current(), Location::Search { .. }) {
+                "Can't paste into search results. Open a folder to paste into"
             } else {
                 "Can't paste into the Trash. Restore items instead"
             };

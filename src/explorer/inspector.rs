@@ -334,6 +334,9 @@ fn location_text(location: &Location) -> String {
         Location::Directory(path) => path.to_string_lossy().into_owned(),
         Location::Trash => "Trash".to_owned(),
         Location::Recent => "Recent".to_owned(),
+        Location::Search { root, query } => {
+            format!("Search “{query}” in {}", root.to_string_lossy())
+        }
     }
 }
 
@@ -548,7 +551,7 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
     }
     match &entry.origin {
         Some(origin) => rows.push(Fact::new(
-            if this.tab().state.current() == &Location::Recent {
+            if this.tab().state.current().lists_files_from_elsewhere() {
                 "Folder"
             } else {
                 "Original location"

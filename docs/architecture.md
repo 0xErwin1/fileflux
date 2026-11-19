@@ -31,6 +31,7 @@ One package, one library and one binary.
 | `devices` | `lsblk -J` discovery and the `udisksctl` mount, unmount and eject plans |
 | `ops` | Create, rename, copy, move: never overwrite silently, never follow symlinks for copy or move, never delete a source before its replacement is verified |
 | `trash` | The freedesktop Trash: list, trash, restore, empty |
+| `search` | Recursive name search: a breadth-first walk that never follows symlinked folders, stays on the root's device, follows the listing's hidden rule, checks a cancel flag before every entry, hands matches over in batches and stops at a cap |
 | `watch` | inotify through `rustix`: the folder `WatchHub` and the device `DeviceWatcher` |
 | `settings` | `settings.toml` and `session.toml`: tolerant loading, version migration, atomic saving, merging |
 | `bookmarks` | The GTK bookmarks file as the favorites: parsing, labels, order-preserving atomic edits |
@@ -54,6 +55,7 @@ The UI thread only draws and handles input. Everything that can block runs elsew
 | Work | Where it runs | Guard |
 |---|---|---|
 | Directory scans, Trash reads, places discovery | GPUI's background executor | A generation counter: a stale completion never overwrites a newer result |
+| Recursive search | A walk on the background executor, collected by the UI a few times a second | A cancel flag (`AtomicBool`) the walk checks before every entry, set when the search is replaced, stopped, or its tab navigates away or closes; a generation counter refuses the batches of a walk that is no longer the tab's |
 | Arranging large folders (sort, filter, search) | Background executor jobs | The listing is indexed once. The previous order stays on screen and drives selection until the latest request completes; the latest change wins. Small folders are arranged in place |
 | Live refresh of folders | One shared watch thread (`WatchHub`): a dedicated thread blocked in `poll` on one inotify instance, not a worker of the executor | One watch per distinct folder however many tabs show it, released when the last tab leaves. Watches are identified by the kernel's watch descriptor, and replaced folders are re-watched |
 | Device refresh | One `DeviceWatcher` thread (`/dev`, `/dev/disk/by-id`, `/dev/bus/usb`, `/proc/self/mountinfo`, gvfs) | 300 ms of quiet before a re-read; at most one re-read in flight; a slow poll only when a watch cannot be established |

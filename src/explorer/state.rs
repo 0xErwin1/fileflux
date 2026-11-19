@@ -86,6 +86,37 @@ pub(crate) struct Scan {
     pub(crate) notice: Option<String>,
 }
 
+/// How the search behind a [`Location::Search`] stands, for the status bar
+/// and the empty states.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SearchStatus {
+    /// The walk is still running.
+    pub(crate) searching: bool,
+    /// The walk stopped at the result cap.
+    pub(crate) capped: bool,
+    /// The walk was stopped before it finished (Escape, navigation).
+    pub(crate) stopped: bool,
+    /// Folders the walk could not read.
+    pub(crate) unreadable_dirs: usize,
+    /// A new walk is running over results that are still shown: its first
+    /// batch replaces them (after a file operation or a filter change, so
+    /// the list does not flash empty).
+    pub(crate) replacing: bool,
+}
+
+/// A walk the view must start for the current [`Location::Search`]; its
+/// batches settle through [`ExplorerState::apply_search_batch`] under
+/// `generation`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SearchRun {
+    /// Which walk this is; batches of an older one are refused.
+    pub(crate) generation: u64,
+    pub(crate) root: PathBuf,
+    pub(crate) query: String,
+    /// Whether the walk skips what the listing hides.
+    pub(crate) hide_hidden: bool,
+}
+
 /// The selected paths that still name an entry of `entries`.
 pub(crate) fn retain_existing(
     selected: &BTreeSet<PathBuf>,
@@ -126,7 +157,7 @@ impl Favorites {
     pub(crate) fn contains(&self, location: &Location) -> bool {
         match location {
             Location::Directory(path) => self.0.iter().any(|favorite| favorite.path == *path),
-            Location::Trash | Location::Recent => false,
+            Location::Trash | Location::Recent | Location::Search { .. } => false,
         }
     }
 
@@ -209,6 +240,11 @@ pub(crate) struct ExplorerState {
     op_refresh_deferred: bool,
     /// Bumped on every scan that starts; completions compare against it.
     generation: u64,
+    /// Bumped whenever the walk of a search starts or must be disowned (a
+    /// new query, a navigation, a stop): its batches compare against it.
+    search_generation: u64,
+    /// How the search of the current [`Location::Search`] stands.
+    search: SearchStatus,
     /// Bumped on every committed listing: which listing an arrangement
     /// result was computed for.
     listing_epoch: u64,
@@ -241,6 +277,8 @@ impl ExplorerState {
             pending: None,
             op_refresh_deferred: false,
             generation: 1,
+            search_generation: 0,
+            search: SearchStatus::default(),
             listing_epoch: 0,
             arrange: ArrangeSlot::default(),
             home,
@@ -360,7 +398,8 @@ impl ExplorerState {
         }
         let current = match self.nav.current() {
             Location::Directory(path) => Location::Directory(path.clone()),
-            Location::Trash | Location::Recent => return None,
+            // The Trash and the results of a search are not watched.
+            Location::Trash | Location::Recent | Location::Search { .. } => return None,
         };
         self.begin_scan(Transition::Visit(current), true, None)
     }
@@ -407,7 +446,7 @@ impl ExplorerState {
     pub(crate) fn pending_directory(&self) -> Option<&Path> {
         match &self.pending.as_ref()?.location {
             Location::Directory(path) => Some(path),
-            Location::Trash | Location::Recent => None,
+            Location::Trash | Location::Recent | Location::Search { .. } => None,
         }
     }
 
@@ -426,6 +465,11 @@ impl ExplorerState {
             return None;
         }
         let current = self.nav.current().clone();
+        // The results of a search are searched again, not re-read: see
+        // [`Self::restart_search`].
+        if matches!(current, Location::Search { .. }) {
+            return None;
+        }
         self.begin_scan(Transition::Visit(current), true, None)
     }
 
@@ -488,6 +532,10 @@ impl ExplorerState {
                 (location, candidate, false)
             }
         };
+        if !live {
+            // Leaving (or reloading) a search disowns its walk at once.
+            self.disown_search();
+        }
         self.generation += 1;
         self.load_error = None;
         self.pending = Some(Scan {
@@ -533,6 +581,9 @@ impl ExplorerState {
             return false;
         }
         self.nav = scan.candidate;
+        if !scan.live {
+            self.search = SearchStatus::default();
+        }
         self.listing = listing;
         self.listing_epoch += 1;
         let index = index.filter(|index| index.len() == self.listing.entries.len());
@@ -580,6 +631,191 @@ impl ExplorerState {
         }
         self.pending = None;
         self.load_error = Some(error);
+        true
+    }
+
+    // --- recursive search -----------------------------------------------------
+
+    /// The query of the shown search, which is what the search box holds
+    /// there; `None` outside a search.
+    pub(crate) fn search_query(&self) -> Option<&str> {
+        match self.nav.current() {
+            Location::Search { query, .. } => Some(query),
+            _ => None,
+        }
+    }
+
+    /// Whether the shown location can be searched through its subfolders:
+    /// a folder, or a search of one.
+    pub(crate) fn can_search_subfolders(&self) -> bool {
+        matches!(
+            self.nav.current(),
+            Location::Directory(_) | Location::Search { .. }
+        )
+    }
+
+    /// How the shown search stands.
+    pub(crate) fn search_status(&self) -> &SearchStatus {
+        &self.search
+    }
+
+    /// Turns the shown folder into a search of it and its subfolders for
+    /// `query`: a visit of the [`Location::Search`], whose scan commits an
+    /// empty listing at once. After the commit, [`Self::start_search`] says
+    /// which walk to run. `None` outside a folder (the Trash and Recent are
+    /// not searched) and when a search already shows.
+    pub(crate) fn begin_search(&mut self, query: String) -> Option<Scan> {
+        let Location::Directory(root) = self.nav.current() else {
+            return None;
+        };
+        let search = Location::Search {
+            root: root.clone(),
+            query,
+        };
+        self.begin_scan(Transition::Visit(search), false, None)
+    }
+
+    /// The walk for the search that just committed: `None` for an empty
+    /// query, which finds nothing.
+    pub(crate) fn start_search(&mut self) -> Option<SearchRun> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.run_for_current(false)
+    }
+
+    /// The shown search with a new `query`, in place (history keeps one
+    /// entry): the old results go, and the walk to run for the new one is
+    /// returned. `None` when the query did not change, or for an empty one.
+    pub(crate) fn refine_search(&mut self, query: String) -> Option<SearchRun> {
+        let Location::Search { root, query: shown } = self.nav.current() else {
+            return None;
+        };
+        if *shown == query {
+            return None;
+        }
+        let root = root.clone();
+        self.nav.replace_current(Location::Search { root, query });
+        self.clear_results();
+        self.run_for_current(false)
+    }
+
+    /// The shown search again, after a file operation or a change of the
+    /// hidden-files rule: results stay on screen until the new walk's first
+    /// batch replaces them. `None` when no search shows, or one is not
+    /// worth running (empty query), or a navigation is in flight (which
+    /// either leaves the search or starts its own walk).
+    pub(crate) fn restart_search(&mut self) -> Option<SearchRun> {
+        if !matches!(self.nav.current(), Location::Search { .. }) {
+            return None;
+        }
+        if self.pending.is_some() {
+            self.op_refresh_deferred = true;
+            return None;
+        }
+        self.run_for_current(true)
+    }
+
+    fn run_for_current(&mut self, keep_results: bool) -> Option<SearchRun> {
+        self.search_generation += 1;
+        let Location::Search { root, query } = self.nav.current() else {
+            return None;
+        };
+        if query.is_empty() {
+            self.search = SearchStatus::default();
+            self.clear_results();
+            return None;
+        }
+        let run = SearchRun {
+            generation: self.search_generation,
+            root: root.clone(),
+            query: query.clone(),
+            hide_hidden: self.arrangement.filters.hide_hidden,
+        };
+        self.search = SearchStatus {
+            searching: true,
+            replacing: keep_results && !self.listing.entries.is_empty(),
+            ..SearchStatus::default()
+        };
+        if !keep_results {
+            self.clear_results();
+        }
+        Some(run)
+    }
+
+    /// Empties the results: nothing is listed, selected or remembered.
+    fn clear_results(&mut self) {
+        self.listing = Listing::default();
+        self.listing_epoch += 1;
+        let epoch = self.listing_epoch;
+        self.arrange.with(|cache| cache.reset(epoch, None));
+        self.selected.clear();
+        self.anchor = None;
+        self.cursor = None;
+    }
+
+    /// Refuses the batches of the walk that runs now.
+    fn disown_search(&mut self) {
+        self.search_generation += 1;
+        if self.search.searching {
+            self.search.searching = false;
+            self.search.stopped = true;
+        }
+    }
+
+    /// Stops the running walk (Escape), keeping what it found. `false` when
+    /// none was running.
+    pub(crate) fn stop_search(&mut self) -> bool {
+        if !self.search.searching {
+            return false;
+        }
+        self.disown_search();
+        self.search.replacing = false;
+        true
+    }
+
+    /// Adds the matches a walk found. `false` (nothing changes) when the
+    /// walk is not the one that runs now.
+    pub(crate) fn apply_search_batch(&mut self, generation: u64, batch: Vec<Entry>) -> bool {
+        if generation != self.search_generation || !self.search.searching {
+            return false;
+        }
+        if self.search.replacing {
+            self.search.replacing = false;
+            self.listing.entries = batch;
+            self.listing_epoch += 1;
+            let epoch = self.listing_epoch;
+            self.arrange.with(|cache| cache.reset(epoch, None));
+        } else {
+            self.listing.entries.extend(batch);
+            self.listing_epoch += 1;
+            self.arrange.with(ArrangeCache::grow);
+        }
+        true
+    }
+
+    /// Settles a finished walk. `false` (nothing changes) when it is not the
+    /// one that runs now.
+    pub(crate) fn finish_search(
+        &mut self,
+        generation: u64,
+        summary: fileflux::core::search::SearchSummary,
+    ) -> bool {
+        if generation != self.search_generation || !self.search.searching {
+            return false;
+        }
+        if self.search.replacing {
+            // The new walk found nothing where results were shown.
+            self.clear_results();
+        }
+        self.search = SearchStatus {
+            searching: false,
+            capped: summary.capped,
+            stopped: summary.cancelled,
+            unreadable_dirs: summary.unreadable_dirs,
+            replacing: false,
+        };
+        self.selected = retain_existing(&self.selected, &self.listing.entries);
         true
     }
 
@@ -1041,6 +1277,7 @@ impl ExplorerState {
         }
         match self.nav.current() {
             Location::Directory(current) => Ok(Location::Directory(current.join(candidate))),
+            Location::Search { root, .. } => Ok(Location::Directory(root.join(candidate))),
             Location::Trash | Location::Recent => Err(PathArgument::Unresolvable(
                 "relative paths need a current directory".to_owned(),
             )),
@@ -2714,6 +2951,215 @@ mod tests {
         state.set_query("b".into());
         assert_eq!(names(state.selected_entries()), ["b", "c"], "hidden stays");
         assert_eq!(names(state.visible_selected()), ["b"], "only what is shown");
+        Ok(())
+    }
+
+    // --- recursive search -----------------------------------------------------
+
+    fn search_location(query: &str) -> Location {
+        Location::Search {
+            root: PathBuf::from("/fixture/a"),
+            query: query.to_owned(),
+        }
+    }
+
+    /// A state showing a search of `/fixture/a` for `query`, with its walk.
+    fn searched(query: &str) -> Result<(ExplorerState, SearchRun), Box<dyn std::error::Error>> {
+        let mut state = committed()?;
+        let scan = state
+            .begin_search(query.to_owned())
+            .ok_or("a folder can be searched")?;
+        assert!(state.commit(scan, Listing::default()));
+        let run = state.start_search().ok_or("a query has a walk")?;
+        Ok((state, run))
+    }
+
+    fn found(names: &[&str]) -> Vec<Entry> {
+        names
+            .iter()
+            .map(|name| entry(name, EntryKind::File))
+            .collect()
+    }
+
+    #[test]
+    fn a_search_is_a_visit_of_the_folder_with_a_walk_for_its_query() -> TestResult {
+        let (state, run) = searched("rep")?;
+        assert_eq!(state.current(), &search_location("rep"));
+        assert_eq!(state.search_query(), Some("rep"));
+        assert_eq!(run.root, PathBuf::from("/fixture/a"));
+        assert_eq!(run.query, "rep");
+        assert!(run.hide_hidden, "hidden files are hidden by default");
+        assert!(state.search_status().searching);
+        assert!(state.listing().entries.is_empty(), "results stream in");
+        let mut state = state;
+        assert!(state.navigation().can_back());
+        let scan = state.begin(Transition::Back).ok_or("back is a scan")?;
+        assert_eq!(scan.location, dir("/fixture/a"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_hidden_rule_of_the_arrangement_reaches_the_walk() -> TestResult {
+        let mut state = committed()?;
+        state.arrange(ArrangeCommand::ToggleHidden);
+        let scan = state.begin_search("x".to_owned()).ok_or("a scan")?;
+        assert!(state.commit(scan, Listing::default()));
+        let run = state.start_search().ok_or("a walk")?;
+        assert!(!run.hide_hidden);
+        Ok(())
+    }
+
+    #[test]
+    fn batches_extend_the_results_and_only_the_current_walk_counts() -> TestResult {
+        let (mut state, run) = searched("rep")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report_a", "report_b"])));
+        assert!(state.apply_search_batch(run.generation, found(&["report_c"])));
+        assert_eq!(state.listing().entries.len(), 3);
+        assert_eq!(
+            state.visible_shared().len(),
+            3,
+            "the order follows the growing results"
+        );
+        assert!(!state.apply_search_batch(run.generation - 1, found(&["stale"])));
+        assert_eq!(state.listing().entries.len(), 3, "a stale batch is refused");
+        Ok(())
+    }
+
+    #[test]
+    fn a_finished_walk_settles_the_status_and_refuses_later_batches() -> TestResult {
+        let (mut state, run) = searched("rep")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report"])));
+        let summary = fileflux::core::search::SearchSummary {
+            found: 1,
+            capped: true,
+            cancelled: false,
+            unreadable_dirs: 2,
+        };
+        assert!(state.finish_search(run.generation, summary));
+        assert_eq!(
+            state.search_status(),
+            &SearchStatus {
+                searching: false,
+                capped: true,
+                stopped: false,
+                unreadable_dirs: 2,
+                replacing: false,
+            }
+        );
+        assert!(!state.apply_search_batch(run.generation, found(&["late"])));
+        assert!(!state.finish_search(run.generation, summary));
+        assert_eq!(state.listing().entries.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn refining_a_search_replaces_its_walk_and_keeps_one_history_entry() -> TestResult {
+        let (mut state, run) = searched("re")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report", "readme"])));
+        state.select_only(Path::new("/fixture/report"));
+        assert!(state.refine_search("re".to_owned()).is_none(), "unchanged");
+        let next = state
+            .refine_search("rep".to_owned())
+            .ok_or("a new query restarts the walk")?;
+        assert!(next.generation > run.generation);
+        assert_eq!(next.query, "rep");
+        assert_eq!(state.current(), &search_location("rep"));
+        assert!(state.listing().entries.is_empty(), "the old results go");
+        assert!(state.selection().is_empty());
+        assert!(
+            !state.apply_search_batch(run.generation, found(&["old"])),
+            "the old walk is disowned"
+        );
+        assert!(state.apply_search_batch(next.generation, found(&["report"])));
+        let scan = state.begin(Transition::Back).ok_or("back")?;
+        assert_eq!(
+            scan.location,
+            dir("/fixture/a"),
+            "one step back leaves the search, not one per query"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_a_search_keeps_what_it_found() -> TestResult {
+        let (mut state, run) = searched("rep")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report"])));
+        assert!(state.stop_search());
+        assert!(!state.stop_search(), "nothing runs any more");
+        assert!(!state.search_status().searching);
+        assert!(state.search_status().stopped);
+        assert_eq!(state.listing().entries.len(), 1);
+        assert!(!state.apply_search_batch(run.generation, found(&["late"])));
+        Ok(())
+    }
+
+    #[test]
+    fn navigating_away_disowns_the_walk() -> TestResult {
+        let (mut state, run) = searched("rep")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report"])));
+        let scan = state.begin(Transition::Up).ok_or("up")?;
+        assert!(!state.search_status().searching);
+        assert!(
+            !state.apply_search_batch(run.generation, found(&["late"])),
+            "a batch that lands during the navigation is refused"
+        );
+        assert!(state.commit(scan, listing(&[("x", EntryKind::File)])));
+        assert_eq!(state.search_query(), None);
+        assert_eq!(state.search_status(), &SearchStatus::default());
+        Ok(())
+    }
+
+    #[test]
+    fn a_restarted_search_keeps_its_results_until_the_new_walk_answers() -> TestResult {
+        let (mut state, run) = searched("rep")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report_a", "report_b"])));
+        let summary = fileflux::core::search::SearchSummary::default();
+        assert!(state.finish_search(run.generation, summary));
+        let again = state.restart_search().ok_or("a search restarts")?;
+        assert!(again.generation > run.generation);
+        assert_eq!(state.listing().entries.len(), 2, "still on screen");
+        assert!(state.search_status().searching);
+        assert!(state.apply_search_batch(again.generation, found(&["report_b"])));
+        assert_eq!(state.listing().entries.len(), 1, "the first batch replaces");
+        // A walk that finds nothing where results were shown empties them.
+        let (mut state, run) = searched("rep")?;
+        assert!(state.apply_search_batch(run.generation, found(&["report"])));
+        assert!(state.finish_search(run.generation, summary));
+        let again = state.restart_search().ok_or("a search restarts")?;
+        assert!(state.finish_search(again.generation, summary));
+        assert!(state.listing().entries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_search_is_not_reread_or_watched_but_searched_again() -> TestResult {
+        let (mut state, _) = searched("rep")?;
+        assert!(state.begin_op_refresh().is_none());
+        assert!(state.begin_live_refresh().is_none());
+        assert!(state.folder_changed(Path::new("/fixture/a")).is_none());
+        let mut folder = committed()?;
+        assert!(folder.restart_search().is_none(), "a folder has no search");
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_query_searches_nothing_and_only_a_folder_is_searched() -> TestResult {
+        let mut state = committed()?;
+        let scan = state.begin_search(String::new()).ok_or("a scan")?;
+        assert!(state.commit(scan, Listing::default()));
+        assert!(state.start_search().is_none());
+        assert!(!state.search_status().searching);
+        assert!(
+            state.begin_search("x".to_owned()).is_none(),
+            "a search is refined, not searched"
+        );
+        let mut trash = committed()?;
+        let scan = trash
+            .begin(Transition::Visit(Location::Trash))
+            .ok_or("a scan")?;
+        assert!(trash.commit(scan, Listing::default()));
+        assert!(!trash.can_search_subfolders());
+        assert!(trash.begin_search("x".to_owned()).is_none());
         Ok(())
     }
 }

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Search in subfolders: a toggle by the search box and Ctrl+Shift+F search file names in the folder and everything under it. Results stream into a read-only view that shows each match's folder; the walk is breadth-first, off the UI thread, cancellable with Escape, never follows symlinked folders, stays on one filesystem, follows the hidden-files rule, and stops at 10,000 matches ("N found · searching…", "stopped at 10,000"). Enter, Open containing folder and the file operations work on results. A search tab is not saved in the session.
 - Recent view in Places from the freedesktop `recently-used.xbel` (read-only, live, Open containing folder, restorable tab).
 - Grid thumbnails reuse current entries from the freedesktop thumbnail cache.
 
@@ -34,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The narrow-window sidebar overlay now spans the area above the status bar like the docked sidebar, instead of ending short with a clipped bottom row and a corner artifact.
 - Folders are sorted by Modified, newest first, and hidden files are hidden by default (Ctrl+H shows them, with a "Hidden shown" chip). Settings and session files move to `version = 2`: a saved *Name, ascending* sort and `hide_hidden = false` (the old defaults) are migrated, any other saved choice is kept.
 - Toasts stack in the bottom-right corner and close sooner: 3 s for info and success, 6 s with Undo, 8 s for errors and warnings, at most 3 at once.
 - The explorer started as a read-only browser and now supports file operations built on safety defaults: Trash first, no silent overwrite, partial-then-rename copies.

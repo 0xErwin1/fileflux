@@ -332,6 +332,8 @@ impl Explorer {
                 .by_id_mut(id)
                 .and_then(|tab| tab.state.begin_op_refresh());
             self.start_scan_in(id, scan, window, cx);
+            // Results of a search are looked up again, not re-read.
+            self.restart_search_in(id, cx);
         }
     }
 
@@ -1053,7 +1055,7 @@ impl Explorer {
             ),
         };
         let mut rows = menu_rows(&target);
-        if self.tab().state.current() == &Location::Recent {
+        if self.tab().state.current().lists_files_from_elsewhere() {
             rows = recent_menu_rows(rows, target.selected);
         }
         let names: Vec<String> = self
@@ -1194,9 +1196,15 @@ impl Explorer {
     /// Selection stays; the grid, list, keyboard and viewer follow the new
     /// order on the next frame.
     pub(crate) fn arrange(&mut self, command: ArrangeCommand, cx: &mut Context<Self>) {
+        let hidden_before = self.tab().state.arrangement().filters.hide_hidden;
         self.tab_mut().state.arrange(command);
         let id = self.active_id();
         self.arrange_tab(id, cx);
+        // A search skips hidden files while they are hidden, so showing or
+        // hiding them searches again.
+        if self.tab().state.arrangement().filters.hide_hidden != hidden_before {
+            self.restart_search_in(id, cx);
+        }
         // The open Sort/Filter menu redraws its check marks.
         let arrangement = self.tab().state.arrangement().clone();
         if let Some(menu) = self.menu.as_mut()
@@ -1583,7 +1591,8 @@ impl Explorer {
         }
     }
 
-    /// "Open containing folder" in the Recent view: goes to the folder of
+    /// "Open containing folder" in the Recent view and in search results: goes
+    /// to the folder of
     /// the single selected file and selects the file there.
     pub(crate) fn open_containing_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.selected_visible_paths();
@@ -1647,7 +1656,9 @@ impl Explorer {
         };
         let folder = match (folder, self.tab().state.current()) {
             (Some(folder), _) => folder,
-            (None, Location::Directory(folder)) => folder.clone(),
+            (None, Location::Directory(folder) | Location::Search { root: folder, .. }) => {
+                folder.clone()
+            }
             (None, Location::Trash | Location::Recent) => return,
         };
         let command = terminal.command(&folder);

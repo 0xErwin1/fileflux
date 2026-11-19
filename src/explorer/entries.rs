@@ -395,7 +395,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             &weak_for_drops,
             cx,
         ),
-        Location::Trash | Location::Recent => container,
+        Location::Trash | Location::Recent | Location::Search { .. } => container,
     };
 
     if this.tab().state.is_loading() && count == 0 {
@@ -405,6 +405,16 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .text_color(colors.muted)
                 .child("Loading…"),
         );
+    }
+
+    if let Some(query) = this.tab().state.search_query()
+        && this.tab().state.folder_is_empty()
+    {
+        return container.justify_center().child(search_empty_state(
+            query,
+            this.tab().state.search_status(),
+            &colors,
+        ));
     }
 
     if this.tab().state.folder_is_empty() {
@@ -465,7 +475,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let weak = cx.entity().downgrade();
     let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.tab().state.selection().clone());
     let list_view = this.tab().state.view() == View::List;
-    let in_recent = this.tab().state.current() == &Location::Recent;
+    let in_recent = this.tab().state.current().lists_files_from_elsewhere();
     let columns = this.rendered_columns.max(1);
     let item_count = if list_view {
         count
@@ -593,8 +603,53 @@ struct GridData<'a> {
     drag: Option<&'a Arc<Vec<PathBuf>>>,
     /// The selection is the target of an open context menu.
     outlined: bool,
-    /// The Recent view: a tile's second line names the folder the file is in.
+    /// The Recent view and search results: a tile's second line names the
+    /// folder the file is in.
     in_recent: bool,
+}
+
+/// The message of a search with nothing to list: still looking, nothing
+/// found, or no query yet.
+fn search_empty_state(
+    query: &str,
+    status: &super::state::SearchStatus,
+    colors: &bolt::colors::Colors,
+) -> gpui::Stateful<gpui::Div> {
+    let (title, note) = if query.is_empty() {
+        (
+            "Type to search subfolders".to_owned(),
+            "Names are matched in this folder and everything under it.",
+        )
+    } else if status.searching {
+        (
+            "Searching\u{2026}".to_owned(),
+            "Matches appear here as they are found. Escape stops the search.",
+        )
+    } else if status.stopped {
+        (
+            "Search stopped".to_owned(),
+            "Nothing was found before it stopped.",
+        )
+    } else {
+        (
+            format!("No files named \u{201c}{query}\u{201d}"),
+            "The search covers this folder and its subfolders, skips hidden files while they are hidden and never follows links or other drives.",
+        )
+    };
+    div()
+        .id("explorer-entries-search-empty")
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(Spacing::SM)
+        .text_color(colors.muted)
+        .child(
+            div()
+                .text_color(colors.strong)
+                .text_size(px(18.0))
+                .child(title),
+        )
+        .child(note)
 }
 
 /// One grid row: the tiles of [`grid_tile_range`], each fixed-width, on a

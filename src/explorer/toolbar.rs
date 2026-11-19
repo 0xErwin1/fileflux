@@ -123,10 +123,29 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 }))
                 .child(
                     SearchField::new("explorer-search", &this.tab().search_input)
-                        .aria_label("Search names in current folder")
+                        .aria_label(if this.tab().deep_search {
+                            "Search names in the current folder and its subfolders"
+                        } else {
+                            "Search names in current folder"
+                        })
                         .width(gpui::rems(13.125))
                         .count(search_count(this, cx)),
                 ),
+        )
+        // "Search in subfolders": the box searches everything under the
+        // folder instead of filtering what it lists.
+        .child(
+            Button::new("explorer-search-subfolders", "Search in subfolders")
+                .ghost()
+                .icon_only()
+                .icon(icon(gpui_kit_assets::IconName::FolderSearch))
+                .tooltip("Search in subfolders (Ctrl+Shift+F)")
+                .selected(this.tab().deep_search)
+                .toggled(this.tab().deep_search)
+                .disabled(!this.tab().state.can_search_subfolders())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_deep_search(window, cx);
+                })),
         )
         // Grid/list view: one segmented control, the pressed segment raised
         // and tinted.
@@ -186,7 +205,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                 .tooltip("Add or remove the current folder as a favorite")
                 .disabled(matches!(
                     this.tab().state.current(),
-                    Location::Trash | Location::Recent
+                    Location::Trash | Location::Recent | Location::Search { .. }
                 ))
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_favorite(cx);
@@ -292,7 +311,7 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
         let target = crumb.target.clone();
         let drop = match &crumb.target {
             Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
-            Location::Trash | Location::Recent => None,
+            Location::Trash | Location::Recent | Location::Search { .. } => None,
         };
         let mut segment = div()
             .id(("explorer-crumb", index))
@@ -385,6 +404,22 @@ fn view_segment(
 /// The live search count: "n of m", "no matches", or nothing without a
 /// query.
 fn search_count(this: &Explorer, _cx: &mut Context<Explorer>) -> Option<SearchCount> {
+    // A subfolder search counts what it found; the status bar says more.
+    if this.tab().state.search_query().is_some() {
+        let state = &this.tab().state;
+        // While the order of the results is made, all of them count.
+        let found = if state.is_arranging() {
+            state.listing().entries.len()
+        } else {
+            state.visible_shared().len()
+        };
+        let status = state.search_status();
+        return Some(SearchCount::new(match (found, status.searching) {
+            (0, true) => "searching\u{2026}".to_owned(),
+            (0, false) => "no matches".to_owned(),
+            (found, _) => format!("{found} found"),
+        }));
+    }
     let query = this.tab().state.query();
     if query.is_empty() {
         return None;

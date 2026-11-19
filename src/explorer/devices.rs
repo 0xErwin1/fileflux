@@ -534,7 +534,8 @@ impl DeviceHub {
 /// The folder of a location, when it is one.
 fn directory_of(location: &Location) -> Option<PathBuf> {
     match location {
-        Location::Directory(path) => Some(path.clone()),
+        // A search reads the files under its root, so the root is "shown".
+        Location::Directory(path) | Location::Search { root: path, .. } => Some(path.clone()),
         Location::Trash | Location::Recent => None,
     }
 }

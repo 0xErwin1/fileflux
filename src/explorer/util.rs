@@ -9,6 +9,8 @@ use std::time::SystemTime;
 use chrono::{DateTime, Datelike as _, TimeZone, Utc};
 use fileflux::core::places::format_bytes;
 
+use super::state::SearchStatus;
+
 /// The Size cell of the details list: folders show their item count when
 /// the caller knows it (`child_count`, counted off the UI thread after the
 /// scan) and stay empty until then. Everything else keeps its human size.
@@ -123,6 +125,17 @@ pub(crate) fn breadcrumbs(
                 target: Location::Recent,
             }];
         }
+        Location::Search { root, query } => {
+            // The folder searched, then the search itself as the last
+            // segment: a click on the folder ends the search.
+            let mut crumbs = breadcrumbs(&Location::Directory(root.clone()), home);
+            crumbs.push(Crumb {
+                label: format!("Search \u{201c}{query}\u{201d}"),
+                kind: CrumbKind::Folder,
+                target: location.clone(),
+            });
+            return crumbs;
+        }
         Location::Directory(path) => path,
     };
     let (base, root_kind, rest) = match home.filter(|home| path.starts_with(home)) {
@@ -226,6 +239,58 @@ pub(crate) fn status_label(
         Some(shown) => format!("{shown} of {total} shown"),
         None => count_of(total, "item", "items"),
     }
+}
+
+/// The status bar's text for a recursive search: `"12 found · searching…"`
+/// while the walk runs, `"12 found"` when it is done, `"10,000 found
+/// (stopped at 10,000)"` at the cap, `"12 found · stopped"` after Escape;
+/// `"3 of 12 found"` while filters narrow the results. Folders that could not
+/// be read are said once the walk is over.
+pub(crate) fn search_status_label(
+    found: usize,
+    shown: Option<usize>,
+    status: &SearchStatus,
+) -> String {
+    let found = with_thousands(found);
+    let mut text = match shown {
+        Some(shown) => format!("{} of {found} found", with_thousands(shown)),
+        None => format!("{found} found"),
+    };
+    if status.searching {
+        text.push_str(" \u{b7} searching\u{2026}");
+        return text;
+    }
+    if status.capped {
+        text.push_str(&format!(
+            " (stopped at {})",
+            with_thousands(fileflux::core::search::MAX_RESULTS)
+        ));
+    } else if status.stopped {
+        text.push_str(" \u{b7} stopped");
+    }
+    if status.unreadable_dirs > 0 {
+        text.push_str(&format!(
+            " \u{b7} {}",
+            match status.unreadable_dirs {
+                1 => "1 folder could not be read".to_owned(),
+                many => format!("{many} folders could not be read"),
+            }
+        ));
+    }
+    text
+}
+
+/// `10000` as `"10,000"`.
+fn with_thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 /// The visible position of index `index` in a chunked grid row of `columns`
@@ -445,6 +510,70 @@ mod tests {
         assert_eq!(
             shape(breadcrumbs(&Location::Recent, Some(home))),
             [("Recent".to_owned(), CrumbKind::Folder, Location::Recent)]
+        );
+    }
+
+    #[test]
+    fn a_search_is_a_last_crumb_after_the_folder_it_searches() {
+        use fileflux::core::Location;
+        let home = std::path::Path::new("/home/me");
+        let search = Location::Search {
+            root: "/home/me/docs".into(),
+            query: "report".to_owned(),
+        };
+        let crumbs = breadcrumbs(&search, Some(home));
+        let labels: Vec<&str> = crumbs.iter().map(|crumb| crumb.label.as_str()).collect();
+        assert_eq!(labels, ["Home", "docs", "Search \u{201c}report\u{201d}"]);
+        assert_eq!(
+            crumbs.get(1).map(|crumb| &crumb.target),
+            Some(&Location::Directory("/home/me/docs".into())),
+            "a click on the folder leaves the search"
+        );
+        assert_eq!(crumbs.last().map(|crumb| &crumb.target), Some(&search));
+    }
+
+    #[test]
+    fn the_search_status_names_progress_the_cap_and_unreadable_folders() {
+        let running = SearchStatus {
+            searching: true,
+            ..SearchStatus::default()
+        };
+        assert_eq!(
+            search_status_label(12, None, &running),
+            "12 found \u{b7} searching\u{2026}"
+        );
+        assert_eq!(
+            search_status_label(12, None, &SearchStatus::default()),
+            "12 found"
+        );
+        assert_eq!(
+            search_status_label(3, Some(1), &SearchStatus::default()),
+            "1 of 3 found"
+        );
+        let capped = SearchStatus {
+            capped: true,
+            ..SearchStatus::default()
+        };
+        assert_eq!(
+            search_status_label(10_000, None, &capped),
+            "10,000 found (stopped at 10,000)"
+        );
+        let stopped = SearchStatus {
+            stopped: true,
+            unreadable_dirs: 2,
+            ..SearchStatus::default()
+        };
+        assert_eq!(
+            search_status_label(4, None, &stopped),
+            "4 found \u{b7} stopped \u{b7} 2 folders could not be read"
+        );
+        let one = SearchStatus {
+            unreadable_dirs: 1,
+            ..SearchStatus::default()
+        };
+        assert_eq!(
+            search_status_label(0, None, &one),
+            "0 found \u{b7} 1 folder could not be read"
         );
     }
 
