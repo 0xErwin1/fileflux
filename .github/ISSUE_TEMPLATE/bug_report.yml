@@ -1,0 +1,71 @@
+name: Bug report
+description: Something does not work as documented, or a file operation did something unexpected.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If Fileflux **lost, overwrote or misplaced a file**, say so at the top and stop using the affected folder until you have copied what is left.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, ideally on a scratch folder. Include the exact file names if they matter (spaces, non-UTF-8, very long).
+      placeholder: |
+        1. Open a folder with …
+        2. Press …
+        3. See …
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Navigation, tabs or views
+        - Sort or filter
+        - File operations (copy, move, rename, delete)
+        - Trash or undo
+        - Drag and drop
+        - Devices (mount, unmount, eject, phones)
+        - Image viewer
+        - Settings or session
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Fileflux version
+      description: Output of `fileflux --version`, or the commit hash if you built from source.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and session
+      description: For example "NixOS 25.05, Wayland (Hyprland)" or "Fedora 41, X11".
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Extra details
+      description: Filesystem or device involved (ext4, btrfs, NTFS, MTP phone…), the notice or toast text, and logs from `RUST_LOG=debug fileflux`. Remove personal paths first.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I read the user guide (`docs/user-guide.md`) section for this feature.
+          required: false

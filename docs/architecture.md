@@ -1,0 +1,93 @@
+# Architecture
+
+How Fileflux is organized, how work is spread across threads, and the safety invariants that file operations keep. Read this before changing `src/core/ops.rs`, `src/core/trash.rs` or the explorer's operation code.
+
+## Quick path
+
+1. `src/core/` is GPUI-free logic, exported as the library `fileflux::core`. It is unit-tested without a window.
+2. `src/explorer/` and `src/viewer/` are the GUI, compiled into the `fileflux` binary only.
+3. Anything that touches the disk runs off the UI thread and goes through `core::ops` or `core::trash`.
+
+## Crate layout
+
+One package, one library and one binary.
+
+| Part | Path | Role |
+|---|---|---|
+| Library `fileflux` | `src/lib.rs` | Exposes `fileflux::cli` and `fileflux::core`. No GPUI dependency in these modules |
+| Binary `fileflux` | `src/main.rs`, `src/gui.rs`, `src/theme.rs` | Parses the command line through `fileflux::cli`, starts GPUI, installs Bolt's dark theme, opens the explorer or the viewer inside `gpui_component`'s `Root` |
+| Explorer | `src/explorer/` | The window: state, views, sidebar, toolbar, tabs, dialogs, progress, key bindings |
+| Viewer | `src/viewer/` | The image viewer window: navigation, zoom, rotation, info panel |
+| Integration tests | `tests/` | `cli.rs`, `settings.rs`, `open_with_quoting.rs` |
+| Benchmark | `examples/read_dir_bench.rs` | Directory-scan timing helper |
+
+### `fileflux::core`
+
+| Module | Responsibility |
+|---|---|
+| `fs` | Read-only directory scanning: one level, metadata only, partial failures reported |
+| `navigation` | In-memory history over locations; a pure state machine |
+| `places` | Sidebar places, freedesktop user dirs, mounted volumes, gvfs mounts, usage |
+| `devices` | `lsblk -J` discovery and the `udisksctl` mount, unmount and eject plans |
+| `ops` | Create, rename, copy, move: never overwrite silently, never follow symlinks for copy or move, never delete a source before its replacement is verified |
+| `trash` | The freedesktop Trash: list, trash, restore, empty |
+| `watch` | inotify through `rustix`: the folder `WatchHub` and the device `DeviceWatcher` |
+| `settings` | `settings.toml` and `session.toml`: tolerant loading, atomic saving, merging |
+| `apps` | "Open with…": `.desktop` discovery and `Exec=` parsing (no shell) |
+| `images`, `kinds` | Which files are images; the file categories used by sort and filter |
+
+### Explorer modules
+
+| Group | Modules |
+|---|---|
+| State and arrangement | `state`, `entries`, `arrange`, `arrange_menu` |
+| Operations | `actions`, `ops`, `paste`, `clipboard`, `dnd`, `progress` |
+| Chrome | `view`, `toolbar`, `tabstrip`, `tabs`, `sidebar`, `table`, `inspector`, `overlay` |
+| Devices and persistence | `devices`, `persist` |
+
+## Threading model
+
+The UI thread only draws and handles input. Everything that can block runs elsewhere, and every result returns tagged so a stale one can be ignored.
+
+| Work | Where it runs | Guard |
+|---|---|---|
+| Directory scans, Trash reads, places discovery | GPUI's background executor | A generation counter: a stale completion never overwrites a newer result |
+| Arranging large folders (sort, filter, search) | Background executor jobs | The listing is indexed once. The previous order stays on screen and drives selection until the latest request completes; the latest change wins. Small folders are arranged in place |
+| Live refresh of folders | One shared watch thread (`WatchHub`): a dedicated thread blocked in `poll` on one inotify instance, not a worker of the executor | One watch per distinct folder however many tabs show it, released when the last tab leaves. Watches are identified by the kernel's watch descriptor, and replaced folders are re-watched |
+| Device refresh | One `DeviceWatcher` thread (`/dev`, `/dev/disk/by-id`, `/dev/bus/usb`, `/proc/self/mountinfo`, gvfs) | 300 ms of quiet before a re-read; at most one re-read in flight; a slow poll only when a watch cannot be established |
+| File operations (create, rename, trash, copy, move, delete, restore, undo) | Off the UI thread (background work started by the operation code) | Cancellable between items; progress reported to the UI; the UI re-reads the affected folders on completion |
+| `udisksctl`, `lsblk`, `gio` | Off the UI thread, no shell | 30 s timeout |
+| `statvfs` on gvfs mounts | A throwaway thread | 2 s limit: a locked phone can stall the kernel call |
+| Settings and session saves | Off the UI thread | See below |
+
+**Persistence.** The explorer takes a snapshot of its persisted state on every pump tick and hands it to the persistence layer, which waits for 500 ms without change, then returns a save job to run off the UI thread. Saves are numbered so a slow one never overwrites what the window close wrote after it, and closing the window flushes what is pending. Files are written to a temporary file, synced and renamed (see [Settings](settings.md#atomic-writes)).
+
+**Navigation beats refresh.** A navigation always wins over the refresh of a finished operation, so a late completion never pulls you back.
+
+## Safety invariants
+
+These hold for every file operation. A change that breaks one needs a new design discussion, not a patch.
+
+| Invariant | How it is kept |
+|---|---|
+| **Trash first** | Del moves to the Trash. Permanent deletion needs Shift+Del, the Trash view, or an unavailable Trash, behind a confirmation whose default is Cancel and that a background result cannot replace. Danger buttons ignore the pointer for about 400 ms after their dialog appears |
+| **No silent overwrite** | Creating, renaming and pasting never replace an existing entry without an explicit **Replace**. Replace moves the old item aside, deletes it only after the new one is in place, and puts it back if that fails |
+| **`renameat2` with `RENAME_NOREPLACE`** | Moves and finishing a copy use `renameat2(RENAME_NOREPLACE)`, so a name that appears meanwhile is never clobbered. Where the filesystem or kernel lacks it (`EINVAL`, `ENOTSUP`, `ENOSYS`: FUSE, gvfs), a pre-check plus a plain rename is used |
+| **Partial, then rename** | A copy is built under a hidden temporary name and renamed into place, so a cancelled or failed copy never leaves a half file under the real name. Temporary names are hidden from listings. A move across devices copies, verifies, and only then removes the source |
+| **Identity-checked undo** | Each undo entry records the device and inode of what it acted on (and, for the Trash, the item's `.trashinfo` origin). Undo acts only if the item at that place is still the same one; otherwise it reports "Can't undo: … changed since …" and touches nothing. Undo of a copy trashes, never deletes |
+| **Symlinks are never followed** | Copies recreate links; deletes remove the link; the busy-device check resolves real locations instead |
+| **Visible only** | Operations act only on entries visible under the current filter |
+| **Dialogs are stable** | Each danger button acts on exactly the paths its dialog listed; dialogs from background results queue behind the open one |
+| **Devices are guarded** | Unmount and eject are refused or delayed while an operation uses the device (see [Devices](devices.md#safety-rules)) |
+| **No shell** | `xdg-open`, `udisksctl`, `lsblk`, `gio`, terminal and "Open with…" programs are started with explicit arguments. `Exec=` lines that would let a file name run as a shell command are not listed |
+| **Safe settings** | A broken or newer file is backed up or left alone, never half-written |
+
+Names are bounded to 255 bytes: invented names ("name (2).ext") shorten the stem on a character boundary, and Trash names whose `.trashinfo` would not fit are stored under a shortened name with the exact original path recorded.
+
+## Pinned stack
+
+The GPUI stack follows DBFlux, as ReqFlux does, so all three apps build against one GPUI and one Bolt. `Cargo.toml` pins `gpui-pre`, `gpui-component`, `gpui-pre-linux` and `bolt` to one DBFlux git revision through `[patch.crates-io]`; move that revision together with DBFlux. The Rust toolchain is pinned in `rust-toolchain.toml` and installed by the Nix shell. The design language is documented in [`design/system.md`](../design/system.md).
+
+## Related
+
+[Development](development.md) · [Contributing](../CONTRIBUTING.md)

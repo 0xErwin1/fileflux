@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an improvement or a new capability.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should Fileflux do? Describe what you see and press, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: What do you do today, or what do other file managers do?
+  - type: textarea
+    id: safety
+    attributes:
+      label: Effect on files
+      description: If this creates, moves, overwrites or deletes anything, how should it stay safe (Trash first, no silent overwrite, undo)?
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and the documentation (`docs/`).
+          required: true

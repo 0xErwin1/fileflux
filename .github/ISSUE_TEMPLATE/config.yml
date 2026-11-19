@@ -1,0 +1,4 @@
+# Blank issues are disabled so every report carries the version, distribution
+# and steps we need to act on it; the bug report and feature request forms
+# cover both kinds of issue.
+blank_issues_enabled: false
