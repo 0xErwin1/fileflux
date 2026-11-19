@@ -118,9 +118,15 @@
             # build sandbox has no display for GUI checks.
             doCheck = false;
 
-            # TODO: install icons (share/icons/hicolor/...) once Fileflux has them.
             postInstall = ''
               install -Dm644 ${./packaging/fileflux.desktop} $out/share/applications/fileflux.desktop
+              install -Dm644 ${./assets/icon/fileflux.svg} $out/share/icons/hicolor/scalable/apps/fileflux.svg
+              install -Dm644 ${./assets/icon/fileflux-16.png} $out/share/icons/hicolor/16x16/apps/fileflux.png
+              install -Dm644 ${./assets/icon/fileflux-32.png} $out/share/icons/hicolor/32x32/apps/fileflux.png
+              install -Dm644 ${./assets/icon/fileflux-48.png} $out/share/icons/hicolor/48x48/apps/fileflux.png
+              install -Dm644 ${./assets/icon/fileflux-64.png} $out/share/icons/hicolor/64x64/apps/fileflux.png
+              install -Dm644 ${./assets/icon/fileflux-128.png} $out/share/icons/hicolor/128x128/apps/fileflux.png
+              install -Dm644 ${./assets/icon/fileflux-256.png} $out/share/icons/hicolor/256x256/apps/fileflux.png
             '';
 
             postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

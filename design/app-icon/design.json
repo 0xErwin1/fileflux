@@ -1,0 +1,28 @@
+{
+  "title": "Fileflux app icon",
+  "brief": "Application icon for Fileflux in the Bolt family style (dark palette, info blue and tint, chamfered tiles), folder-based mark distinct from ReqFlux's paper plane and DBFlux's bolt glyph, legible at 16 px. Each artboard shows the icon at 256/64/32/16 on dark and light backgrounds; 32 and 16 use a simplified small variant. RECOMMENDED: 01-chamfer-folder.html (closest to the Bolt shell and in-app folder tiles, strongest 16 px silhouette without leaning on the unapproved cobalt accent).",
+  "feature": "odd/tasks/app-icon.md",
+  "artboards": [
+    {
+      "file": "01-chamfer-folder.html",
+      "title": "Chamfer folder (recommended)",
+      "tradeoff": "Closest to the Bolt shell and the in-app folder tiles (info blue on panel, chamfered corners); the dark tile is quiet on dark docks and shares the chamfer idea with DBFlux, differing by colour and the folder subject",
+      "width": 960,
+      "height": 720
+    },
+    {
+      "file": "02-cobalt-flow.html",
+      "title": "Cobalt flow",
+      "tradeoff": "Strongest family resemblance to ReqFlux (cobalt fill, white glyph) and very legible on any background; least Fileflux-specific colour and it leans on the provisional, unapproved brand accent",
+      "width": 960,
+      "height": 720
+    },
+    {
+      "file": "03-island-rows.html",
+      "title": "Island rows",
+      "tradeoff": "Outlined folder with detail rows says 'file explorer' rather than just 'folder' and echoes the 2px tint edge; thin strokes and rows blur at 16 px, so the small variant drops the rows to one bar",
+      "width": 960,
+      "height": 720
+    }
+  ]
+}

@@ -243,10 +243,19 @@ jobs:
 
       - name: Assemble the package
         run: |
-          mkdir -p pkg/bin pkg/share/applications
+          mkdir -p pkg/bin pkg/share/applications pkg/share/icons/hicolor/scalable/apps
+          for size in 16 32 48 64 128 256; do
+            mkdir -p "pkg/share/icons/hicolor/${size}x${size}/apps"
+          done
           cp target/release/fileflux pkg/bin/fileflux
           cp packaging/fileflux.desktop pkg/share/applications/fileflux.desktop
-          # TODO: ship an icon (share/icons/hicolor/...) once Fileflux has one.
+          cp assets/icon/fileflux.svg pkg/share/icons/hicolor/scalable/apps/fileflux.svg
+          cp assets/icon/fileflux-16.png pkg/share/icons/hicolor/16x16/apps/fileflux.png
+          cp assets/icon/fileflux-32.png pkg/share/icons/hicolor/32x32/apps/fileflux.png
+          cp assets/icon/fileflux-48.png pkg/share/icons/hicolor/48x48/apps/fileflux.png
+          cp assets/icon/fileflux-64.png pkg/share/icons/hicolor/64x64/apps/fileflux.png
+          cp assets/icon/fileflux-128.png pkg/share/icons/hicolor/128x128/apps/fileflux.png
+          cp assets/icon/fileflux-256.png pkg/share/icons/hicolor/256x256/apps/fileflux.png
           cp LICENSE pkg/LICENSE
 
       # One tarball, published under two names: the rolling name for humans

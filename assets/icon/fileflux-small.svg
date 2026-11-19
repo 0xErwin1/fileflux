@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Small-size variant of the Fileflux mark: a single larger folder silhouette without the border or leaf gap, so it stays legible at 16 and 32 px. PNG sizes 16 and 32 are rasterized from this file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <path d="M112 0H512V400L400 512H0V112Z" fill="#100F13"/>
+  <path d="M112 96H220L256 140H440V372L396 416H72V136Z" fill="#6EA8FF"/>
+</svg>

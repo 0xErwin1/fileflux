@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fileflux app icon · Chamfer folder</title>
+<style>
+:root{--desk:#050507;--background:#09090B;--panel:#100F13;--line:#232128;--line-2:#37333D;--strong:#F7F4F7;--foreground:#C6C3CC;--muted:#8E8996;--info:#6EA8FF;--tint:#9DB1FF;--accent:#2B45B8;--ui:system-ui,-apple-system,"Segoe UI",sans-serif;--mono:ui-monospace,"SFMono-Regular",Consolas,monospace;--cut:14px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--desk);color:var(--foreground);font:500 13px/1.5 var(--ui);padding:8px;min-height:100vh}
+main{display:grid;gap:8px;max-width:960px;margin:0 auto}
+header,.board{background:var(--panel);border:1px solid rgba(255,255,255,.05);clip-path:polygon(var(--cut) 0,100% 0,100% calc(100% - var(--cut)),calc(100% - var(--cut)) 100%,0 100%,0 var(--cut));padding:24px}
+h1{margin:0 0 4px;color:var(--strong);font-size:20px;font-weight:600}
+p{margin:0;color:var(--muted);max-width:68ch}
+.label{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);margin-bottom:12px}
+.boards{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:8px}
+.surface{padding:24px;display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap;border:1px solid var(--line)}
+.dark{background:var(--background)}
+.light{background:var(--strong)}
+.size{display:grid;gap:8px;justify-items:start}
+.size span{font:500 12px var(--mono);color:var(--muted)}
+.light .size span{color:var(--line-2)}
+svg{display:block}
+</style></head>
+<body><main>
+<header><div class="label">Fileflux app icon · direction 1 of 3</div><h1>Chamfer folder</h1><p>Closest to the Bolt shell and the in-app folder tiles (info blue on panel, chamfered corners); the dark tile is quiet on dark docks and shares the chamfer idea with DBFlux, differing by colour and the folder subject.</p></header>
+<section class="boards" aria-label="Icon at four sizes on dark and light backgrounds">
+<div class="board"><div class="label">On dark</div><div class="surface dark"><div class="size"><svg width="256" height="256" role="img" aria-label="Chamfer folder icon at 256 pixels"><use href="#b1"/></svg><span>256px</span></div><div class="size"><svg width="64" height="64" role="img" aria-label="Chamfer folder icon at 64 pixels"><use href="#b1"/></svg><span>64px</span></div><div class="size"><svg width="32" height="32" role="img" aria-label="Chamfer folder icon at 32 pixels"><use href="#s1"/></svg><span>32px</span></div><div class="size"><svg width="16" height="16" role="img" aria-label="Chamfer folder icon at 16 pixels"><use href="#s1"/></svg><span>16px</span></div></div></div>
+<div class="board"><div class="label">On light</div><div class="surface light"><div class="size"><svg width="256" height="256" role="img" aria-label="Chamfer folder icon at 256 pixels"><use href="#b1"/></svg><span>256px</span></div><div class="size"><svg width="64" height="64" role="img" aria-label="Chamfer folder icon at 64 pixels"><use href="#b1"/></svg><span>64px</span></div><div class="size"><svg width="32" height="32" role="img" aria-label="Chamfer folder icon at 32 pixels"><use href="#s1"/></svg><span>32px</span></div><div class="size"><svg width="16" height="16" role="img" aria-label="Chamfer folder icon at 16 pixels"><use href="#s1"/></svg><span>16px</span></div></div></div>
+</section>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="b1" viewBox="0 0 512 512">
+  <path d="M112 0H512V400L400 512H0V112Z" fill="#100F13"/>
+  <path d="M112 8H504V400L400 504H8V112Z" fill="none" stroke="#37333D" stroke-width="8"/>
+  <path d="M136 120H222L256 160H416V204H96V160Z" fill="#9DB1FF"/>
+  <path d="M96 218H416V352L376 392H96Z" fill="#6EA8FF"/>
+</symbol>
+<symbol id="s1" viewBox="0 0 512 512">
+  <path d="M112 0H512V400L400 512H0V112Z" fill="#100F13"/>
+  <path d="M112 96H220L256 140H440V372L396 416H72V136Z" fill="#6EA8FF"/>
+</symbol>
+</defs></svg>
+</main></body></html>

@@ -104,8 +104,8 @@ stdenv.mkDerivation {
   # Tarball layout, from .github/workflows/nightly.yml:
   #   bin/fileflux
   #   share/applications/fileflux.desktop
+  #   share/icons/hicolor/{scalable,16x16,...,256x256}/apps/fileflux.{svg,png}
   #   LICENSE
-  # TODO: install the icons once the tarball ships them.
   installPhase = ''
     runHook preInstall
 
@@ -113,7 +113,7 @@ stdenv.mkDerivation {
 
     install -Dm755 bin/fileflux $out/bin/${appId}
 
-    # Channel-scoped desktop entry, so a stable and a nightly package can
+    # Channel-scoped desktop entry and icons, so a stable and a nightly package can
     # coexist in one profile. StartupWMClass stays `fileflux`: it is the
     # window's app id, which the nightly binary does not change.
     install -Dm644 share/applications/fileflux.desktop \
@@ -121,7 +121,15 @@ stdenv.mkDerivation {
     sed -i \
       -e 's|^Exec=fileflux|Exec=${appId}|' \
       -e 's|^Name=Fileflux$|Name=${appName}|' \
+      -e 's|^Icon=fileflux$|Icon=${appId}|' \
       $out/share/applications/${appId}.desktop
+
+    install -Dm644 share/icons/hicolor/scalable/apps/fileflux.svg \
+      $out/share/icons/hicolor/scalable/apps/${appId}.svg
+    for size in 16 32 48 64 128 256; do
+      install -Dm644 "share/icons/hicolor/''${size}x''${size}/apps/fileflux.png" \
+        "$out/share/icons/hicolor/''${size}x''${size}/apps/${appId}.png"
+    done
 
     install -Dm644 LICENSE $out/share/licenses/${appId}/LICENSE
 

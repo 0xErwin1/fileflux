@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fileflux mark: an info-blue folder with a tint back leaf on a chamfered Bolt panel tile (design/app-icon/01-chamfer-folder.html). PNG sizes 48 and up are rasterized from this file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <path d="M112 0H512V400L400 512H0V112Z" fill="#100F13"/>
+  <path d="M112 8H504V400L400 504H8V112Z" fill="none" stroke="#37333D" stroke-width="8"/>
+  <path d="M136 120H222L256 160H416V204H96V160Z" fill="#9DB1FF"/>
+  <path d="M96 218H416V352L376 392H96Z" fill="#6EA8FF"/>
+</svg>

@@ -4,6 +4,7 @@ Name=Fileflux
 GenericName=File Manager and Image Viewer
 Comment=Browse files and view images
 Exec=fileflux %F
+Icon=fileflux
 Terminal=false
 StartupWMClass=fileflux
 Categories=System;FileManager;Graphics;Viewer;
