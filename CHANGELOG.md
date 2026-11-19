@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Recent view in Places from the freedesktop `recently-used.xbel` (read-only, live, Open containing folder, restorable tab).
+- Grid thumbnails reuse current entries from the freedesktop thumbnail cache.
+
 - Native Bolt file explorer on GPUI: places sidebar, breadcrumb path bar with an editable field, back/forward/up history, grid and list views, folder subbar, status bar with free space, and a dark theme.
 - Command line: open a folder or file's parent, open images in the viewer, `--help` and `--version`, clear errors with exit status 2 for missing paths.
 - Image viewer in a window of its own: folder browsing, zoom, pan, rotation, info panel, fullscreen, animated GIF and WebP, and `scripts/install-desktop.sh` to register Fileflux as an image handler.

@@ -26,7 +26,9 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Drag and drop](#drag-and-drop)
 - [Progress and toasts](#progress-and-toasts)
 - [Details panel](#details-panel)
+- [Thumbnails](#thumbnails)
 - [Image viewer](#image-viewer)
+- [Recent files](#recent-files)
 - [Sidebar](#sidebar)
 - [Current scope](#current-scope)
 
@@ -256,6 +258,10 @@ A read-only panel on the right (300 px by default, resizable), toggled by the to
 
 Only image files are previewed.
 
+## Thumbnails
+
+Image tiles in the grid use the freedesktop thumbnail cache (`$XDG_CACHE_HOME/thumbnails/{normal,large,x-large}`) when it holds a current thumbnail: the file name is the MD5 of the image's canonical `file://` URI, and the PNG's `Thumb::URI` must match and `Thumb::MTime` must equal the file's modification time. Otherwise the image itself is loaded. Fileflux only reads the cache and never creates thumbnails.
+
 ## Image viewer
 
 Opening an image shows it in a window of its own, with no sidebar: `fileflux photo.png`, a double click on an image in the explorer, or **Open in viewer**. The viewer walks the images of the folder in the explorer's order (current sort and filter).
@@ -278,6 +284,10 @@ scripts/install-desktop.sh --uninstall      # undo exactly what was installed
 ```
 
 The script writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list`, and `--uninstall` restores the defaults it replaced.
+
+## Recent files
+
+The sidebar's Places section has a **Recent** row. It lists up to 200 files that applications opened, newest first, from the freedesktop `recently-used.xbel` (`$XDG_DATA_HOME/recently-used.xbel`, else `~/.local/share/recently-used.xbel`). The view is read-only and updates live when that file changes. Missing files and non-local entries (`sftp://`, `smb://`) are skipped. The Modified column shows when each file was last used. Enter opens a file as usual, and the context menu's **Open containing folder** goes to its folder with the file selected. Nothing can be created, pasted or dropped into Recent, and Fileflux never writes `recently-used.xbel`.
 
 ## Sidebar
 

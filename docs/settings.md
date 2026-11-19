@@ -32,6 +32,9 @@ A version 1 file is migrated when it is read, and rewritten as version 2 at the 
 
 ## What is saved and when
 
+`session.toml` records a Recent tab as `recent = true`, like `trash = true` for the Trash.
+
+
 - **The default view, sort and filters are the active tab's.** A new tab already starts from the tab it was opened from, so whatever the active tab shows is saved as the default for the next launch. Per-folder memory is not implemented.
 - **Restoring.** Starting `fileflux` without a path reopens the saved tabs, in order, with the saved one active. Startup never checks the folders on the UI thread: each tab opens as saved and loads in the background. A tab whose folder no longer exists then switches to its nearest existing parent (home if none), with a status-bar notice.
 - **A path on the command line wins.** `fileflux ~/x` opens only that folder and neither reads nor overwrites the saved session, so a quick launch never replaces the tabs of your last regular run. Preferences are still loaded and saved.
