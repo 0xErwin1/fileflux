@@ -10,6 +10,7 @@ Goal: clearer context-menu targets, sidebar context menu, resizable side panels,
 - Agent plan announced to the user: hover highlight on tiles/rows; the right-clicked target keeps an accent outline while the menu is open; menu header naming the target ("report.pdf", "3 items", "Home (this folder)"); sidebar menu Open / Open in new tab / Add or Remove favorite / Copy path / Properties; drag the borders of the sidebar and the details panel, widths persisted in settings.toml, double-click resets; toasts top-centered under the toolbar in the title band so they never cover Sort/Filter/New folder/Empty Trash; measure in release, move per-keystroke filter/sort work off the UI thread.
 - S6: "Me gustaria que los sub menus de un menu contextual no remplace el menu sino que sea escalado" — cascading (flyout) submenus instead of drill-in pages.
 - S7: "porque no tengo opcion de favoritos?" (screenshot: entry context menu on folder 'personal' with Open, Open in new tab, Cut, Copy, Paste into folder, Rename, Copy path, Properties, Move to Trash, Delete permanently — no favorites row)
+- S8: "Los toast deberia de desapracer mas rapido. Ni estar en medio de la pantalla. deberian de ir a una esquina" — plan told to the user: bottom-right corner above the status bar (never over subbar buttons or the grid center); info/success 3 s, with Undo 6 s, errors 8 s or until closed; hover pauses the timer; new toasts stack upward, max 3 visible. Supersedes S4's top-centered placement.
 
 ## Tasks
 - T1 | S1-S4 | route: writer (parallel with T2, disjoint surfaces) | done | Context target highlight + menu header, sidebar context menu, resizable sidebar and details panel (persisted), toast placement | commit: 2f4be0e
@@ -17,6 +18,7 @@ Goal: clearer context-menu targets, sidebar context menu, resizable side panels,
 - T3 | S5 | route: writer | done | Wire the async arrangement in the UI: build ArrangeIndex on the scan thread, commit_indexed, arrange_tab background jobs with generation guard, visible_shared in render paths, move refresh_snapshot clone off the UI thread, native validation on a 1M-entry folder | commit: 0068b56
 - T4 | S6 | route: blocked on Bolt | blocked | Cascading submenus for Sort by / Filter (context menus and subbar buttons) | commit: -
 - T5 | S7 | route: inline after devices T4 (shared files) | pending | Entry context menu: Add to favorites / Remove from favorites for a single selected folder (not in Trash), reusing the sidebar commands; test + native check | commit: -
+- T6 | S8 | route: batched with standards T1 (shared files) | pending | Toasts to bottom-right corner, shorter timeouts by kind, hover pause, max 3 | commit: -
 
 ## Log
 - L1: "[Image#1] me cuesta diferenciar donde puedo hacer click derecho y ver el menu contextual de donde estoy parado. Me falta opciones en la sidebar para abrir, abrir en una tab, marcar favorito (cuando este) Tambien me falta que se puedan redimencionar las sidebars [Image#2] las notificaciones parecen medio tiradas tal vez un poco mas arriba no estarian mal Sobre las pruebas de 990k archivos, hacel"
@@ -26,3 +28,4 @@ Goal: clearer context-menu targets, sidebar context menu, resizable side panels,
 - L5: "Me gustaria que los sub menus de un menu contextual no remplace el menu sino que sea escalado" → T4.
 - L6: "No hay sub menus? Eso deberia de estar, es algo que falta quitar de dbflux y generalizar clarmaente. Dame letra para mandar otro agente" → cancelled the in-app hand-rolled cascade writer (its partial edits to arrange_menu.rs/ops.rs/ops_tests.rs discarded) to avoid duplicating what belongs in Bolt; T4 waits for a generic Bolt submenu extracted from DBFlux, then Fileflux bumps the bolt rev and adopts it.
 - L7: "porque no tengo opcion de favoritos?" → T5 (gap: favorites only in toolbar star and sidebar menu).
+- L8: "Los toast deberia de desapracer mas rapido. Ni estar en medio de la pantalla. deberian de ir a una esquina" → T6, supersedes the S4 placement.
