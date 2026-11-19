@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "chosen": "01-familiar-grid.html",
+  "handoffs": {
+    "01-familiar-grid.html": {
+      "status": "implemented",
+      "queued": false,
+      "sentAt": "2026-11-17T01:05:58.601Z",
+      "startedAt": "2026-11-17T01:06:22.395Z",
+      "implementedAt": "2026-11-17T13:40:42.848Z",
+      "note": "Native GPUI/Bolt layout implemented with fixed tiles and the shared Bolt data grid; 48 Rust tests pass and the user confirmed double-click navigation. The prior native code-review escalation remains unresolved."
+    }
+  }
+}

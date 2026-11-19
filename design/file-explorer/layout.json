@@ -1,0 +1,25 @@
+{
+  "arrangement": "free",
+  "positions": {
+    "system": {
+      "x": 0,
+      "y": 76
+    },
+    "01-familiar-grid.html": {
+      "x": 70,
+      "y": 1343
+    },
+    "02-detail-list.html": {
+      "x": 70,
+      "y": 2398
+    },
+    "03-compact-grid.html": {
+      "x": 70,
+      "y": 3453
+    },
+    "04-refined-shell.html": {
+      "x": 70,
+      "y": 4508
+    }
+  }
+}

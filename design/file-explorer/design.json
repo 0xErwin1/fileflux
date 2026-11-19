@@ -1,0 +1,35 @@
+{
+  "title": "File explorer",
+  "brief": "Fileflux file explorer, same Bolt family as DBFlux and ReqFlux: sidebar places (Home, Desktop, Trash, mounted volumes, favorites), central toolbar with current path and scoped search, icon grid and detail list views, reference image is a plain dark compact folder grid with blue icons and filenames underneath, no card borders. Brand colors reuse ReqFlux cobalt provisionally for family comparison \u2014 not an approved Fileflux identity.",
+  "artboards": [
+    {
+      "file": "01-familiar-grid.html",
+      "title": "Familiar grid",
+      "tradeoff": "Conventional three-region explorer closest to the reference image; standard 290px sidebar leaves less room for entries",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "02-detail-list.html",
+      "title": "Detail list",
+      "tradeoff": "Two-row toolbar puts the editable path first and rows carry full metadata; less iconic warmth, denser information",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "03-compact-grid.html",
+      "title": "Compact grid",
+      "tradeoff": "Proposed 220px sidebar and 88px tiles maximize visible items; tighter spacing, less breathing room",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "04-refined-shell.html",
+      "title": "Refined shell",
+      "tradeoff": "Breadcrumbs, name-only sidebar with volume usage, larger two-tone folders and image thumbnails, a details/preview panel and CRUD affordances (context menu, F2 rename, trash with undo); the inspector costs ~300px of grid width",
+      "width": 1440,
+      "height": 900
+    }
+  ],
+  "feature": "odd/tasks/explorer-mvp.md"
+}

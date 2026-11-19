@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fileflux · Compact grid</title><style>
+:root{--desk:#050507;--background:#09090B;--panel:#100F13;--raised:#1A181E;--line:#232128;--line-2:#37333D;--divider:#18161B;--strong:#F7F4F7;--foreground:#C6C3CC;--muted:#8E8996;--info:#6EA8FF;--success:#7BE0A0;--warning:#FFC23D;--danger:#FF6B5E;--tint:#9DB1FF;--accent:#2B45B8;--on-accent:#FFFFFF;--selection:rgba(157,177,255,.12);--hover:rgba(255,255,255,.04);--edge:rgba(255,255,255,.05);--ui:system-ui,-apple-system,"Segoe UI",sans-serif;--mono:ui-monospace,"SFMono-Regular",Consolas,monospace;--sidebar:290px}
+*{box-sizing:border-box}[hidden]{display:none!important}::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:var(--line-2)}::-webkit-scrollbar-track{background:transparent}*{scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}html,body{height:100%;margin:0}body{background:var(--desk);color:var(--foreground);font:500 13px var(--ui)}button,input,select{font:inherit;color:inherit}button{cursor:pointer}button,input,select{border:0;border-radius:0}button{background:none}button:hover{background:var(--hover)}button:disabled{opacity:.4;cursor:default}button:disabled:hover{background:none}:focus-visible{outline:1.5px solid var(--tint);outline-offset:-2px}input:focus-visible{outline-offset:0}.icon{width:16px;height:16px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}button .icon{pointer-events:none}
+.app{height:100dvh;min-height:420px;display:flex;flex-direction:column}.titlebar{height:44px;flex-shrink:0;background:var(--background);display:flex;align-items:center;padding:0 14px;gap:12px}.brand{display:flex;gap:8px;align-items:center;color:var(--strong);font-weight:700;letter-spacing:-.02em}.brandmark{width:22px;height:22px;background:var(--tint);color:var(--background);clip-path:polygon(6px 0,100% 0,100% 16px,16px 100%,0 100%,0 6px);display:grid;place-items:center;font-weight:800}.windowtitle{position:absolute;left:50%;transform:translateX(-50%);color:var(--muted);font-size:12px}.demo{margin-left:auto;color:var(--muted);font:11px var(--mono)}.middle{min-height:0;flex:1;display:flex;gap:8px;padding:0 8px}.island{background:var(--panel);border:1px solid var(--edge);clip-path:polygon(14px 0,100% 0,100% calc(100% - 14px),calc(100% - 14px) 100%,0 100%,0 14px)}
+.sidebar{width:var(--sidebar);flex-shrink:0;display:flex;flex-direction:column;overflow:auto}.sidebarheader{min-height:46px;padding:0 16px;display:flex;align-items:center;gap:8px;color:var(--strong);border-bottom:1px solid var(--line)}.sidebarheader .icon{color:var(--tint)}.section{margin:24px 0 0}.label{margin:0 16px 8px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.14em;color:var(--muted)}.navrow{position:relative;min-height:26px;padding:4px 16px;display:flex;align-items:center;gap:8px;text-align:left;width:100%;font-size:13px}.navrow .icon{width:15px;height:15px;color:var(--muted)}.navrow.active{color:var(--strong);background:var(--selection)}.navrow.active:before{content:"";width:2px;background:var(--tint);position:absolute;inset:0 auto 0 0}.navrow.active .icon{color:var(--tint)}.navmeta{margin-left:auto;color:var(--muted);font:11px var(--mono)}.volumemeta{margin:6px 16px 16px 39px;color:var(--muted);font-size:12px}.volumehint{font-size:11px;color:var(--muted);padding:8px 16px}.sidefoot{margin-top:auto;min-height:46px;padding:16px;color:var(--muted);font-size:12px;display:flex;align-items:center;gap:8px}
+.document{flex:1;min-width:0;display:flex;flex-direction:column}.toolbar{display:flex;gap:8px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}.navbuttons{display:flex;gap:4px}.iconbtn{width:30px;height:30px;display:inline-flex;justify-content:center;align-items:center;color:var(--muted)}.cut{clip-path:polygon(6px 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%,0 6px)}.location{height:30px;min-width:160px;flex:1;display:flex;align-items:center;gap:8px;padding:0 10px;background:var(--background);border:1px solid var(--line-2)}.location>.icon{width:14px;height:14px;color:var(--muted)}.breadcrumbs{display:flex;gap:2px;align-items:center;overflow:auto;white-space:nowrap}.breadcrumbs button{font-size:12px;padding:4px;color:var(--muted)}.breadcrumbs button:last-of-type{color:var(--foreground)}.breadcrumbs .icon{width:10px;height:10px;color:var(--muted)}.pathinput{background:none;min-width:0;flex:1;font:12px var(--mono);width:100%}.pathinput[hidden],.breadcrumbs[hidden]{display:none}.searchbox{width:210px;height:30px;display:flex;align-items:center;gap:8px;padding:0 10px;background:var(--background);border:1px solid var(--line-2)}.searchbox .icon{width:14px;height:14px;color:var(--muted)}.searchbox input{width:100%;min-width:0;outline:none;background:none;font-size:12px}.searchbox:focus-within{outline:1.5px solid var(--tint)}input::placeholder{color:var(--muted);opacity:1}.viewtoggle{display:flex;background:var(--background);padding:2px;gap:2px;border:1px solid var(--line)}.viewtoggle .iconbtn{height:26px}.viewtoggle [aria-pressed=true]{background:var(--raised);color:var(--tint)}.contenthead{display:flex;align-items:center;gap:12px;padding:16px 24px}.heading{margin:0;font-size:18px;font-weight:700;color:var(--strong)}.foldercount{font:12px var(--mono);color:var(--muted)}.sortwrap{margin-left:auto;font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:center}select{padding:6px 8px;background:var(--raised);color:var(--foreground);min-height:30px}.scope{margin:0 24px 12px;color:var(--muted);font-size:12px}.scope:empty{display:none}.entries{overflow:auto;flex:1;min-height:0;padding:0 16px 24px}.entries.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;align-content:start}.entry{position:relative;color:var(--foreground);min-width:0}.grid .entry{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:16px 4px 8px;gap:12px;min-height:104px;text-align:center}.grid .entry>.icon{width:44px;height:44px;stroke-width:1.5;color:var(--muted)}.grid .entry.folder>.icon{color:var(--info);fill:var(--selection)}.grid .entry .filename{font-size:12px;line-height:1.5;overflow-wrap:anywhere;max-width:100%;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.entry.selected{background:var(--selection);color:var(--strong)}.entry.selected:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--tint)}.selectedcheck{position:absolute;top:6px;right:6px;color:var(--tint);display:none}.selectedcheck .icon{width:12px;height:12px}.selected .selectedcheck{display:block}
+.list .entry,.listhead{display:grid;grid-template-columns:minmax(180px,1fr) 120px 100px 170px;gap:16px;align-items:center;text-align:left;width:100%;padding:0 12px}.list .entry{min-height:32px;border-bottom:1px solid var(--divider);font-size:13px}.list .identity{display:flex;align-items:center;gap:8px;min-width:0}.list .identity>.icon{width:16px;height:16px;color:var(--muted)}.list .folder .identity>.icon{color:var(--info)}.list .filename{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metadata{color:var(--muted);font:12px var(--mono)}.size{text-align:right}.listhead{height:32px;color:var(--muted);border-bottom:1px solid var(--line);font-size:12px;flex-shrink:0}.listheadwrap{margin:0 16px;overflow:hidden}.listheadwrap[hidden]{display:none}.empty{padding:64px 24px;text-align:center;color:var(--muted)}.empty strong{display:block;color:var(--strong);font-size:18px;margin:16px}.empty button{border:1px solid var(--line-2);background:var(--raised);padding:8px 12px;margin:16px}.statusbar{height:38px;flex-shrink:0;display:flex;align-items:center;gap:16px;padding:0 16px;font-size:12px;color:var(--muted);background:var(--background)}.statusbar .right{margin-left:auto}.statusbar kbd{font:11px var(--mono);color:var(--foreground)}.statusmessage{color:var(--foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.statusmessage.error{color:var(--danger)}.mobiletoggle{display:none}.compact{--sidebar:220px}.compact .entries.grid{grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:4px}.compact .grid .entry{min-height:88px;padding:12px 4px;gap:8px}.compact .grid .entry>.icon{width:36px;height:36px}.compact .contenthead{padding:12px 16px}.compact .toolbar{padding:8px 12px}.compact .section{margin-top:16px}.toolrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1;min-width:0}.toolrow+.toolrow{margin-top:8px}.widepath .location{flex:1;min-width:240px}.widepath .breadcrumbs{flex:1;min-width:120px}.widepath .searchbox{width:320px}.widepath .viewtoggle{margin-left:auto}.viewnote{font-size:12px;color:var(--muted);font-family:var(--mono)}
+@media(max-width:1000px){.searchbox{width:180px}.list .entry,.listhead{grid-template-columns:minmax(180px,1fr) 100px 80px 150px;gap:12px}.list{min-width:590px}.entries.list{overflow:visible}.document:has(.entries.list){overflow:auto}.windowtitle{display:none}.viewnote{display:none}}
+@media(max-width:760px){.sidebar{display:none;position:absolute;z-index:2;left:8px;top:44px;bottom:38px;width:min(290px,calc(100% - 16px));border:1px solid var(--line-2)}.sidebar.open{display:flex}.mobiletoggle{display:inline-flex}.toolbar{padding:8px}.location{min-width:160px}.searchbox,.widepath .searchbox{flex:1;width:auto}.contenthead{padding:16px}.heading{font-size:18px}.foldercount{display:none}.statusbar .right{display:none}.statusbar{gap:8px}.demo{font-size:10px}.entries.grid{grid-template-columns:repeat(auto-fill,minmax(88px,1fr))}.widepath .location{min-width:140px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
+</style></head>
+<body class="compact"><div class="app">
+<header class="titlebar"><button class="iconbtn mobiletoggle" aria-label="Toggle sidebar" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button><div class="brand"><span class="brandmark">F</span>fileflux</div><span class="windowtitle">Home — Fileflux</span><span class="demo">DESIGN PREVIEW · SAMPLE FILES</span></header>
+<div class="middle"><aside class="sidebar island" aria-label="File locations"><div class="sidebarheader"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5h6l2 2h10v13H3z"/><path d="M3 10h18"/></svg> Explorer</div>
+<nav aria-label="Places"><section class="section"><h2 class="label">Places</h2><button class="navrow" data-path="/home/alex"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7v11h-7v-7h-4v7H3z"/></svg><span>Home</span></button><button class="navrow" data-path="/home/alex/Desktop"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13"/><path d="M8 21h8m-4-4v4"/></svg><span>Desktop</span></button><button class="navrow" data-path="/home/alex/Documents"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8m-8 4h6"/></svg><span>Documents</span></button><button class="navrow" data-path="/home/alex/Downloads"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 16v5h16v-5"/></svg><span>Downloads</span></button><button class="navrow" data-path="/home/alex/Pictures"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18"/><path d="m3 17 6-6 4 4 3-3 5 5"/><circle cx="16" cy="8" r="1"/></svg><span>Pictures</span></button><button class="navrow" data-path="/home/alex/Music"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l11-2v13M9 8l11-2"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg><span>Music</span></button><button class="navrow" data-path="trash:"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/></svg><span>Trash</span></button><div class="volumemeta">Preview only · nothing deleted</div></section>
+<section class="section"><h2 class="label">Favorites</h2><button class="navrow" data-path="/home/alex/Projects"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1z"/></svg><span>Projects</span></button><button class="navrow" data-path="/home/alex/Wallpapers"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1z"/></svg><span>Wallpapers</span></button><button class="navrow" data-path="/home/alex/Design assets"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1z"/></svg><span>Design assets</span></button></section>
+<section class="section"><h2 class="label">Volumes</h2><button class="navrow" data-path="/"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 4-3 11v5h20v-5L19 4zM2 15h20M6 18h1m3 0h1"/></svg><span>System</span></button><div class="volumemeta">284 GB free of 512 GB</div><button class="navrow" data-path="/media/Archive"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 4-3 11v5h20v-5L19 4zM2 15h20M6 18h1m3 0h1"/></svg><span>Archive</span></button><div class="volumemeta">1.2 TB free of 2 TB</div><p class="volumehint">Sample mounted volumes</p></section></nav>
+<footer class="sidefoot"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7v11h-7v-7h-4v7H3z"/></svg> Local files</footer></aside>
+<main class="document island"><div class="toolbar"><div class="navbuttons"><button class="iconbtn" id="back" aria-label="Go back" title="Go back"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m14 5-7 7 7 7"/></svg></button><button class="iconbtn" id="forward" aria-label="Go forward" title="Go forward"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m10 5 7 7-7 7"/></svg></button><button class="iconbtn" id="up" aria-label="Parent folder" title="Parent folder"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21V3m-7 7 7-7 7 7"/></svg></button></div>
+<div class="location cut"><button class="iconbtn" id="editpath" aria-label="Edit current path" title="Edit path (Ctrl+L)"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5h6l2 2h10v13H3z"/><path d="M3 10h18"/></svg></button><nav class="breadcrumbs" aria-label="Current path"></nav><input class="pathinput" id="path" aria-label="Current folder path" hidden spellcheck="false"></div>
+<label class="searchbox cut"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input type="search" id="search" placeholder="Search this folder…" aria-label="Search names in current folder"></label>
+<div class="viewtoggle cut" role="group" aria-label="View"><button class="iconbtn" data-view="grid" aria-label="Icon view" aria-pressed="true" title="Icon view"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6"/><rect x="15" y="3" width="6" height="6"/><rect x="3" y="15" width="6" height="6"/><rect x="15" y="15" width="6" height="6"/></svg></button><button class="iconbtn" data-view="list" aria-label="List view" aria-pressed="false" title="List view"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13M3 5h1m-1 7h1m-1 7h1"/></svg></button></div></div>
+<div class="contenthead"><h1 class="heading">Home</h1><span class="foldercount"></span><label class="sortwrap">Sort<select id="sort" aria-label="Sort files"><option value="name">Name ↑</option><option value="modified">Modified ↓</option><option value="kind">Type</option></select></label></div>
+<p class="scope"></p><div class="listheadwrap" hidden><div class="listhead"><span>Name ↑</span><span>Type</span><span class="size">Size</span><span>Modified</span></div></div>
+<div class="entries grid" aria-label="Folder contents"></div><div class="empty" hidden></div>
+</main></div>
+<footer class="statusbar"><span id="itemcount"></span><span class="statusmessage" role="status" aria-live="polite"></span><span class="right"><kbd>Ctrl L</kbd> Path &nbsp; · &nbsp; <kbd>Ctrl F</kbd> Search &nbsp; · &nbsp; Double-click to open</span></footer>
+</div>
+<script>
+(function(){
+"use strict";
+const HOME="/home/alex";
+const F=(n,t,s,m)=>({n,t,s:s||0,m:m||"2026-01-01"});
+const FS={
+"/":{name:"System",entries:[F("etc","folder",4096,"2025-11-02"),F("home","folder",4096,"2025-08-14"),F("media","folder",4096,"2026-01-09"),F("system.log","text",20487,"2026-02-15")]},
+"/etc":{name:"etc",entries:[F("fstab","text",660,"2025-08-14"),F("hostname","text",7,"2025-08-14"),F("hosts","text",214,"2025-08-14")]},
+"/home":{name:"home",entries:[F("alex","folder",4096,"2026-02-16")]},
+[HOME]:{name:"alex",entries:[
+F("Desktop","folder",4096,"2026-02-14"),F("Documents","folder",4096,"2026-02-13"),F("Downloads","folder",4096,"2026-02-11"),F("Music","folder",4096,"2026-01-28"),F("Pictures","folder",4096,"2026-02-02"),F("Projects","folder",4096,"2026-02-16"),F("Wallpapers","folder",4096,"2026-02-02"),F("Design assets","folder",4096,"2026-01-19"),
+F("app-logs.txt","text",38214,"2026-02-15"),F("backup-home.tar.gz","archive",2147483648,"2026-02-01"),F("budget-2026.ods","other",38912,"2026-02-10"),F("demo-recording.mp4","video",734003200,"2026-02-12"),F("explorer.rs","code",18643,"2026-02-16"),F("notes.txt","text",1562,"2026-02-16"),F("podcast-episode.mp3","audio",48234496,"2026-01-28"),F("report-draft.pdf","pdf",912384,"2026-02-13"),F("resume.pdf","pdf",204800,"2026-01-15"),F("screenshot-session.png","image",1048576,"2026-02-14"),F("theme.css","code",8432,"2026-02-09"),F("todo.md","text",742,"2026-02-13"),F("wallpaper-mountains.jpg","image",3355443,"2026-02-02")
+]},
+[HOME+"/Desktop"]:{name:"Desktop",entries:[F("meeting-notes.txt","text",1893,"2026-02-10"),F("release-checklist.md","text",1204,"2026-02-13"),F("screenshot-2026-02-14.png","image",245312,"2026-02-14"),F("todo.md","text",742,"2026-02-13")]},
+[HOME+"/Documents"]:{name:"Documents",entries:[F("Invoices","folder",4096,"2026-02-03"),F("archive-2025.tar.gz","archive",524288000,"2026-01-20"),F("budget-2026.ods","other",38912,"2026-02-10"),F("notes.txt","text",1562,"2026-02-16"),F("report-draft.pdf","pdf",912384,"2026-02-13")]},
+[HOME+"/Documents/Invoices"]:{name:"Invoices",entries:[F("invoice-2026-01.pdf","pdf",143360,"2026-02-03"),F("invoice-2026-02.pdf","pdf",139264,"2026-02-03")]},
+[HOME+"/Downloads"]:{name:"Downloads",entries:[F("app-installer.tar.gz","archive",96531456,"2026-02-11"),F("article-printable.pdf","pdf",1245184,"2026-02-06"),F("changelog.txt","text",8192,"2026-02-11"),F("dataset-sample.csv","other",4194304,"2026-02-04"),F("ffmpeg-6.1.tar.xz","archive",11534336,"2026-01-22"),F("wallpaper-pack.zip","archive",48234496,"2026-01-30")]},
+[HOME+"/Pictures"]:{name:"Pictures",entries:[F("portrait-cathedral.jpg","image",2411724,"2026-01-12"),F("screenshot-session.png","image",1048576,"2026-02-14"),F("wallpaper-lake.jpg","image",4194304,"2026-02-02"),F("wallpaper-mountains.jpg","image",3355443,"2026-02-02")]},
+[HOME+"/Music"]:{name:"Music",entries:[F("ambient-loop.mp3","audio",7864320,"2026-01-28"),F("interview-cut.mp3","audio",26214400,"2026-01-28"),F("podcast-episode.mp3","audio",48234496,"2026-01-28")]},
+[HOME+"/Projects"]:{name:"Projects",entries:[F("dbflux","folder",4096,"2026-01-18"),F("fileflux","folder",4096,"2026-02-16"),F("reqflux","folder",4096,"2026-02-08")]},
+[HOME+"/Projects/fileflux"]:{name:"fileflux",entries:[F("Cargo.toml","code",486,"2026-02-16"),F("README.md","text",2140,"2026-02-16"),F("design","folder",4096,"2026-02-16")]},
+[HOME+"/Projects/fileflux/design"]:{name:"design",entries:[F("file-explorer","folder",4096,"2026-02-16")]},
+[HOME+"/Projects/fileflux/design/file-explorer"]:{name:"file-explorer",entries:[F("01-familiar-grid.html","code",18432,"2026-02-16"),F("02-detail-list.html","code",18944,"2026-02-16"),F("03-compact-grid.html","code",17920,"2026-02-16")]},
+[HOME+"/Projects/reqflux"]:{name:"reqflux",entries:[F("Cargo.toml","code",512,"2026-02-08"),F("README.md","text",1980,"2026-02-08")]},
+[HOME+"/Projects/dbflux"]:{name:"dbflux",entries:[F("Cargo.toml","code",498,"2026-01-18"),F("README.md","text",2211,"2026-01-18")]},
+[HOME+"/Wallpapers"]:{name:"Wallpapers",entries:[F("aurora-over-fjord.jpg","image",5242880,"2026-01-30"),F("dune-at-dusk.jpg","image",4194304,"2026-01-30"),F("fog-forest.jpg","image",3670016,"2026-01-30"),F("wallpaper-lake.jpg","image",4194304,"2026-02-02"),F("wallpaper-mountains.jpg","image",3355443,"2026-02-02")]},
+[HOME+"/Design assets"]:{name:"Design assets",entries:[]},
+"/media":{name:"media",entries:[F("Archive","folder",4096,"2026-01-09")]},
+"/media/Archive":{name:"Archive",entries:[F("backup-dbflux.tar.gz","archive",1073741824,"2026-01-09"),F("old-laptop-image.img","other",21474836480,"2025-12-14"),F("photos-2019.tar","archive",8589934592,"2025-06-02"),F("README.txt","text",402,"2026-01-09")]},
+"trash:":{name:"Trash",entries:[F("draft-v1.pdf","pdf",655360,"2026-01-08"),F("old-mockups.fig","other",2453672,"2026-01-05"),F("temp-notes.txt","text",312,"2026-01-03"),F("unused-plugin.rs","code",4096,"2025-12-20")]}
+};
+FS["trash:"].trash=true;
+FS["trash:"].note="Preview only — items stay in Trash; nothing here is deleted or restored.";
+const ICON={folder:'<path d="M3 7V5h6l2 2h10v13H3z"/><path d="M3 10h18"/>',image:'<rect x="3" y="3" width="18" height="18"/><path d="m3 17 6-6 4 4 3-3 5 5"/><circle cx="16" cy="8" r="1"/>',text:'<path d="M5 3h9l5 5v13H5z"/><path d="M14 3v6h5M8 13h8m-8 4h6"/>',code:'<path d="m8 8-4 4 4 4"/><path d="m16 8 4 4-4 4"/>',pdf:'<path d="M5 3h9l5 5v13H5z"/><path d="M14 3v6h5M8 14h8m-8 3h5"/>',audio:'<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',video:'<rect x="3" y="5" width="18" height="14"/><path d="m10 9 5 3-5 3z"/>',archive:'<rect x="4" y="3" width="16" height="18"/><path d="M12 3v6m-2 2h4m-2 2h4"/>',other:'<path d="M5 3h9l5 5v13H5z"/><path d="M14 3v6h5"/>'};
+const KIND={folder:"Folder",image:"Image",text:"Text",code:"Code",pdf:"PDF",audio:"Audio",video:"Video",archive:"Archive",other:"File"};
+const WIDE=document.body.classList.contains("widepath");
+const $=s=>document.querySelector(s);
+const sidebar=$(".sidebar"),crumbsEl=$(".breadcrumbs"),pathInput=$("#path"),searchInput=$("#search"),sortSel=$("#sort"),entriesEl=$(".entries"),emptyEl=$(".empty"),listheadWrap=$(".listheadwrap"),headingEl=$(".heading"),countEl=$(".foldercount"),scopeEl=$(".scope"),itemCount=$("#itemcount"),statusMsg=$(".statusmessage"),titleEl=$(".windowtitle");
+const backBtn=$("#back"),fwdBtn=$("#forward"),upBtn=$("#up"),editBtn=$("#editpath"),sideToggle=$(".mobiletoggle");
+const viewBtns=[...document.querySelectorAll(".viewtoggle .iconbtn")];
+const navRows=[...document.querySelectorAll(".navrow")];
+let view=WIDE?"list":"grid";
+let path=HOME;
+let hist=[HOME],hi=0;
+let query="";
+let note="",noteBad=false;
+const selByPath=new Map();
+selByPath.set(path,new Set());
+let selection=selByPath.get(path);
+function selSet(){let s=selByPath.get(path);if(!s){s=new Set();selByPath.set(path,s);}return s;}
+function svg(kind){return '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">'+(ICON[kind]||ICON.other)+"</svg>";}
+function human(s){if(s<1024)return s+" B";const u=["KB","MB","GB","TB"];let v=s/1024,i=0;while(v>=1024&&i<u.length-1){v/=1024;i++;}return (v>=100?String(Math.round(v)):v.toFixed(1))+" "+u[i];}
+function df(m){return new Date(m+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});}
+function sorted(list){const mode=sortSel.value;return list.slice().sort((a,b)=>{const fa=a.t==="folder",fb=b.t==="folder";if(fa!==fb)return fa?-1:1;if(mode==="modified")return b.m.localeCompare(a.m)||a.n.localeCompare(b.n);if(mode==="kind")return (KIND[a.t]||"").localeCompare(KIND[b.t]||"")||a.n.localeCompare(b.n);return a.n.localeCompare(b.n,undefined,{numeric:true,sensitivity:"base"});});}
+function applySelection(){const sel=selByPath.get(path)||new Set();[...entriesEl.children].forEach(el=>{const on=sel.has(el.dataset.name);el.classList.toggle("selected",on);el.setAttribute("aria-selected",on?"true":"false");});}
+function updateStatus(){
+const total=FS[path].entries.length;
+itemCount.textContent=total===1?"1 item":total+" items";
+statusMsg.classList.toggle("error",noteBad);
+if(note)statusMsg.textContent=note;
+else if(selection.size===1)statusMsg.textContent=[...selection][0]+" selected";
+else if(selection.size>1)statusMsg.textContent=selection.size+" items selected";
+else statusMsg.textContent="";
+}
+function renderEntries(list){
+entriesEl.replaceChildren();
+list.forEach((e,i)=>{
+const b=document.createElement("button");
+b.type="button";b.className="entry"+(e.t==="folder"?" folder":"");
+b.dataset.name=e.n;b.tabIndex=i===0?0:-1;
+if(view==="grid"){
+b.innerHTML=svg(e.t)+'<span class="filename"></span><span class="selectedcheck" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="m4 12 5 5 11-11"/></svg></span>';
+b.querySelector(".filename").textContent=e.n;
+}else{
+b.innerHTML='<span class="identity">'+svg(e.t)+'<span class="filename"></span></span><span class="metadata"></span><span class="metadata size"></span><span class="metadata"></span>';
+b.querySelector(".filename").textContent=e.n;
+const md=b.querySelectorAll(".metadata");
+md[0].textContent=KIND[e.t]||"File";
+md[1].textContent=e.t==="folder"?"\u2014":human(e.s);
+md[2].textContent=df(e.m);
+}
+entriesEl.appendChild(b);
+});
+applySelection();
+}
+function addCrumb(label,p,current){
+const b=document.createElement("button");
+b.type="button";b.textContent=label;
+if(current)b.setAttribute("aria-current","page");
+b.addEventListener("click",()=>navigate(p));
+crumbsEl.appendChild(b);
+if(!current)crumbsEl.insertAdjacentHTML("beforeend",'<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>');
+}
+function renderCrumbs(){
+crumbsEl.replaceChildren();
+if(path==="trash:"){addCrumb("Trash","trash:",true);return;}
+addCrumb("System","/",path==="/");
+let acc="";
+path.split("/").filter(Boolean).forEach((seg,i,arr)=>{acc+="/"+seg;addCrumb(seg,acc,i===arr.length-1);});
+}
+function render(){
+const folder=FS[path];
+const total=folder.entries.length;
+const filtered=query?folder.entries.filter(e=>e.n.toLowerCase().includes(query)):folder.entries;
+const list=sorted(filtered);
+headingEl.textContent=folder.name;
+titleEl.textContent=folder.name+" — Fileflux";
+if(document.activeElement!==pathInput)pathInput.value=path;
+countEl.textContent=total===1?"1 item":total+" items";
+entriesEl.className="entries "+view;
+viewBtns.forEach(b=>b.setAttribute("aria-pressed",b.dataset.view===view?"true":"false"));
+renderCrumbs();
+renderEntries(list);
+let kind=null;
+if(total===0)kind="empty";else if(list.length===0)kind="noresult";
+emptyEl.hidden=!kind;
+listheadWrap.hidden=view!=="list"||!!kind;
+entriesEl.hidden=!!kind;
+if(kind==="empty"){
+emptyEl.replaceChildren();
+const h=document.createElement("strong");h.textContent="This folder is empty";
+const p=document.createElement("p");p.textContent=folder.trash?"Trash is empty. Deleted items would appear here.":"Favorites can point to an empty folder. Nothing to show yet.";
+emptyEl.append(h,p);
+}else if(kind==="noresult"){
+emptyEl.replaceChildren();
+const h=document.createElement("strong");h.textContent="No matches for “"+searchInput.value.trim()+"”";
+const p=document.createElement("p");p.textContent="Search checks names in "+path+" only, not its subfolders.";
+const btn=document.createElement("button");btn.type="button";btn.textContent="Clear search";
+btn.addEventListener("click",()=>{searchInput.value="";query="";render();searchInput.focus();});
+emptyEl.append(h,p,btn);
+}
+if(folder.trash&&!query)scopeEl.textContent=folder.note;
+else if(folder.trash&&query)scopeEl.textContent=folder.note+" Filtering "+list.length+" of "+total+" in this folder.";
+else if(query)scopeEl.textContent="Filtering “"+searchInput.value.trim()+"” — "+list.length+" of "+total+" items in "+path+". Current folder only, no subfolders.";
+else scopeEl.textContent="";
+navRows.forEach(r=>r.classList.toggle("active",r.dataset.path===path));
+backBtn.disabled=hi<=0;
+fwdBtn.disabled=hi>=hist.length-1;
+upBtn.disabled=path==="/"||path==="trash:";
+updateStatus();
+}
+function navigate(p,push=true){
+if(!FS[p])return false;
+note="";noteBad=false;pathInput.removeAttribute("aria-invalid");
+if(!selByPath.has(p))selByPath.set(p,new Set());
+path=p;selection=selByPath.get(p);
+query="";searchInput.value="";
+if(push){hist=hist.slice(0,hi+1);hist.push(p);hi=hist.length-1;}
+if(sidebar.classList.contains("open")){sidebar.classList.remove("open");sideToggle.setAttribute("aria-expanded","false");}
+render();
+return true;
+}
+function open(name,viaKeyboard){
+const e=FS[path].entries.find(x=>x.n===name);
+if(!e)return;
+if(e.t!=="folder"){
+note="Preview only — “"+name+"” would open in its default app. The prototype does not access the operating system.";noteBad=false;
+updateStatus();return;
+}
+const child=(path==="/"?"":path)+"/"+name;
+if(navigate(child)){if(viaKeyboard){const f=entriesEl.querySelector(".entry");if(f)f.focus();}}
+else{note="No such folder in this preview: "+child;noteBad=true;updateStatus();}
+}
+function startEdit(){
+if(!WIDE){crumbsEl.hidden=true;pathInput.hidden=false;}
+pathInput.value=path;pathInput.focus();pathInput.select();
+}
+function endEdit(){
+pathInput.value=path;pathInput.removeAttribute("aria-invalid");
+if(noteBad){note="";noteBad=false;}
+if(!WIDE){pathInput.hidden=true;crumbsEl.hidden=false;}else pathInput.blur();
+updateStatus();
+}
+navRows.forEach(r=>r.addEventListener("click",()=>navigate(r.dataset.path)));
+backBtn.addEventListener("click",()=>{if(hi>0){hi--;navigate(hist[hi],false);}});
+fwdBtn.addEventListener("click",()=>{if(hi<hist.length-1){hi++;navigate(hist[hi],false);}});
+upBtn.addEventListener("click",()=>{if(path==="/"||path==="trash:")return;navigate(path.slice(0,path.lastIndexOf("/"))||"/");});
+editBtn.addEventListener("click",()=>{document.activeElement===pathInput?endEdit():startEdit();});
+pathInput.addEventListener("keydown",ev=>{
+if(ev.key==="Enter"){ev.preventDefault();
+const v=pathInput.value.trim();
+if(!v)return;
+if(v===path){endEdit();return;}
+if(navigate(v))endEdit();
+else{note="No such folder in this preview: "+v+" — known places are in the sidebar.";noteBad=true;pathInput.setAttribute("aria-invalid","true");updateStatus();}
+}else if(ev.key==="Escape"){ev.preventDefault();endEdit();}
+});
+pathInput.addEventListener("input",()=>{if(noteBad){note="";noteBad=false;pathInput.removeAttribute("aria-invalid");updateStatus();}});
+searchInput.addEventListener("input",()=>{query=searchInput.value.trim().toLowerCase();note="";noteBad=false;render();});
+searchInput.addEventListener("keydown",ev=>{if(ev.key==="Escape"){ev.preventDefault();searchInput.value="";query="";render();searchInput.blur();}});
+sortSel.addEventListener("change",render);
+viewBtns.forEach(b=>b.addEventListener("click",()=>{if(view!==b.dataset.view){view=b.dataset.view;render();}}));
+entriesEl.addEventListener("click",ev=>{
+const b=ev.target.closest(".entry");if(!b)return;
+if(ev.detail===0){open(b.dataset.name,true);return;}
+const sel=selSet();
+if(ev.ctrlKey||ev.metaKey){if(sel.has(b.dataset.name))sel.delete(b.dataset.name);else sel.add(b.dataset.name);}
+else{sel.clear();sel.add(b.dataset.name);}
+note="";noteBad=false;
+applySelection();updateStatus();
+});
+entriesEl.addEventListener("dblclick",ev=>{const b=ev.target.closest(".entry");if(b)open(b.dataset.name,false);});
+entriesEl.addEventListener("keydown",ev=>{
+const els=[...entriesEl.querySelectorAll(".entry")];if(!els.length)return;
+const i=els.indexOf(document.activeElement);
+const k=ev.key;
+if(k==="ArrowRight"||k==="ArrowLeft"){ev.preventDefault();if(i<0)els[0].focus();else{const j=k==="ArrowRight"?i+1:i-1;if(j>=0&&j<els.length)els[j].focus();}}
+else if(k==="ArrowDown"||k==="ArrowUp"){ev.preventDefault();if(i<0){els[0].focus();return;}const dir=k==="ArrowDown"?1:-1;const x=els[i].offsetLeft,y=els[i].offsetTop;let best=-1,bd=Infinity;els.forEach((el,j)=>{const ey=el.offsetTop;if(j!==i&&(dir>0?ey>y:ey<y)){const d=Math.abs(el.offsetLeft-x)+Math.abs(ey-y)*8;if(d<bd){bd=d;best=j;}}});if(best>=0)els[best].focus();else els[dir>0?els.length-1:0].focus();}
+else if(k==="Home"){ev.preventDefault();els[0].focus();}
+else if(k==="End"){ev.preventDefault();els[els.length-1].focus();}
+else if(k==="Escape"){const sel=selSet();sel.clear();applySelection();updateStatus();}
+});
+document.addEventListener("keydown",ev=>{
+const mod=ev.ctrlKey||ev.metaKey;
+if(mod&&ev.key.toLowerCase()==="l"){ev.preventDefault();startEdit();}
+else if(mod&&ev.key.toLowerCase()==="f"){ev.preventDefault();searchInput.focus();searchInput.select();}
+});
+sideToggle.addEventListener("click",()=>{const openNow=sidebar.classList.toggle("open");sideToggle.setAttribute("aria-expanded",openNow?"true":"false");});
+render();
+})();
+</script></body></html>
