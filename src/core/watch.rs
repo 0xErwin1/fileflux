@@ -532,6 +532,430 @@ impl Debounce {
     }
 }
 
+// --- device events -----------------------------------------------------------
+
+/// Quiet time after the last device event before the list is re-read.
+pub const DEVICE_QUIET: Duration = Duration::from_millis(300);
+/// The longest a device re-read may be postponed by a stream of events.
+pub const DEVICE_MAX_DELAY: Duration = Duration::from_millis(1_500);
+/// Extra re-reads after a USB device appears: gvfs mounts a phone, and
+/// udisks a stick, a moment after the kernel node shows up.
+pub const USB_FOLLOW_UPS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+/// How often the list is re-read when a watch could not be established.
+pub const SAFETY_POLL: Duration = Duration::from_secs(30);
+
+/// Where a change that may alter the device list was seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeviceSource {
+    /// A node appeared or went away in `/dev`.
+    Dev,
+    /// A link appeared or went away in `/dev/disk/by-id`.
+    DiskById,
+    /// A USB device node appeared or went away under `/dev/bus/usb`.
+    Usb,
+    /// The kernel mount table changed (`/proc/self/mountinfo`).
+    Mounts,
+    /// A gvfs mount appeared or went away.
+    Gvfs,
+}
+
+/// Decides when a burst of device events is quiet enough to re-read: the
+/// pure half of the device watcher.
+#[derive(Clone, Debug, Default)]
+pub struct RefreshGate {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    follow_ups: Vec<Instant>,
+}
+
+impl RefreshGate {
+    /// Records an event from `source` seen at `now`. A USB event also
+    /// schedules the follow-up reads.
+    pub fn note(&mut self, now: Instant, source: DeviceSource) {
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+        if source == DeviceSource::Usb {
+            self.follow_ups = USB_FOLLOW_UPS.iter().map(|after| now + *after).collect();
+        }
+    }
+
+    /// Whether a re-read is due at `now`: events are pending and either
+    /// nothing new arrived for [`DEVICE_QUIET`] or the oldest one has
+    /// waited [`DEVICE_MAX_DELAY`], or a follow-up read has come due.
+    pub fn ready(&self, now: Instant) -> bool {
+        let burst = match (self.first, self.last) {
+            (Some(first), Some(last)) => {
+                now.saturating_duration_since(last) >= DEVICE_QUIET
+                    || now.saturating_duration_since(first) >= DEVICE_MAX_DELAY
+            }
+            _ => false,
+        };
+        burst || self.follow_ups.iter().any(|at| *at <= now)
+    }
+
+    /// Whether anything is waiting to be re-read.
+    pub fn pending(&self) -> bool {
+        self.first.is_some() || !self.follow_ups.is_empty()
+    }
+
+    /// Marks the re-read as started at `now`: the events seen so far and
+    /// the follow-ups already due are consumed; events that arrive while it
+    /// runs are not lost.
+    pub fn start(&mut self, now: Instant) {
+        self.first = None;
+        self.last = None;
+        self.follow_ups.retain(|at| *at > now);
+    }
+}
+
+/// Whether the slow fallback poll is due: only while a watch is missing
+/// (`degraded`), every [`SAFETY_POLL`].
+pub fn safety_poll_due(last: Option<Instant>, now: Instant, degraded: bool) -> bool {
+    degraded && last.is_none_or(|last| now.saturating_duration_since(last) >= SAFETY_POLL)
+}
+
+/// What the kernel's answer on the open mount table means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountPoll {
+    /// Nothing changed since the last answer.
+    Quiet,
+    /// A mount or unmount happened: the kernel raises `POLLPRI | POLLERR`.
+    Changed,
+    /// The descriptor is not usable any more.
+    Broken,
+}
+
+/// Reads the `poll` result on `/proc/self/mountinfo`.
+pub fn mount_poll(revents: PollFlags) -> MountPoll {
+    if revents.intersects(PollFlags::HUP | PollFlags::NVAL) {
+        MountPoll::Broken
+    } else if revents.intersects(PollFlags::PRI | PollFlags::ERR) {
+        MountPoll::Changed
+    } else {
+        MountPoll::Quiet
+    }
+}
+
+/// The places the device watcher looks at.
+#[derive(Clone, Debug)]
+pub struct DeviceRoots {
+    /// Block device nodes appear here.
+    pub dev: PathBuf,
+    /// The stable links to them; optional.
+    pub by_id: PathBuf,
+    /// USB device nodes, one folder per bus; optional.
+    pub usb: PathBuf,
+    /// The kernel mount table, polled for changes.
+    pub mountinfo: PathBuf,
+    /// The gvfs directory, when there can be one. Its parent is watched for
+    /// it to appear.
+    pub gvfs: Option<PathBuf>,
+}
+
+impl DeviceRoots {
+    /// The system's own, with the gvfs directory of `$XDG_RUNTIME_DIR`.
+    pub fn system() -> Self {
+        Self {
+            dev: PathBuf::from("/dev"),
+            by_id: PathBuf::from("/dev/disk/by-id"),
+            usb: PathBuf::from("/dev/bus/usb"),
+            mountinfo: PathBuf::from("/proc/self/mountinfo"),
+            gvfs: super::places::gvfs_root_from_env(),
+        }
+    }
+}
+
+/// What a kernel watch of the device watcher stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Armed {
+    /// Entries of this folder are the source's news.
+    Source(DeviceSource),
+    /// `/dev/bus/usb`: a new bus folder is watched too.
+    UsbRoot,
+    /// The gvfs directory.
+    Gvfs,
+    /// The gvfs directory's parent: only the entry `gvfs` matters.
+    Runtime,
+}
+
+/// What every device folder is watched for.
+const DEVICE_MASK: WatchFlags = WatchFlags::CREATE
+    .union(WatchFlags::DELETE)
+    .union(WatchFlags::MOVED_FROM)
+    .union(WatchFlags::MOVED_TO)
+    .union(WatchFlags::DELETE_SELF)
+    .union(WatchFlags::MOVE_SELF)
+    .union(WatchFlags::ONLYDIR);
+
+fn watch_dir(inotify: &OwnedFd, path: &Path) -> io::Result<i32> {
+    Ok(inotify::add_watch(inotify, path, DEVICE_MASK)?)
+}
+
+/// Watches `usb` and every bus folder in it that exists now.
+fn arm_usb(inotify: &OwnedFd, usb: &Path, watches: &mut HashMap<i32, Armed>) {
+    let Ok(wd) = watch_dir(inotify, usb) else {
+        return;
+    };
+    watches.insert(wd, Armed::UsbRoot);
+    for entry in std::fs::read_dir(usb).into_iter().flatten().flatten() {
+        if let Ok(wd) = watch_dir(inotify, &entry.path()) {
+            watches.insert(wd, Armed::Source(DeviceSource::Usb));
+        }
+    }
+}
+
+/// What the device watcher's thread owns.
+struct DeviceLoop {
+    inotify: OwnedFd,
+    wake: OwnedFd,
+    mountinfo: Option<std::fs::File>,
+    watches: HashMap<i32, Armed>,
+    roots: DeviceRoots,
+    sender: Sender<DeviceSource>,
+    shared: Arc<DeviceShared>,
+}
+
+/// What the watcher handle and its thread share.
+#[derive(Debug, Default)]
+struct DeviceShared {
+    shutdown: AtomicBool,
+    degraded: AtomicBool,
+}
+
+/// One inotify instance plus the mount-table poll on one dedicated thread,
+/// reporting [`DeviceSource`]s whenever something that may change the device
+/// list happened. Dropping the watcher stops and joins the thread.
+#[derive(Debug)]
+pub struct DeviceWatcher {
+    shared: Arc<DeviceShared>,
+    wake: Arc<OwnedFd>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DeviceWatcher {
+    /// Starts watching `roots`; events arrive on the returned channel.
+    /// `Err` only when inotify itself is unavailable. A watch that cannot be
+    /// established leaves the watcher [`degraded`](Self::degraded) (for
+    /// `dev` and the mount table; the others are optional).
+    pub fn new(roots: &DeviceRoots) -> io::Result<(Self, Receiver<DeviceSource>)> {
+        let inotify = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
+        let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
+        let mut watches = HashMap::new();
+        let mut degraded = false;
+
+        match watch_dir(&inotify, &roots.dev) {
+            Ok(wd) => {
+                watches.insert(wd, Armed::Source(DeviceSource::Dev));
+            }
+            Err(error) => {
+                log::warn!("cannot watch {}: {error}", roots.dev.display());
+                degraded = true;
+            }
+        }
+        if let Ok(wd) = watch_dir(&inotify, &roots.by_id) {
+            watches.insert(wd, Armed::Source(DeviceSource::DiskById));
+        }
+        arm_usb(&inotify, &roots.usb, &mut watches);
+        if let Some(gvfs) = &roots.gvfs {
+            if let Ok(wd) = watch_dir(&inotify, gvfs) {
+                watches.insert(wd, Armed::Gvfs);
+            }
+            if let Some(runtime) = gvfs.parent()
+                && let Ok(wd) = watch_dir(&inotify, runtime)
+            {
+                watches.insert(wd, Armed::Runtime);
+            }
+        }
+        let mountinfo = match std::fs::File::open(&roots.mountinfo) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                log::warn!("cannot watch {}: {error}", roots.mountinfo.display());
+                degraded = true;
+                None
+            }
+        };
+
+        let shared = Arc::new(DeviceShared {
+            shutdown: AtomicBool::new(false),
+            degraded: AtomicBool::new(degraded),
+        });
+        let wake = Arc::new(wake);
+        let (sender, receiver) = mpsc::channel();
+        let state = DeviceLoop {
+            inotify,
+            wake: wake.try_clone()?,
+            mountinfo,
+            watches,
+            roots: roots.clone(),
+            sender,
+            shared: Arc::clone(&shared),
+        };
+        let thread = std::thread::Builder::new()
+            .name("fileflux-devices".to_owned())
+            .spawn(move || state.run())?;
+        Ok((
+            Self {
+                shared,
+                wake,
+                thread: Some(thread),
+            },
+            receiver,
+        ))
+    }
+
+    /// Whether a watch that matters could not be established or was lost:
+    /// the caller then falls back to the slow poll.
+    pub fn degraded(&self) -> bool {
+        self.shared.degraded.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        // A failed write leaves the thread parked: do not join then.
+        if let Err(error) = rustix::io::write(&*self.wake, &1u64.to_ne_bytes()) {
+            log::warn!("cannot wake the device watcher thread: {error}");
+            return;
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::warn!("the device watcher thread panicked");
+        }
+    }
+}
+
+impl DeviceLoop {
+    /// Sleeps in `poll` until inotify, the mount table or the wake fd has
+    /// something, then reports what it means.
+    fn run(mut self) {
+        loop {
+            let mut fds = vec![
+                PollFd::new(&self.inotify, PollFlags::IN),
+                PollFd::new(&self.wake, PollFlags::IN),
+            ];
+            if let Some(mountinfo) = &self.mountinfo {
+                fds.push(PollFd::new(mountinfo, PollFlags::PRI));
+            }
+            match poll(&mut fds, None) {
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(error) => {
+                    log::warn!("device poll failed, stopping the device watcher: {error}");
+                    self.shared.degraded.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let mounts = fds.get(2).map(|fd| mount_poll(fd.revents()));
+            drop(fds);
+            let mut counter = [0u8; 8];
+            rustix::io::read(&self.wake, &mut counter).ok();
+            if self.shared.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut batch: Vec<DeviceSource> = Vec::new();
+            match mounts {
+                Some(MountPoll::Changed) => batch.push(DeviceSource::Mounts),
+                Some(MountPoll::Broken) => {
+                    log::warn!("the mount table is no longer watchable");
+                    self.mountinfo = None;
+                    self.shared.degraded.store(true, Ordering::SeqCst);
+                }
+                Some(MountPoll::Quiet) | None => {}
+            }
+            let healthy = self.drain(&mut batch);
+            for source in batch {
+                // The receiver is gone when the explorer is.
+                self.sender.send(source).ok();
+            }
+            if !healthy {
+                self.shared.degraded.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+
+    /// Reads every queued inotify event into `batch` (one entry per
+    /// source). `false` when reading failed and the watcher cannot go on.
+    fn drain(&mut self, batch: &mut Vec<DeviceSource>) -> bool {
+        let mut events: Vec<(i32, ReadFlags, Option<Vec<u8>>)> = Vec::new();
+        let mut healthy = true;
+        {
+            let mut buffer = [MaybeUninit::<u8>::uninit(); 4096];
+            let mut reader = inotify::Reader::new(&self.inotify, &mut buffer);
+            loop {
+                match reader.next() {
+                    Ok(event) => events.push((
+                        event.wd(),
+                        event.events(),
+                        event.file_name().map(|name| name.to_bytes().to_vec()),
+                    )),
+                    Err(Errno::AGAIN) => break,
+                    Err(error) => {
+                        log::warn!("device inotify read failed, stopping: {error}");
+                        healthy = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let push = |source: DeviceSource, batch: &mut Vec<DeviceSource>| {
+            if !batch.contains(&source) {
+                batch.push(source);
+            }
+        };
+        for (wd, flags, name) in events {
+            if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
+                // Events were lost: everything may have changed.
+                for source in [
+                    DeviceSource::Dev,
+                    DeviceSource::DiskById,
+                    DeviceSource::Usb,
+                    DeviceSource::Gvfs,
+                ] {
+                    push(source, batch);
+                }
+                continue;
+            }
+            let Some(armed) = self.watches.get(&wd).copied() else {
+                continue;
+            };
+            if flags.contains(ReadFlags::IGNORED) {
+                // The kernel dropped the watch: its folder is gone.
+                self.watches.remove(&wd);
+            }
+            match armed {
+                Armed::Source(source) => push(source, batch),
+                Armed::Gvfs => push(DeviceSource::Gvfs, batch),
+                Armed::UsbRoot => {
+                    if let Some(name) = &name
+                        && flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO)
+                        && let Ok(bus) = std::str::from_utf8(name)
+                        && let Ok(wd) = watch_dir(&self.inotify, &self.roots.usb.join(bus))
+                    {
+                        self.watches.insert(wd, Armed::Source(DeviceSource::Usb));
+                    }
+                    push(DeviceSource::Usb, batch);
+                }
+                Armed::Runtime => {
+                    if name.as_deref() != Some(b"gvfs".as_slice()) {
+                        continue;
+                    }
+                    if flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO)
+                        && let Some(gvfs) = &self.roots.gvfs
+                        && let Ok(wd) = watch_dir(&self.inotify, gvfs)
+                    {
+                        self.watches.insert(wd, Armed::Gvfs);
+                    }
+                    push(DeviceSource::Gvfs, batch);
+                }
+            }
+        }
+        healthy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1693,349 @@ mod vprobes {
         assert!(t.elapsed() < Duration::from_secs(1));
         stop.store(true, Ordering::SeqCst);
         fs::remove_dir_all(&base).ok();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use std::fs;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const LONG: Duration = Duration::from_secs(3);
+    const SHORT: Duration = Duration::from_millis(400);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    // --- the pure decisions ----------------------------------------------------
+
+    #[test]
+    fn an_event_is_acted_on_only_after_the_quiet_period() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::default();
+        assert!(!gate.pending());
+        assert!(!gate.ready(t0), "nothing happened");
+
+        gate.note(t0, DeviceSource::Mounts);
+        assert!(gate.pending());
+        assert!(!gate.ready(t0 + ms(299)));
+        assert!(gate.ready(t0 + DEVICE_QUIET), "300 ms of quiet");
+        assert_eq!(DEVICE_QUIET, ms(300));
+
+        gate.start(t0 + ms(300));
+        assert!(!gate.pending());
+        assert!(!gate.ready(t0 + ms(10_000)), "consumed");
+    }
+
+    #[test]
+    fn a_burst_merges_into_one_read_and_cannot_postpone_it_forever() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::default();
+        // An event every 100 ms keeps resetting the quiet period...
+        for step in 0..10 {
+            gate.note(t0 + ms(step * 100), DeviceSource::Dev);
+            assert!(
+                !gate.ready(t0 + ms(step * 100 + 100) - ms(1)),
+                "step {step}"
+            );
+        }
+        // ...but the oldest unread one is read after the maximum delay.
+        gate.note(t0 + ms(1_400), DeviceSource::Dev);
+        assert!(gate.ready(t0 + DEVICE_MAX_DELAY));
+        gate.start(t0 + DEVICE_MAX_DELAY);
+        assert!(!gate.pending(), "the whole burst was one read");
+    }
+
+    #[test]
+    fn a_usb_device_is_looked_at_again_when_gvfs_and_udisks_had_time_to_mount_it() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::default();
+        gate.note(t0, DeviceSource::Usb);
+        assert!(gate.ready(t0 + ms(300)));
+        gate.start(t0 + ms(300));
+        assert!(!gate.ready(t0 + ms(1_999)));
+        assert!(gate.ready(t0 + USB_FOLLOW_UPS[0]), "+2 s");
+        gate.start(t0 + USB_FOLLOW_UPS[0]);
+        assert!(!gate.ready(t0 + ms(4_999)));
+        assert!(gate.ready(t0 + USB_FOLLOW_UPS[1]), "+5 s");
+        gate.start(t0 + USB_FOLLOW_UPS[1]);
+        assert!(!gate.ready(t0 + ms(60_000)), "and then it stops");
+        assert!(!gate.pending());
+    }
+
+    #[test]
+    fn only_usb_events_ask_for_follow_up_reads() {
+        for source in [
+            DeviceSource::Dev,
+            DeviceSource::DiskById,
+            DeviceSource::Mounts,
+            DeviceSource::Gvfs,
+        ] {
+            let t0 = Instant::now();
+            let mut gate = RefreshGate::default();
+            gate.note(t0, source);
+            gate.start(t0 + ms(300));
+            assert!(!gate.ready(t0 + ms(2_500)), "{source:?}");
+            assert!(!gate.pending(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn the_slow_poll_runs_only_when_a_watch_is_missing() {
+        let now = Instant::now();
+        let ago = |seconds| now.checked_sub(Duration::from_secs(seconds));
+        assert_eq!(SAFETY_POLL, Duration::from_secs(30));
+        assert!(safety_poll_due(None, now, true));
+        assert!(safety_poll_due(ago(30), now, true));
+        assert!(!safety_poll_due(ago(29), now, true));
+        for last in [None, ago(1), ago(3_600)] {
+            assert!(!safety_poll_due(last, now, false), "watches are in place");
+        }
+    }
+
+    #[test]
+    fn the_mount_table_poll_reads_pri_and_err_as_a_change() {
+        assert_eq!(mount_poll(PollFlags::empty()), MountPoll::Quiet);
+        assert_eq!(mount_poll(PollFlags::PRI), MountPoll::Changed);
+        assert_eq!(mount_poll(PollFlags::ERR), MountPoll::Changed);
+        assert_eq!(
+            mount_poll(PollFlags::PRI | PollFlags::ERR),
+            MountPoll::Changed
+        );
+        assert_eq!(mount_poll(PollFlags::HUP), MountPoll::Broken);
+        assert_eq!(mount_poll(PollFlags::NVAL), MountPoll::Broken);
+        assert_eq!(
+            mount_poll(PollFlags::IN | PollFlags::NVAL),
+            MountPoll::Broken
+        );
+    }
+
+    /// The kernel flags `/proc/self/mountinfo` for `poll` only when the
+    /// table changed since the last look, and a change is reported once:
+    /// the watcher does not spin on it. Mounting needs root, so this checks
+    /// the idle behavior of the real file; a mount from another process
+    /// during the test only makes the first answer `Changed`.
+    #[test]
+    fn the_real_mount_table_reports_a_change_once_not_continuously() -> TestResult {
+        let table = fs::File::open("/proc/self/mountinfo")?;
+        let answer = || -> Result<MountPoll, Box<dyn std::error::Error>> {
+            let mut fds = [PollFd::new(&table, PollFlags::PRI)];
+            poll(&mut fds, Some(&rustix::event::Timespec::default()))?;
+            Ok(mount_poll(fds[0].revents()))
+        };
+        let first = answer()?;
+        assert_ne!(first, MountPoll::Broken);
+        assert_eq!(
+            answer()?,
+            MountPoll::Quiet,
+            "nothing new since the last answer"
+        );
+        assert_eq!(answer()?, MountPoll::Quiet);
+        Ok(())
+    }
+
+    // --- the real thing on a scratch directory ------------------------------------
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> io::Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "fileflux-devwatch-{label}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::remove_dir_all(&path).ok();
+            fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        fn roots(&self) -> DeviceRoots {
+            DeviceRoots {
+                dev: self.0.join("dev"),
+                by_id: self.0.join("dev/disk/by-id"),
+                usb: self.0.join("dev/bus/usb"),
+                mountinfo: self.0.join("mountinfo"),
+                gvfs: Some(self.0.join("run/gvfs")),
+            }
+        }
+
+        /// The fake `/dev`, `/dev/disk/by-id`, `/dev/bus/usb/001`, the
+        /// runtime directory and a mount table file.
+        fn populate(&self) -> io::Result<()> {
+            fs::create_dir_all(self.0.join("dev/disk/by-id"))?;
+            fs::create_dir_all(self.0.join("dev/bus/usb/001"))?;
+            fs::create_dir_all(self.0.join("run"))?;
+            fs::write(self.0.join("mountinfo"), b"")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Every source that arrives within `wait`.
+    fn sources(rx: &Receiver<DeviceSource>, wait: Duration) -> Vec<DeviceSource> {
+        let mut seen = Vec::new();
+        while let Ok(source) = rx.recv_timeout(wait) {
+            if !seen.contains(&source) {
+                seen.push(source);
+            }
+        }
+        seen
+    }
+
+    fn expect(rx: &Receiver<DeviceSource>, want: DeviceSource) -> TestResult {
+        let end = Instant::now() + LONG;
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(source) if source == want => return Ok(()),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Err(format!("no {want:?} event within {LONG:?}").into())
+    }
+
+    #[test]
+    fn nodes_appearing_and_vanishing_in_dev_and_by_id_are_reported() -> TestResult {
+        let scratch = Scratch::new("dev")?;
+        scratch.populate()?;
+        let (watcher, rx) = DeviceWatcher::new(&scratch.roots())?;
+        assert!(!watcher.degraded());
+
+        fs::write(scratch.0.join("dev/sdb1"), b"")?;
+        expect(&rx, DeviceSource::Dev)?;
+        fs::remove_file(scratch.0.join("dev/sdb1"))?;
+        expect(&rx, DeviceSource::Dev)?;
+        fs::write(scratch.0.join("dev/disk/by-id/usb-Kingston-part1"), b"")?;
+        expect(&rx, DeviceSource::DiskById)?;
+        fs::remove_file(scratch.0.join("dev/disk/by-id/usb-Kingston-part1"))?;
+        expect(&rx, DeviceSource::DiskById)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_usb_node_is_reported_even_on_a_bus_that_appears_later() -> TestResult {
+        let scratch = Scratch::new("usb")?;
+        scratch.populate()?;
+        let (_watcher, rx) = DeviceWatcher::new(&scratch.roots())?;
+
+        fs::write(scratch.0.join("dev/bus/usb/001/007"), b"")?;
+        expect(&rx, DeviceSource::Usb)?;
+        sources(&rx, SHORT);
+        fs::create_dir(scratch.0.join("dev/bus/usb/002"))?;
+        expect(&rx, DeviceSource::Usb)?;
+        sources(&rx, SHORT);
+        fs::write(scratch.0.join("dev/bus/usb/002/003"), b"")?;
+        expect(&rx, DeviceSource::Usb)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gvfs_mounts_appearing_and_vanishing_are_reported() -> TestResult {
+        let scratch = Scratch::new("gvfs")?;
+        scratch.populate()?;
+        let gvfs = scratch.0.join("run/gvfs");
+        fs::create_dir(&gvfs)?;
+        let (watcher, rx) = DeviceWatcher::new(&scratch.roots())?;
+        assert!(!watcher.degraded());
+
+        fs::create_dir_all(gvfs.join("mtp:host=Fake_Phone_123/Internal shared storage/DCIM"))?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        // Only the mounts themselves matter, not what is inside them.
+        sources(&rx, SHORT);
+        fs::write(
+            gvfs.join("mtp:host=Fake_Phone_123/Internal shared storage/a.jpg"),
+            b"",
+        )?;
+        assert!(
+            sources(&rx, SHORT).is_empty(),
+            "files inside a mount are not news"
+        );
+        fs::remove_dir_all(gvfs.join("mtp:host=Fake_Phone_123"))?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_gvfs_directory_that_does_not_exist_yet_is_picked_up_when_it_is_created() -> TestResult {
+        let scratch = Scratch::new("gvfs-late")?;
+        scratch.populate()?;
+        let gvfs = scratch.0.join("run/gvfs");
+        let (watcher, rx) = DeviceWatcher::new(&scratch.roots())?;
+        assert!(!watcher.degraded(), "no gvfs session yet is normal");
+
+        fs::write(scratch.0.join("run/pipewire-0"), b"")?;
+        assert!(
+            sources(&rx, SHORT).is_empty(),
+            "other runtime files are not news"
+        );
+        fs::create_dir(&gvfs)?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        sources(&rx, SHORT);
+        fs::create_dir(gvfs.join("sftp:host=x"))?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        // The gvfs session ends and a new one starts.
+        fs::remove_dir_all(&gvfs)?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        sources(&rx, SHORT);
+        fs::create_dir(&gvfs)?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        sources(&rx, SHORT);
+        fs::create_dir(gvfs.join("sftp:host=y"))?;
+        expect(&rx, DeviceSource::Gvfs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_mount_table_file_is_watched_without_spinning() -> TestResult {
+        let scratch = Scratch::new("mountinfo")?;
+        scratch.populate()?;
+        let (_watcher, rx) = DeviceWatcher::new(&scratch.roots())?;
+        // A regular file never signals: the watcher is asleep, not looping.
+        assert!(sources(&rx, SHORT).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_dev_or_mount_table_means_the_slow_poll_takes_over() -> TestResult {
+        let scratch = Scratch::new("degraded")?;
+        let (watcher, _rx) = DeviceWatcher::new(&scratch.roots())?;
+        assert!(watcher.degraded(), "nothing to watch");
+        scratch.populate()?;
+        let mut roots = scratch.roots();
+        roots.mountinfo = scratch.0.join("absent");
+        let (watcher, _rx) = DeviceWatcher::new(&roots)?;
+        assert!(watcher.degraded(), "no mount table");
+        // Optional places do not count: no by-id, no USB, no gvfs.
+        let mut roots = scratch.roots();
+        roots.by_id = scratch.0.join("absent");
+        roots.usb = scratch.0.join("absent");
+        roots.gvfs = None;
+        let (watcher, _rx) = DeviceWatcher::new(&roots)?;
+        assert!(!watcher.degraded());
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_watcher_stops_its_thread_promptly() -> TestResult {
+        let scratch = Scratch::new("drop")?;
+        scratch.populate()?;
+        let (watcher, rx) = DeviceWatcher::new(&scratch.roots())?;
+        let started = Instant::now();
+        drop(watcher);
+        assert!(started.elapsed() < LONG, "the join returned");
+        assert!(matches!(
+            rx.recv_timeout(LONG),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
         Ok(())
     }
 }

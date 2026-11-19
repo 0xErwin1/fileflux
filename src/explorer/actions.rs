@@ -164,6 +164,7 @@ impl Explorer {
             places
                 .volumes
                 .iter()
+                .filter(|volume| !volume.kind.is_gvfs())
                 .map(|volume| volume.path.clone())
                 .collect()
         });

@@ -1838,6 +1838,45 @@ fn dismissing_the_no_trash_dialog_reports_the_items_it_dropped() {
 }
 
 #[test]
+fn a_phone_has_no_trash_so_the_delete_asks_for_permanent_deletion() -> TestResult {
+    let scratch = Scratch::new("gvfs-no-trash")?;
+    let gvfs = scratch.dir("run/gvfs")?;
+    let dcim = scratch.dir("run/gvfs/mtp:host=Fake_Phone_123/Internal shared storage/DCIM")?;
+    let photo = scratch.file(
+        "run/gvfs/mtp:host=Fake_Phone_123/Internal shared storage/DCIM/IMG_1.jpg",
+        "x",
+    )?;
+    let local = scratch.file("local.txt", "y")?;
+    // Even listed as a device of its own (a mount point of the sidebar), and
+    // on the very device the home Trash is on, a gvfs path is never trashed
+    // and no `.Trash-<uid>` is created on the phone.
+    let phone = gvfs.join("mtp:host=Fake_Phone_123");
+    let ctx = JobCtx::from_env_with(
+        scratch.trash(),
+        vec![phone.clone()],
+        FuseRoots::from_table(b"", Some(&gvfs)),
+    );
+
+    let report = run_job(
+        Job::Trash(vec![photo.clone(), local.clone()]),
+        &ctx,
+        &sink(),
+    );
+
+    assert_eq!(report.needs_permanent, std::slice::from_ref(&photo));
+    assert!(photo.exists(), "nothing was deleted");
+    assert!(!local.exists(), "the local file went to the Trash");
+    assert_eq!(fs::read_dir(&dcim)?.count(), 1);
+    assert!(!phone.join(".Trash-1000").exists());
+    let created: Vec<_> = fs::read_dir(&phone)?
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(created, [os("Internal shared storage")]);
+    Ok(())
+}
+
+#[test]
 fn a_cancelled_trash_job_reports_what_needed_permanent_deletion() -> TestResult {
     let scratch = Scratch::new("cancel-no-trash")?;
     let a = scratch.file("a.txt", "a")?;

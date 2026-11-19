@@ -30,6 +30,7 @@ use fileflux::core::apps::{App, OpenWith, expand_exec};
 use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
+use fileflux::core::places::FuseRoots;
 use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
 };
@@ -292,12 +293,22 @@ impl std::fmt::Debug for JobCtx {
 impl JobCtx {
     /// The real chooser: the home Trash on the home device, else
     /// `$topdir/.Trash-$uid` of the mount (from `mounts`) that holds the
-    /// path; anything else is `NoTrash`.
+    /// path; anything else is `NoTrash`. Paths on gvfs (phones, shares) have
+    /// no Trash, whatever `mounts` says.
     pub(crate) fn from_env(trash_root: PathBuf, mounts: Vec<PathBuf>) -> JobCtx {
+        Self::from_env_with(trash_root, mounts, FuseRoots::system())
+    }
+
+    /// [`Self::from_env`] with the FUSE roots given.
+    pub(crate) fn from_env_with(
+        trash_root: PathBuf,
+        mounts: Vec<PathBuf>,
+        roots: FuseRoots,
+    ) -> JobCtx {
         let root = trash_root.clone();
         JobCtx {
             trash_root,
-            target_for: Box::new(move |path| choose_target(path, &root, &mounts)),
+            target_for: Box::new(move |path| choose_target(path, &root, &mounts, &roots)),
         }
     }
 }
@@ -306,7 +317,16 @@ fn choose_target(
     path: &Path,
     trash_root: &Path,
     mounts: &[PathBuf],
+    roots: &FuseRoots,
 ) -> Result<TrashTarget, TrashError> {
+    // gvfs has no Trash, and a `.Trash-<uid>` must never be created on a
+    // phone or a share: the delete falls to its confirmation instead.
+    if roots.is_gvfs(path) {
+        return Err(TrashError::NoTrash(format!(
+            "{} is on a phone or network mount, which has no Trash",
+            path.display()
+        )));
+    }
     // std has no getuid; the owner of our own /proc entry is us.
     let uid = fs::metadata("/proc/self")?.uid();
     let anchor = nearest_existing_ancestor(trash_root).ok_or_else(|| {

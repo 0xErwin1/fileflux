@@ -11,15 +11,19 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use fileflux::core::Location;
 use fileflux::core::devices::{
     BlockNode, Device, DeviceError, DevicePlan, DeviceState, devices, eject_plan, fallback_target,
-    find_tool, list_blocks, mount, path_is_on_mounts, path_uses_mounts, real_location,
-    run_power_off, run_unmount, unmount_plan,
+    find_tool, gio_unmount_plan, list_blocks, mount, path_is_on_mounts, path_uses_mounts,
+    real_location, run_power_off, run_unmount, unmount_plan, unmount_program,
 };
-use fileflux::core::places::{Volume, discover_volumes};
+use fileflux::core::places::{Volume, VolumeKind, discover_volumes};
+use fileflux::core::watch::{
+    DeviceRoots, DeviceSource, DeviceWatcher, RefreshGate, safety_poll_due,
+};
 use gpui::{ClipboardItem, Context, Window};
 
 use super::ops::{
@@ -27,16 +31,6 @@ use super::ops::{
 };
 use super::state::Transition;
 use super::view::{Explorer, TabId};
-
-/// How often the device list is re-read while the window is focused.
-///
-/// A poll (the mount table plus `lsblk`, one short process, off the UI
-/// thread, never two at once, only while the window has the focus) was
-/// chosen over watching `/dev/disk/by-uuid`: that directory does not change
-/// when a device is mounted or unmounted, nor for filesystems without a UUID
-/// or when another tool does the mounting, and a USB stick plugged in
-/// while the window is in the background is picked up on the next focus.
-pub(crate) const POLL_EVERY: Duration = Duration::from_secs(2);
 
 /// How long an unmount waits for the tabs on the device to move away: the
 /// number of steps and the time of each.
@@ -165,6 +159,7 @@ pub(crate) fn unlisted_volumes(volumes: &[Volume], devices: &[Device]) -> Vec<Vo
                 path: mount.to_path_buf(),
                 removable: device.ejectable,
                 usage: None,
+                kind: VolumeKind::Disk,
             })
         })
         .collect()
@@ -312,21 +307,46 @@ pub(crate) fn queued_notice(plan: &DevicePlan, count: usize) -> Option<String> {
 }
 
 /// Whether the device list is re-read now: never while a read is running,
-/// at once the first time, and then every [`POLL_EVERY`] while the window
-/// has the focus.
-pub(crate) fn poll_due(
+/// at once the first time (or after `last` was cleared to force one), then
+/// when the watcher's events have settled (`gate`), and only while a watch
+/// is missing (`degraded`) on the slow fallback poll. There is no polling
+/// while the watches work, focused or not.
+pub(crate) fn refresh_due(
+    gate: &RefreshGate,
     last: Option<Instant>,
     now: Instant,
-    window_active: bool,
+    degraded: bool,
     in_flight: bool,
 ) -> bool {
     if in_flight {
         return false;
     }
-    match last {
-        None => true,
-        Some(last) => window_active && now.saturating_duration_since(last) >= POLL_EVERY,
+    last.is_none() || gate.ready(now) || safety_poll_due(last, now, degraded)
+}
+
+/// What a gvfs mount's menu and row offer: only Unmount, and only when
+/// `gio` is installed to do it. Never Mount or Eject: a phone is neither a
+/// block device nor powered off from here.
+pub(crate) fn gvfs_actions(kind: VolumeKind, gio: bool) -> DeviceActions {
+    DeviceActions {
+        mount: false,
+        unmount: gio && kind.is_gvfs(),
+        eject: false,
     }
+}
+
+/// Unmounting the gvfs mount at `path` through `gio`: `None` without `gio`,
+/// or when `path` is not a gvfs volume of `volumes`.
+pub(crate) fn gvfs_unmount_plan(
+    volumes: &[Volume],
+    path: &Path,
+    gio: Option<&Path>,
+) -> Option<DevicePlan> {
+    gio?;
+    let volume = volumes
+        .iter()
+        .find(|volume| volume.path == path && volume.kind.is_gvfs())?;
+    Some(gio_unmount_plan(&volume.label, &volume.path))
 }
 
 /// Queues `plan` to run when its device is idle; `false` when the same plan
@@ -371,19 +391,82 @@ pub(crate) struct DeviceHub {
     pub(crate) active: Vec<DevicePlan>,
     /// Whether the queued plans are being checked against the operations.
     pub(crate) checking: bool,
+    /// When the list was last read; `None` forces a read at the next tick.
     pub(crate) last_poll: Option<Instant>,
+    /// A read is running.
     pub(crate) polling: bool,
+    /// `gio`, when installed: the only way to unmount a gvfs mount.
+    pub(crate) gio: Option<PathBuf>,
+    /// The thread that reports device changes; `None` when inotify is
+    /// unavailable.
+    pub(crate) watcher: Option<DeviceWatcher>,
+    /// What the watcher reported, drained at every tick.
+    pub(crate) signals: Option<Receiver<DeviceSource>>,
+    /// The events seen and not yet read.
+    pub(crate) gate: RefreshGate,
+    /// Whether the window had the focus at the last tick.
+    pub(crate) was_active: bool,
+    /// The watcher's channel closed: its thread stopped.
+    pub(crate) signals_closed: bool,
 }
 
 impl DeviceHub {
-    /// Looks for `udisksctl` and `lsblk` on `$PATH`.
+    /// Looks for `udisksctl`, `lsblk` and `gio` on `$PATH` and starts the
+    /// watcher on `/dev`, the mount table and the gvfs directory.
     pub(crate) fn from_env() -> Self {
         let path = std::env::var_os("PATH");
+        let (watcher, signals) = match DeviceWatcher::new(&DeviceRoots::system()) {
+            Ok((watcher, signals)) => (Some(watcher), Some(signals)),
+            Err(error) => {
+                log::warn!("device events are unavailable, polling slowly instead: {error}");
+                (None, None)
+            }
+        };
         Self {
             udisksctl: find_tool("udisksctl", path.as_deref()),
             lsblk: find_tool("lsblk", path.as_deref()),
+            gio: find_tool("gio", path.as_deref()),
+            watcher,
+            signals,
+            was_active: true,
             ..Self::default()
         }
+    }
+
+    /// Whether the slow fallback poll is needed: no watcher, or a watch
+    /// that could not be established or was lost.
+    pub(crate) fn degraded(&self) -> bool {
+        self.signals_closed || self.watcher.as_ref().is_none_or(DeviceWatcher::degraded)
+    }
+
+    /// Moves what the watcher reported into the gate.
+    pub(crate) fn collect_signals(&mut self, now: Instant) {
+        let Some(signals) = &self.signals else {
+            return;
+        };
+        loop {
+            match signals.try_recv() {
+                Ok(source) => {
+                    log::debug!("device event: {source:?}");
+                    self.gate.note(now, source);
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.signals_closed = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A window that just got the focus back looks at the devices again: a
+    /// change the kernel could not announce (a FUSE directory only tells
+    /// about what happens through it) shows up at the latest then.
+    pub(crate) fn note_focus(&mut self, active: bool, now: Instant) {
+        if active && !self.was_active {
+            self.gate.note(now, DeviceSource::Mounts);
+        }
+        self.was_active = active;
     }
 
     /// The one-line notice under the Devices label when a tool is missing.
@@ -433,31 +516,49 @@ fn directory_of(location: &Location) -> Option<PathBuf> {
 impl Explorer {
     /// What the device with block node `path` offers right now.
     pub(crate) fn device_actions(&self, path: &Path) -> Option<DeviceActions> {
-        let device = self.devices.find(path)?;
-        Some(actions_for(device, self.devices.udisksctl.is_some()))
+        if let Some(device) = self.devices.find(path) {
+            return Some(actions_for(device, self.devices.udisksctl.is_some()));
+        }
+        let volume = self.gvfs_volume(path)?;
+        Some(gvfs_actions(volume.kind, self.devices.gio.is_some()))
     }
 
-    /// Runs on every pump tick: re-reads the devices when due and starts the
-    /// queued unmounts whose operations have ended.
+    /// The gvfs mount at `path` among the sidebar's volumes.
+    fn gvfs_volume(&self, path: &Path) -> Option<&Volume> {
+        self.places
+            .as_ref()?
+            .volumes
+            .iter()
+            .find(|volume| volume.path == path && volume.kind.is_gvfs())
+    }
+
+    /// Runs on every pump tick: re-reads the devices when the watcher's
+    /// events have settled and starts the queued unmounts whose operations
+    /// have ended.
     pub(crate) fn pump_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.devices.collect_signals(now);
+        self.devices.note_focus(window.is_window_active(), now);
         if self.places.is_some()
-            && poll_due(
+            && refresh_due(
+                &self.devices.gate,
                 self.devices.last_poll,
-                Instant::now(),
-                window.is_window_active(),
+                now,
+                self.devices.degraded(),
                 self.devices.polling,
             )
         {
-            self.refresh_devices(cx);
+            self.refresh_devices(now, cx);
         }
         self.start_ready_plans(window, cx);
     }
 
     /// Reads the mount table and `lsblk` on the background executor and
     /// applies what changed.
-    fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+    fn refresh_devices(&mut self, now: Instant, cx: &mut Context<Self>) {
         self.devices.polling = true;
-        self.devices.last_poll = Some(Instant::now());
+        self.devices.last_poll = Some(now);
+        self.devices.gate.start(now);
         let home = self.home.clone();
         let lsblk = self.devices.lsblk.clone();
         let read = cx.background_executor().spawn(async move {
@@ -489,6 +590,14 @@ impl Explorer {
                 if let Some(places) = self.places.as_mut()
                     && places.volumes != volumes
                 {
+                    log::info!(
+                        "devices updated: {}",
+                        volumes
+                            .iter()
+                            .map(|volume| volume.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                     places.volumes = volumes;
                     changed = true;
                 }
@@ -504,7 +613,7 @@ impl Explorer {
                 }
             }
             // The last good list stays; a failing lsblk is not worth a toast
-            // every two seconds.
+            // on every device event.
             Some(Err(error)) => log::debug!("the device list could not be read: {error}"),
             None => {}
         }
@@ -631,9 +740,18 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let plan = self.devices.find(path).and_then(unmount_plan);
+        let plan = self.devices.find(path).and_then(unmount_plan).or_else(|| {
+            let volumes = &self.places.as_ref()?.volumes;
+            gvfs_unmount_plan(volumes, path, self.devices.gio.as_deref())
+        });
         match plan {
             Some(plan) => self.request_device_plan(plan, window, cx),
+            None if self.gvfs_volume(path).is_some() => self.say(
+                Severity::Info,
+                "Unmount it from your system's file manager",
+                window,
+                cx,
+            ),
             None => self.say(
                 Severity::Info,
                 "That device cannot be unmounted here",
@@ -853,9 +971,8 @@ impl Explorer {
     /// stops if one uses the device. `udisksctl` and every read of the
     /// filesystem run off the UI thread.
     fn run_device_plan(&mut self, plan: DevicePlan, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(udisksctl) = self.devices.udisksctl.clone() else {
-            return;
-        };
+        let udisksctl = self.devices.udisksctl.clone();
+        let gio = self.devices.gio.clone();
         let eject = plan.power_off.is_some();
         let key = plan
             .power_off
@@ -952,7 +1069,11 @@ impl Explorer {
                         return Some(Err(DeviceError::Failed { reason }));
                     }
                     let step = step.clone();
-                    let program = udisksctl.clone();
+                    let program = match unmount_program(&step, udisksctl.as_deref(), gio.as_deref())
+                    {
+                        Ok(program) => program.to_path_buf(),
+                        Err(error) => return Some(Err(error)),
+                    };
                     let done = cx
                         .background_executor()
                         .spawn(async move { run_unmount(&program, &step) })
@@ -963,7 +1084,11 @@ impl Explorer {
                 }
                 unmounted = true;
                 if let Some(disk) = plan.power_off.clone() {
-                    let program = udisksctl.clone();
+                    let Some(program) = udisksctl.clone() else {
+                        return Some(Err(DeviceError::Failed {
+                            reason: "udisksctl was not found".to_owned(),
+                        }));
+                    };
                     let done = cx
                         .background_executor()
                         .spawn(async move { run_power_off(&program, &disk) })
@@ -1033,7 +1158,7 @@ mod tests {
     use super::*;
     use crate::explorer::ops::paste::{ClipMode, ConflictLink, PasteJob};
     use crate::explorer::ops::{Identity, NewKind, UndoAction};
-    use fileflux::core::devices::{DeviceState, UnmountStep};
+    use fileflux::core::devices::{DeviceState, UnmountStep, UnmountVia};
     use std::ffi::OsString;
     use std::sync::mpsc::channel;
 
@@ -1078,6 +1203,7 @@ mod tests {
             unmount: vec![UnmountStep {
                 device: p("/dev/sdb1"),
                 mounts: vec![p(mount)],
+                via: UnmountVia::Udisks,
             }],
             power_off: Some(p("/dev/sdb")),
         }
@@ -1241,6 +1367,7 @@ mod tests {
             path: p("/run/media/u/KINGSTON"),
             removable: true,
             usage: None,
+            kind: VolumeKind::Disk,
         };
         let other = DeviceState::Mounted(p("/mnt/odd"));
         let devices = [
@@ -1256,6 +1383,7 @@ mod tests {
                 path: p("/mnt/odd"),
                 removable: true,
                 usage: None,
+                kind: VolumeKind::Disk,
             }]
         );
         assert!(unlisted_volumes(&[], &[]).is_empty());
@@ -1469,6 +1597,7 @@ mod tests {
             unmount: vec![UnmountStep {
                 device: p("/dev/sdb1"),
                 mounts: vec![p("/run/media/u/A"), p("/mnt/bind")],
+                via: UnmountVia::Udisks,
             }],
             ..plan("TWO", "/unused")
         };
@@ -1590,22 +1719,160 @@ mod tests {
     // --- polling and queue ----------------------------------------------------
 
     #[test]
-    fn the_device_list_is_read_first_at_once_then_every_two_seconds_while_focused() {
+    fn the_device_list_is_read_at_once_then_only_when_events_settle() {
+        let now = Instant::now();
+        let ago = |millis: u64| now.checked_sub(Duration::from_millis(millis));
+        let idle = RefreshGate::default();
+        assert!(
+            refresh_due(&idle, None, now, false, false),
+            "the first read does not wait for anything"
+        );
+        assert!(
+            !refresh_due(&idle, None, now, false, true),
+            "never two at once"
+        );
+        // No polling while the watches work, focused or not, however long.
+        for last in [ago(1_000), ago(60_000), ago(3_600_000)] {
+            assert!(!refresh_due(&idle, last, now, false, false), "{last:?}");
+        }
+        // An event is read once it settled (300 ms), not before.
+        let mut gate = RefreshGate::default();
+        gate.note(now - Duration::from_millis(100), DeviceSource::Gvfs);
+        assert!(
+            !refresh_due(&gate, ago(5_000), now, false, false),
+            "still bursting"
+        );
+        let mut gate = RefreshGate::default();
+        gate.note(now - Duration::from_millis(400), DeviceSource::Gvfs);
+        assert!(refresh_due(&gate, ago(5_000), now, false, false), "settled");
+        assert!(
+            !refresh_due(&gate, ago(5_000), now, false, true),
+            "an event during a read waits for it to end"
+        );
+    }
+
+    #[test]
+    fn the_slow_poll_runs_only_when_a_watch_is_missing() {
         let now = Instant::now();
         let ago = |seconds: u64| now.checked_sub(Duration::from_secs(seconds));
+        let idle = RefreshGate::default();
+        assert!(!refresh_due(&idle, ago(29), now, true, false));
         assert!(
-            poll_due(None, now, false, false),
-            "the first read does not wait for focus"
+            refresh_due(&idle, ago(30), now, true, false),
+            "30 s fallback"
         );
-        assert!(!poll_due(None, now, true, true), "never two at once");
-        assert!(!poll_due(ago(1), now, true, false), "too soon");
-        assert!(poll_due(ago(2), now, true, false));
-        assert!(poll_due(ago(60), now, true, false));
+        assert!(!refresh_due(&idle, ago(30), now, true, true));
         assert!(
-            !poll_due(ago(60), now, false, false),
-            "an unfocused window does not poll"
+            !refresh_due(&idle, ago(3_600), now, false, false),
+            "watches work"
         );
-        assert!(!poll_due(ago(60), now, true, true));
+        let _ = safety_poll_due;
+    }
+
+    #[test]
+    fn watcher_events_feed_the_gate_and_a_stopped_watcher_is_degraded() {
+        let now = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut hub = DeviceHub {
+            signals: Some(receiver),
+            ..DeviceHub::default()
+        };
+        hub.collect_signals(now);
+        assert!(!hub.gate.pending(), "nothing reported");
+        sender.send(DeviceSource::Gvfs).ok();
+        sender.send(DeviceSource::Mounts).ok();
+        hub.collect_signals(now);
+        assert!(hub.gate.pending());
+        assert!(!hub.gate.ready(now + Duration::from_millis(299)));
+        assert!(hub.gate.ready(now + Duration::from_millis(300)));
+        assert!(!hub.signals_closed);
+        drop(sender);
+        hub.collect_signals(now);
+        assert!(hub.signals_closed, "the thread is gone");
+        assert!(hub.degraded());
+        assert!(DeviceHub::default().degraded(), "no watcher at all");
+    }
+
+    #[test]
+    fn regaining_the_focus_looks_at_the_devices_again_once() {
+        let now = Instant::now();
+        let mut hub = DeviceHub {
+            was_active: true,
+            ..DeviceHub::default()
+        };
+        hub.note_focus(true, now);
+        hub.note_focus(false, now);
+        assert!(!hub.gate.pending(), "losing the focus is not news");
+        hub.note_focus(true, now);
+        assert!(hub.gate.pending(), "the focus came back");
+        hub.gate.start(now);
+        hub.note_focus(true, now);
+        assert!(!hub.gate.pending(), "staying focused is not news");
+    }
+
+    // --- gvfs mounts ----------------------------------------------------------
+
+    fn gvfs_volume(kind: VolumeKind) -> Volume {
+        Volume {
+            label: "Google Pixel 8".to_owned(),
+            path: p("/run/user/1000/gvfs/mtp:host=Google_Pixel_8_39060DLJH0031N"),
+            removable: false,
+            usage: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_gvfs_mount_offers_unmount_only_and_only_with_gio() {
+        for kind in [VolumeKind::Phone, VolumeKind::Share, VolumeKind::Remote] {
+            assert_eq!(
+                gvfs_actions(kind, true),
+                DeviceActions {
+                    mount: false,
+                    unmount: true,
+                    eject: false
+                },
+                "{kind:?}"
+            );
+            assert_eq!(
+                gvfs_actions(kind, false),
+                DeviceActions::default(),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            gvfs_actions(VolumeKind::Disk, true),
+            DeviceActions::default()
+        );
+    }
+
+    #[test]
+    fn unmounting_a_gvfs_mount_runs_gio_on_its_path() {
+        let phone = gvfs_volume(VolumeKind::Phone);
+        let disk = Volume {
+            kind: VolumeKind::Disk,
+            path: p("/mnt/data"),
+            ..gvfs_volume(VolumeKind::Disk)
+        };
+        let volumes = [phone.clone(), disk.clone()];
+        let gio = Path::new("/usr/bin/gio");
+
+        let plan = gvfs_unmount_plan(&volumes, &phone.path, Some(gio));
+
+        let plan = plan.map(|plan| (plan.label.clone(), plan.mounts(), plan.power_off.clone()));
+        assert_eq!(
+            plan,
+            Some(("Google Pixel 8".to_owned(), vec![phone.path.clone()], None))
+        );
+        assert!(
+            gvfs_unmount_plan(&volumes, &phone.path, None).is_none(),
+            "no gio"
+        );
+        assert!(
+            gvfs_unmount_plan(&volumes, &disk.path, Some(gio)).is_none(),
+            "a disk"
+        );
+        assert!(gvfs_unmount_plan(&volumes, Path::new("/nowhere"), Some(gio)).is_none());
     }
 
     #[test]

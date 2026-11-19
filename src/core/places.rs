@@ -26,6 +26,29 @@ pub struct Volume {
     pub removable: bool,
     /// `None` when the filesystem could not be queried: no numbers are made up.
     pub usage: Option<Usage>,
+    /// What kind of storage it is: a disk partition or a gvfs mount.
+    pub kind: VolumeKind,
+}
+
+/// What a sidebar volume is: decides the icon and what can be done with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeKind {
+    /// A partition from the mount table.
+    Disk,
+    /// A phone or camera exposed by gvfs (`mtp:`, `gphoto2:`, `afc:`).
+    Phone,
+    /// A network share exposed by gvfs (`smb-share:`, `nfs:`, `afp-volume:`).
+    Share,
+    /// Any other gvfs mount (`sftp:`, `ftp:`, `dav:`, cloud accounts, ...).
+    Remote,
+}
+
+impl VolumeKind {
+    /// Whether gvfs serves it through its FUSE directory: no Trash, no
+    /// block-device actions.
+    pub fn is_gvfs(self) -> bool {
+        self != VolumeKind::Disk
+    }
 }
 
 impl Volume {
@@ -35,6 +58,7 @@ impl Volume {
             label: place.label,
             path: place.path,
             usage: None,
+            kind: VolumeKind::Disk,
         }
     }
 }
@@ -115,6 +139,210 @@ fn is_removable_mount(path: &Path) -> bool {
     path.starts_with("/run/media") || path.starts_with("/media")
 }
 
+// --- gvfs and FUSE ------------------------------------------------------------
+
+/// The directory gvfs exposes its mounts in: `$XDG_RUNTIME_DIR/gvfs`. A
+/// missing or relative runtime directory means there is none to look in.
+pub fn gvfs_root(runtime_dir: Option<&OsStr>) -> Option<PathBuf> {
+    let runtime = Path::new(runtime_dir.filter(|value| !value.is_empty())?);
+    runtime.is_absolute().then(|| runtime.join("gvfs"))
+}
+
+/// [`gvfs_root`] for the process environment.
+pub fn gvfs_root_from_env() -> Option<PathBuf> {
+    gvfs_root(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
+}
+
+/// How long a gvfs mount may take to answer `statvfs` before its meter is
+/// left out: a phone that is locked or asleep can stall it indefinitely.
+const GVFS_USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Looks like the serial number MTP appends to the host name: a long token
+/// of letters and digits with at least one digit.
+fn is_serial(token: &str) -> bool {
+    token.len() >= 6
+        && token.chars().all(|c| c.is_ascii_alphanumeric())
+        && token.chars().any(|c| c.is_ascii_digit())
+}
+
+fn percent_decoded(value: &str) -> String {
+    super::trash::decode_percent(value.as_bytes()).map_or_else(
+        || value.to_owned(),
+        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+/// The friendly label and kind of a gvfs mount from its directory name
+/// (`scheme:key=value,key=value`): `mtp:host=Google_Pixel_8_39060DLJH0031N`
+/// is "Google Pixel 8", `smb-share:server=nas,share=media` is "media on
+/// nas", `sftp:host=x` is "x". A name that does not parse stays as it is.
+pub fn parse_gvfs_name(name: &str) -> (String, VolumeKind) {
+    let raw = || (name.to_owned(), VolumeKind::Remote);
+    let Some((scheme, fields)) = name.split_once(':') else {
+        return raw();
+    };
+    let field = |key: &str| {
+        fields
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, value)| percent_decoded(value))
+            .filter(|value| !value.is_empty())
+    };
+    match scheme {
+        "mtp" | "gphoto2" | "afc" => {
+            let Some(host) = field("host") else {
+                return raw();
+            };
+            let mut words: Vec<&str> = host.split('_').filter(|w| !w.is_empty()).collect();
+            if words.len() > 1 && words.last().is_some_and(|last| is_serial(last)) {
+                words.pop();
+            }
+            (words.join(" "), VolumeKind::Phone)
+        }
+        "smb-share" | "afp-volume" | "nfs" => {
+            let server = field("server").or_else(|| field("host"));
+            let share = field("share").or_else(|| field("volume"));
+            match (share, server) {
+                (Some(share), Some(server)) => (format!("{share} on {server}"), VolumeKind::Share),
+                (None, Some(only)) | (Some(only), None) => (only, VolumeKind::Share),
+                (None, None) => raw(),
+            }
+        }
+        _ => match field("host").or_else(|| field("server")) {
+            Some(host) => (host, VolumeKind::Remote),
+            None => raw(),
+        },
+    }
+}
+
+/// The mounts listed in the gvfs directory `root`. Only the names are read:
+/// listing never mounts, stats or opens anything. A missing directory lists
+/// nothing, and no usage is filled in.
+pub fn gvfs_volumes(root: &Path) -> Vec<Volume> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<OsString> = entries
+        .flatten()
+        .map(|entry| entry.file_name())
+        .filter(|name| !name.as_bytes().starts_with(b"."))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let (label, kind) = parse_gvfs_name(&name.to_string_lossy());
+            Volume {
+                label,
+                path: root.join(&name),
+                removable: false,
+                usage: None,
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// Runs `work` on its own thread and gives up on it after `timeout`; a
+/// thread stuck in the kernel is left behind instead of stalling the caller.
+fn within<T: Send + 'static>(
+    timeout: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fileflux-statvfs".to_owned())
+        .spawn(move || {
+            // The caller may have given up already.
+            sender.send(work()).ok();
+        })
+        .ok()?;
+    receiver.recv_timeout(timeout).ok()
+}
+
+/// [`volume_usage`] that cannot hang: `None` after [`GVFS_USAGE_TIMEOUT`].
+fn bounded_usage(path: &Path) -> Option<Usage> {
+    let path = path.to_path_buf();
+    within(GVFS_USAGE_TIMEOUT, move || volume_usage(&path)).flatten()
+}
+
+/// Where FUSE filesystems (and gvfs) are mounted: those paths have weaker
+/// semantics than a disk (no atomic no-replace rename, no `fsync`, no
+/// timestamps or modes, no Trash), and operations degrade on them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FuseRoots {
+    fuse: Vec<PathBuf>,
+    gvfs: Vec<PathBuf>,
+}
+
+impl FuseRoots {
+    /// From mount table bytes plus the gvfs directory. Mounts of type
+    /// `fuse`, `fuse.*` and `fuseblk` count (not `fusectl`); those of type
+    /// `fuse.gvfsd-fuse` and the gvfs directory itself are gvfs.
+    pub fn from_table(mounts: &[u8], gvfs_root: Option<&Path>) -> Self {
+        let mut roots = Self::default();
+        for line in mounts.split(|&byte| byte == b'\n') {
+            let mut fields = line
+                .split(|&byte| byte == b' ' || byte == b'\t')
+                .filter(|field| !field.is_empty());
+            let (_, Some(mount), Some(fs_type)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let mount = PathBuf::from(OsString::from_vec(decode_fstab_field(mount)));
+            if fs_type == b"fuse.gvfsd-fuse" {
+                roots.gvfs.push(mount);
+            } else if fs_type == b"fuse" || fs_type == b"fuseblk" || fs_type.starts_with(b"fuse.") {
+                roots.fuse.push(mount);
+            }
+        }
+        if let Some(root) = gvfs_root {
+            roots.gvfs.push(root.to_path_buf());
+            if let Ok(real) = fs::canonicalize(root) {
+                roots.gvfs.push(real);
+            }
+        }
+        roots
+    }
+
+    /// From the live mount table and `$XDG_RUNTIME_DIR`. An unreadable
+    /// table leaves only the gvfs directory.
+    pub fn system() -> Self {
+        let mounts = fs::read("/proc/self/mounts").unwrap_or_default();
+        Self::from_table(&mounts, gvfs_root_from_env().as_deref())
+    }
+
+    /// Whether `path` is on a FUSE filesystem or on gvfs.
+    pub fn covers(&self, path: &Path) -> bool {
+        self.is_gvfs(path) || self.fuse.iter().any(|root| path.starts_with(root))
+    }
+
+    /// Whether `path` is on gvfs: a phone or a network share that has no
+    /// Trash and whose mounts are not block devices.
+    pub fn is_gvfs(&self, path: &Path) -> bool {
+        self.gvfs.iter().any(|root| path.starts_with(root))
+    }
+}
+
+/// [`discover_volumes`] against fixed inputs: the mounted partitions of the
+/// `mounts` table, then the mounts listed in the `gvfs` directory, each with
+/// whatever `usage` answers for its path.
+pub fn discover_volumes_with(
+    mounts: &[u8],
+    user: Option<&OsStr>,
+    gvfs: Option<&Path>,
+    usage: impl Fn(&Path) -> Option<Usage>,
+) -> Vec<Volume> {
+    let table = parse_mounts(mounts, user);
+    let mut volumes: Vec<Volume> = table.volumes.into_iter().map(Volume::from_place).collect();
+    volumes.extend(gvfs.map(gvfs_volumes).unwrap_or_default());
+    for volume in &mut volumes {
+        volume.usage = usage(&volume.path);
+    }
+    volumes
+}
+
 /// Completed discovery. Configuration problems are explicit warnings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Places {
@@ -189,24 +417,37 @@ pub fn discover() -> io::Result<Places> {
     )?;
     warnings.extend(discovered.warnings);
     discovered.warnings = warnings;
+    if let Some(root) = gvfs_root_from_env() {
+        discovered.volumes.extend(gvfs_volumes(&root));
+    }
     // Discovery already runs off the UI thread, so statvfs may block here.
     for volume in &mut discovered.volumes {
-        volume.usage = volume_usage(&volume.path);
+        volume.usage = usage_of_volume(&volume.path);
     }
     Ok(discovered)
 }
 
-/// Re-reads the mounted volumes alone: the mount table plus `statvfs`, for
-/// the sidebar's live refresh. `home` only decides which `/run/media/<user>`
-/// root counts as the user's. Blocking: call it off the UI thread.
+/// Re-reads the mounted volumes alone: the mount table, the gvfs directory
+/// and `statvfs`, for the sidebar's live refresh. `home` only decides which
+/// `/run/media/<user>` root counts as the user's. Blocking: call it off the
+/// UI thread.
 pub fn discover_volumes(home: Option<&Path>) -> io::Result<Vec<Volume>> {
     let mounts = fs::read("/proc/self/mounts")?;
-    let table = parse_mounts(&mounts, home.and_then(Path::file_name));
-    let mut volumes: Vec<Volume> = table.volumes.into_iter().map(Volume::from_place).collect();
-    for volume in &mut volumes {
-        volume.usage = volume_usage(&volume.path);
+    let gvfs = gvfs_root_from_env();
+    Ok(discover_volumes_with(
+        &mounts,
+        home.and_then(Path::file_name),
+        gvfs.as_deref(),
+        usage_of_volume,
+    ))
+}
+
+/// `statvfs` for a listed volume: a gvfs mount's answer is bounded in time.
+fn usage_of_volume(path: &Path) -> Option<Usage> {
+    match gvfs_root_from_env() {
+        Some(root) if path.starts_with(&root) => bounded_usage(path),
+        _ => volume_usage(path),
     }
-    Ok(volumes)
 }
 
 /// Environment-aware variable read shared by `discover`: an empty value is
@@ -864,6 +1105,7 @@ snapfuse /snap/core22/1 squashfs ro 0 0\n\
             path: PathBuf::from(path),
             removable: false,
             usage: None,
+            kind: VolumeKind::Disk,
         };
         let places = Places {
             home: PathBuf::from("/home/me"),
@@ -1144,6 +1386,174 @@ tmpfs /run tmpfs rw 0 0\n";
                 .all(|path| Path::new(path).is_absolute()),
             "reported partition mountpoints must be absolute; a container root need not be a disk"
         );
+        Ok(())
+    }
+    // --- gvfs and FUSE -------------------------------------------------------
+
+    #[test]
+    fn the_gvfs_root_is_below_the_runtime_directory() {
+        let os = OsStr::new;
+        assert_eq!(
+            gvfs_root(Some(os("/run/user/1000"))),
+            Some(PathBuf::from("/run/user/1000/gvfs"))
+        );
+        assert_eq!(gvfs_root(None), None);
+        assert_eq!(gvfs_root(Some(os(""))), None);
+        assert_eq!(gvfs_root(Some(os("relative"))), None, "never relative");
+    }
+
+    #[test]
+    fn gvfs_names_become_friendly_labels() {
+        use VolumeKind::{Phone, Remote, Share};
+        let cases = [
+            (
+                "mtp:host=Google_Pixel_8_39060DLJH0031N",
+                "Google Pixel 8",
+                Phone,
+            ),
+            ("mtp:host=Fake_Phone_123", "Fake Phone 123", Phone),
+            ("mtp:host=Solo", "Solo", Phone),
+            ("smb-share:server=nas,share=media", "media on nas", Share),
+            ("smb-share:share=media,server=nas", "media on nas", Share),
+            (
+                "smb-share:server=my%20nas,share=a%2Fb",
+                "a/b on my nas",
+                Share,
+            ),
+            ("sftp:host=x", "x", Remote),
+            ("sftp:host=x,user=bob", "x", Remote),
+            ("ftp:host=files.example.org", "files.example.org", Remote),
+            ("something", "something", Remote),
+            ("weird:nothing=1", "weird:nothing=1", Remote),
+            ("sftp:host=", "sftp:host=", Remote),
+        ];
+        for (name, label, kind) in cases {
+            assert_eq!(
+                parse_gvfs_name(name),
+                (label.to_owned(), kind),
+                "gvfs name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gvfs_directory_lists_its_mounts_by_name_only() -> TestResult {
+        let scratch = Scratch::new("gvfs-list")?;
+        let root = scratch.path().join("run").join("gvfs");
+        fs::create_dir_all(
+            root.join("mtp:host=Fake_Phone_123")
+                .join("Internal shared storage"),
+        )?;
+        fs::create_dir_all(root.join("sftp:host=x"))?;
+        fs::write(root.join(".hidden"), b"")?;
+
+        let volumes = gvfs_volumes(&root);
+
+        let listed: Vec<_> = volumes
+            .iter()
+            .map(|v| (v.label.as_str(), v.kind, v.removable, v.usage))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("Fake Phone 123", VolumeKind::Phone, false, None),
+                ("x", VolumeKind::Remote, false, None),
+            ]
+        );
+        assert_eq!(
+            volumes.first().map(|v| v.path.clone()),
+            Some(root.join("mtp:host=Fake_Phone_123"))
+        );
+        assert!(gvfs_volumes(&scratch.path().join("absent")).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_lists_disks_then_gvfs_with_usage_only_where_it_answers() -> TestResult {
+        let scratch = Scratch::new("gvfs-discover")?;
+        let root = scratch.path().join("gvfs");
+        fs::create_dir_all(root.join("mtp:host=Fake_Phone_123"))?;
+        fs::create_dir_all(root.join("smb-share:server=nas,share=media"))?;
+        let mounts = b"/dev/sda2 / ext4 rw 0 0\n\
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n";
+        let phone = root.join("mtp:host=Fake_Phone_123");
+        let answer = |path: &Path| {
+            if path == Path::new("/") || path == phone {
+                Usage::from_blocks(4096, 1000, 250)
+            } else {
+                // statvfs failed, or reported zero blocks.
+                Usage::from_blocks(4096, 0, 0)
+            }
+        };
+
+        let volumes = discover_volumes_with(mounts, None, Some(&root), answer);
+
+        let kinds: Vec<_> = volumes.iter().map(|v| (v.label.as_str(), v.kind)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("System", VolumeKind::Disk),
+                ("Fake Phone 123", VolumeKind::Phone),
+                ("media on nas", VolumeKind::Share),
+            ]
+        );
+        assert!(
+            volumes.get(1).is_some_and(|v| v.usage.is_some()),
+            "the phone answered statvfs"
+        );
+        assert_eq!(
+            volumes.get(2).map(|v| v.usage),
+            Some(None),
+            "zero blocks: no meter"
+        );
+        // Without a gvfs directory only the disks are listed.
+        let plain = discover_volumes_with(mounts, None, None, answer);
+        assert_eq!(plain.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_statvfs_that_hangs_is_given_up_on() {
+        use std::time::Duration;
+        let slow = within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(600));
+            7
+        });
+        assert_eq!(slow, None);
+        assert_eq!(within(Duration::from_secs(5), || 7), Some(7));
+    }
+
+    #[test]
+    fn fuse_roots_cover_fuse_mounts_and_gvfs_only() -> TestResult {
+        let scratch = Scratch::new("fuse-roots")?;
+        let gvfs = scratch.path().join("run").join("gvfs");
+        let mounts = b"/dev/sda2 / ext4 rw 0 0\n\
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n\
+me@host:/ /mnt/remote fuse.sshfs rw 0 0\n\
+/dev/sdb1 /mnt/ntfs fuseblk rw 0 0\n\
+fusectl /sys/fs/fuse/connections fusectl rw 0 0\n\
+/dev/sdc1 /mnt/plain ext4 rw 0 0\n";
+
+        let roots = FuseRoots::from_table(mounts, Some(&gvfs));
+
+        for path in [
+            "/mnt/remote/dir/file",
+            "/mnt/ntfs",
+            "/run/user/1000/gvfs/mtp:host=P/Internal/DCIM",
+        ] {
+            assert!(roots.covers(Path::new(path)), "{path} is FUSE");
+        }
+        for path in ["/mnt/plain/x", "/", "/home/me", "/mnt/remote2"] {
+            assert!(!roots.covers(Path::new(path)), "{path} is not FUSE");
+        }
+        assert!(roots.covers(&gvfs.join("mtp:host=Fake_Phone_123")));
+        assert!(roots.is_gvfs(&gvfs.join("mtp:host=Fake_Phone_123/DCIM")));
+        assert!(roots.is_gvfs(Path::new("/run/user/1000/gvfs/smb-share:server=a,share=b")));
+        assert!(
+            !roots.is_gvfs(Path::new("/mnt/remote/x")),
+            "sshfs is FUSE, not gvfs"
+        );
+        assert!(!FuseRoots::default().covers(Path::new("/mnt/remote")));
         Ok(())
     }
 }

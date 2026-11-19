@@ -558,6 +558,7 @@ pub(crate) fn transfer_summary(
         )
     };
     let (severity, text) = with_leftovers(report, severity, text, &mut details);
+    details.extend(report.notes.iter().cloned());
     (Notice { severity, text }, details)
 }
 

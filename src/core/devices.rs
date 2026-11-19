@@ -132,6 +132,18 @@ pub struct UnmountStep {
     pub device: PathBuf,
     /// Every mount point the step takes away.
     pub mounts: Vec<PathBuf>,
+    /// The tool that does it.
+    pub via: UnmountVia,
+}
+
+/// The tool an [`UnmountStep`] runs through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmountVia {
+    /// `udisksctl unmount --block-device=<device>`.
+    Udisks,
+    /// `gio mount -u <path>`: a gvfs mount (phone, share), whose `device`
+    /// is the mount path itself.
+    Gio,
 }
 
 impl UnmountStep {
@@ -401,6 +413,7 @@ pub fn unmount_plan(device: &Device) -> Option<DevicePlan> {
             } else {
                 device.mounts.clone()
             },
+            via: UnmountVia::Udisks,
         }],
         power_off: None,
     })
@@ -411,6 +424,7 @@ fn mounted_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
         out.push(UnmountStep {
             device: node.path.clone(),
             mounts: node.mountpoints.clone(),
+            via: UnmountVia::Udisks,
         });
     }
     for child in &node.children {
@@ -740,15 +754,72 @@ pub fn mount(udisksctl: &Path, device: &Path) -> Result<PathBuf, DeviceError> {
     }
 }
 
+/// `gio mount -u <path>`: unmounts a gvfs mount. The path is absolute, so it
+/// is never read as an option.
+pub fn gio_unmount_args(path: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("mount"),
+        OsString::from("-u"),
+        path.as_os_str().to_owned(),
+    ]
+}
+
+/// Unmounting the gvfs mount at `mount` through `gio`.
+pub fn gio_unmount_plan(label: &str, mount: &Path) -> DevicePlan {
+    DevicePlan {
+        label: label.to_owned(),
+        unmount: vec![UnmountStep {
+            device: mount.to_path_buf(),
+            mounts: vec![mount.to_path_buf()],
+            via: UnmountVia::Gio,
+        }],
+        power_off: None,
+    }
+}
+
+/// The program that runs `step`: `udisksctl` or `gio`, whichever the step
+/// goes through; an error when that one is not installed.
+pub fn unmount_program<'a>(
+    step: &UnmountStep,
+    udisksctl: Option<&'a Path>,
+    gio: Option<&'a Path>,
+) -> Result<&'a Path, DeviceError> {
+    let (program, name) = match step.via {
+        UnmountVia::Udisks => (udisksctl, "udisksctl"),
+        UnmountVia::Gio => (gio, "gio"),
+    };
+    program.ok_or_else(|| DeviceError::Failed {
+        reason: format!("{name} was not found"),
+    })
+}
+
 /// Unmounts one device. A device that is already unmounted counts as done.
-pub fn run_unmount(udisksctl: &Path, step: &UnmountStep) -> Result<(), DeviceError> {
-    let output = run_tool(udisksctl, &unmount_args(&step.device), UDISKS_TIMEOUT)?;
-    let already = output.stderr.contains("NotMounted") || output.stderr.contains("is not mounted");
+/// `program` is the one [`unmount_program`] chose for the step.
+pub fn run_unmount(program: &Path, step: &UnmountStep) -> Result<(), DeviceError> {
+    let args = match step.via {
+        UnmountVia::Udisks => unmount_args(&step.device),
+        UnmountVia::Gio => gio_unmount_args(&step.device),
+    };
+    let output = run_tool(program, &args, UDISKS_TIMEOUT)?;
+    let already = output.stderr.contains("NotMounted")
+        || output.stderr.contains("is not mounted")
+        || output
+            .stderr
+            .contains("Containing mount for file not found");
     if output.success || already {
         Ok(())
     } else {
         Err(DeviceError::Failed {
-            reason: failure_reason(&output.stderr),
+            reason: match step.via {
+                UnmountVia::Udisks => failure_reason(&output.stderr),
+                UnmountVia::Gio => output
+                    .stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("gio failed without a message")
+                    .to_owned(),
+            },
         })
     }
 }
@@ -1097,6 +1168,7 @@ mod tests {
                 unmount: vec![UnmountStep {
                     device: PathBuf::from("/dev/sdb1"),
                     mounts: vec![PathBuf::from("/run/media/iperez/KINGSTON")],
+                    via: UnmountVia::Udisks,
                 }],
                 power_off: None,
             })
@@ -1125,10 +1197,12 @@ mod tests {
                     UnmountStep {
                         device: PathBuf::from("/dev/sdb1"),
                         mounts: vec![PathBuf::from("/run/media/iperez/KINGSTON")],
+                        via: UnmountVia::Udisks,
                     },
                     UnmountStep {
                         device: PathBuf::from("/dev/sdb2"),
                         mounts: vec![PathBuf::from("/run/media/iperez/second")],
+                        via: UnmountVia::Udisks,
                     },
                 ],
                 power_off: Some(PathBuf::from("/dev/sdb")),
@@ -1596,10 +1670,12 @@ mod tests {
                 UnmountStep {
                     device: PathBuf::from("/dev/sdb1"),
                     mounts: vec![PathBuf::from("/run/media/u/A")],
+                    via: UnmountVia::Udisks,
                 },
                 UnmountStep {
                     device: PathBuf::from("/dev/sdb2"),
                     mounts: vec![PathBuf::from("/run/media/u/B")],
+                    via: UnmountVia::Udisks,
                 },
             ],
             power_off: Some(PathBuf::from("/dev/sdb")),
@@ -1657,6 +1733,77 @@ mod tests {
         )?;
         run_plan(&ctl, &plan())?;
         assert_eq!(fs::read_to_string(&log)?.lines().count(), 3);
+        Ok(())
+    }
+    fn first_step(plan: &DevicePlan) -> UnmountStep {
+        plan.unmount
+            .first()
+            .cloned()
+            .unwrap_or_else(|| UnmountStep {
+                device: PathBuf::new(),
+                mounts: Vec::new(),
+                via: UnmountVia::Udisks,
+            })
+    }
+
+    #[test]
+    fn gio_unmounts_a_gvfs_path_by_argv() {
+        assert_eq!(
+            gio_unmount_args(Path::new("/run/user/1000/gvfs/mtp:host=P")),
+            ["mount", "-u", "/run/user/1000/gvfs/mtp:host=P"].map(OsString::from)
+        );
+        let plan = gio_unmount_plan("Pixel", Path::new("/run/user/1000/gvfs/mtp:host=P"));
+        assert_eq!(plan.label, "Pixel");
+        assert_eq!(plan.power_off, None, "a phone is never powered off");
+        assert_eq!(
+            plan.mounts(),
+            [PathBuf::from("/run/user/1000/gvfs/mtp:host=P")]
+        );
+        assert_eq!(plan.unmount.len(), 1);
+        assert_eq!(
+            plan.unmount.first().map(|step| step.via),
+            Some(UnmountVia::Gio)
+        );
+    }
+
+    #[test]
+    fn each_step_runs_through_its_own_tool_and_needs_it_installed() {
+        let udisks = Path::new("/bin/udisksctl");
+        let gio = Path::new("/bin/gio");
+        let block = first_step(&plan());
+        let gvfs = first_step(&gio_unmount_plan("P", Path::new("/g/x")));
+        assert_eq!(unmount_program(&block, Some(udisks), Some(gio)), Ok(udisks));
+        assert_eq!(unmount_program(&gvfs, Some(udisks), Some(gio)), Ok(gio));
+        assert!(matches!(
+            unmount_program(&gvfs, Some(udisks), None),
+            Err(DeviceError::Failed { reason }) if reason.contains("gio")
+        ));
+        assert!(unmount_program(&block, None, Some(gio)).is_err());
+    }
+
+    #[test]
+    fn a_gio_unmount_runs_gio_with_the_path_and_reports_its_message() -> TestResult {
+        let fixture = Fixture::new()?;
+        let log = fixture.0.join("argv.log");
+        let ok = fixture.script("gio", &format!("echo \"$@\" >> '{}'", log.display()))?;
+        let step = first_step(&gio_unmount_plan("P", Path::new("/g/mtp:host=P")));
+        run_unmount(&ok, &step)?;
+        assert_eq!(fs::read_to_string(&log)?, "mount -u /g/mtp:host=P\n");
+        let busy = fixture.script(
+            "gio-busy",
+            "echo 'gio: Unmounting failed: busy' >&2; exit 1",
+        )?;
+        assert_eq!(
+            run_unmount(&busy, &step),
+            Err(DeviceError::Failed {
+                reason: "gio: Unmounting failed: busy".to_owned()
+            })
+        );
+        let gone = fixture.script(
+            "gio-gone",
+            "echo 'gio: Containing mount for file not found' >&2; exit 1",
+        )?;
+        run_unmount(&gone, &step)?;
         Ok(())
     }
 }

@@ -424,6 +424,7 @@ fn report_of(items: Vec<ItemReport>, cancelled: bool) -> TransferReport {
         bytes: 0,
         cancelled,
         leftovers: Vec::new(),
+        notes: Vec::new(),
     }
 }
 
@@ -449,6 +450,21 @@ fn a_clean_transfer_says_what_was_copied_or_moved_and_where() {
     ];
     let (many, _) = summary(ClipMode::Cut, items, false);
     assert_eq!(many.text, "Moved 3 items to Pictures");
+}
+
+#[test]
+fn what_a_weak_filesystem_could_not_do_is_a_detail_not_a_failure() {
+    let mut report = report_of(vec![ok("/x/a.png", "/phone/DCIM/a.png")], false);
+    report
+        .notes
+        .push("Modification times and permissions could not be set here".to_owned());
+    let (notice, details) = transfer_summary(ClipMode::Copy, &p("/phone/DCIM"), &report, &[]);
+    assert_eq!(notice.text, "Copied \u{201c}a.png\u{201d} to DCIM");
+    assert_eq!(notice.severity, Severity::Success);
+    assert_eq!(
+        details,
+        ["Modification times and permissions could not be set here"]
+    );
 }
 
 #[test]

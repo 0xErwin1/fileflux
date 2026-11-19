@@ -14,7 +14,7 @@ use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, IslandMetrics, Spacing, TreeMetrics};
 use fileflux::core::Location;
 use fileflux::core::devices::{Device, DeviceState, device_for_mount};
-use fileflux::core::places::Volume;
+use fileflux::core::places::{Volume, VolumeKind};
 use std::path::{Path, PathBuf};
 
 use fileflux::core::settings::{DETAILS_WIDTH_RANGE, SIDEBAR_WIDTH_RANGE};
@@ -303,6 +303,30 @@ fn unmounted_row(
     )
 }
 
+/// The icon of a device row: a phone, a share, a remote machine, a USB
+/// drive or a disk.
+fn volume_glyph(volume: &Volume, device: Option<&Device>) -> gpui_kit_assets::IconName {
+    match volume.kind {
+        VolumeKind::Phone => gpui_kit_assets::IconName::Smartphone,
+        VolumeKind::Share => gpui_kit_assets::IconName::Network,
+        VolumeKind::Remote => gpui_kit_assets::IconName::Server,
+        VolumeKind::Disk if volume.removable || device.is_some_and(|device| device.ejectable) => {
+            gpui_kit_assets::IconName::Usb
+        }
+        VolumeKind::Disk => gpui_kit_assets::IconName::HardDrive,
+    }
+}
+
+/// What a row's menu acts on besides its place: the block device behind a
+/// disk, or the mount path of a gvfs mount (whose Unmount goes through `gio`).
+fn menu_target(volume: &Volume, device: Option<&Device>) -> Option<PathBuf> {
+    match device {
+        Some(device) => Some(device.path.clone()),
+        None if volume.kind.is_gvfs() => Some(volume.path.clone()),
+        None => None,
+    }
+}
+
 /// One device row: icon and name, then the 3 px meter and the mono
 /// "free of" line, both left out without usage numbers.
 fn volume_row(
@@ -316,11 +340,7 @@ fn volume_row(
     let tint = ChromeColors::tint(cx.theme());
     let location = Location::Directory(volume.path.clone());
     let active = this.tab().state.current() == &location;
-    let glyph = if volume.removable || device.is_some_and(|device| device.ejectable) {
-        gpui_kit_assets::IconName::Usb
-    } else {
-        gpui_kit_assets::IconName::HardDrive
-    };
+    let glyph = volume_glyph(volume, device);
     let name = if volume.path == home {
         "Home".to_owned()
     } else {
@@ -369,7 +389,7 @@ fn volume_row(
         format!("volume-{index}"),
         name_for_menu,
         volume.path.to_string_lossy().into_owned(),
-        (Some(location), device.map(|device| device.path.clone())),
+        (Some(location), menu_target(volume, device)),
         active,
         cx,
     )
@@ -839,5 +859,32 @@ mod tests {
             ),
             "the drag clamps are the settings clamps"
         );
+    }
+    fn volume(kind: VolumeKind, removable: bool) -> Volume {
+        Volume {
+            label: "x".to_owned(),
+            path: PathBuf::from("/x"),
+            removable,
+            usage: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn each_kind_of_volume_has_its_own_icon() {
+        use gpui_kit_assets::IconName;
+        let glyph = |kind, removable| volume_glyph(&volume(kind, removable), None);
+        assert_eq!(glyph(VolumeKind::Phone, false), IconName::Smartphone);
+        assert_eq!(glyph(VolumeKind::Share, false), IconName::Network);
+        assert_eq!(glyph(VolumeKind::Remote, false), IconName::Server);
+        assert_eq!(glyph(VolumeKind::Disk, true), IconName::Usb);
+        assert_eq!(glyph(VolumeKind::Disk, false), IconName::HardDrive);
+    }
+
+    #[test]
+    fn only_a_gvfs_row_without_a_block_device_acts_on_its_own_path() {
+        let phone = volume(VolumeKind::Phone, false);
+        assert_eq!(menu_target(&phone, None), Some(PathBuf::from("/x")));
+        assert_eq!(menu_target(&volume(VolumeKind::Disk, false), None), None);
     }
 }
