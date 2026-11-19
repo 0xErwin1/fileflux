@@ -196,6 +196,19 @@ pub fn discover() -> io::Result<Places> {
     Ok(discovered)
 }
 
+/// Re-reads the mounted volumes alone: the mount table plus `statvfs`, for
+/// the sidebar's live refresh. `home` only decides which `/run/media/<user>`
+/// root counts as the user's. Blocking: call it off the UI thread.
+pub fn discover_volumes(home: Option<&Path>) -> io::Result<Vec<Volume>> {
+    let mounts = fs::read("/proc/self/mounts")?;
+    let table = parse_mounts(&mounts, home.and_then(Path::file_name));
+    let mut volumes: Vec<Volume> = table.volumes.into_iter().map(Volume::from_place).collect();
+    for volume in &mut volumes {
+        volume.usage = volume_usage(&volume.path);
+    }
+    Ok(volumes)
+}
+
 /// Environment-aware variable read shared by `discover`: an empty value is
 /// unset, a relative value is ignored with a warning.
 fn xdg_dir(variable: &str, warnings: &mut Vec<String>) -> Option<PathBuf> {

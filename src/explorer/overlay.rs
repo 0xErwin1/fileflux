@@ -20,7 +20,7 @@ use gpui::{
 
 use super::actions::RenameView;
 use super::icon;
-use super::ops::{DialogAction, DialogChoice, MenuCommand, MenuPage, MenuRow};
+use super::ops::{DialogAction, DialogChoice, DialogKind, MenuCommand, MenuPage, MenuRow};
 use super::view::{Explorer, MENU_CONTEXT};
 
 /// The menu and the dialog, when open. Also hands the keyboard back to the
@@ -69,6 +69,8 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::Cut => IconName::Scissors,
         MenuCommand::Copy => IconName::Copy,
         MenuCommand::Paste | MenuCommand::PasteIntoFolder => IconName::ClipboardPaste,
+        MenuCommand::Mount => IconName::HardDrive,
+        MenuCommand::Unmount | MenuCommand::Eject => IconName::Eject,
     })
 }
 
@@ -224,6 +226,8 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         DialogAction::OpenWith { selected, .. } => Some(*selected),
         _ => None,
     };
+    // Waiting for a device to be free destroys nothing: not a danger button.
+    let calm = open_with.is_some() || matches!(dialog.kind, DialogKind::DeviceBusy { .. });
     let body = div()
         .flex()
         .flex_col()
@@ -336,7 +340,7 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         .child(
             {
                 let confirm = Button::new("explorer-dialog-confirm", text.confirm);
-                if open_with.is_some() {
+                if calm {
                     confirm.primary()
                 } else {
                     confirm.danger()
@@ -350,6 +354,8 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     let modal = Modal::new(text.title.clone()).id("explorer-dialog");
     let modal = if open_with.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::FolderOpen))
+    } else if calm {
+        modal.icon(icon(gpui_kit_assets::IconName::Usb))
     } else {
         modal
             .danger()

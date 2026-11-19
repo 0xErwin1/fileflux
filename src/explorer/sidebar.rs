@@ -13,8 +13,9 @@ use bolt::composites::{Island, ListRow};
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, IslandMetrics, Spacing, TreeMetrics};
 use fileflux::core::Location;
+use fileflux::core::devices::{Device, DeviceState, device_for_mount};
 use fileflux::core::places::Volume;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fileflux::core::settings::{DETAILS_WIDTH_RANGE, SIDEBAR_WIDTH_RANGE};
 use gpui::{
@@ -24,6 +25,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, tooltip::Tooltip};
 
 use super::actions::MenuOn;
+use super::devices::{actions_for, caption, unlisted_volumes};
 use super::dnd::{self, DropTarget};
 use super::entries;
 use super::icon;
@@ -198,24 +200,114 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
 }
 
 /// The Devices section: the mount table's real storage volumes with a
-/// usage meter when `statvfs` answered.
+/// usage meter when `statvfs` answered, then the devices that are not
+/// mounted (click to mount), and a one-line notice when a tool is missing.
 fn volumes_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
+    let colors = bolt::colors(cx);
     let mut section = div().flex_none().flex().flex_col().pb(Spacing::MD);
     section = section.child(section_label("volumes-label", "Devices", cx));
     let Some(places) = this.places.clone() else {
         return section;
     };
-    for (index, volume) in places.volumes.iter().enumerate() {
-        section = section.child(volume_row(index, volume, places.home.as_path(), this, cx));
+    let unlisted = unlisted_volumes(&places.volumes, &this.devices.list);
+    for (index, volume) in places.volumes.iter().chain(&unlisted).enumerate() {
+        let device = device_for_mount(&this.devices.list, &volume.path);
+        section = section.child(volume_row(
+            index,
+            (volume, device),
+            places.home.as_path(),
+            this,
+            cx,
+        ));
+    }
+    // Without `udisksctl` nothing can be mounted: those rows would only
+    // tempt a click that cannot work.
+    if this.devices.udisksctl.is_some() {
+        let unmounted = this
+            .devices
+            .list
+            .iter()
+            .filter(|device| !matches!(device.state, DeviceState::Mounted(_)));
+        for (index, device) in unmounted.enumerate() {
+            section = section.child(unmounted_row(index, device, this, cx));
+        }
+    }
+    if let Some(notice) = this.devices.notice() {
+        section = section.child(
+            div()
+                .id("explorer-devices-notice")
+                .px(Spacing::LG)
+                .py(Spacing::SM)
+                .text_size(px(11.0))
+                .line_height(px(15.0))
+                .text_color(colors.muted)
+                .child(notice),
+        );
     }
     section
+}
+
+/// One device that is not mounted: muted, with "Not mounted" (or "Locked",
+/// or what an action is doing) under the name. A click mounts it.
+fn unmounted_row(
+    index: usize,
+    device: &Device,
+    this: &Explorer,
+    cx: &mut Context<Explorer>,
+) -> Stateful<Div> {
+    let colors = bolt::colors(cx);
+    let glyph = if device.state == DeviceState::Locked {
+        gpui_kit_assets::IconName::Lock
+    } else if device.ejectable {
+        gpui_kit_assets::IconName::Usb
+    } else {
+        gpui_kit_assets::IconName::HardDrive
+    };
+    let tooltip = match &device.fstype {
+        Some(fstype) => format!("{} \u{b7} {fstype}", device.path.display()),
+        None => device.path.display().to_string(),
+    };
+    row_shell(
+        this,
+        format!("device-{index}"),
+        device.label.clone(),
+        tooltip,
+        (None, Some(device.path.clone())),
+        false,
+        cx,
+    )
+    .py(Spacing::SM)
+    .flex_col()
+    .items_stretch()
+    .gap(px(2.0))
+    .text_color(colors.muted)
+    .child(
+        div()
+            .flex()
+            .items_center()
+            .gap(Spacing::SM)
+            .child(
+                Icon::new(icon(glyph))
+                    .size(TreeMetrics::ICON)
+                    .color(colors.muted),
+            )
+            .child(device.label.clone()),
+    )
+    .child(
+        div()
+            .ml(px(25.0))
+            .font_family(bolt::fonts::editor_family(cx))
+            .text_size(px(11.0))
+            .text_color(colors.muted)
+            .child(caption(device, this.devices.working_on(device))),
+    )
 }
 
 /// One device row: icon and name, then the 3 px meter and the mono
 /// "free of" line, both left out without usage numbers.
 fn volume_row(
     index: usize,
-    volume: &Volume,
+    (volume, device): (&Volume, Option<&Device>),
     home: &Path,
     this: &Explorer,
     cx: &mut Context<Explorer>,
@@ -224,7 +316,7 @@ fn volume_row(
     let tint = ChromeColors::tint(cx.theme());
     let location = Location::Directory(volume.path.clone());
     let active = this.tab().state.current() == &location;
-    let glyph = if volume.removable {
+    let glyph = if volume.removable || device.is_some_and(|device| device.ejectable) {
         gpui_kit_assets::IconName::Usb
     } else {
         gpui_kit_assets::IconName::HardDrive
@@ -235,7 +327,8 @@ fn volume_row(
         volume.label.clone()
     };
     let name_for_menu = name.clone();
-    let top = div()
+    let actions = device.map(|device| actions_for(device, this.devices.udisksctl.is_some()));
+    let mut top = div()
         .flex()
         .items_center()
         .gap(Spacing::SM)
@@ -245,12 +338,38 @@ fn volume_row(
                 .color(if active { tint } else { colors.muted }),
         )
         .child(name);
+    // The eject button of the reference design: right-aligned on removable
+    // rows, "Eject <name>" on hover.
+    if let (Some(device), Some(actions)) = (device, actions)
+        && actions.eject
+    {
+        let target = device.path.clone();
+        let tooltip = format!("Eject {}", device.label);
+        top = top.child(
+            div()
+                .id(("volume-eject", index))
+                .ml_auto()
+                .flex_none()
+                .size(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(colors.muted)
+                .hover(|button| button.bg(colors.line).text_color(colors.strong))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.eject_device(&target, window, cx);
+                }))
+                .child(Icon::new(icon(gpui_kit_assets::IconName::Eject)).size(px(13.0))),
+        );
+    }
     let mut row = row_shell(
         this,
         format!("volume-{index}"),
         name_for_menu,
         volume.path.to_string_lossy().into_owned(),
-        location,
+        (Some(location), device.map(|device| device.path.clone())),
         active,
         cx,
     )
@@ -289,12 +408,16 @@ fn volume_row(
 
 /// The shared row chrome: selection bar, click navigation and the full
 /// path as the tooltip (skipped when there is no path to show).
+///
+/// `target` is the place the row stands for and the block device behind it,
+/// when it is one. A row without a place is a device that is not mounted: a
+/// click mounts it, and nothing can be dropped on it.
 fn row_shell(
     this: &Explorer,
     id: String,
     name: String,
     path: String,
-    location: Location,
+    (location, device): (Option<Location>, Option<PathBuf>),
     active: bool,
     cx: &mut Context<Explorer>,
 ) -> Stateful<Div> {
@@ -306,12 +429,8 @@ fn row_shell(
         Some(MenuOn::Sidebar { row, .. }) if *row == id
     );
     let menu_row = id.clone();
-    let menu_location = location.clone();
-    // Dropping on a row is dropping on its place: a folder, or the Trash.
-    let target = match &location {
-        Location::Directory(path) => DropTarget::Folder(path.clone()),
-        Location::Trash => DropTarget::Trash,
-    };
+    let menu_target = (location.clone(), device.clone());
+    let click_target = (location.clone(), device.clone());
     let row = ListRow::new(ElementId::Name(id.clone().into()))
         .selected(active)
         .selection_bar(true)
@@ -345,33 +464,59 @@ fn row_shell(
         } else {
             colors.foreground
         })
-        .on_click(cx.listener({
-            let location = location.clone();
-            move |this, _event, window, cx| {
-                this.navigate(Transition::Visit(location.clone()), window, cx);
-            }
-        }))
+        .on_click(
+            cx.listener(move |this, _event, window, cx| match &click_target {
+                (Some(location), _) => {
+                    this.navigate(Transition::Visit(location.clone()), window, cx);
+                }
+                (None, Some(device)) => this.activate_device(device.clone(), window, cx),
+                (None, None) => {}
+            }),
+        )
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
-                this.open_sidebar_menu(
-                    event.position,
-                    menu_row.clone(),
-                    name.clone(),
-                    menu_location.clone(),
-                    window,
-                    cx,
-                );
-            }),
-        )
-        .on_mouse_up(
-            MouseButton::Middle,
-            cx.listener(move |this, _event, window, cx| {
-                this.open_tab(location.clone(), Placement::Background, window, cx);
+                match &menu_target {
+                    (Some(location), device) => this.open_sidebar_menu(
+                        event.position,
+                        menu_row.clone(),
+                        name.clone(),
+                        (location.clone(), device.clone()),
+                        window,
+                        cx,
+                    ),
+                    (None, Some(device)) => this.open_device_menu(
+                        event.position,
+                        menu_row.clone(),
+                        name.clone(),
+                        device.clone(),
+                        window,
+                        cx,
+                    ),
+                    (None, None) => {}
+                }
             }),
         );
-    let row = dnd::drop_target(row, target, &cx.entity().downgrade(), cx);
+    let row = match &location {
+        Some(location) => {
+            let middle = location.clone();
+            let row = row.on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _event, window, cx| {
+                    this.open_tab(middle.clone(), Placement::Background, window, cx);
+                }),
+            );
+            // Dropping on a row is dropping on its place: a folder, or the
+            // Trash.
+            let target = match location {
+                Location::Directory(path) => DropTarget::Folder(path.clone()),
+                Location::Trash => DropTarget::Trash,
+            };
+            dnd::drop_target(row, target, &cx.entity().downgrade(), cx)
+        }
+        None => row,
+    };
     // No path tooltip while a menu is open: it would sit on top of the
     // menu's header.
     if path.is_empty() || this.menu.is_some() {
@@ -407,7 +552,7 @@ fn nav_row(
         id,
         shown_label.clone(),
         path,
-        location.clone(),
+        (Some(location.clone()), None),
         active,
         cx,
     )

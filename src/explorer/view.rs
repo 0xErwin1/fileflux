@@ -24,6 +24,7 @@ use bolt::controls::{Button, InputEvent, InputState};
 use bolt::modals::{ModalKey, ModalKeyHandler, ModalSeams, on_modal_key};
 use bolt::toast::{ToastGlobal, ToastHost};
 use bolt::tokens::{IslandMetrics, Spacing};
+use fileflux::core::devices::path_uses_mounts;
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::settings::{
     self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
@@ -45,6 +46,7 @@ use gpui_component::tooltip::Tooltip;
 use crate::explorer::actions::{MenuState, PendingSelect, Renaming};
 use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
+use crate::explorer::devices::DeviceHub;
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{DialogQueue, MenuPage};
@@ -620,6 +622,9 @@ pub(crate) struct OpContext {
     pub(crate) origin: TabId,
     /// The folders the operation changes.
     pub(crate) affected: Affected,
+    /// Every path it reads or writes: what keeps a device from being
+    /// unmounted while the operation runs (see `explorer::devices`).
+    pub(crate) touches: Vec<PathBuf>,
 }
 
 /// The explorer view: the window's tabs plus everything the tabs share.
@@ -725,6 +730,8 @@ pub(crate) struct Explorer {
     folder_debounce: HashMap<PathBuf, Debounce>,
     /// The retained loop that drains the watcher channel.
     _watch_pump: Option<Task<()>>,
+    /// The machine's devices and the actions on them: the Devices section.
+    pub(crate) devices: DeviceHub,
 }
 
 impl Focusable for Explorer {
@@ -886,6 +893,7 @@ impl Explorer {
             watch_events,
             folder_debounce: HashMap::new(),
             _watch_pump: None,
+            devices: DeviceHub::from_env(),
         };
         this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -893,6 +901,7 @@ impl Explorer {
                 if this
                     .update_in(cx, |this, window, cx| {
                         this.pump_watch_events(window, cx);
+                        this.pump_devices(window, cx);
                         this.persist_tick(window, cx);
                     })
                     .is_err()
@@ -1384,6 +1393,23 @@ impl Explorer {
                 self.start_scan_in(id, scan, window, cx);
             }
         }
+    }
+
+    /// Lets go of every watch on a folder under `mounts`, so an inotify watch
+    /// cannot keep a mount busy.
+    pub(crate) fn release_watches_under(&mut self, mounts: &[PathBuf]) {
+        for tab in self.tabs.iter_mut() {
+            for slot in [&mut tab.watch.committed, &mut tab.watch.target] {
+                if slot
+                    .as_ref()
+                    .is_some_and(|handle| path_uses_mounts(handle.path(), mounts))
+                {
+                    *slot = None;
+                }
+            }
+        }
+        self.folder_debounce
+            .retain(|path, _| !path_uses_mounts(path, mounts));
     }
 
     /// The watcher thread died: drop the hub and every hold, so tabs go back

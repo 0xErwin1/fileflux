@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use fileflux::core::Entry;
 use fileflux::core::apps::{App, OpenWith, expand_exec};
+use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::trash::{
@@ -1165,6 +1166,12 @@ pub(crate) enum MenuCommand {
     AddFavorite,
     /// Sidebar rows: unpin the row's folder from the Favorites.
     RemoveFavorite,
+    /// Devices: mount the unmounted filesystem.
+    Mount,
+    /// Devices: unmount the mounted filesystem.
+    Unmount,
+    /// Devices: unmount every partition of the disk and power it off.
+    Eject,
 }
 
 /// Which page of the one menu is showing. The empty-space menu opens on
@@ -1513,6 +1520,13 @@ pub(crate) enum DialogKind {
         existing: String,
         incoming: String,
     },
+    /// Running operations use the device that is about to be unmounted or
+    /// ejected; `count` of them, the device is called `label`.
+    DeviceBusy {
+        label: String,
+        count: usize,
+        eject: bool,
+    },
 }
 
 /// What a confirmed dialog does. It carries exactly what its own dialog
@@ -1535,6 +1549,8 @@ pub(crate) enum DialogAction {
         job: u64,
         apply_all: bool,
     },
+    /// "Wait and eject": queue the plan until nothing uses the device.
+    DeviceWhenIdle(DevicePlan),
 }
 
 /// One confirmation: its words and the action its danger button runs.
@@ -1848,6 +1864,27 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             format!("Applications for {mime}. Up and Down choose, Enter opens."),
             "Open",
         ),
+        DialogKind::DeviceBusy {
+            label,
+            count,
+            eject,
+        } => {
+            let gerund = if *eject { "Ejecting" } else { "Unmounting" };
+            let (are, them) = if *count == 1 {
+                ("1 operation is", "it")
+            } else {
+                (&*format!("{count} operations are"), "them")
+            };
+            (
+                format!("{are} using {label}"),
+                format!("{gerund} now could corrupt data. Wait for {them} to finish, or cancel."),
+                if *eject {
+                    "Wait and eject"
+                } else {
+                    "Wait and unmount"
+                },
+            )
+        }
         DialogKind::EmptyTrash { count } => (
             "Empty the Trash?".to_owned(),
             if *count == 1 {

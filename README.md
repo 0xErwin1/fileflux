@@ -57,7 +57,7 @@ The script only writes to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mi
 
 | Area | Behavior |
 |---|---|
-| Navigation | Sidebar places (Home, Desktop, Documents, Downloads, Music, Pictures, Videos per your freedesktop config), scoped **Home Trash**, and mounted disk partitions/USB storage from the mount table — one entry per device, without virtual or duplicate bind mounts; the root filesystem reads "System". Names only (full paths in tooltips); each volume shows a thin usage meter and "X free of Y" from `statvfs`. Mounting, unmounting and ejecting are not performed. |
+| Navigation | Sidebar places (Home, Desktop, Documents, Downloads, Music, Pictures, Videos per your freedesktop config), scoped **Home Trash**, and mounted disk partitions/USB storage from the mount table — one entry per device, without virtual or duplicate bind mounts; the root filesystem reads "System". Names only (full paths in tooltips); each volume shows a thin usage meter and "X free of Y" from `statvfs`. Removable drives and unmounted partitions can be mounted, unmounted and ejected: see [Devices](#devices). |
 | Path bar | A breadcrumb bar (Home icon and "Home" under `$HOME`, else `/`) with chevron separators; each segment navigates, the current folder reads strong, long paths collapse their leading segments instead of overflowing. Clicking the bar's empty space or Ctrl+L switches to the editable field: Enter navigates absolute, relative, or `~/…` paths — no shell evaluation. Escape, a click elsewhere or leaving the field restores the committed path and returns to the breadcrumbs. Invalid or missing paths report an error and keep the current listing, history, and selection. |
 | History | Back/forward/up with disabled states (Alt+Left/Right/Up). Failed loads change nothing. |
 | Views | A folder subbar under the toolbar shows the current folder and its "4 folders · 7 files" count. A segmented grid/list toggle switches presentation. Icon grid of fixed-size tiles (equal-size rows, left-aligned partial rows — the last row never stretches) with two-tone folders, image thumbnails and a size subline (folders show "N items"), and a details list drawn by the pinned shared `gpui_component::table::DataTable` (`Name/Size/Modified`, no row-number gutter, local/relative dates, right-aligned sizes; folders show "N items", counted in the background after the listing appears): click a header to sort (the arrow draws in the tint color, folders stay first), columns spread over the pane edge to edge with drag-to-resize honored. Sizes use one decimal SI formatter everywhere. The view toggle keeps folder, query and selection. |
@@ -71,6 +71,24 @@ The script only writes to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mi
 | Loading | Directory scans, Trash reads and places discovery run off the UI thread with a generation guard: stale completions (including a newer failed request's) never overwrite newer results. |
 
 Non-UTF8 file names keep their exact raw bytes for navigation; lossy text appears only in display strings.
+
+## Devices
+
+The **Devices** section of the sidebar lists the mounted volumes (usage meter as before) and, under them, the filesystems that are not mounted yet: muted, with "Not mounted" under the name. Everything goes through `udisksctl` (no root, no shell, always with `--no-user-interaction`); Fileflux never mounts or unmounts anything on its own.
+
+| Action | How | What runs |
+|---|---|---|
+| Mount | Click the unmounted row, or right-click → **Mount** | `udisksctl mount -b <device> --no-user-interaction`; on success the tab goes to the mount point the tool reported. |
+| Unmount | Right-click a mounted removable volume → **Unmount** | `udisksctl unmount -b <device> --no-user-interaction`. |
+| Eject | The eject icon at the right of a removable row (tooltip "Eject <name>"), or right-click → **Eject** | Every mounted partition of the disk is unmounted (deepest mount first), then `udisksctl power-off -b <disk> --no-user-interaction`. A toast says "<name> can be removed safely". |
+
+- **What is listed.** Mounted volumes as before, plus unmounted filesystems read from `lsblk -J` on removable, USB and hot-plug disks and on non-system disks. Left out: swap, RAID/LVM members, loop, zram and optical devices, empty card readers, and every disk that holds a system mount (`/`, `/boot`, `/efi`, `/usr`, `/var`, `/nix`, `/etc`, `/home`, `/opt`, `/swap`, `/root`) or active swap. An encrypted (LUKS) container that nobody unlocked shows as **Locked** (no unlock yet). A device without a label is called "<size> Volume".
+- **What can be acted on.** Mount: an unmounted, unlocked filesystem. Unmount: a mount under `/run/media` or `/media`, or any mount on a removable/hot-plug disk; never a system or `fstab` mount elsewhere. Eject: removable or hot-plug disks only.
+- **Running operations.** Unmounting while a copy, move, paste, drag, Trash or delete writes there can corrupt data. Before an unmount or eject, the running operations that read or write on the device are counted; if any, a dialog says "N operations are using <name>" and lists them, with **Wait and eject** (or **Wait and unmount**) and **Cancel** (the default). Waiting queues the action, shows a toast, and runs it once no operation uses the device; nothing is unmounted while one still does.
+- **Tabs.** Tabs that show (or are opening) a folder on the device move to the nearest existing ancestor outside the mount, with a status notice, and their live-refresh watches are released before the unmount, because an inotify watch can keep a mount busy.
+- **Errors.** A busy or unauthorized device shows a toast with the reason `udisksctl` gave ("Could not unmount KINGSTON: target is busy"). Every call runs off the UI thread with a 30 s timeout.
+- **Missing tools.** Without `udisksctl` the mount and eject actions and the unmounted rows are hidden, with a one-line notice under the section label; without `lsblk` only mounted volumes show, with a notice.
+- **Refresh.** While the window has the focus, the mount table and `lsblk` are re-read every 2 s on a background thread (never two at once), and right after every action; a stick plugged in while the window is in the background appears when it is focused again. A poll was chosen over watching `/dev/disk/by-uuid`, which does not change when a device is mounted or unmounted, nor for filesystems without a UUID.
 
 ## Sort and filter
 

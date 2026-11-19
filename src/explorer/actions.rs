@@ -27,6 +27,7 @@ use fileflux::core::images::is_image_path;
 
 use super::arrange::ArrangeCommand;
 use super::arrange_menu::page_rows;
+use super::devices::{device_menu_rows, job_paths, with_device_rows};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx, MenuCommand,
@@ -88,8 +89,16 @@ pub(crate) enum MenuOn {
     Entries,
     /// The empty space of the entries area: the folder itself.
     EmptySpace,
-    /// One sidebar row, by its element id, and the place it stands for.
-    Sidebar { row: String, location: Location },
+    /// One sidebar row, by its element id, and the place it stands for; for
+    /// a mounted device also its block device (`/dev/sdb1`).
+    Sidebar {
+        row: String,
+        location: Location,
+        device: Option<PathBuf>,
+    },
+    /// The row of a device that is not mounted, by its element id and block
+    /// device.
+    Device { row: String, device: PathBuf },
 }
 
 /// The open context menu.
@@ -176,11 +185,12 @@ impl Explorer {
     ) {
         let ctx = self.job_ctx();
         let affected = Affected::of_job(&job);
+        let touches = job_paths(&job, &ctx.trash_root);
         self.start_work(
             title,
             Unit::Items,
             cancellable,
-            affected,
+            (affected, touches),
             move |sink| super::ops::run_job(job, &ctx, &sink),
             window,
             cx,
@@ -196,7 +206,7 @@ impl Explorer {
         title: impl Into<String>,
         unit: Unit,
         cancellable: bool,
-        affected: Affected,
+        (affected, touches): (Affected, Vec<PathBuf>),
         work: impl FnOnce(Sink) -> Report + Send + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -209,6 +219,7 @@ impl Explorer {
             OpContext {
                 origin: self.active_id(),
                 affected,
+                touches,
             },
         );
         let work = cx.background_executor().spawn(async move { work(sink) });
@@ -739,7 +750,7 @@ impl Explorer {
 
     // --- dialogs ---------------------------------------------------------------------
 
-    fn open_dialog(
+    pub(crate) fn open_dialog(
         &mut self,
         kind: DialogKind,
         names: &[String],
@@ -891,6 +902,10 @@ impl Explorer {
                 }
                 return;
             }
+            DialogAction::DeviceWhenIdle(plan) => {
+                self.queue_device_plan(plan, window, cx);
+                return;
+            }
             DialogAction::Conflict { job, apply_all } => {
                 // Replace: the one destructive answer.
                 self.answer_conflict(
@@ -1027,20 +1042,55 @@ impl Explorer {
         position: Point<Pixels>,
         row: String,
         name: String,
-        location: Location,
+        (location, device): (Location, Option<PathBuf>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.cancel_rename(window, cx);
-        let rows = sidebar_menu_rows(&SidebarTarget {
+        let mut rows = sidebar_menu_rows(&SidebarTarget {
             trash: location == Location::Trash,
             favorite: self.favorites.contains(&location),
         });
+        if let Some(actions) = device
+            .as_deref()
+            .and_then(|device| self.device_actions(device))
+        {
+            rows = with_device_rows(rows, actions);
+        }
         self.show_menu(
             position,
             rows,
             MenuPage::Context,
-            (MenuOn::Sidebar { row, location }, Some(name)),
+            (
+                MenuOn::Sidebar {
+                    row,
+                    location,
+                    device,
+                },
+                Some(name),
+            ),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the menu of the row of a device that is not mounted.
+    pub(crate) fn open_device_menu(
+        &mut self,
+        position: Point<Pixels>,
+        row: String,
+        name: String,
+        device: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_rename(window, cx);
+        let actions = self.device_actions(&device).unwrap_or_default();
+        self.show_menu(
+            position,
+            device_menu_rows(actions),
+            MenuPage::Context,
+            (MenuOn::Device { row, device }, Some(name)),
             window,
             cx,
         );
@@ -1175,16 +1225,23 @@ impl Explorer {
             _ => {}
         }
         // A sidebar row's menu acts on that row's place, not on the entries.
-        let sidebar = match self.menu.as_ref().map(|menu| &menu.on) {
-            Some(MenuOn::Sidebar { location, .. }) => Some(location.clone()),
-            _ => None,
+        let (sidebar, device_row) = match self.menu.as_ref().map(|menu| &menu.on) {
+            Some(MenuOn::Sidebar {
+                location, device, ..
+            }) => (Some((location.clone(), device.clone())), None),
+            Some(MenuOn::Device { device, .. }) => (None, Some(device.clone())),
+            _ => (None, None),
         };
         self.close_menu(window, cx);
-        if let Some(location) = sidebar {
-            return self.run_sidebar_command(command, location, window, cx);
+        if let Some((location, device)) = sidebar {
+            return self.run_sidebar_command(command, (location, device), window, cx);
+        }
+        if let Some(device) = device_row {
+            return self.run_device_command(command, device, window, cx);
         }
         match command {
             MenuCommand::AddFavorite | MenuCommand::RemoveFavorite => {}
+            MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
             MenuCommand::Arrange(_) | MenuCommand::Page(_) => {}
             MenuCommand::Open => self.open_selected(window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
@@ -1216,11 +1273,16 @@ impl Explorer {
     fn run_sidebar_command(
         &mut self,
         command: MenuCommand,
-        location: Location,
+        (location, device): (Location, Option<PathBuf>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match command {
+            MenuCommand::Unmount | MenuCommand::Eject => {
+                if let Some(device) = device {
+                    self.run_device_command(command, device, window, cx);
+                }
+            }
             MenuCommand::Open => {
                 self.navigate(Transition::Visit(location), window, cx);
             }

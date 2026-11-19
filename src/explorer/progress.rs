@@ -219,6 +219,14 @@ impl Registry {
         }
     }
 
+    /// The title of a running operation, for the dialogs that name it.
+    pub(crate) fn title(&self, id: u64) -> Option<&str> {
+        self.ops
+            .iter()
+            .find(|op| op.id == id)
+            .map(|op| op.title.as_str())
+    }
+
     pub(crate) fn is_running(&self, id: u64) -> bool {
         self.ops.iter().any(|op| op.id == id)
     }

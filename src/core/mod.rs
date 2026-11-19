@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 pub mod apps;
+pub mod devices;
 pub mod fs;
 pub mod images;
 pub mod kinds;

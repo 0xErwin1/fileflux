@@ -15,6 +15,7 @@ use fileflux::core::Location;
 use fileflux::core::ops::Conflict;
 use gpui::{ClipboardItem, Context, Task, Window};
 
+use super::devices::job_paths;
 use super::ops::paste::{
     ClipMode, ConflictAnswer, ConflictLink, ConflictRequest, PasteInto, PasteJob, PastePlan,
     clip_notice, clipboard_is_stale, clipboard_text, paste_target, paste_title, plan_paste,
@@ -165,7 +166,7 @@ impl Explorer {
                 let title = paste_title(mode, &sources, &dest);
                 let (request_tx, request_rx) = channel();
                 let (reply_tx, reply_rx) = channel();
-                let job = PasteJob {
+                let job = Job::Paste(PasteJob {
                     sources,
                     dest,
                     mode,
@@ -173,14 +174,15 @@ impl Explorer {
                         requests: request_tx,
                         replies: reply_rx,
                     },
-                };
+                });
                 let ctx = self.job_ctx();
+                let touches = job_paths(&job, &ctx.trash_root);
                 let id = self.start_work(
                     title,
                     Unit::Bytes,
                     true,
-                    Affected::Everything,
-                    move |sink| super::ops::run_job(Job::Paste(job), &ctx, &sink),
+                    (Affected::Everything, touches),
+                    move |sink| super::ops::run_job(job, &ctx, &sink),
                     window,
                     cx,
                 );
