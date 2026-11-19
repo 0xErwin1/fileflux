@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 
 use fileflux::core::Location;
+use fileflux::core::settings::{SESSION_VERSION, Session, SessionSplit, SessionTab};
 
 use super::ops::paste::ClipMode;
 use super::tabs::{Placement, TabList};
@@ -155,14 +156,6 @@ impl<T> Panes<T> {
         self.focus
     }
 
-    /// The tabs of `side`, when that pane exists.
-    pub(crate) fn list(&self, side: Side) -> Option<&TabList<T>> {
-        match side {
-            Side::Left => Some(&self.left),
-            Side::Right => self.right.as_ref(),
-        }
-    }
-
     /// The focused pane's tabs.
     pub(crate) fn focused(&self) -> &TabList<T> {
         match (self.focus, &self.right) {
@@ -224,18 +217,33 @@ impl<T> Panes<T> {
     }
 
     /// Turns the split off. The pane that had the focus becomes the single
-    /// pane and the other one is parked, tabs intact.
-    pub(crate) fn unsplit(&mut self) {
+    /// pane and the other one is parked, tabs intact. `true` when the pane
+    /// that stays is not the one in the left slot (the focus was on the
+    /// right pane): the tab on screen then changed hands, so the caller
+    /// re-reads it and puts the keyboard on its entries.
+    pub(crate) fn unsplit(&mut self) -> bool {
         if !self.split {
-            return;
+            return false;
         }
-        if self.focus == Side::Right
-            && let Some(right) = self.right.as_mut()
-        {
+        let swapped = self.focus == Side::Right;
+        if swapped && let Some(right) = self.right.as_mut() {
             std::mem::swap(&mut self.left, right);
         }
         self.focus = Side::Left;
         self.split = false;
+        swapped
+    }
+
+    /// The last step of reopening a saved session's second pane, once its
+    /// tabs are open: the pane is shown or parked again, and the focus
+    /// returns to it only when it was focused (and shown).
+    pub(crate) fn finish_restore(&mut self, shown: bool, focused: bool) {
+        self.focus_side(Side::Left);
+        if !shown {
+            self.unsplit();
+        } else if focused {
+            self.focus_side(Side::Right);
+        }
     }
 
     /// The focused pane's tab count.
@@ -243,9 +251,21 @@ impl<T> Panes<T> {
         self.focused().len()
     }
 
-    /// The position of the focused pane's active tab.
+    /// Where the focused pane's tabs start in the window-wide order of
+    /// [`Self::iter`]: every index this type takes or returns (`get`,
+    /// `position`, `activate`, `close`, `active_index`) counts in that one
+    /// order, left pane first, so an index can never mean a tab of the other
+    /// pane.
+    pub(crate) fn focused_offset(&self) -> usize {
+        match (self.focus, &self.right) {
+            (Side::Right, Some(_)) => self.left.len(),
+            _ => 0,
+        }
+    }
+
+    /// The window-wide position of the focused pane's active tab.
     pub(crate) fn active_index(&self) -> usize {
-        self.focused().active_index()
+        self.focused_offset() + self.focused().active_index()
     }
 
     /// The focused pane's active tab.
@@ -263,14 +283,20 @@ impl<T> Panes<T> {
         self.focused_mut().open(item, placement)
     }
 
-    /// Closes the focused pane's tab at `index` (see [`TabList::close`]).
+    /// Closes the tab at the window-wide `index` (see [`TabList::close`]).
+    /// `None` — nothing changes — when it is not a tab of the focused pane.
     pub(crate) fn close(&mut self, index: usize) -> Option<T> {
-        self.focused_mut().close(index)
+        let local = index.checked_sub(self.focused_offset())?;
+        self.focused_mut().close(local)
     }
 
-    /// Activates the focused pane's tab at `index`.
+    /// Activates the tab at the window-wide `index`. `false` — nothing
+    /// changes — when it is not a tab of the focused pane.
     pub(crate) fn activate(&mut self, index: usize) -> bool {
-        self.focused_mut().activate(index)
+        match index.checked_sub(self.focused_offset()) {
+            Some(local) => self.focused_mut().activate(local),
+            None => false,
+        }
     }
 
     /// Cycles the focused pane's active tab.
@@ -298,15 +324,40 @@ impl<T> Panes<T> {
             .chain(self.right.iter_mut().flat_map(TabList::iter_mut))
     }
 
-    /// The tab at `index` of [`Self::iter`]'s order.
+    /// The tab at the window-wide `index` (see [`Self::focused_offset`]).
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
         self.iter().nth(index)
     }
 
-    /// The position in [`Self::iter`]'s order of the first tab `matches`
-    /// accepts.
+    /// The window-wide position of the first tab `matches` accepts.
     pub(crate) fn position(&self, matches: impl Fn(&T) -> bool) -> Option<usize> {
         self.iter().position(matches)
+    }
+}
+
+/// The pane that must take the focus before a drop is handled: the pane the
+/// drop landed in, which is not necessarily the one that has the focus (the
+/// press that started the drag focused the pane the entries came from).
+/// `None` when the focus is already right, or the view shows one pane.
+pub(crate) fn drop_focus(split: bool, focus: Side, dropped_in: Side) -> Option<Side> {
+    (split && focus != dropped_in).then_some(dropped_in)
+}
+
+/// The session to save for `panes`: the left slot's tabs first, and the
+/// second pane (shown or parked) with whether it was shown and focused.
+/// `tab` saves one tab.
+pub(crate) fn session_of<T>(panes: &Panes<T>, tab: impl Fn(&T) -> SessionTab) -> Session {
+    let saved = |list: &TabList<T>| list.iter().map(&tab).collect::<Vec<_>>();
+    Session {
+        version: SESSION_VERSION,
+        active: panes.left.active_index(),
+        tabs: saved(&panes.left),
+        split: panes.right.as_ref().map(|right| SessionSplit {
+            shown: panes.split,
+            focused: panes.split && panes.focus == Side::Right,
+            active: right.active_index(),
+            tabs: saved(right),
+        }),
     }
 }
 
@@ -363,6 +414,19 @@ pub(crate) fn plan_transfer(
     if selection.is_empty() {
         return Err(format!("Select something to {verb} first"));
     }
+    // A selected folder cannot go into itself or anything inside it.
+    if selection.iter().any(|source| dest.starts_with(source)) {
+        return Err(format!("Can't {verb} a folder into itself"));
+    }
+    // Items already in the destination folder have nowhere to go.
+    if selection
+        .iter()
+        .any(|source| source.parent() == Some(dest.as_path()))
+    {
+        return Err(format!(
+            "Can't {verb} here: the items already live in the other pane's folder"
+        ));
+    }
     Ok(Transfer {
         sources: selection,
         dest,
@@ -372,6 +436,11 @@ pub(crate) fn plan_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::explorer::arrange::Arrangement;
+    use crate::explorer::persist::session_tab;
+    use crate::explorer::state::View;
+    use fileflux::core::settings::restore_session;
+    use std::path::Path;
 
     fn dir(path: &str) -> Location {
         Location::Directory(PathBuf::from(path))
@@ -456,7 +525,7 @@ mod tests {
         assert_eq!(panes.len(), 1);
         panes.open("r2", Placement::Foreground);
         assert_eq!(panes.len(), 2);
-        assert!(panes.close(0).is_some());
+        assert!(panes.close(panes.focused_offset()).is_some());
         assert_eq!(panes.len(), 1);
         assert!(panes.switch_focus());
         assert_eq!(panes.len(), 3, "the left pane kept all of its tabs");
@@ -625,5 +694,180 @@ mod tests {
                 plan_transfer(ClipMode::Copy, &here, Some(&dir("/b")), paths(&["/a/x"])).is_ok()
             );
         }
+    }
+
+    #[test]
+    fn a_transfer_into_the_folder_the_items_live_in_is_refused() {
+        for mode in [ClipMode::Copy, ClipMode::Cut] {
+            let verb = if mode == ClipMode::Copy {
+                "copy"
+            } else {
+                "move"
+            };
+            assert_eq!(
+                plan_transfer(mode, &dir("/a"), Some(&dir("/a")), paths(&["/a/x"])),
+                Err(format!(
+                    "Can't {verb} here: the items already live in the other pane's folder"
+                ))
+            );
+        }
+        // One item from the destination is enough (a search can mix folders).
+        let search = Location::Search {
+            root: PathBuf::from("/"),
+            query: "q".to_owned(),
+        };
+        assert!(
+            plan_transfer(
+                ClipMode::Copy,
+                &search,
+                Some(&dir("/b")),
+                paths(&["/a/x", "/b/y"])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_selected_folder_cannot_go_into_itself_or_below() {
+        for dest in ["/a/docs", "/a/docs/deep/er"] {
+            assert_eq!(
+                plan_transfer(
+                    ClipMode::Cut,
+                    &dir("/a"),
+                    Some(&dir(dest)),
+                    paths(&["/a/docs"])
+                ),
+                Err("Can't move a folder into itself".to_owned())
+            );
+        }
+        // A sibling sharing a name prefix is not inside it.
+        assert!(
+            plan_transfer(
+                ClipMode::Copy,
+                &dir("/a"),
+                Some(&dir("/a/docs2")),
+                paths(&["/a/docs"])
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn indices_count_window_wide_and_never_reach_the_other_pane() {
+        let mut panes = split_panes(); // flat: l1 l2 | r1, focus left
+        let at = 2;
+        assert_eq!(panes.position(|tab| *tab == "r1"), Some(at));
+        assert_eq!(panes.get(at), Some(&"r1"));
+        // Focused left: the right pane's tab is out of reach.
+        assert!(!panes.activate(at));
+        assert_eq!(panes.close(at), None);
+        assert_eq!(all(&panes), ["l1", "l2", "r1"]);
+        assert_eq!(panes.active_index(), 1, "l2 is active");
+        // Focused right: the same index works and the left tabs do not.
+        assert!(panes.switch_focus());
+        assert_eq!(panes.active_index(), 2);
+        assert!(!panes.activate(0));
+        assert_eq!(panes.close(1), None);
+        assert!(panes.activate(at));
+        panes.open("r2", Placement::Foreground); // flat: l1 l2 | r1 r2
+        assert_eq!(panes.active_index(), 3);
+        assert_eq!(panes.close(at), Some("r1"));
+        assert_eq!(all(&panes), ["l1", "l2", "r2"]);
+    }
+
+    #[test]
+    fn unsplitting_says_whether_the_remaining_tab_changed() {
+        let mut panes = split_panes();
+        assert!(!panes.unsplit(), "the left pane stays: nothing changed");
+        assert!(!panes.unsplit(), "already one pane");
+        let mut panes = split_panes();
+        assert!(panes.switch_focus());
+        assert!(panes.unsplit(), "the right pane took the left slot");
+        assert_eq!(*panes.active(), "r1");
+        assert_eq!(panes.focus(), Side::Left);
+    }
+
+    #[test]
+    fn a_drop_focuses_the_pane_it_landed_in() {
+        assert_eq!(drop_focus(true, Side::Left, Side::Right), Some(Side::Right));
+        assert_eq!(drop_focus(true, Side::Right, Side::Left), Some(Side::Left));
+        assert_eq!(drop_focus(true, Side::Right, Side::Right), None);
+        assert_eq!(drop_focus(false, Side::Left, Side::Right), None);
+    }
+
+    fn saved(panes: &Panes<Location>) -> Session {
+        session_of(panes, |location| {
+            session_tab(location, View::List, &Arrangement::default())
+        })
+    }
+
+    fn rebuild(restored: &fileflux::core::settings::Restored) -> Option<Panes<Location>> {
+        let mut tabs = restored.tabs.iter().map(|tab| tab.location.clone());
+        let mut panes = Panes::new(tabs.next()?);
+        for location in tabs {
+            panes.open(location, Placement::Background);
+        }
+        assert!(panes.activate(restored.active));
+        if let Some(split) = &restored.split {
+            let mut tabs = split.tabs.iter().map(|tab| tab.location.clone());
+            assert!(panes.split(tabs.next()));
+            panes.focus_side(Side::Right);
+            for location in tabs {
+                panes.open(location, Placement::Background);
+            }
+            let at = panes.focused_offset() + split.active;
+            assert!(panes.activate(at));
+            panes.finish_restore(split.shown, split.focused);
+        }
+        Some(panes)
+    }
+
+    fn layout_of(panes: &Panes<Location>) -> (bool, Side, Vec<Location>, [usize; 2]) {
+        let active = |side| match side {
+            Side::Left => Some(&panes.left),
+            Side::Right => panes.right.as_ref(),
+        };
+        let active = |side| active(side).map_or(0, TabList::active_index);
+        (
+            panes.is_split(),
+            panes.focus(),
+            panes.iter().cloned().collect(),
+            [active(Side::Left), active(Side::Right)],
+        )
+    }
+
+    #[test]
+    fn the_split_survives_a_save_and_restore() -> Result<(), String> {
+        let home = Some(Path::new("/h"));
+        for (shown, focus_right) in [(true, true), (true, false), (false, false)] {
+            let mut panes = Panes::new(dir("/l1"));
+            panes.open(dir("/l2"), Placement::Foreground);
+            panes.activate(0);
+            assert!(panes.split(Some(dir("/r1"))));
+            panes.focus_side(Side::Right);
+            panes.open(Location::Trash, Placement::Background);
+            panes.open(dir("/r3"), Placement::Foreground);
+            if !focus_right {
+                panes.focus_side(Side::Left);
+            }
+            if !shown {
+                panes.unsplit();
+            }
+            let session = saved(&panes);
+            let restored = restore_session(&session, home);
+            let split = restored.split.as_ref().ok_or("the split is saved")?;
+            assert_eq!(split.shown, shown);
+            assert_eq!(split.focused, shown && focus_right);
+            let again = rebuild(&restored).ok_or("the panes rebuild")?;
+            assert_eq!(layout_of(&again), layout_of(&panes));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_window_that_never_split_saves_no_second_pane() {
+        let panes = Panes::new(dir("/a"));
+        assert!(saved(&panes).split.is_none());
+        assert!(restore_session(&saved(&panes), None).split.is_none());
     }
 }

@@ -50,7 +50,11 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
         .border_b_1()
         .border_color(colors.line);
     let active = this.tabs.active_index();
-    for (index, tab) in this.tabs.focused().iter().enumerate() {
+    // Indices count window-wide (see `Panes::focused_offset`), so a click
+    // can only reach a tab of the pane the strip belongs to.
+    let offset = this.tabs.focused_offset();
+    for (local, tab) in this.tabs.focused().iter().enumerate() {
+        let index = offset + local;
         let location = tab.state.current();
         strip = strip.child(render_tab(
             index,

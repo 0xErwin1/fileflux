@@ -30,9 +30,7 @@ use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::recent;
 use fileflux::core::search::{SearchOptions, SearchSummary, search};
-use fileflux::core::settings::{
-    self, Preferences, SESSION_VERSION, SETTINGS_VERSION, Session, Settings,
-};
+use fileflux::core::settings::{self, Preferences, SETTINGS_VERSION, Session, Settings};
 use fileflux::core::terminal::{self, Terminal, TerminalEnv};
 use fileflux::core::thumbnails::{Outcome, Skip};
 use fileflux::core::watch::{
@@ -1092,40 +1090,15 @@ impl Explorer {
             }
             .sanitized(),
         };
-        let saved_tabs = |list: &crate::explorer::tabs::TabList<Tab>| -> Vec<settings::SessionTab> {
-            list.iter()
-                .map(|tab| {
-                    session_tab(
-                        tab.state.current(),
-                        tab.state.view(),
-                        tab.state.arrangement(),
-                    )
-                })
-                .collect()
-        };
         // The panes as they are laid out: the left one first, whichever of
         // them has the focus. A parked second pane is saved too.
-        let session = Session {
-            version: SESSION_VERSION,
-            active: self
-                .tabs
-                .list(Side::Left)
-                .map_or(0, crate::explorer::tabs::TabList::active_index),
-            tabs: self
-                .tabs
-                .list(Side::Left)
-                .map(saved_tabs)
-                .unwrap_or_default(),
-            split: self
-                .tabs
-                .list(Side::Right)
-                .map(|right| settings::SessionSplit {
-                    shown: self.tabs.is_split(),
-                    focused: self.tabs.is_split() && self.tabs.focus() == Side::Right,
-                    active: right.active_index(),
-                    tabs: saved_tabs(right),
-                }),
-        };
+        let session = panes::session_of(&self.tabs, |tab| {
+            session_tab(
+                tab.state.current(),
+                tab.state.view(),
+                tab.state.arrangement(),
+            )
+        });
         (settings, session)
     }
 
@@ -2824,8 +2797,11 @@ impl Explorer {
     /// refuses with a toast.
     pub(crate) fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_split() {
-            self.tabs.unsplit();
-            self.after_tab_switch(false, window, cx);
+            // From the right pane, the tab that stays came from the parked
+            // slot: it is re-read like after F6, and the keyboard goes to
+            // the entries of the pane that remains.
+            let changed = self.tabs.unsplit();
+            self.after_tab_switch(changed, window, cx);
             return;
         }
         let width = f32::from(window.viewport_size().width);
@@ -2865,6 +2841,17 @@ impl Explorer {
             return;
         }
         self.focus_pane(side, window, cx);
+    }
+
+    /// A release inside `side` while entries are being dragged: the pane the
+    /// drop lands in takes the focus (see [`panes::drop_focus`]).
+    fn drop_in_pane(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        if !cx.has_active_drag() {
+            return;
+        }
+        if let Some(side) = panes::drop_focus(self.tabs.is_split(), self.tabs.focus(), side) {
+            self.press_in_pane(side, window, cx);
+        }
     }
 
     /// F6: the other pane takes the focus.
@@ -2957,13 +2944,10 @@ impl Explorer {
             }
             self.open_tab_with(state, location, Placement::Background, window, cx);
         }
-        self.activate_tab(active, window, cx);
-        self.tabs.focus_side(Side::Left);
-        if !shown {
-            self.tabs.unsplit();
-        } else if focused {
-            self.tabs.focus_side(Side::Right);
-        }
+        // The saved position counts in the second pane's own tabs.
+        let at = self.tabs.focused_offset() + active;
+        self.activate_tab(at, window, cx);
+        self.tabs.finish_restore(shown, focused);
         self.after_tab_switch(false, window, cx);
     }
 }
@@ -3383,6 +3367,13 @@ impl Explorer {
         }
         pane.capture_any_mouse_down(cx.listener(move |this, _event, window, cx| {
             this.press_in_pane(side, window, cx);
+        }))
+        // A drop lands before any press in this pane: it takes the focus
+        // first (capture phase, ahead of the drop target), so the paste is
+        // started from the pane it was dropped in, not from the one the
+        // drag began in.
+        .capture_any_mouse_up(cx.listener(move |this, _event, window, cx| {
+            this.drop_in_pane(side, window, cx);
         }))
         .child(
             div()
