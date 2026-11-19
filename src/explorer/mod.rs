@@ -11,6 +11,7 @@ pub(crate) mod favorites;
 pub(crate) mod inspector;
 pub(crate) mod ops;
 pub(crate) mod overlay;
+pub(crate) mod panes;
 pub(crate) mod persist;
 pub(crate) mod progress;
 pub(crate) mod sidebar;

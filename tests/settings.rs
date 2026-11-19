@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use fileflux::core::Location;
 use fileflux::core::settings::{
     ArrangementPrefs, CategoryPref, DatePref, SESSION_VERSION, SETTINGS_VERSION, SaveOutcome,
-    Session, SessionTab, Settings, SizePref, SortDirPref, SortKeyPref, ViewMode,
+    Session, SessionSplit, SessionTab, Settings, SizePref, SortDirPref, SortKeyPref, ViewMode,
     launch_uses_session, load_session, load_settings, merge_settings, restore_fallback,
     restore_session, save_session, save_session_ordered, save_settings, save_settings_ordered,
     session_path, settings_path,
@@ -126,6 +126,7 @@ fn session_round_trip_keeps_tabs_views_arrangements_and_the_active_index() {
             SessionTab::trash(ViewMode::List, ArrangementPrefs::default()),
             SessionTab::recent(ViewMode::Grid, ArrangementPrefs::default()),
         ],
+        split: None,
     };
 
     save_session(&path, &session).expect("session saves");
@@ -133,6 +134,131 @@ fn session_round_trip_keeps_tabs_views_arrangements_and_the_active_index() {
 
     assert_eq!(loaded.notice, None);
     assert_eq!(loaded.value, session);
+}
+
+#[test]
+fn session_round_trip_keeps_the_split_and_both_panes_tabs() {
+    let scratch = Scratch::new("session-split");
+    let path = scratch.path().join("session.toml");
+    let session = Session {
+        version: SESSION_VERSION,
+        active: 1,
+        tabs: vec![tab(Path::new("/left/a")), tab(Path::new("/left/b"))],
+        split: Some(SessionSplit {
+            shown: true,
+            focused: true,
+            active: 2,
+            tabs: vec![
+                tab(Path::new("/right/a")),
+                SessionTab::trash(ViewMode::Grid, ArrangementPrefs::default()),
+                SessionTab::recent(ViewMode::List, busy_arrangement()),
+            ],
+        }),
+    };
+
+    save_session(&path, &session).expect("session saves");
+    let loaded = load_session(&path, now());
+
+    assert_eq!(loaded.notice, None);
+    assert_eq!(loaded.value, session);
+}
+
+#[test]
+fn a_session_without_a_split_writes_no_split_key() {
+    let scratch = Scratch::new("session-nosplit");
+    let path = scratch.path().join("session.toml");
+    let session = Session {
+        version: SESSION_VERSION,
+        active: 0,
+        tabs: vec![tab(Path::new("/only"))],
+        split: None,
+    };
+    save_session(&path, &session).expect("session saves");
+    let text = std::fs::read_to_string(&path).expect("file reads");
+    assert!(!text.contains("split"), "{text}");
+}
+
+#[test]
+fn a_version_two_file_without_split_data_loads_as_a_single_pane() {
+    let scratch = Scratch::new("session-v2-plain");
+    let path = scratch.path().join("session.toml");
+    std::fs::write(
+        &path,
+        "version = 2\nactive = 1\n\n[[tabs]]\npath = \"/a\"\n\n[[tabs]]\npath = \"/b\"\n",
+    )
+    .expect("file writes");
+    let loaded = load_session(&path, now());
+    assert_eq!(loaded.notice, None);
+    assert!(!loaded.migrated, "no migration for a plain v2 file");
+    assert_eq!(loaded.value.version, 2);
+    assert_eq!(loaded.value.split, None);
+    let restored = restore_session(&loaded.value, None);
+    assert_eq!(restored.tabs.len(), 2);
+    assert_eq!(restored.active, 1);
+    assert_eq!(restored.split, None);
+}
+
+#[test]
+fn restore_brings_back_the_split_with_clamped_indexes() {
+    let session = Session {
+        version: SESSION_VERSION,
+        active: 0,
+        tabs: vec![tab(Path::new("/l"))],
+        split: Some(SessionSplit {
+            shown: true,
+            focused: true,
+            active: 9,
+            tabs: vec![tab(Path::new("/r1")), tab(Path::new("relative"))],
+        }),
+    };
+    let restored = restore_session(&session, Some(Path::new("/home/u")));
+    let split = restored.split.expect("the split is restored");
+    assert!(split.shown);
+    assert!(split.focused);
+    assert_eq!(split.active, 1, "clamped to the last tab of the pane");
+    assert_eq!(
+        split.tabs[0].location,
+        Location::Directory(PathBuf::from("/r1"))
+    );
+    assert_eq!(
+        split.tabs[1].location,
+        Location::Directory(PathBuf::from("/home/u"))
+    );
+    assert_eq!(
+        split.tabs[1].fell_back_from,
+        Some(PathBuf::from("relative"))
+    );
+}
+
+#[test]
+fn a_split_without_tabs_restores_as_a_single_pane_and_a_hidden_one_stays_parked() {
+    let empty = Session {
+        version: SESSION_VERSION,
+        active: 0,
+        tabs: vec![tab(Path::new("/l"))],
+        split: Some(SessionSplit {
+            shown: true,
+            focused: true,
+            active: 0,
+            tabs: Vec::new(),
+        }),
+    };
+    assert_eq!(restore_session(&empty, None).split, None);
+
+    let parked = Session {
+        split: Some(SessionSplit {
+            shown: false,
+            focused: true,
+            active: 0,
+            tabs: vec![tab(Path::new("/r"))],
+        }),
+        ..empty
+    };
+    let split = restore_session(&parked, None)
+        .split
+        .expect("parked tabs stay");
+    assert!(!split.shown);
+    assert!(!split.focused, "a hidden pane cannot hold the focus");
 }
 
 #[test]
@@ -382,6 +508,7 @@ fn restore_opens_every_saved_tab_in_order_without_touching_the_filesystem() {
             SessionTab::trash(ViewMode::Grid, ArrangementPrefs::default()),
             SessionTab::recent(ViewMode::List, ArrangementPrefs::default()),
         ],
+        split: None,
     };
     let restored = restore_session(&session, Some(Path::new("/home/u")));
 
@@ -410,6 +537,7 @@ fn restore_replaces_only_a_relative_path_and_clamps_the_active_index() {
         version: SESSION_VERSION,
         active: 9,
         tabs: vec![tab(Path::new("/abs")), tab(Path::new("relative"))],
+        split: None,
     };
     let restored = restore_session(&session, Some(Path::new("/home/u")));
     assert_eq!(restored.active, 1, "clamped to the last tab");

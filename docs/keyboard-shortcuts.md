@@ -6,11 +6,15 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 
 | Key | Action | Notes |
 |---|---|---|
-| Ctrl+T | New tab | On the current folder, to the right of the active tab |
+| Ctrl+T | New tab | On the current folder, to the right of the active tab; tab shortcuts act on the focused pane |
 | Ctrl+W | Close tab | The last tab is never closed |
 | Ctrl+Tab / Ctrl+PageDown | Next tab | Wraps around |
 | Ctrl+Shift+Tab / Ctrl+PageUp | Previous tab | Wraps around |
 | Alt+1 … Alt+9 | Jump to tab 1–9 | Nothing happens when there is no such tab |
+| F3 | Split into two panes / back to one | Also the toolbar's Split view button; see [Dual pane](user-guide.md#dual-pane) |
+| F6 | Switch to the other pane | Only while split |
+| F5 | Copy the selection to the other pane's folder | Conflict dialog, progress and Undo as for paste; refused into Trash, Recent and search results |
+| Shift+F5 | Move the selection to the other pane's folder | Same |
 | Ctrl+L | Edit the path | Enter navigates; Escape restores |
 | Ctrl+F | Search file names | Current folder only; Escape clears |
 | Ctrl+Shift+F | Search in subfolders | Turns on *Search in subfolders* and focuses the search field; see [Search in subfolders](user-guide.md#search-in-subfolders) |
@@ -39,7 +43,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 
 Inside a context menu, ↑ ↓ move, Enter confirms and Escape closes. Inside a dialog, ↑ ↓ move the focus and Escape cancels.
 
-While a text field has the keyboard, the file operations (Ctrl+A, F2, Del, Ctrl+C/X/V/Z and the rest) are left to the field; the tab shortcuts still work. Behind a dialog or an open menu, none of these shortcuts act.
+While a text field has the keyboard, the file operations (Ctrl+A, F2, Del, Ctrl+C/X/V/Z and the rest) are left to the field; the tab shortcuts, F3 and F6 still work (F5 and Shift+F5 are left to the field). Behind a dialog or an open menu, none of these shortcuts act.
 
 ## Image viewer
 

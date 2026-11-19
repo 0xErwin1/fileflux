@@ -409,7 +409,25 @@ impl SessionTab {
     }
 }
 
-/// `session.toml`: the tabs that were open, left to right.
+/// The second pane of the dual-pane view: its tabs, its active tab and
+/// whether the view was split when the window closed. A file written before
+/// the split view existed has none, which loads as a single pane, so the
+/// session version did not change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionSplit {
+    /// The view was split: both panes are on screen. When it was not, the
+    /// tabs are kept for the next time the view is split.
+    pub shown: bool,
+    /// The second pane had the keyboard focus.
+    pub focused: bool,
+    /// The active tab's position in `tabs`.
+    pub active: usize,
+    pub tabs: Vec<SessionTab>,
+}
+
+/// `session.toml`: the tabs that were open, left to right, and the second
+/// pane's when the view was split.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
@@ -417,6 +435,9 @@ pub struct Session {
     /// The active tab's position in `tabs`.
     pub active: usize,
     pub tabs: Vec<SessionTab>,
+    /// The second pane; `None` for a window that never split.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SessionSplit>,
 }
 
 impl Default for Session {
@@ -425,6 +446,7 @@ impl Default for Session {
             version: SESSION_VERSION,
             active: 0,
             tabs: Vec::new(),
+            split: None,
         }
     }
 }
@@ -995,11 +1017,24 @@ pub struct RestoredTab {
     pub fell_back_from: Option<PathBuf>,
 }
 
+/// The second pane to reopen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredSplit {
+    /// Both panes are on screen; otherwise the tabs wait parked.
+    pub shown: bool,
+    /// The second pane has the keyboard focus (never while parked).
+    pub focused: bool,
+    pub tabs: Vec<RestoredTab>,
+    pub active: usize,
+}
+
 /// The tabs to reopen and which one is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Restored {
     pub tabs: Vec<RestoredTab>,
     pub active: usize,
+    /// The second pane, when the session had one with tabs.
+    pub split: Option<RestoredSplit>,
 }
 
 /// The tabs a saved session reopens, in order, with the saved folders as
@@ -1009,8 +1044,31 @@ pub struct Restored {
 /// scan fails. Only a relative path, which no scan could resolve, is
 /// replaced up front (by `home`, else `/`). The active index is clamped.
 pub fn restore_session(session: &Session, home: Option<&Path>) -> Restored {
-    let tabs: Vec<RestoredTab> = session
-        .tabs
+    let tabs = restore_tabs(&session.tabs, home);
+    let active = session.active.min(tabs.len().saturating_sub(1));
+    let split = session
+        .split
+        .as_ref()
+        .filter(|split| !split.tabs.is_empty())
+        .map(|split| {
+            let tabs = restore_tabs(&split.tabs, home);
+            RestoredSplit {
+                shown: split.shown,
+                focused: split.shown && split.focused,
+                active: split.active.min(tabs.len().saturating_sub(1)),
+                tabs,
+            }
+        });
+    Restored {
+        tabs,
+        active,
+        split,
+    }
+}
+
+/// The tabs of one pane, in order (see [`restore_session`]).
+fn restore_tabs(saved: &[SessionTab], home: Option<&Path>) -> Vec<RestoredTab> {
+    saved
         .iter()
         .map(|tab| {
             let (location, fell_back_from) = match &tab.path {
@@ -1033,9 +1091,7 @@ pub fn restore_session(session: &Session, home: Option<&Path>) -> Restored {
                 fell_back_from,
             }
         })
-        .collect();
-    let active = session.active.min(tabs.len().saturating_sub(1));
-    Restored { tabs, active }
+        .collect()
 }
 
 /// Where a restored tab whose folder `missing` is gone opens instead: its

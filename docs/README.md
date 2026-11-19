@@ -17,7 +17,7 @@ Fileflux is a Linux file explorer built with GPUI and Bolt. Start with the user 
 
 ## At a glance
 
-- Navigation, tabs, grid and list views, sort and filter, a details panel and an image viewer.
+- Navigation, tabs, a dual-pane view, grid and list views, sort and filter, a details panel and an image viewer.
 - File operations (create, rename, copy, cut, paste, drag and drop, Trash, undo) that never overwrite or delete silently.
 - Preferences and open tabs are remembered in two small TOML files; favorites are your GTK bookmarks.
 - Removable drives and gvfs mounts (phones, shares) in the sidebar.

@@ -85,16 +85,6 @@ impl<T> TabList<T> {
             .chain(self.after.iter_mut())
     }
 
-    /// The tab at `index`.
-    pub(crate) fn get(&self, index: usize) -> Option<&T> {
-        self.iter().nth(index)
-    }
-
-    /// The position of the first tab `matches` accepts.
-    pub(crate) fn position(&self, matches: impl Fn(&T) -> bool) -> Option<usize> {
-        self.iter().position(matches)
-    }
-
     /// Opens `item` to the right of the active tab; returns its position.
     pub(crate) fn open(&mut self, item: T, placement: Placement) -> usize {
         match placement {

@@ -703,7 +703,7 @@ pub(crate) fn render_list(
     _weak: &WeakEntity<Explorer>,
     cx: &mut Context<Explorer>,
 ) -> impl IntoElement {
-    let desired = distribute_widths(explorer.entries_width, explorer.list_widths.dragged());
+    let desired = distribute_widths(explorer.entries_width(), explorer.list_widths.dragged());
     explorer.tab().table.update(cx, |table, cx| {
         let delegate = table.delegate_mut();
         let data_changed =

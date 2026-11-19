@@ -16,6 +16,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Views](#views)
 - [Sort and filter](#sort-and-filter)
 - [Tabs](#tabs)
+- [Dual pane](#dual-pane)
 - [Selection](#selection)
 - [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks)
 - [Open, Open with and terminal](#open-open-with-and-terminal)
@@ -133,6 +134,26 @@ Each tab keeps its own location, history, selection, view, sort, filter text, sc
 - Switching tabs cancels an inline rename and closes an open context menu.
 - A file operation keeps running when you switch tabs. When it finishes, every tab showing a folder it changed is re-read.
 - Tabs are restored at the next launch (see [Settings](settings.md)).
+
+## Dual pane
+
+F3 or the **Split view** button in the toolbar shows two folders side by side; pressing it again goes back to one pane. The new pane opens on the folder you were in, with the same view, sort and filters.
+
+| Action | How |
+|---|---|
+| Split / unsplit | F3 or the toolbar button. Unsplitting keeps the pane that has the focus; the other pane's tabs are parked, still open and live, and come back with the next split |
+| Switch pane | F6, or click anywhere in a pane |
+| Copy to the other pane | F5: the selection is copied into the folder the other pane shows |
+| Move to the other pane | Shift+F5: the selection is moved there |
+| Drag and drop | Drag between panes like anywhere else: a move on the same device, a copy across devices, Ctrl copies, Shift moves |
+
+- **Each pane is a tab strip of its own** (Ctrl+T, Ctrl+W, Ctrl+Tab and Alt+1 … Alt+9 act on the focused pane), and every tab keeps its location, history, view, sort, filters and selection. The focused pane has a 3 px tinted edge on top.
+- **The focused pane is the one you are working in.** The sidebar, breadcrumbs, path field, search, toolbar and every keyboard shortcut act on it. Clicking in the other pane focuses it first (an open dialog or context menu keeps the press for itself).
+- **F5 and Shift+F5 use the paste engine**, so you get the conflict dialog (Skip, Keep both, Replace), the progress card with Cancel, and Undo. They leave the clipboard alone. Without a split they say so in a toast. They are refused, with a toast, when the other pane shows the Trash, Recent or search results (there is no folder to put files in), and out of the Trash (use Restore).
+- **Shared across both panes:** the sidebar and favorites, the clipboard, the undo history, progress cards, dialogs and toasts. When an operation finishes, every tab of both panes showing a folder it changed is re-read; live refresh and device ejects cover the tabs of both panes.
+- **Window width.** Two panes need a window at least **1100 px** wide. In a narrower window F3 refuses with a toast; a window that shrinks while split shows only the focused pane (F6 switches which one) until it widens again. F5 and Shift+F5 still work then.
+- **The details panel is not drawn while split** (there is no room beside two panes); Properties and Ctrl+I show it again once you unsplit.
+- The split, both panes' tabs and which pane had the focus are restored at the next launch (see [Settings](settings.md)).
 
 ## Selection
 

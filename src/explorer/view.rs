@@ -58,6 +58,7 @@ use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{DialogQueue, MenuPage};
 use crate::explorer::ops::{OpenAction, Severity, UndoStack, open_action};
+use crate::explorer::panes::{self, PaneLayout, Panes, PerPane, Side};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
     session_tab, view_from_pref, view_to_pref,
@@ -68,7 +69,7 @@ use crate::explorer::state::{
     ExplorerState, Favorites, PathArgument, Scan, SearchRun, Transition, View,
 };
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
-use crate::explorer::tabs::{Affected, Placement, TabList};
+use crate::explorer::tabs::{Affected, Placement};
 use crate::explorer::toasts;
 use crate::explorer::{entries, overlay, progress, sidebar, tabstrip, toolbar, util};
 
@@ -170,6 +171,14 @@ actions!(
         JumpToTab8,
         /// Activates the ninth tab (Alt+9).
         JumpToTab9,
+        /// Splits the window into two panes, or goes back to one (F3).
+        ToggleSplit,
+        /// Moves the focus to the other pane (F6).
+        SwitchPane,
+        /// Copies the selection to the other pane's folder (F5).
+        CopyToOtherPane,
+        /// Moves the selection to the other pane's folder (Shift+F5).
+        MoveToOtherPane,
     ]
 );
 
@@ -253,6 +262,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", CopyEntries, operations),
         KeyBinding::new("ctrl-x", CutEntries, operations),
         KeyBinding::new("ctrl-v", PasteEntries, operations),
+        KeyBinding::new("f5", CopyToOtherPane, operations),
+        KeyBinding::new("shift-f5", MoveToOtherPane, operations),
         KeyBinding::new("menu", OpenContextMenu, operations),
         KeyBinding::new("shift-f10", OpenContextMenu, operations),
         KeyBinding::new("up", MenuUp, Some(MENU_CONTEXT)),
@@ -283,6 +294,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-7", JumpToTab7, tabs),
         KeyBinding::new("alt-8", JumpToTab8, tabs),
         KeyBinding::new("alt-9", JumpToTab9, tabs),
+        KeyBinding::new("f3", ToggleSplit, tabs),
+        KeyBinding::new("f6", SwitchPane, tabs),
     ]);
     install_modal_seams(cx);
 }
@@ -372,6 +385,10 @@ const WATCH_STEP: Duration = Duration::from_millis(100);
 const SUBBAR_HEIGHT: f32 = 44.0;
 /// The subbar's horizontal padding.
 const SUBBAR_PADDING: f32 = 20.0;
+
+/// The height of the edge above a pane of the split view, tinted while the
+/// pane has the focus.
+const PANE_EDGE: f32 = 3.0;
 
 /// Below this viewport width the sidebar parks behind the sidebar toggle,
 /// so path, search and view stay reachable.
@@ -629,8 +646,8 @@ impl TabWatch {
     }
 }
 
-impl TabList<Tab> {
-    /// The tab with `id`, if it is still open.
+impl Panes<Tab> {
+    /// The tab with `id` in either pane, if it is still open.
     pub(crate) fn by_id_mut(&mut self, id: TabId) -> Option<&mut Tab> {
         self.iter_mut().find(|tab| tab.id == id)
     }
@@ -648,12 +665,32 @@ pub(crate) struct OpContext {
     pub(crate) touches: Vec<PathBuf>,
 }
 
+/// What a pane's entries area measured (see [`Explorer::entries_width`]).
+#[derive(Clone, Copy, Debug)]
+struct PaneGeometry {
+    width: Option<f32>,
+    /// The grid column count of the last render, so keyboard row steps use
+    /// the same geometry the list draws with.
+    columns: usize,
+}
+
+impl Default for PaneGeometry {
+    fn default() -> Self {
+        Self {
+            width: None,
+            columns: 1,
+        }
+    }
+}
+
 /// The explorer view: the window's tabs plus everything the tabs share.
 /// All per-folder state lives in [`Tab`]; this struct adds the window's
 /// UI: focus handles, the sidebar, the operations and their dialogs.
 pub(crate) struct Explorer {
-    /// The open tabs, one of them active.
-    pub(crate) tabs: TabList<Tab>,
+    /// The open tabs of one pane, or of two while the view is split; each
+    /// pane has one active tab and the focused pane is the one every
+    /// command acts on (see [`Panes`]).
+    pub(crate) tabs: Panes<Tab>,
     /// The id the next opened tab gets.
     next_tab_id: TabId,
     /// The home directory, when known: `~` in typed paths, new tabs.
@@ -678,15 +715,17 @@ pub(crate) struct Explorer {
     /// The whole-window focus, so Escape has somewhere to give the focus
     /// back and the shell keys work after a click on bare chrome.
     pub(crate) shell_focus: FocusHandle,
-    /// The entries area focus, which carries the arrow keys.
-    pub(crate) entries_focus: FocusHandle,
+    /// The entries area focus of each pane (see [`Self::entries_focus`]),
+    /// which carries the arrow keys.
+    pane_focus: PerPane<FocusHandle>,
     /// The column widths the user dragged on the details table, honored by
     /// [`crate::explorer::table::distribute_widths`] on every render.
     pub(crate) list_widths: ListWidths,
-    /// The entries area's measured inner width, recorded by the draw-nothing
-    /// measuring canvas every frame; `None` until the first layout reached
-    /// it, so the first frame draws with the estimate below.
-    pub(crate) entries_width: Option<f32>,
+    /// What each pane's entries area measured: the inner width recorded by
+    /// the draw-nothing measuring canvas every frame (`None` until the first
+    /// layout reached it, so the first frame draws with the estimate below)
+    /// and the grid column count drawn with it.
+    pane_geometry: PerPane<PaneGeometry>,
     /// Whether the sidebar is shown; narrow windows park it behind the
     /// sidebar toggle.
     pub(crate) sidebar_open: bool,
@@ -710,9 +749,6 @@ pub(crate) struct Explorer {
     /// A settings problem for the status bar (an invalid file at startup, a
     /// failed save); the next navigation dismisses it.
     settings_notice: Option<String>,
-    /// The grid column count of the last render, so keyboard row steps use
-    /// the same geometry the list draws with.
-    pub(crate) rendered_columns: usize,
     /// Whether the user wants the details panel (Ctrl+I, toolbar button).
     pub(crate) inspector_open: bool,
     /// Whether the panel drew in the last render: wanted and wide enough.
@@ -784,7 +820,32 @@ impl Explorer {
     /// The focus the window gives the explorer when it opens, so the entry
     /// keyboard works at once.
     pub(crate) fn initial_focus(&self) -> FocusHandle {
-        self.entries_focus.clone()
+        self.entries_focus().clone()
+    }
+
+    /// The entries area focus of the focused pane (while a pane is drawn,
+    /// of that pane).
+    pub(crate) fn entries_focus(&self) -> &FocusHandle {
+        self.pane_focus.get(self.tabs.focus())
+    }
+
+    /// The measured inner width of the focused pane's entries area.
+    pub(crate) fn entries_width(&self) -> Option<f32> {
+        self.pane_geometry.get(self.tabs.focus()).width
+    }
+
+    /// Records the measured width of `side`'s entries area; `true` when it
+    /// changed.
+    pub(crate) fn record_entries_width(&mut self, side: Side, width: f32) -> bool {
+        let geometry = self.pane_geometry.get_mut(side);
+        let changed = geometry.width != Some(width);
+        geometry.width = Some(width);
+        changed
+    }
+
+    /// The grid column count the focused pane drew with last.
+    pub(crate) fn rendered_columns(&self) -> usize {
+        self.pane_geometry.get(self.tabs.focus()).columns
     }
 
     /// The active tab.
@@ -855,6 +916,9 @@ impl Explorer {
             );
         }
         let active_tab = restored.as_ref().map_or(0, |restored| restored.active);
+        let restored_split = restored
+            .as_ref()
+            .and_then(|restored| restored.split.clone());
         let mut rest = tab_states.into_iter();
         let first_state = rest.next().unwrap_or_else(|| {
             ExplorerState::new(Location::Directory(PathBuf::from("/")), home.clone())
@@ -882,7 +946,7 @@ impl Explorer {
             host: toast_host.clone(),
         });
         let mut this = Self {
-            tabs: TabList::new(first),
+            tabs: Panes::new(first),
             next_tab_id: 1,
             home,
             favorites: favorites_of(favorites, &legacy_favorites),
@@ -901,9 +965,9 @@ impl Explorer {
                 std::env::var_os("XDG_DATA_HOME").as_deref(),
             ),
             shell_focus: cx.focus_handle(),
-            entries_focus: cx.focus_handle(),
+            pane_focus: PerPane::new(cx.focus_handle(), cx.focus_handle()),
             list_widths: ListWidths::default(),
-            entries_width: None,
+            pane_geometry: PerPane::default(),
             sidebar_open: !preferences.sidebar_collapsed,
             sidebar_overlay_open: false,
             sidebar_width: preferences.sidebar_width as f32,
@@ -913,7 +977,6 @@ impl Explorer {
             restore_pending,
             restore_fallbacks: 0,
             settings_notice: None,
-            rendered_columns: 1,
             inspector_open: preferences.details_open,
             inspector_shown: false,
             progress: Registry::default(),
@@ -1001,6 +1064,9 @@ impl Explorer {
             }
             this.activate_tab(active_tab, window, cx);
         }
+        if let Some(split) = restored_split {
+            this.restore_split(split, window, cx);
+        }
         this.settings_notice = (!notices.is_empty()).then(|| notices.join(" \u{b7} "));
         this
     }
@@ -1026,12 +1092,8 @@ impl Explorer {
             }
             .sanitized(),
         };
-        let session = Session {
-            version: SESSION_VERSION,
-            active: self.tabs.active_index(),
-            tabs: self
-                .tabs
-                .iter()
+        let saved_tabs = |list: &crate::explorer::tabs::TabList<Tab>| -> Vec<settings::SessionTab> {
+            list.iter()
                 .map(|tab| {
                     session_tab(
                         tab.state.current(),
@@ -1039,7 +1101,30 @@ impl Explorer {
                         tab.state.arrangement(),
                     )
                 })
-                .collect(),
+                .collect()
+        };
+        // The panes as they are laid out: the left one first, whichever of
+        // them has the focus. A parked second pane is saved too.
+        let session = Session {
+            version: SESSION_VERSION,
+            active: self
+                .tabs
+                .list(Side::Left)
+                .map_or(0, crate::explorer::tabs::TabList::active_index),
+            tabs: self
+                .tabs
+                .list(Side::Left)
+                .map(saved_tabs)
+                .unwrap_or_default(),
+            split: self
+                .tabs
+                .list(Side::Right)
+                .map(|right| settings::SessionSplit {
+                    shown: self.tabs.is_split(),
+                    focused: self.tabs.is_split() && self.tabs.focus() == Side::Right,
+                    active: right.active_index(),
+                    tabs: saved_tabs(right),
+                }),
         };
         (settings, session)
     }
@@ -1360,7 +1445,7 @@ impl Explorer {
                         tab.path_editing = false;
                     }
                     if active {
-                        self.entries_focus.focus(window, cx);
+                        self.entries_focus().focus(window, cx);
                     }
                 }
                 self.sync_search_input(id, window, cx);
@@ -1961,7 +2046,7 @@ impl Explorer {
             input.set_value(seed, window, cx);
         });
         self.tab_mut().state.cancel_path_edit();
-        self.entries_focus.focus(window, cx);
+        self.entries_focus().focus(window, cx);
         cx.notify();
     }
 
@@ -1969,26 +2054,33 @@ impl Explorer {
     /// the focus, so no blur would tell): returns to the breadcrumbs,
     /// restoring the committed path, like Escape but without stealing a
     /// focus the press itself is about to give elsewhere.
-    pub(crate) fn leave_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tab().path_editing {
+    ///
+    /// The path field of tab `id`: in a split view the press may be in the
+    /// other pane, which has taken the focus by now.
+    pub(crate) fn leave_path_edit(
+        &mut self,
+        id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focused_pane = id == self.active_id();
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        if !tab.path_editing {
             return;
         }
-        let was_focused = self
-            .tab()
-            .path_input
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
-        self.tab_mut().path_edited = false;
-        self.tab_mut().path_editing = false;
-        self.tab_mut().path_seed = committed_path_text(self.tab().state.current());
-        let seed = self.tab().path_seed.clone();
-        self.tab().path_input.update(cx, |input, cx| {
+        let was_focused = tab.path_input.read(cx).focus_handle(cx).is_focused(window);
+        tab.path_edited = false;
+        tab.path_editing = false;
+        tab.path_seed = committed_path_text(tab.state.current());
+        let seed = tab.path_seed.clone();
+        tab.path_input.update(cx, |input, cx| {
             input.set_value(seed, window, cx);
         });
-        self.tab_mut().state.cancel_path_edit();
-        if was_focused {
-            self.entries_focus.focus(window, cx);
+        tab.state.cancel_path_edit();
+        if was_focused && focused_pane {
+            self.entries_focus().focus(window, cx);
         }
         cx.notify();
     }
@@ -2001,14 +2093,14 @@ impl Explorer {
         // A subfolder search that is still walking is stopped first, its
         // results kept; Escape again clears the query and leaves it.
         if self.stop_search(id, cx) {
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
             return;
         }
         if let Location::Search { root, .. } = self.tab().state.current().clone() {
             self.tab().search_input.update(cx, |input, cx| {
                 input.set_value(String::new(), window, cx);
             });
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
             self.navigate(Transition::Visit(Location::Directory(root)), window, cx);
             return;
         }
@@ -2017,7 +2109,7 @@ impl Explorer {
         self.tab().search_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
-        self.entries_focus.focus(window, cx);
+        self.entries_focus().focus(window, cx);
         cx.notify();
     }
 
@@ -2063,7 +2155,7 @@ impl Explorer {
         tab.deep_debounce = None;
         self.apply_deep_query(id, window, cx);
         if id == self.active_id() {
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
         }
     }
 
@@ -2334,7 +2426,7 @@ impl Explorer {
             let current = self.tab().state.current().clone();
             self.tab_mut().state.clear_path_error();
             self.tab_mut().path_editing = false;
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
             self.navigate(Transition::Visit(current), window, cx);
             return;
         }
@@ -2419,7 +2511,7 @@ impl Explorer {
             }
             View::Grid => {
                 self.tab().grid_scroll.scroll_to_item(
-                    util::grid_row(position, self.rendered_columns.max(1)),
+                    util::grid_row(position, self.rendered_columns().max(1)),
                     ScrollStrategy::Nearest,
                 );
             }
@@ -2509,7 +2601,13 @@ impl Explorer {
         } else {
             0.0
         };
-        (total - self.shell_width(window) - panel - 2.0 * 16.0).max(0.0)
+        let side_by_side = panes::layout(self.tabs.is_split(), total) == PaneLayout::SideBySide;
+        let (count, gaps) = if side_by_side {
+            (2.0, IslandMetrics::GAP.as_f32())
+        } else {
+            (1.0, 0.0)
+        };
+        ((total - self.shell_width(window) - panel - gaps) / count - 2.0 * 16.0).max(0.0)
     }
 
     /// Everything in the window that is not the document island: the outer
@@ -2526,12 +2624,14 @@ impl Explorer {
 
     /// Whether the details panel draws at this window width.
     fn inspector_wanted(&self, window: &Window) -> bool {
-        inspector::panel_visible(
-            self.inspector_open,
-            f32::from(window.viewport_size().width),
-            self.shell_width(window),
-            self.details_width,
-        )
+        // The split view has no room for the panel beside two panes.
+        !self.tabs.is_split()
+            && inspector::panel_visible(
+                self.inspector_open,
+                f32::from(window.viewport_size().width),
+                self.shell_width(window),
+                self.details_width,
+            )
     }
 }
 
@@ -2708,9 +2808,163 @@ impl Explorer {
                 input.update(cx, |input, cx| input.focus(window, cx));
             });
         } else {
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
         }
         cx.notify();
+    }
+}
+
+// --- panes --------------------------------------------------------------------
+
+impl Explorer {
+    /// F3 and the toolbar button: splits the window into two panes, or goes
+    /// back to one. The new pane opens on the folder the focused pane shows,
+    /// with its presentation, and a pane parked by an earlier un-split comes
+    /// back as it was. A window narrower than [`panes::SPLIT_MIN_WIDTH`]
+    /// refuses with a toast.
+    pub(crate) fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_split() {
+            self.tabs.unsplit();
+            self.after_tab_switch(false, window, cx);
+            return;
+        }
+        let width = f32::from(window.viewport_size().width);
+        if !panes::may_split(width) {
+            self.say(Severity::Info, panes::split_refusal(width), window, cx);
+            return;
+        }
+        if self.tabs.has_right() {
+            self.tabs.split(None);
+        } else {
+            let location = self.tab().state.current().clone();
+            let state = self.tab().state.for_new_tab(location.clone());
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            let mut tab = Tab::new(id, state, window, cx);
+            let scan = tab.state.begin(Transition::Visit(location));
+            self.tabs.split(Some(tab));
+            self.start_scan_in(id, scan, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Gives the focus to `side` (a press inside it, or F6) and drops what
+    /// belongs to the pane that had it: the inline rename and the open menu.
+    pub(crate) fn focus_pane(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.focus() == side || !self.tabs.focus_side(side) {
+            return;
+        }
+        self.after_tab_switch(true, window, cx);
+    }
+
+    /// A press inside `side`'s area. It focuses the pane, except while a
+    /// dialog or the context menu is open: their overlays sit over both
+    /// panes, and a press on them belongs to them.
+    fn press_in_pane(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialogs.is_open() || self.menu.is_some() {
+            return;
+        }
+        self.focus_pane(side, window, cx);
+    }
+
+    /// F6: the other pane takes the focus.
+    pub(crate) fn switch_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs.is_split() {
+            self.say(
+                Severity::Info,
+                "Split the view (F3) to work in two panes",
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.tabs.switch_focus() {
+            self.after_tab_switch(true, window, cx);
+        }
+    }
+
+    /// F5 (copy) and Shift+F5 (move): the selection goes to the folder the
+    /// other pane shows, through the same paste engine as Ctrl+V and a drop:
+    /// the conflict dialog, the progress card and the undo come with it. The
+    /// system clipboard and the internal one are left alone.
+    pub(crate) fn transfer_to_other_pane(
+        &mut self,
+        mode: ClipMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let other = self
+            .tabs
+            .other()
+            .map(|list| list.active().state.current().clone());
+        let planned = panes::plan_transfer(
+            mode,
+            self.tab().state.current(),
+            other.as_ref(),
+            self.selected_visible_paths(),
+        );
+        match planned {
+            Ok(transfer) => {
+                self.start_paste(transfer.sources, transfer.dest, mode, None, window, cx);
+            }
+            Err(notice) => self.say(Severity::Info, notice, window, cx),
+        }
+    }
+
+    /// Reopens the second pane of a restored session (see
+    /// [`settings::RestoredSplit`]): its tabs open like the first pane's,
+    /// the saved active tab takes over, and the pane is shown, focused or
+    /// parked as it was.
+    fn restore_split(
+        &mut self,
+        split: settings::RestoredSplit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings::RestoredSplit {
+            shown,
+            focused,
+            tabs,
+            active,
+        } = split;
+        let home = self.home.clone();
+        let mut states = tabs.into_iter().map(|tab| {
+            ExplorerState::new(tab.location, home.clone()).with_presentation(
+                view_from_pref(tab.view),
+                arrangement_from_prefs(&tab.arrangement),
+            )
+        });
+        let Some(first_state) = states.next() else {
+            return;
+        };
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let location = first_state.current().clone();
+        if let Location::Directory(path) = &location {
+            self.restore_pending.insert(id, path.clone());
+        }
+        let mut first = Tab::new(id, first_state, window, cx);
+        let scan = first.state.begin(Transition::Visit(location));
+        if !self.tabs.split(Some(first)) {
+            return;
+        }
+        self.tabs.focus_side(Side::Right);
+        self.start_scan_in(id, scan, window, cx);
+        for state in states {
+            let location = state.current().clone();
+            if let Location::Directory(path) = &location {
+                self.restore_pending.insert(self.next_tab_id, path.clone());
+            }
+            self.open_tab_with(state, location, Placement::Background, window, cx);
+        }
+        self.activate_tab(active, window, cx);
+        self.tabs.focus_side(Side::Left);
+        if !shown {
+            self.tabs.unsplit();
+        } else if focused {
+            self.tabs.focus_side(Side::Right);
+        }
+        self.after_tab_switch(false, window, cx);
     }
 }
 
@@ -2755,16 +3009,8 @@ impl Render for Explorer {
         let colors = bolt::colors(cx);
         let narrow = f32::from(window.viewport_size().width) < NARROW_WIDTH;
 
-        // Grid geometry comes from the entries area's measured inner width
-        // once the first frame has reported it; the estimate only seeds the
-        // very first frame. The arrow keys reuse the same geometry.
-        self.rendered_columns = entries::grid_columns(
-            self.entries_width
-                .unwrap_or_else(|| self.content_width(window)),
-        );
-
         self.close_sidebar_overlay(sidebar::OverlayEvent::Resized { narrow });
-        let document = self.render_document_island(window, cx);
+        let document = self.render_documents(window, cx);
         let side = sidebar::render(self, narrow, cx);
 
         // The sidebar reads on the LEFT of the content island (artboard
@@ -3010,6 +3256,18 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &JumpToTab9, window, cx| {
                 this.jump_to_tab(9, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
+                this.toggle_split(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchPane, window, cx| {
+                this.switch_pane(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyToOtherPane, window, cx| {
+                this.transfer_to_other_pane(ClipMode::Copy, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveToOtherPane, window, cx| {
+                this.transfer_to_other_pane(ClipMode::Cut, window, cx);
+            }))
             .child(middle)
             .child(self.render_statusbar(cx))
             .child(self.render_toasts(window, cx))
@@ -3055,8 +3313,89 @@ impl Explorer {
     fn grid_step(&self) -> isize {
         match self.tab().state.view() {
             View::List => 1,
-            View::Grid => self.rendered_columns.max(1) as isize,
+            View::Grid => self.rendered_columns().max(1) as isize,
         }
+    }
+
+    /// The document area: the one pane, or both panes of a split view.
+    ///
+    /// Each pane is drawn as the focused pane for the duration of its own
+    /// draw: everything the pane's views read (`tab()`, the focus handle,
+    /// the measured geometry) then answers for that pane, and the real focus
+    /// is restored right after. A press anywhere in a pane focuses it first
+    /// (capture phase), so the handlers of its entries, toolbar and tabs run
+    /// against the pane the pointer is in.
+    fn render_documents(&mut self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let width = f32::from(window.viewport_size().width);
+        let layout = panes::layout(self.tabs.is_split(), width);
+        let real = self.tabs.focus();
+        let area = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .gap(IslandMetrics::GAP);
+        if layout != PaneLayout::SideBySide {
+            self.set_columns(real, window);
+            return area.child(self.render_pane(real, false, true, window, cx));
+        }
+        let mut area = area;
+        for side in [Side::Left, Side::Right] {
+            self.tabs.focus_side(side);
+            self.set_columns(side, window);
+            let pane = self.render_pane(side, true, side == real, window, cx);
+            area = area.child(pane);
+        }
+        self.tabs.focus_side(real);
+        area
+    }
+
+    /// The grid column count of `side`: from its entries area's measured
+    /// width once the first frame has reported it (the estimate only seeds
+    /// the very first frame). The arrow keys reuse the same geometry.
+    fn set_columns(&mut self, side: Side, window: &Window) {
+        let estimate = self.content_width(window);
+        let geometry = self.pane_geometry.get_mut(side);
+        geometry.columns = entries::grid_columns(geometry.width.unwrap_or(estimate));
+    }
+
+    /// One pane: its document island under a 3 px edge that is tinted while
+    /// the pane has the focus (drawn only while two panes show).
+    fn render_pane(
+        &mut self,
+        side: Side,
+        split: bool,
+        focused: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let tint = bolt::tokens::ChromeColors::tint(cx.theme());
+        let island = self.render_document_island(window, cx);
+        let pane = div()
+            .id(("explorer-pane", side.index()))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col();
+        if !split {
+            return pane.child(island);
+        }
+        pane.capture_any_mouse_down(cx.listener(move |this, _event, window, cx| {
+            this.press_in_pane(side, window, cx);
+        }))
+        .child(
+            div()
+                .id(("explorer-pane-edge", side.index()))
+                .flex_none()
+                .h(px(PANE_EDGE))
+                .bg(if focused {
+                    tint
+                } else {
+                    gpui::transparent_black()
+                }),
+        )
+        .child(island)
     }
 
     /// The document island: toolbar, scope line, folder subbar, then the

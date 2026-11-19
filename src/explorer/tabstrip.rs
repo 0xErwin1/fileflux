@@ -50,7 +50,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
         .border_b_1()
         .border_color(colors.line);
     let active = this.tabs.active_index();
-    for (index, tab) in this.tabs.iter().enumerate() {
+    for (index, tab) in this.tabs.focused().iter().enumerate() {
         let location = tab.state.current();
         strip = strip.child(render_tab(
             index,

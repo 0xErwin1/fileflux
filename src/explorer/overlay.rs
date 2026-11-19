@@ -32,10 +32,10 @@ pub(crate) fn render(
     cx: &mut Context<Explorer>,
 ) -> Vec<AnyElement> {
     if this.menu.is_none() && this.menu_focus.is_focused(window) {
-        this.entries_focus.focus(window, cx);
+        this.entries_focus().focus(window, cx);
     }
     if !this.dialogs.is_open() && this.dialog_focus.contains_focused(window, cx) {
-        this.entries_focus.focus(window, cx);
+        this.entries_focus().focus(window, cx);
     }
     let mut layers = Vec::new();
     layers.extend(render_menu(this, cx));

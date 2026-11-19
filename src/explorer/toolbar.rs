@@ -176,6 +176,19 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     View::List,
                 )),
         )
+        // The split view toggle: tinted while two panes show.
+        .child(
+            Button::new("explorer-split-toggle", "Split view")
+                .ghost()
+                .icon_only()
+                .icon(icon(gpui_kit_assets::IconName::Columns2))
+                .tooltip("Split into two panes (F3); F6 switches pane, F5 copies, Shift+F5 moves")
+                .selected(this.tabs.is_split())
+                .toggled(this.tabs.is_split())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_split(window, cx);
+                })),
+        )
         // The details panel toggle: tinted while the panel is open.
         .child(
             Button::new("explorer-inspector-toggle", "Details panel")
@@ -241,6 +254,9 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
 
 /// The editable path field in the breadcrumb bar's place.
 fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
+    // The tab this frame belongs to: a press in the other pane of a split
+    // view moves the focus before this handler runs.
+    let id = this.tab().id;
     div()
         .id("explorer-path-frame")
         .flex_1()
@@ -250,8 +266,8 @@ fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
             this.restore_path_on_escape(window, cx);
             cx.stop_propagation();
         }))
-        .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
-            this.leave_path_edit(window, cx);
+        .on_mouse_down_out(cx.listener(move |this, _event, window, cx| {
+            this.leave_path_edit(id, window, cx);
         }))
         .child(
             bolt::controls::Input::new(&this.tab().path_input)

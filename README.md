@@ -5,6 +5,7 @@ A fast GPUI file manager for Linux, written in Rust. Fileflux is part of the Bol
 ## Features
 
 - Tabs, grid and list views, breadcrumbs and an editable path field, with every tab's folder kept live: [User guide](docs/user-guide.md).
+- Dual pane (F3): two folders side by side, each with its own tabs, and F5 / Shift+F5 to copy or move to the other pane: [Dual pane](docs/user-guide.md#dual-pane).
 - Sort and filter by type, date, size, name and hidden files: [Sort and filter](docs/user-guide.md#sort-and-filter).
 - Search file names in a folder and all its subfolders, with results streaming in and Escape to stop: [Search in subfolders](docs/user-guide.md#search-in-subfolders).
 - Create, rename, copy, cut, paste and drag and drop, with progress, conflict handling and Undo: [File operations](docs/user-guide.md#file-operations).
@@ -59,6 +60,8 @@ Every option and exit status is in the [command line reference](docs/user-guide.
 | Key | Action |
 |---|---|
 | Ctrl+T / Ctrl+W | New / close tab |
+| F3 / F6 | Split into two panes / switch pane |
+| F5 / Shift+F5 | Copy / move to the other pane |
 | Ctrl+L | Edit the path |
 | Ctrl+F | Search file names |
 | Ctrl+Shift+F | Search in subfolders |

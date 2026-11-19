@@ -635,7 +635,7 @@ impl Explorer {
     fn finish_rename(&mut self, from_blur: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.renaming = None;
         if !from_blur {
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
         }
         cx.notify();
     }
@@ -821,7 +821,7 @@ impl Explorer {
         if self.dialogs.is_open() {
             self.focus_dialog_default(window, cx);
         } else {
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
         }
         cx.notify();
     }
@@ -1242,7 +1242,7 @@ impl Explorer {
 
     pub(crate) fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
-            self.entries_focus.focus(window, cx);
+            self.entries_focus().focus(window, cx);
             cx.notify();
         }
     }

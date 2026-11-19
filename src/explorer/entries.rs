@@ -32,6 +32,7 @@ use gpui_component::ActiveTheme;
 
 use super::actions::{MenuOn, RenameView};
 use super::dnd::{self, DropTarget};
+use super::panes::Side;
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
 use super::{icon, util};
@@ -351,7 +352,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let container = div()
         .id("explorer-entries")
         .key_context(ENTRIES_CONTEXT)
-        .track_focus(&this.entries_focus)
+        .track_focus(this.entries_focus())
         .flex_1()
         .min_h_0()
         .min_w_0()
@@ -474,7 +475,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.tab().state.selection().clone());
     let list_view = this.tab().state.view() == View::List;
     let in_recent = this.tab().state.current().lists_files_from_elsewhere();
-    let columns = this.rendered_columns.max(1);
+    let columns = this.rendered_columns().max(1);
     let item_count = if list_view {
         count
     } else {
@@ -552,7 +553,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             .min_w_0()
             .flex()
             .flex_col()
-            .child(measure_width(&weak))
+            .child(measure_width(&weak, this.tabs.focus()))
             .child(rows),
     )
 }
@@ -562,14 +563,13 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
 /// the width the area actually has instead of a viewport-minus-sidebar
 /// estimate. The width (and the columns derived from it) is stored only
 /// when it changed, so the measurement never becomes a paint loop.
-fn measure_width(weak: &WeakEntity<Explorer>) -> impl IntoElement {
+fn measure_width(weak: &WeakEntity<Explorer>, side: Side) -> impl IntoElement {
     let weak = weak.clone();
     canvas(
         move |bounds, window, cx| {
             let width = f32::from(bounds.size.width);
             if let Err(error) = weak.update(cx, |this, cx| {
-                if this.entries_width != Some(width) {
-                    this.entries_width = Some(width);
+                if this.record_entries_width(side, width) {
                     cx.notify();
                     window.request_animation_frame();
                 }
@@ -860,7 +860,7 @@ pub(crate) fn handle_entry_click(
     cx: &mut App,
 ) {
     if let Err(error) = weak.update(cx, |this, cx| {
-        this.entries_focus.focus(window, cx);
+        this.entries_focus().focus(window, cx);
         if click_count >= 2 {
             this.open_path(&path, window, cx);
         } else if modifiers.shift {
@@ -892,7 +892,7 @@ pub(crate) fn entry_context_menu(
     move |event: &MouseDownEvent, window, cx| {
         cx.stop_propagation();
         if let Err(error) = weak.update(cx, |this, cx| {
-            this.entries_focus.focus(window, cx);
+            this.entries_focus().focus(window, cx);
             this.open_context_menu(event.position, Some(&path), window, cx);
         }) {
             log::debug!("the row outlived its explorer: {error}");
