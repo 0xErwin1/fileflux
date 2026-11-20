@@ -1325,6 +1325,29 @@ const EVERY_APP: &[(&str, &str)] = &[
     ("z.desktop", "Zed Editor"),
 ];
 
+/// What a single click on a row does: it moves the highlight and nothing
+/// else; the file opens only when the dialog is confirmed (Enter or a double
+/// click), with the row that is highlighted then.
+#[test]
+fn selecting_a_row_highlights_it_without_opening_and_confirming_launches_it() {
+    let mut dialog = chooser(&[("a.desktop", "Alpha"), ("b.desktop", "Beta")], EVERY_APP);
+    let launch = |dialog: &DialogState| match dialog.open_with_pick() {
+        Some(OpenWithPick::Launch { app, .. }) => Some(app.name),
+        _ => None,
+    };
+    assert_eq!(launch(&dialog), Some("Alpha".to_owned()));
+
+    dialog.select_open_with(1);
+    assert_eq!(launch(&dialog), Some("Beta".to_owned()), "highlighted");
+    assert_eq!(dialog.text.names.len(), 3, "the list is unchanged");
+
+    dialog.select_open_with(99);
+    assert_eq!(launch(&dialog), Some("Beta".to_owned()), "no such row");
+
+    dialog.select_open_with(2);
+    assert_eq!(dialog.open_with_pick(), Some(OpenWithPick::Other));
+}
+
 #[test]
 fn a_type_nobody_handles_still_offers_other_application() {
     let dialog = chooser(&[], EVERY_APP);

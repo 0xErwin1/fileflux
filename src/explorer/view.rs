@@ -1806,7 +1806,14 @@ impl Explorer {
                 let mut hits = Vec::new();
                 for (path, modified, found) in answers {
                     if found.is_some() {
-                        hits.push((path, entries::Thumb { modified, found }));
+                        hits.push((
+                            path,
+                            entries::Thumb {
+                                modified,
+                                found,
+                                misses: 0,
+                            },
+                        ));
                     } else {
                         missing.push((path, modified));
                     }
@@ -1831,16 +1838,23 @@ impl Explorer {
                                 Outcome::Skipped(Skip::InsideCache) => Some(path.clone()),
                                 Outcome::Failed | Outcome::Skipped(_) => None,
                             };
-                            (path, entries::Thumb { modified, found })
+                            let misses = u32::from(found.is_none());
+                            (
+                                path,
+                                entries::Thumb {
+                                    modified,
+                                    found,
+                                    misses,
+                                },
+                            )
                         })
                     })
                     .collect::<Vec<_>>();
                 let mut made = Vec::new();
                 for job in running {
                     let (path, thumb) = job.await;
-                    if thumb.found.is_some() {
-                        made.push((path, thumb));
-                    }
+                    // A miss is published too: it is what bounds the retries.
+                    made.push((path, thumb));
                 }
                 if !made.is_empty() && !Self::publish_thumbnails(&this, id, made, cx) {
                     return;
@@ -1862,7 +1876,20 @@ impl Explorer {
     ) -> bool {
         let published = this.update(cx, |this, cx| {
             if let Some(tab) = this.tabs.by_id_mut(id) {
-                Arc::make_mut(&mut tab.thumbs).extend(answers);
+                let thumbs = Arc::make_mut(&mut tab.thumbs);
+                for (path, mut thumb) in answers {
+                    if thumb.found.is_none() {
+                        let known = thumbs.get(&path);
+                        // A miss never replaces a preview already found for
+                        // the same unchanged file.
+                        if known.is_some_and(|k| k.found.is_some() && k.modified == thumb.modified)
+                        {
+                            continue;
+                        }
+                        thumb.misses = entries::misses_after(known, thumb.modified);
+                    }
+                    thumbs.insert(path, thumb);
+                }
             }
             cx.notify();
         });

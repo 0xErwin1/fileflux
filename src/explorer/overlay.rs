@@ -226,7 +226,7 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                         // A click selects the row, as it does in every list;
                         // a double click opens the file with it, like Enter.
                         .on_click(move |event, window, cx| {
-                            let confirm = event.click_count() >= 2;
+                            let confirm = open_with_click_opens(event.click_count());
                             if let Err(error) = click_weak.update(cx, |this, cx| {
                                 if confirm {
                                     this.choose_open_with(index, window, cx);
@@ -426,4 +426,23 @@ pub(crate) fn under_button(position: gpui::Point<gpui::Pixels>) -> gpui::Point<g
 /// The point menus anchor to when the toolbar button opens one.
 pub(crate) fn below(position: gpui::Point<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
     point(position.x - px(180.0), position.y + px(14.0))
+}
+
+/// Whether a click on a row of the "Open with…" list opens the file with it:
+/// a double click does, a single click only selects the row. Enter does not
+/// come through here; it confirms the selected row (`confirm_dialog`).
+pub(crate) fn open_with_click_opens(click_count: usize) -> bool {
+    click_count >= 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_with_click_opens;
+
+    #[test]
+    fn a_single_click_selects_and_a_double_click_opens() {
+        assert!(!open_with_click_opens(1));
+        assert!(open_with_click_opens(2));
+        assert!(open_with_click_opens(3));
+    }
 }

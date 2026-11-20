@@ -261,6 +261,26 @@ pub(crate) struct Thumb {
     /// The entry's modification time when it was looked up.
     pub(crate) modified: Option<SystemTime>,
     pub(crate) found: Option<PathBuf>,
+    /// How many lookups of this unchanged file found nothing (see
+    /// [`misses_after`]); `0` when a thumbnail was found.
+    pub(crate) misses: u32,
+}
+
+/// A file with no thumbnail is looked up this many times while it stays
+/// unchanged (the first answer plus one retry, for a thumbnailer installed
+/// or a cache written since); after that it keeps its glyph until it changes.
+const MAX_MISSES: u32 = 2;
+
+/// The miss count of a lookup that found nothing for a file modified at
+/// `modified`, given the answer `previous` it replaces: the misses add up
+/// while the file is unchanged and start over when it changed.
+pub(crate) fn misses_after(previous: Option<&Thumb>, modified: Option<SystemTime>) -> u32 {
+    match previous {
+        Some(thumb) if thumb.modified == modified && thumb.found.is_none() => {
+            thumb.misses.saturating_add(1)
+        }
+        _ => 1,
+    }
 }
 
 /// The lookups of one listing, by image path. A tile with no answer yet
@@ -307,12 +327,16 @@ pub(crate) fn plan_thumbnails(
     let ordered = order.into_iter().filter_map(|index| snapshot.get(index));
     for entry in ordered.filter(|entry| wants_thumbnail(entry)) {
         match known.get(&entry.path) {
-            // A thumbnail that was found stays while the file is unchanged; a
-            // file that had none is asked again, because the reason may have
-            // gone away (a thumbnailer installed, its cache written by another
-            // application) and nothing else would ever retry it.
+            // A thumbnail that was found stays while the file is unchanged. A
+            // file that had none is asked once more, because the reason may
+            // have gone away (a thumbnailer installed, its cache written by
+            // another application); a second miss on the same file settles it
+            // until the file changes, so a file that can never be thumbnailed
+            // does not spawn the thumbnailer on every listing.
             Some(thumb)
-                if trust_known && thumb.modified == entry.modified && thumb.found.is_some() =>
+                if trust_known
+                    && thumb.modified == entry.modified
+                    && (thumb.found.is_some() || thumb.misses >= MAX_MISSES) =>
             {
                 keep.insert(entry.path.clone(), thumb.clone());
             }
@@ -1219,6 +1243,7 @@ mod tests {
                 Thumb {
                     modified: entry.modified,
                     found: Some(PathBuf::from("/cache").join(&entry.name)),
+                    misses: 0,
                 },
             );
         }
@@ -1279,11 +1304,84 @@ mod tests {
             Thumb {
                 modified: entry.modified,
                 found: None,
+                misses: MAX_MISSES,
             },
         );
         let (keep, todo) = plan_thumbnails(std::slice::from_ref(&entry), &[0], &known, false);
         assert_eq!(keep.len(), 1);
         assert_eq!(todo.len(), 1);
+    }
+
+    /// Runs one planning pass the way the explorer does and records `outcome`
+    /// (a miss) for every image it queued, returning how many it queued.
+    fn pass_with_misses(snapshot: &[Entry], known: &mut Thumbs) -> usize {
+        let (mut keep, todo) = plan_thumbnails(snapshot, &[], known, true);
+        for (path, modified) in &todo {
+            let misses = misses_after(keep.get(path), *modified);
+            keep.insert(
+                path.clone(),
+                Thumb {
+                    modified: *modified,
+                    found: None,
+                    misses,
+                },
+            );
+        }
+        *known = keep;
+        todo.len()
+    }
+
+    /// A first miss on an unchanged file is retried once.
+    #[test]
+    fn a_first_miss_on_an_unchanged_file_is_retried_once() {
+        let snapshot = [image("a.png", 1)];
+        let mut known = Thumbs::new();
+        assert_eq!(pass_with_misses(&snapshot, &mut known), 1, "first lookup");
+        assert_eq!(pass_with_misses(&snapshot, &mut known), 1, "the retry");
+    }
+
+    /// The second miss settles it: the file is not queued again.
+    #[test]
+    fn a_second_miss_on_the_same_unchanged_file_is_not_queued_again() {
+        let snapshot = [image("a.png", 1)];
+        let mut known = Thumbs::new();
+        pass_with_misses(&snapshot, &mut known);
+        pass_with_misses(&snapshot, &mut known);
+        for _ in 0..3 {
+            assert_eq!(pass_with_misses(&snapshot, &mut known), 0);
+        }
+        assert!(known.contains_key(Path::new("/p/a.png")), "glyph stays");
+    }
+
+    /// A changed file is looked up again after a settled miss, and gets its
+    /// retry again.
+    #[test]
+    fn a_changed_file_is_queued_again_after_a_miss() {
+        let mut known = Thumbs::new();
+        let before = [image("a.png", 1)];
+        pass_with_misses(&before, &mut known);
+        pass_with_misses(&before, &mut known);
+        assert_eq!(pass_with_misses(&before, &mut known), 0, "settled");
+
+        let after = [image("a.png", 2)];
+        assert_eq!(pass_with_misses(&after, &mut known), 1, "changed");
+        assert_eq!(pass_with_misses(&after, &mut known), 1, "its own retry");
+        assert_eq!(pass_with_misses(&after, &mut known), 0, "settled again");
+    }
+
+    /// A miss counts up only while the file is unchanged.
+    #[test]
+    fn misses_add_up_only_for_the_same_unchanged_file() {
+        let t = |secs: u64, found: Option<&str>, misses| Thumb {
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+            found: found.map(PathBuf::from),
+            misses,
+        };
+        let at = |secs: u64| Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        assert_eq!(misses_after(None, at(1)), 1);
+        assert_eq!(misses_after(Some(&t(1, None, 1)), at(1)), 2);
+        assert_eq!(misses_after(Some(&t(1, None, 2)), at(2)), 1, "changed");
+        assert_eq!(misses_after(Some(&t(1, Some("/c"), 0)), at(1)), 1);
     }
 
     /// A scratch directory under the temporary directory, unique per
