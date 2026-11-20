@@ -307,7 +307,13 @@ pub(crate) fn plan_thumbnails(
     let ordered = order.into_iter().filter_map(|index| snapshot.get(index));
     for entry in ordered.filter(|entry| wants_thumbnail(entry)) {
         match known.get(&entry.path) {
-            Some(thumb) if trust_known && thumb.modified == entry.modified => {
+            // A thumbnail that was found stays while the file is unchanged; a
+            // file that had none is asked again, because the reason may have
+            // gone away (a thumbnailer installed, its cache written by another
+            // application) and nothing else would ever retry it.
+            Some(thumb)
+                if trust_known && thumb.modified == entry.modified && thumb.found.is_some() =>
+            {
                 keep.insert(entry.path.clone(), thumb.clone());
             }
             Some(thumb) => {

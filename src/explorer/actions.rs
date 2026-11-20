@@ -1531,6 +1531,15 @@ impl Explorer {
     }
 
     /// A click on one row of the "Open with…" list: choose it and confirm.
+    /// Highlights one application of the "Open with…" chooser without
+    /// opening anything: what a single click does.
+    pub(crate) fn select_open_with(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.dialogs.current_mut() {
+            dialog.select_open_with(index);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn choose_open_with(
         &mut self,
         index: usize,

@@ -223,9 +223,16 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                         .when(index == selected, |row| row.bg(colors.line))
                         .hover(|row| row.bg(colors.line))
                         .child(name.clone())
-                        .on_click(move |_event, window, cx| {
+                        // A click selects the row, as it does in every list;
+                        // a double click opens the file with it, like Enter.
+                        .on_click(move |event, window, cx| {
+                            let confirm = event.click_count() >= 2;
                             if let Err(error) = click_weak.update(cx, |this, cx| {
-                                this.choose_open_with(index, window, cx);
+                                if confirm {
+                                    this.choose_open_with(index, window, cx);
+                                } else {
+                                    this.select_open_with(index, cx);
+                                }
                             }) {
                                 log::debug!("the dialog outlived its explorer: {error}");
                             }

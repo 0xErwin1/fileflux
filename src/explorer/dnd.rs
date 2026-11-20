@@ -262,6 +262,9 @@ pub(crate) struct DraggedEntries {
     pub(crate) paths: Arc<Vec<PathBuf>>,
 }
 
+/// The element id the automation bridge reads the drag card by.
+pub(crate) const DRAG_PREVIEW_ID: &str = "explorer-drag-preview";
+
 /// How far the drag card's top-left sits from the pointer, right and down,
 /// so the card never covers the pointer. pcmanfm paints the grabbed cell with
 /// the pointer inside it at the same relative spot; a small card reads better
@@ -297,37 +300,44 @@ impl Render for DragPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Inert until the pointer left the drag threshold.
         if !drag_armed(window, cx) {
-            return div();
+            return div().id(DRAG_PREVIEW_ID);
         }
         let colors = bolt::colors(cx);
         let tint = ChromeColors::tint(cx.theme());
         let (margin_x, margin_y) = preview_margin(self.grab);
-        div().flex().child(
-            div()
-                .ml(margin_x)
-                .mt(margin_y)
-                .flex()
-                .items_center()
-                .gap(Spacing::SM)
-                .px(px(10.0))
-                .py(px(6.0))
-                .max_w(px(280.0))
-                .bg(colors.raised)
-                .border_1()
-                .border_color(tint)
-                .text_size(px(13.0))
-                .text_color(colors.strong)
-                .child(
-                    Icon::new(icon(self.glyph))
-                        .size(px(16.0))
-                        .color(if self.folder {
-                            colors.info
-                        } else {
-                            colors.muted
-                        }),
-                )
-                .child(div().min_w_0().truncate().child(self.text.clone())),
-        )
+        // Named so the automation bridge can read the card's bounds and check
+        // where it sits against the pointer, which a screenshot cannot.
+        div()
+            .id(DRAG_PREVIEW_ID)
+            .role(gpui::accesskit::Role::Tooltip)
+            .aria_label(self.text.clone())
+            .flex()
+            .child(
+                div()
+                    .ml(margin_x)
+                    .mt(margin_y)
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .max_w(px(280.0))
+                    .bg(colors.raised)
+                    .border_1()
+                    .border_color(tint)
+                    .text_size(px(13.0))
+                    .text_color(colors.strong)
+                    .child(
+                        Icon::new(icon(self.glyph))
+                            .size(px(16.0))
+                            .color(if self.folder {
+                                colors.info
+                            } else {
+                                colors.muted
+                            }),
+                    )
+                    .child(div().min_w_0().truncate().child(self.text.clone())),
+            )
     }
 }
 
