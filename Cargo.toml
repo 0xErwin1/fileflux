@@ -21,10 +21,10 @@ gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9", default-fea
 
 # Bolt, the design system shared with DBFlux and ReqFlux, from the same DBFlux
 # rev as the GPUI stack.
-bolt = { git = "https://github.com/0xErwin1/dbflux", rev = "7ceb70b0314edb5df81020ba09c89f6f1da035c1" }
+bolt = { git = "https://github.com/0xErwin1/dbflux", rev = "91192cb1966e5af4a6022094cb73b7e6b62d386b" }
 
 # The GPUI automation bridge (dev-only, behind the `ui-automation` feature).
-gpui-mcp = { git = "https://github.com/0xErwin1/dbflux", rev = "7ceb70b0314edb5df81020ba09c89f6f1da035c1", default-features = false, features = ["gpui-pre"], optional = true }
+gpui-mcp = { git = "https://github.com/0xErwin1/dbflux", rev = "91192cb1966e5af4a6022094cb73b7e6b62d386b", default-features = false, features = ["gpui-pre"], optional = true }
 
 # Only what startup and logging need.
 anyhow = "1.0.104"
@@ -92,10 +92,10 @@ let_underscore_must_use = "warn"
 # gpui-component on one GPUI build without copying them here. The rev is
 # DBFlux's main where Bolt was merged (#1233); move it with DBFlux.
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/0xErwin1/dbflux", rev = "7ceb70b0314edb5df81020ba09c89f6f1da035c1" }
-gpui-base = { git = "https://github.com/0xErwin1/dbflux", rev = "7ceb70b0314edb5df81020ba09c89f6f1da035c1" }
-gpui-component = { git = "https://github.com/0xErwin1/dbflux", rev = "7ceb70b0314edb5df81020ba09c89f6f1da035c1" }
-gpui-pre-linux = { git = "https://github.com/0xErwin1/dbflux", rev = "7ceb70b0314edb5df81020ba09c89f6f1da035c1" }
+gpui-pre = { git = "https://github.com/0xErwin1/dbflux", rev = "91192cb1966e5af4a6022094cb73b7e6b62d386b" }
+gpui-base = { git = "https://github.com/0xErwin1/dbflux", rev = "91192cb1966e5af4a6022094cb73b7e6b62d386b" }
+gpui-component = { git = "https://github.com/0xErwin1/dbflux", rev = "91192cb1966e5af4a6022094cb73b7e6b62d386b" }
+gpui-pre-linux = { git = "https://github.com/0xErwin1/dbflux", rev = "91192cb1966e5af4a6022094cb73b7e6b62d386b" }
 
 # Line tables keep backtraces usable at a fraction of the link time and
 # memory that full debug info costs with GPUI in the graph.
