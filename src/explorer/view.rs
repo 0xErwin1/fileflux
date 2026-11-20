@@ -3712,6 +3712,15 @@ impl Explorer {
         let search_text = searching_here.then(|| {
             util::search_status_label(entries_count, shown, self.tab().state.search_status())
         });
+        // One selected entry names its type, through the same label the
+        // details panel shows, so the bar and the panel never disagree.
+        let selected_kind = self
+            .tab()
+            .state
+            .selected_entries()
+            .first()
+            .filter(|_| selection.len() == 1)
+            .map(|entry| inspector::kind_label(entry));
         let mut count_text = match &search_text {
             Some(text) if selection.is_empty() => text.clone(),
             _ => util::status_label(
@@ -3719,6 +3728,7 @@ impl Explorer {
                 shown,
                 selection.len(),
                 self.tab().state.selected_size(),
+                selected_kind.as_deref(),
             ),
         };
         // A single selected Trash entry keeps its recorded origin; a Recent

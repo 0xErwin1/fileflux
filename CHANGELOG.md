@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- The status bar names the selected file's type when exactly one entry is selected: `1 selected · Document · PDF · 56.3 KB`, using the same label the details panel shows.
+
 ### Changed
 
 - A grid tile is its entry everywhere inside it: clicking the padding around a tile's icon or name now selects it, where before only the drawn icon and name did, and the hover wash and the click area are the same rectangle. The rubber band therefore starts only from real empty space — the gaps between tiles and rows, the margins, and the area right of the last column and below the last row — instead of from a tile's blank corners.

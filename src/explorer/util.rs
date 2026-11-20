@@ -223,17 +223,21 @@ pub(crate) fn filtered_counts_label(shown: usize, total: usize) -> String {
 
 /// The status bar's left text: `"N items"` (or `"n of N shown"` while a
 /// query filters), and `"N selected · <size>"` once something is selected.
+/// With exactly one entry selected and its kind known, the kind sits between
+/// the count and the size: `"1 selected · Document · PDF · 56.3 KB"`.
 pub(crate) fn status_label(
     total: usize,
     shown: Option<usize>,
     selected: usize,
     selected_bytes: u64,
+    kind: Option<&str>,
 ) -> String {
     if selected > 0 {
-        return format!(
-            "{selected} selected \u{b7} {}",
-            format_bytes(selected_bytes)
-        );
+        let size = format_bytes(selected_bytes);
+        return match kind.filter(|_| selected == 1) {
+            Some(kind) => format!("{selected} selected \u{b7} {kind} \u{b7} {size}"),
+            None => format!("{selected} selected \u{b7} {size}"),
+        };
     }
     match shown {
         Some(shown) => format!("{shown} of {total} shown"),
@@ -597,12 +601,22 @@ mod tests {
         assert_eq!(folder_counts_label(&[make(EntryKind::File)]), "1 file");
         assert_eq!(folder_counts_label(&[]), "empty");
 
-        assert_eq!(status_label(1, None, 0, 0), "1 item");
-        assert_eq!(status_label(12, None, 0, 0), "12 items");
-        assert_eq!(status_label(12, Some(3), 0, 0), "3 of 12 shown");
+        assert_eq!(status_label(1, None, 0, 0, None), "1 item");
+        assert_eq!(status_label(12, None, 0, 0, None), "12 items");
+        assert_eq!(status_label(12, Some(3), 0, 0, None), "3 of 12 shown");
         assert_eq!(
-            status_label(12, None, 3, 12_400_000),
+            status_label(12, None, 3, 12_400_000, None),
             "3 selected \u{b7} 12.4 MB"
+        );
+        // One entry selected: its kind names the file, the size follows.
+        assert_eq!(
+            status_label(1, None, 1, 56_300, Some("Document \u{b7} PDF")),
+            "1 selected \u{b7} Document \u{b7} PDF \u{b7} 56.3 KB"
+        );
+        // Several entries have no single kind.
+        assert_eq!(
+            status_label(12, None, 2, 900, Some("Document \u{b7} PDF")),
+            "2 selected \u{b7} 900 B"
         );
     }
 
