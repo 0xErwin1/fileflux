@@ -498,7 +498,8 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
 /// What the preview box shows for a file: the image itself when the app
 /// decodes it, else the thumbnail an installed freedesktop thumbnailer made
 /// (a video's frame, a PDF's page, an office document's first page) once the
-/// background job has it. `None` keeps the type glyph.
+/// background job has it. `None` keeps the type's icon — the installed
+/// theme's when it has one, else the type glyph.
 fn preview_source(this: &Explorer, entry: &Entry) -> Option<PathBuf> {
     if fileflux::core::thumbnails::is_decodable_image(&entry.path) {
         return Some(entry.path.clone());
@@ -509,25 +510,37 @@ fn preview_source(this: &Explorer, entry: &Entry) -> Option<PathBuf> {
         .and_then(|thumb| thumb.found.clone())
 }
 
+/// The theme icon of a plain file entry: symlinks and broken links keep
+/// their Lucide glyphs, so they never get one.
+fn file_theme_icon(entry: &Entry) -> Option<PathBuf> {
+    (!entry.is_symlink)
+        .then(|| fileflux::core::icons::for_file(&entry.name))
+        .flatten()
+}
+
 fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
     let colors = bolt::colors(cx);
+    let theme = file_theme_icon(entry);
     let tile: AnyElement = if entry.is_directory() {
         folder_glyph(cx)
     } else if entries::has_thumbnail(&entry.name) {
         let glyph = entries::file_glyph(&entry.name);
         let muted = colors.muted;
         let picture = match preview_source(this, entry) {
-            Some(source) => gpui::img(source)
-                .size_full()
-                .object_fit(gpui::ObjectFit::Contain)
-                .with_loading(move || glyph_only(glyph, muted))
-                .with_fallback(move || glyph_only(glyph, muted))
-                .into_any_element(),
-            None => glyph_only(glyph, muted),
+            Some(source) => {
+                let loading = theme.clone();
+                gpui::img(source)
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Contain)
+                    .with_loading(move || glyph_only(loading.clone(), glyph, muted))
+                    .with_fallback(move || glyph_only(theme.clone(), glyph, muted))
+                    .into_any_element()
+            }
+            None => glyph_only(theme, glyph, muted),
         };
         picture
     } else {
-        glyph_only(entries::file_glyph(&entry.name), colors.muted)
+        glyph_only(theme, entries::file_glyph(&entry.name), colors.muted)
     };
 
     let mut rows = Vec::new();
@@ -608,13 +621,22 @@ fn many_selected(selected: &[&Entry], cx: &mut Context<Explorer>) -> Vec<AnyElem
     ]
 }
 
-fn glyph_only(name: gpui_kit_assets::IconName, color: Hsla) -> AnyElement {
+/// The preview box's fallback art for a file, centered: the installed
+/// theme's icon for its type when it has one, else the large Lucide glyph.
+fn glyph_only(theme: Option<PathBuf>, name: gpui_kit_assets::IconName, color: Hsla) -> AnyElement {
     div()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
-        .child(Icon::new(icon(name)).size(px(PREVIEW_GLYPH)).color(color))
+        .child(
+            entries::theme_icon(theme, color, PREVIEW_GLYPH).unwrap_or_else(|| {
+                Icon::new(icon(name))
+                    .size(px(PREVIEW_GLYPH))
+                    .color(color)
+                    .into_any_element()
+            }),
+        )
         .into_any_element()
 }
 

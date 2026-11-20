@@ -92,6 +92,23 @@ pub fn of_extension(extension: &str) -> Option<&'static str> {
         "md" | "markdown" => "text/markdown",
         "html" | "htm" => "text/html",
         "css" => "text/css",
+        // Scripts, source code and the data formats around them, which the
+        // icon theme names per type (see [`icons`]).
+        "sh" | "bash" | "zsh" | "fish" => "application/x-shellscript",
+        "py" => "text/x-python",
+        "rs" => "text/rust",
+        "blend" => "application/x-blender",
+        "pl" => "text/x-perl",
+        "rb" => "application/x-ruby",
+        "lua" => "text/x-lua",
+        "js" | "mjs" => "text/javascript",
+        "ts" => "text/x-typescript",
+        "json" => "application/json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "nix" => "text/x-nix",
+        "desktop" => "application/x-desktop",
+        "diff" | "patch" => "text/x-diff",
         _ => return None,
     })
 }
@@ -138,6 +155,39 @@ mod tests {
         assert_eq!(of_name(OsStr::new(".bashrc")), None, "no extension");
         assert_eq!(of_name(OsStr::new("blender")), None);
         assert_eq!(of_name(OsStr::new("x.unknownext")), None);
+    }
+
+    #[test]
+    fn scripts_and_source_files_name_their_mime_type() {
+        assert_eq!(of_extension("sh"), Some("application/x-shellscript"));
+        assert_eq!(of_extension("bash"), Some("application/x-shellscript"));
+        assert_eq!(of_extension("zsh"), Some("application/x-shellscript"));
+        assert_eq!(of_extension("fish"), Some("application/x-shellscript"));
+        assert_eq!(of_extension("py"), Some("text/x-python"));
+        assert_eq!(of_extension("rs"), Some("text/rust"));
+        assert_eq!(of_extension("blend"), Some("application/x-blender"));
+        assert_eq!(of_extension("pl"), Some("text/x-perl"));
+        assert_eq!(of_extension("rb"), Some("application/x-ruby"));
+        assert_eq!(of_extension("lua"), Some("text/x-lua"));
+        assert_eq!(of_extension("js"), Some("text/javascript"));
+        assert_eq!(of_extension("mjs"), Some("text/javascript"));
+        assert_eq!(of_extension("ts"), Some("text/x-typescript"));
+        assert_eq!(of_extension("json"), Some("application/json"));
+        assert_eq!(of_extension("toml"), Some("application/toml"));
+        assert_eq!(of_extension("yaml"), Some("application/yaml"));
+        assert_eq!(of_extension("yml"), Some("application/yaml"));
+        assert_eq!(of_extension("nix"), Some("text/x-nix"));
+        assert_eq!(of_extension("desktop"), Some("application/x-desktop"));
+        assert_eq!(of_extension("diff"), Some("text/x-diff"));
+        assert_eq!(of_extension("patch"), Some("text/x-diff"));
+        // No thumbnailer claims any of them: the type keeps its glyph.
+        for extension in [
+            "sh", "py", "rs", "blend", "pl", "rb", "lua", "js", "ts", "json", "toml", "yaml",
+            "nix", "desktop", "diff",
+        ] {
+            let mime = of_extension(extension).unwrap_or_default();
+            assert!(!may_have_preview(mime), "{extension} keeps its glyph");
+        }
     }
 
     #[test]

@@ -70,6 +70,8 @@ pub(crate) const DRAG_EPSILON: f32 = 0.5;
 
 const COLUMN_NAMES: [&str; COLUMN_COUNT] = ["Name", "Size", "Modified"];
 const SIZE_COLUMN: usize = 1;
+/// Size of a list row's leading glyph.
+const LIST_ROW_GLYPH: f32 = 14.0;
 
 /// A cell's presentation, decided by pure functions so the mapping tests
 /// read the same truth the cells render.
@@ -541,14 +543,16 @@ impl TableDelegate for EntryTableDelegate {
                 Glyph::BrokenLink => colors.warning,
                 Glyph::File | Glyph::Symlink => colors.muted,
             };
+            // A plain file prefers the installed theme's icon for its type;
+            // folders, symlinks and broken links keep their Lucide glyphs.
             let icon = match glyph {
-                Glyph::File => entries::file_glyph(&entry.name),
-                glyph => glyph.icon_name(),
+                Glyph::File => entries::file_icon(&entry.name, color, LIST_ROW_GLYPH),
+                glyph => Icon::new(super::icon(glyph.icon_name()))
+                    .size(px(LIST_ROW_GLYPH))
+                    .color(color)
+                    .into_any_element(),
             };
-            cell = cell
-                .gap(px(6.0))
-                .flex_none()
-                .child(Icon::new(super::icon(icon)).size(px(14.0)).color(color));
+            cell = cell.gap(px(6.0)).flex_none().child(icon);
         }
         match editing {
             Some(view) => cell

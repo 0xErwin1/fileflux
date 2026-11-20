@@ -2,13 +2,17 @@
 //! the explorer or viewer window inside `gpui_component`'s [`Root`], reusing the
 //! startup lifecycle the setup screen proved.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Result;
 use fileflux::cli::Target;
-use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext as _, AssetSource, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px,
+    size,
+};
 use gpui_component::Root;
 
 use crate::explorer::persist::Startup;
@@ -61,11 +65,38 @@ pub(crate) fn open(target: Target) -> std::process::ExitCode {
     }
 }
 
-/// The Lucide icons gpui-component bundles, which Bolt's `IconSource::Svg`
-/// draws. Pass it to `application().with_assets`; without it, icons paint
-/// nothing.
+/// The Lucide icons gpui-component bundles plus the installed icon theme's
+/// files: relative paths keep coming from the bundled catalog, and a path
+/// starting with `/` — an icon `core::icons` resolved on disk — is read
+/// from the filesystem, which is what lets a theme SVG render through
+/// `svg().path(...)`. Pass it to `application().with_assets`; without it,
+/// icons paint nothing.
 fn assets() -> impl gpui::AssetSource {
-    gpui_kit_assets::AllAssets
+    ThemeAssets
+}
+
+/// The asset source behind [`assets`]: everything the bundled Lucide
+/// catalog serves, with absolute paths read from disk on top.
+#[derive(Clone, Copy, Debug, Default)]
+struct ThemeAssets;
+
+impl AssetSource for ThemeAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path.starts_with('/') {
+            return match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(Cow::Owned(bytes))),
+                Err(error) => {
+                    log::debug!("cannot read the theme icon {path}: {error}");
+                    Ok(None)
+                }
+            };
+        }
+        gpui_kit_assets::AllAssets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<gpui::SharedString>> {
+        gpui_kit_assets::AllAssets.list(path)
+    }
 }
 
 /// Installs the theme, binds the explorer's keys and opens the explorer
@@ -108,4 +139,45 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Absolute paths are read from disk — an icon the theme resolved — a
+    /// missing one is no asset rather than an error, and relative paths keep
+    /// delegating to the bundled Lucide catalog: its icons still arrive and
+    /// its own missing-asset error for unknown names is kept.
+    #[test]
+    fn theme_assets_read_absolute_paths_and_delegate_the_rest() {
+        let scratch =
+            std::env::temp_dir().join(format!("fileflux-theme-assets-test-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&scratch));
+        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let icon = scratch.join("application-x-blender.svg");
+        std::fs::write(&icon, b"<svg/>").expect("icon file");
+
+        let loaded = ThemeAssets.load(&icon.to_string_lossy()).expect("read");
+        assert_eq!(loaded, Some(Cow::Borrowed(b"<svg/>".as_slice())));
+        assert_eq!(
+            ThemeAssets
+                .load(&scratch.join("missing.svg").to_string_lossy())
+                .expect("read"),
+            None,
+            "an unreadable absolute path is no asset, not an error"
+        );
+
+        let bundled = gpui_kit_assets::IconName::File.path();
+        assert!(
+            ThemeAssets.load(&bundled).expect("bundled icon").is_some(),
+            "the bundled Lucide catalog still serves its icons"
+        );
+        assert!(
+            ThemeAssets.load("icons/no-such-icon.svg").is_err(),
+            "the catalog's own error for unknown names is kept"
+        );
+
+        drop(std::fs::remove_dir_all(&scratch));
+    }
 }

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Icons from the installed freedesktop icon theme: a file shows the icon of the application that handles it — Blender's for `.blend`, the script icon for a shell script, the document icon for a PDF — taken from the theme the desktop is configured to use (`gtk-3.0/settings.ini`, its `Inherits=` chain, then `Adwaita`, `breeze`, `Papirus` and `hicolor`), remembered per file type so nothing probes per tile. Types the theme does not name keep the extension-derived glyph.
 - Previews for what the app cannot decode itself: videos, PDFs, office documents and vector images get a thumbnail in the grid and the details panel from the freedesktop thumbnailers installed on the system (`~/.local/share/thumbnailers` and every `$XDG_DATA_DIRS/*/thumbnailers`), the same commands pcmanfm, Nautilus and Thunar use — `ffmpegthumbnailer` or `totem-video-thumbnailer` for video, `evince`'s or poppler's for PDF. Each one runs without a shell, is killed after 10 s, and its output is decoded and rewritten into `~/.cache/thumbnails` as the standard requires, so the other file managers reuse it. With no thumbnailer installed for a type, the tile keeps its kind glyph.
 - The status bar names the selected file's type when exactly one entry is selected: `1 selected · Document · PDF · 56.3 KB`, using the same label the details panel shows.
 

@@ -9,6 +9,7 @@ pub mod apps;
 pub mod bookmarks;
 pub mod devices;
 pub mod fs;
+pub mod icons;
 pub mod images;
 pub mod kinds;
 pub mod mimes;
