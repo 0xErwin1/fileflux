@@ -1713,10 +1713,12 @@ dependencies = [
  "md-5",
  "png 0.18.1",
  "quick-xml",
+ "resvg 0.46.0",
  "rustix",
  "serde",
  "serde_json",
  "toml 1.2.1+spec-1.1.0",
+ "usvg 0.46.0",
 ]
 
 [[package]]

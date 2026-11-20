@@ -57,6 +57,12 @@ serde_json = { version = "=1.0.154", default-features = false, features = ["std"
 quick-xml = { version = "=0.41.0", default-features = false }
 md-5 = { version = "=0.10.6", default-features = false }
 png = { version = "=0.18.1", default-features = false }
+# The SVG rasterizer the GPUI stack already links (gpui-pre renders its own
+# SVGs with it), taken directly only to rasterize themed icons in colour;
+# the `=` pins reuse the exact builds already in the lock, so no new crates
+# compile.
+resvg = { version = "=0.46.0" }
+usvg = { version = "=0.46.0" }
 
 [features]
 default = []

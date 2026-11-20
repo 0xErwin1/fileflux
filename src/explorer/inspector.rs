@@ -622,7 +622,8 @@ fn many_selected(selected: &[&Entry], cx: &mut Context<Explorer>) -> Vec<AnyElem
 }
 
 /// The preview box's fallback art for a file, centered: the installed
-/// theme's icon for its type when it has one, else the large Lucide glyph.
+/// theme's icon for its type when it has one — rasterized in the theme's
+/// own colours, like the grid's tiles — else the large Lucide glyph.
 fn glyph_only(theme: Option<PathBuf>, name: gpui_kit_assets::IconName, color: Hsla) -> AnyElement {
     div()
         .size_full()
@@ -630,7 +631,7 @@ fn glyph_only(theme: Option<PathBuf>, name: gpui_kit_assets::IconName, color: Hs
         .items_center()
         .justify_center()
         .child(
-            entries::theme_icon(theme, color, PREVIEW_GLYPH).unwrap_or_else(|| {
+            entries::theme_icon(theme, PREVIEW_GLYPH).unwrap_or_else(|| {
                 Icon::new(icon(name))
                     .size(px(PREVIEW_GLYPH))
                     .color(color)

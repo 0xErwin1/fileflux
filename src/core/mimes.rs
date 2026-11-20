@@ -88,7 +88,12 @@ pub fn of_extension(extension: &str) -> Option<&'static str> {
         "ppt" => "application/vnd.ms-powerpoint",
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "odp" => "application/vnd.oasis.opendocument.presentation",
-        "txt" => "text/plain",
+        // Common text the theme does not name per type — logs, lock files,
+        // INI-style configuration, and the git/docker/editor dotfile names
+        // (which arrive here as extensions once the leading dot is gone) —
+        // all draw the plain-text icon.
+        "txt" | "log" | "lock" | "cfg" | "conf" | "ini" | "gitignore" | "gitattributes"
+        | "dockerignore" | "editorconfig" => "text/plain",
         "md" | "markdown" => "text/markdown",
         "html" | "htm" => "text/html",
         "css" => "text/css",
@@ -199,5 +204,38 @@ mod tests {
         assert!(!previewable(OsStr::new("a.rs")));
         assert!(!previewable(OsStr::new("Makefile")));
         assert!(!may_have_preview("text/plain"));
+    }
+
+    /// Common text the theme would otherwise not name still resolves to
+    /// `text/plain`, so those files draw the plain-text icon instead of the
+    /// generic file one: logs, lock files, INI-style configuration, and the
+    /// git/docker/editor dotfile names, which reach the table as extensions
+    /// once the leading dot is gone. None of them may preview — a text file
+    /// has no thumbnail, only its icon.
+    #[test]
+    fn common_text_extensions_name_text_plain_and_never_preview() {
+        for extension in [
+            "log",
+            "lock",
+            "cfg",
+            "conf",
+            "ini",
+            "gitignore",
+            "gitattributes",
+            "dockerignore",
+            "editorconfig",
+        ] {
+            assert_eq!(
+                of_extension(extension),
+                Some("text/plain"),
+                "{extension} is plain text"
+            );
+        }
+        assert_eq!(of_name(OsStr::new("install.log")), Some("text/plain"));
+        assert_eq!(of_name(OsStr::new("package.lock")), Some("text/plain"));
+        assert_eq!(of_name(OsStr::new("Cargo.cfg")), Some("text/plain"));
+        assert!(!previewable(OsStr::new("install.log")));
+        assert!(!previewable(OsStr::new("x.gitignore")));
+        assert!(!may_have_preview("text/plain"), "text never previews");
     }
 }

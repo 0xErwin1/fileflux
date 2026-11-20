@@ -97,7 +97,7 @@ A segmented toggle in the toolbar switches between two presentations. The toggle
 
 Sizes use one SI formatter everywhere. Modified dates are shown in UTC.
 
-File icons come from the freedesktop icon theme the desktop is configured to use, so a Blender file, a shell script, a PDF or a spreadsheet shows the icon of the application that handles it. The lookup follows `gtk-icon-theme-name` in `~/.config/gtk-3.0/settings.ini`, that theme's `Inherits=` chain, and then `Adwaita`, `breeze`, `Papirus` and `hicolor`, in `$XDG_DATA_HOME/icons` and every `$XDG_DATA_DIRS/*/icons`; each type is resolved once per session. Types the theme has nothing for keep the built-in glyph. GPUI draws an SVG as a single-colour shape, so a themed icon appears as its silhouette in the row's text colour; where a theme ships a PNG it is drawn as it is.
+File icons come from the freedesktop icon theme the desktop is configured to use, so a Blender file, a shell script, a PDF or a spreadsheet shows the icon of the application that handles it. The lookup follows `gtk-icon-theme-name` in `~/.config/gtk-3.0/settings.ini`, that theme's `Inherits=` chain, and then `Adwaita`, `breeze`, `Papirus` and `hicolor`, in `$XDG_DATA_HOME/icons` and every `$XDG_DATA_DIRS/*/icons`; each type is resolved once per session. Themed icons keep their colours because Fileflux rasterizes them at the size it draws, and a type the theme does not name keeps the built-in glyph.
 
 ## Sort and filter
 

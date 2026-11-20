@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use bolt::composites::ListRow;
@@ -25,10 +25,11 @@ use fileflux::core::places::format_bytes;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Stateful, Styled, WeakEntity, Window,
-    canvas, div, prelude::*, px,
+    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, RenderImage, Stateful, Styled,
+    WeakEntity, Window, canvas, div, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
+use image::{Frame, RgbaImage};
 
 use super::actions::{MenuOn, RenameView};
 use super::dnd::{self, DropTarget};
@@ -198,38 +199,59 @@ fn file_glyph_element(name: gpui_kit_assets::IconName, color: Hsla, size: f32) -
 
 /// The icon of a file's type, `size` pixels square: the installed icon
 /// theme's icon when it has one — Blender's for `.blend`, the script glyph
-/// for a shell script, the document glyph for a PDF — else the bundled
-/// Lucide glyph [`file_glyph`] picks. `color` draws the Lucide glyph and
-/// tints a theme SVG, so both sit the same in their spot. Folders,
-/// symlinks and broken links never come here: they keep their own art.
+/// for a shell script, the document glyph for a PDF — rasterized in the
+/// theme's own colours (see [`theme_icon`]); else the bundled Lucide glyph
+/// [`file_glyph`] picks, drawn in `color`. Folders, symlinks and broken
+/// links never come here: they keep their own art.
 pub(crate) fn file_icon(name: &OsStr, color: Hsla, size: f32) -> gpui::AnyElement {
-    theme_icon(fileflux::core::icons::for_file(name), color, size)
+    theme_icon(fileflux::core::icons::for_file(name), size)
         .unwrap_or_else(|| file_glyph_element(file_glyph(name), color, size))
 }
 
-/// A theme icon file drawn `size` pixels square: an SVG through GPUI's
-/// svg element — the app's asset source (see `gui.rs`) reads absolute
-/// paths from disk — and a PNG as an image, the element that rasterizes
-/// it. `None` without a file, so the caller keeps its Lucide glyph.
-pub(crate) fn theme_icon(
-    found: Option<PathBuf>,
-    color: Hsla,
-    size: f32,
-) -> Option<gpui::AnyElement> {
+/// Every theme icon drawn so far, rasterized once: keyed by the icon's
+/// file and its box in whole pixels, so each (icon, size) is rasterized on
+/// its first frame only — never again per frame per tile — and a raster
+/// that failed once (`None`) is not retried either.
+static RASTERS: LazyLock<Mutex<Rasters>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The rasterized theme icons: the icon file and its box in whole pixels
+/// to the drawn image (`None` when rasterizing that icon failed).
+type Rasters = HashMap<(PathBuf, u32), Option<Arc<RenderImage>>>;
+
+/// The theme icon at `path` rasterized in colour into `size`-pixel square
+/// pixels, memoized per (path, size) for the whole process (see
+/// [`RASTERS`]). GPUI's image pipeline draws BGRA, so the raster's straight
+/// RGBA is channel-swapped on the way in — the same swap GPUI's own image
+/// loader applies to decoded files. `None` when the icon cannot be
+/// rasterized.
+fn rasterized(path: &Path, size: u32) -> Option<Arc<RenderImage>> {
+    let mut rasters = RASTERS.lock().unwrap_or_else(PoisonError::into_inner);
+    rasters
+        .entry((path.to_owned(), size))
+        .or_insert_with(|| {
+            let rendered = fileflux::core::icons::render(path, size)?;
+            let mut pixels = RgbaImage::from_raw(rendered.width, rendered.height, rendered.rgba)?;
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                // Straight RGBA to straight BGRA, the byte order GPUI draws.
+                pixel.swap(0, 2);
+            }
+            Some(Arc::new(RenderImage::new([Frame::new(pixels)])))
+        })
+        .clone()
+}
+
+/// A theme icon file drawn `size` pixels square: rasterized in the theme's
+/// own colours (see [`rasterized`]) and drawn as an image, because GPUI's
+/// `svg` element paints an alpha mask — one single-colour silhouette,
+/// which is exactly what a themed icon must not be. `None` without a file
+/// or without a rasterizable one, so the caller keeps its Lucide glyph.
+pub(crate) fn theme_icon(found: Option<PathBuf>, size: f32) -> Option<gpui::AnyElement> {
     let path = found?;
-    let size = px(size);
-    if path.extension().is_some_and(|extension| extension == "svg") {
-        Some(
-            gpui::svg()
-                .path(path.to_string_lossy().into_owned())
-                .w(size)
-                .h(size)
-                .text_color(color)
-                .into_any_element(),
-        )
-    } else {
-        Some(gpui::img(path).w(size).h(size).into_any_element())
-    }
+    // Whole pixels for the raster and the memo key, so a fractional box
+    // never rasterizes the same icon twice as two sizes.
+    let pixels = size.round().max(1.0) as u32;
+    let image = rasterized(&path, pixels)?;
+    Some(gpui::img(image).w(px(size)).h(px(size)).into_any_element())
 }
 
 /// What the background lookup found for one image: its thumbnail (cached or
@@ -351,7 +373,7 @@ fn centered_art(
     glyph: gpui_kit_assets::IconName,
     color: Hsla,
 ) -> gpui::AnyElement {
-    match theme_icon(theme, color, PHOTO_GLYPH) {
+    match theme_icon(theme, PHOTO_GLYPH) {
         Some(art) => div()
             .size_full()
             .flex()
@@ -1249,5 +1271,42 @@ mod tests {
         let (keep, todo) = plan_thumbnails(std::slice::from_ref(&entry), &[0], &known, false);
         assert_eq!(keep.len(), 1);
         assert_eq!(todo.len(), 1);
+    }
+
+    /// A scratch directory under the temporary directory, unique per
+    /// process, empty at the start and removed by the test that made it.
+    #[allow(clippy::expect_used)]
+    fn scratch(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fileflux-entries-test-{tag}-{}",
+            std::process::id()
+        ));
+        drop(std::fs::remove_dir_all(&path));
+        std::fs::create_dir_all(&path).expect("scratch directory");
+        path
+    }
+
+    /// The theme-icon memo: two asks for the same (icon file, size) get
+    /// the same rasterized image, so an icon is rasterized once per
+    /// process — never again per frame per tile.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_same_icon_and_size_rasterize_once() {
+        let root = scratch("memo");
+        let icon = root.join("red.svg");
+        std::fs::write(
+            &icon,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><rect width=\"64\" height=\"64\" fill=\"#ff0000\"/></svg>",
+        )
+        .expect("icon SVG");
+        let first = rasterized(&icon, 32).expect("the icon rasterizes");
+        let second = rasterized(&icon, 32).expect("the memo answers");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second ask reuses the first raster instead of rasterizing again"
+        );
+        let rasters = RASTERS.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(rasters.len(), 1, "exactly one (icon, size) was rasterized");
+        drop(std::fs::remove_dir_all(&root));
     }
 }

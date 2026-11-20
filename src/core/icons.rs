@@ -6,6 +6,12 @@
 //! names nothing for the type, [`for_file`] answers `None` and the caller
 //! keeps its bundled glyph.
 //!
+//! An icon is only worth drawing in its colours, and GPUI's own SVG
+//! element paints an alpha mask — one single-colour silhouette — so the
+//! found file is rasterized here instead: SVGs with the `resvg` the GPUI
+//! stack already links, raster icons with the `image` crate, at the size
+//! the caller draws (see [`render`]).
+//!
 //! Resolution is deliberately a fixed probe, not the full icon-theme spec:
 //! the themes named by GTK 3's settings and their `Inherits=` chains
 //! first, then `Adwaita`, `breeze`, `Papirus` and `hicolor`; and under a
@@ -50,6 +56,131 @@ pub fn for_file(name: &OsStr) -> Option<PathBuf> {
 /// is probed once, not per file.
 static CACHE: LazyLock<Mutex<HashMap<String, Option<PathBuf>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A themed icon rasterized in full colour, at the size a view draws it:
+/// GPUI's own SVG element paints an alpha mask, so every themed icon
+/// would become one single-colour silhouette — the colour is rasterized
+/// here instead (see [`render`]).
+#[derive(Debug)]
+pub struct RenderedIcon {
+    /// The raster's width in pixels.
+    pub width: u32,
+    /// The raster's height in pixels.
+    pub height: u32,
+    /// The pixels: straight (not premultiplied) RGBA, row-major, exactly
+    /// `4 × width × height` bytes.
+    pub rgba: Vec<u8>,
+}
+
+/// The icon file at `path` rasterized in full colour, its longest edge
+/// `size` pixels: an SVG is parsed and rendered with the `resvg` the GPUI
+/// stack already links and scales freely to the box; a raster icon (PNG,
+/// JPG, WebP, BMP) is decoded with the `image` crate and only ever scaled
+/// down, never up beyond its own pixels. `None` on any failure — unreadable,
+/// unparseable, undecodable — logged at debug level, so the caller keeps
+/// its bundled glyph.
+#[must_use]
+pub fn render(path: &Path, size: u32) -> Option<RenderedIcon> {
+    let size = size.max(1);
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::debug!("could not read icon {}: {error}", path.display());
+            return None;
+        }
+    };
+    match path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("svg") => render_svg(&bytes, size),
+        Some("png" | "jpg" | "jpeg" | "webp" | "bmp") => render_raster(&bytes, size),
+        _ => {
+            log::debug!("unsupported icon format: {}", path.display());
+            None
+        }
+    }
+}
+
+/// An SVG icon rasterized with its longest edge `size` pixels, the other
+/// edge keeping its aspect (an SVG scales freely, up and down). `resvg`
+/// writes premultiplied alpha, un-premultiplied here because GPUI's image
+/// pipeline draws straight alpha.
+fn render_svg(bytes: &[u8], size: u32) -> Option<RenderedIcon> {
+    let tree = match usvg::Tree::from_data(bytes, &usvg::Options::default()) {
+        Ok(tree) => tree,
+        Err(error) => {
+            log::debug!("could not parse an icon SVG: {error}");
+            return None;
+        }
+    };
+    let svg = tree.size();
+    let longest = svg.width().max(svg.height());
+    if !longest.is_finite() || longest <= 0.0 {
+        log::debug!("an icon SVG has no drawable size");
+        return None;
+    }
+    // The box in whole pixels: the longest edge is `size` exactly, the
+    // other edge rounds to its nearest pixel.
+    let scale = size as f32 / longest;
+    let width = (svg.width() * scale).round().clamp(1.0, size as f32) as u32;
+    let height = (svg.height() * scale).round().clamp(1.0, size as f32) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(
+            width as f32 / svg.width(),
+            height as f32 / svg.height(),
+        ),
+        &mut pixmap.as_mut(),
+    );
+    Some(unpremultiply(pixmap.take(), width, height))
+}
+
+/// A raster icon decoded with the `image` crate, fitted inside `size` and
+/// never scaled up: a raster icon ships the pixels it wants, so only a
+/// larger one is scaled down to fit the box.
+fn render_raster(bytes: &[u8], size: u32) -> Option<RenderedIcon> {
+    let icon = match image::load_from_memory(bytes) {
+        Ok(icon) => icon,
+        Err(error) => {
+            log::debug!("could not decode an icon image: {error}");
+            return None;
+        }
+    };
+    let icon = if icon.width().max(icon.height()) > size {
+        icon.thumbnail(size, size)
+    } else {
+        icon
+    };
+    let raster = icon.to_rgba8();
+    let (width, height) = (raster.width(), raster.height());
+    Some(RenderedIcon {
+        width,
+        height,
+        rgba: raster.into_raw(),
+    })
+}
+
+/// Premultiplied RGBA pixels — what `resvg` writes — as straight RGBA,
+/// the alpha the `image` crate produces and GPUI's image pipeline draws.
+fn unpremultiply(mut pixels: Vec<u8>, width: u32, height: u32) -> RenderedIcon {
+    for [red, green, blue, alpha] in pixels.as_chunks_mut::<4>().0 {
+        let alpha = f32::from(*alpha) / 255.0;
+        if alpha > 0.0 {
+            for channel in [red, green, blue] {
+                *channel = (f32::from(*channel) / alpha).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    RenderedIcon {
+        width,
+        height,
+        rgba: pixels,
+    }
+}
 
 /// The resolved lookup world: the theme roots and the themes to try, in
 /// order. Read from the process environment once, not per call.
@@ -455,6 +586,108 @@ mod tests {
             Some(configured),
             "the theme list is tried in order, the configured theme first"
         );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The pixel at `(x, y)` of `rendered`, `[r, g, b, a]`, or `None`
+    /// outside it. Reads the public fields, never the rasterizer.
+    fn pixel_at(rendered: &RenderedIcon, x: u32, y: u32) -> Option<[u8; 4]> {
+        let row = rendered
+            .rgba
+            .chunks_exact(rendered.width as usize * 4)
+            .nth(y as usize)?;
+        row.as_chunks::<4>().0.get(x as usize).copied()
+    }
+
+    /// A themed SVG icon rasterizes in colour at the asked size: a solid
+    /// red square becomes 32×32 with an opaque red centre pixel — the
+    /// colour GPUI's own SVG element, which paints an alpha mask, would
+    /// flatten into one single-colour silhouette.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn an_svg_icon_rasterizes_in_colour_at_the_asked_size() {
+        let root = scratch("render-svg");
+        let icon = root.join("red.svg");
+        std::fs::write(
+            &icon,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><rect width=\"64\" height=\"64\" fill=\"#ff0000\"/></svg>",
+        )
+        .expect("icon SVG");
+        let rendered = render(&icon, 32).expect("the SVG rasterizes");
+        assert_eq!((rendered.width, rendered.height), (32, 32));
+        assert_eq!(
+            pixel_at(&rendered, 16, 16),
+            Some([255, 0, 0, 255]),
+            "the centre keeps the theme's own opaque red"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The asked size is the icon's longest edge and the other edge keeps
+    /// its aspect: a 100×40 SVG rendered at 32 is 32×13 (40 · 32⁄100 =
+    /// 12.8, rounded).
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_asked_size_is_a_non_square_svg_longest_edge() {
+        let root = scratch("render-wide");
+        let icon = root.join("wide.svg");
+        std::fs::write(
+            &icon,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"40\"><rect width=\"100\" height=\"40\" fill=\"#00ff00\"/></svg>",
+        )
+        .expect("icon SVG");
+        let rendered = render(&icon, 32).expect("the SVG rasterizes");
+        assert_eq!(rendered.width, 32, "the longest edge becomes the size");
+        assert_eq!(rendered.height, 13, "the short edge keeps its aspect");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A raster icon decodes with its own pixels, is never scaled up, and
+    /// one larger than the box is scaled down to fit it.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_png_icon_decodes_and_only_ever_scales_down() {
+        let root = scratch("render-png");
+        let small = root.join("small.png");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            24,
+            24,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .save(&small)
+        .expect("small icon PNG");
+        let rendered = render(&small, 32).expect("the small PNG decodes");
+        assert_eq!(
+            (rendered.width, rendered.height),
+            (24, 24),
+            "never scaled up"
+        );
+        assert_eq!(pixel_at(&rendered, 12, 12), Some([10, 20, 30, 255]));
+
+        let wide = root.join("wide.png");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            48,
+            24,
+            image::Rgba([40, 50, 60, 255]),
+        ))
+        .save(&wide)
+        .expect("wide icon PNG");
+        let rendered = render(&wide, 24).expect("the wide PNG decodes");
+        assert_eq!(
+            (rendered.width, rendered.height),
+            (24, 12),
+            "scaled down to fit"
+        );
+        assert_eq!(pixel_at(&rendered, 12, 6), Some([40, 50, 60, 255]));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// An icon file that is not there rasterizes to nothing, so the caller
+    /// keeps its bundled glyph.
+    #[test]
+    fn a_missing_icon_file_rasterizes_to_nothing() {
+        let root = scratch("render-missing");
+        assert!(render(&root.join("gone.svg"), 32).is_none());
         drop(std::fs::remove_dir_all(&root));
     }
 
