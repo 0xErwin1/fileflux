@@ -529,7 +529,7 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
     } else if entries::has_thumbnail(&entry.name) {
         let glyph = entries::file_glyph(&entry.name);
         let muted = colors.muted;
-        let picture = match preview_source(this, entry) {
+        match preview_source(this, entry) {
             Some(source) => {
                 let loading = theme.clone();
                 gpui::img(source)
@@ -540,8 +540,7 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
                     .into_any_element()
             }
             None => glyph_only(theme, glyph, muted),
-        };
-        picture
+        }
     } else {
         glyph_only(theme, entries::file_glyph(&entry.name), colors.muted)
     };

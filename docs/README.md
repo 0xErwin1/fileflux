@@ -14,6 +14,7 @@ Fileflux is a Linux file explorer built with GPUI and Bolt. Start with the user 
 | Build, test and run it | [Development](development.md) |
 | Send a change | [Contributing](../CONTRIBUTING.md) |
 | See what changed | [Changelog](../CHANGELOG.md) |
+| See what is planned | [Roadmap](roadmap.md) |
 
 ## At a glance
 

@@ -148,32 +148,32 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     /// Absolute paths are read from disk — an icon the theme resolved — a
     /// missing one is no asset rather than an error, and relative paths keep
     /// delegating to the bundled Lucide catalog: its icons still arrive and
     /// its own missing-asset error for unknown names is kept.
     #[test]
-    fn theme_assets_read_absolute_paths_and_delegate_the_rest() {
+    fn theme_assets_read_absolute_paths_and_delegate_the_rest() -> TestResult {
         let scratch =
             std::env::temp_dir().join(format!("fileflux-theme-assets-test-{}", std::process::id()));
         drop(std::fs::remove_dir_all(&scratch));
-        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        std::fs::create_dir_all(&scratch)?;
         let icon = scratch.join("application-x-blender.svg");
-        std::fs::write(&icon, b"<svg/>").expect("icon file");
+        std::fs::write(&icon, b"<svg/>")?;
 
-        let loaded = ThemeAssets.load(&icon.to_string_lossy()).expect("read");
+        let loaded = ThemeAssets.load(&icon.to_string_lossy())?;
         assert_eq!(loaded, Some(Cow::Borrowed(b"<svg/>".as_slice())));
         assert_eq!(
-            ThemeAssets
-                .load(&scratch.join("missing.svg").to_string_lossy())
-                .expect("read"),
+            ThemeAssets.load(&scratch.join("missing.svg").to_string_lossy())?,
             None,
             "an unreadable absolute path is no asset, not an error"
         );
 
         let bundled = gpui_kit_assets::IconName::File.path();
         assert!(
-            ThemeAssets.load(&bundled).expect("bundled icon").is_some(),
+            ThemeAssets.load(&bundled)?.is_some(),
             "the bundled Lucide catalog still serves its icons"
         );
         assert!(
@@ -182,5 +182,6 @@ mod tests {
         );
 
         drop(std::fs::remove_dir_all(&scratch));
+        Ok(())
     }
 }

@@ -45,7 +45,7 @@ pub struct Thumbnailer {
 /// files (a file of the same name in a later directory is ignored).
 #[must_use]
 pub fn installed() -> &'static [Thumbnailer] {
-    static INSTALLED: LazyLock<Vec<Thumbnailer>> = LazyLock::new(|| discover_from_env());
+    static INSTALLED: LazyLock<Vec<Thumbnailer>> = LazyLock::new(discover_from_env);
     &INSTALLED
 }
 
@@ -229,10 +229,10 @@ fn substitute(token: &str, path: &str, uri: &str, output: &str, size: &str) -> S
 pub fn run(thumbnailer: &Thumbnailer, source: &Path, size: u32) -> Option<image::RgbaImage> {
     let output = temporary_output()?;
     let result = run_into(thumbnailer, source, &output, size);
-    if let Err(error) = std::fs::remove_file(&output) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            log::debug!("cannot remove the thumbnailer output: {error}");
-        }
+    if let Err(error) = std::fs::remove_file(&output)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        log::debug!("cannot remove the thumbnailer output: {error}");
     }
     result
 }
@@ -333,6 +333,8 @@ fn temporary_output() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     const VIDEO: &str = "[Thumbnailer Entry]
 TryExec=ffmpegthumbnailer
 Exec=/usr/bin/ffmpegthumbnailer -i %i -o %o -s %s -f
@@ -340,22 +342,23 @@ MimeType=video/mp4;video/x-matroska;
 ";
 
     #[test]
-    fn a_thumbnailer_names_its_command_and_its_types() {
-        let (exec, mimes) = parse(VIDEO).expect("a valid entry");
+    fn a_thumbnailer_names_its_command_and_its_types() -> TestResult {
+        let (exec, mimes) = parse(VIDEO).ok_or("a valid entry")?;
         assert_eq!(exec, "/usr/bin/ffmpegthumbnailer -i %i -o %o -s %s -f");
         assert_eq!(mimes, ["video/mp4", "video/x-matroska"]);
         // The wrong group, or a missing key, is not a thumbnailer.
         assert_eq!(parse("[Desktop Entry]\nExec=x\nMimeType=a\n"), None);
         assert_eq!(parse("[Thumbnailer Entry]\nMimeType=video/mp4;\n"), None);
         assert_eq!(parse("[Thumbnailer Entry]\nExec=x\n"), None);
+        Ok(())
     }
 
     #[test]
-    fn field_codes_become_arguments_without_a_shell() {
+    fn field_codes_become_arguments_without_a_shell() -> TestResult {
         let source = Path::new("/home/u/My Holiday.mp4");
         let output = Path::new("/tmp/out.png");
-        let (exec, _) = parse(VIDEO).expect("a valid entry");
-        let arguments = arguments(&exec, source, output, 256).expect("an argument list");
+        let (exec, _) = parse(VIDEO).ok_or("a valid entry")?;
+        let arguments = arguments(&exec, source, output, 256).ok_or("an argument list")?;
         assert_eq!(
             arguments,
             [
@@ -370,62 +373,73 @@ MimeType=video/mp4;video/x-matroska;
             ],
             "the path stays one argument, spaces and all"
         );
+        Ok(())
     }
 
     #[test]
-    fn a_uri_code_gets_the_thumbnailers_own_escaping() {
+    fn a_uri_code_gets_the_thumbnailers_own_escaping() -> TestResult {
         let arguments = arguments(
             "tool %u %o -s %s",
             Path::new("/home/u/a b.png"),
             Path::new("/tmp/o.png"),
             128,
         )
-        .expect("an argument list");
-        assert_eq!(arguments[1], "file:///home/u/a%20b.png");
-        assert_eq!(arguments[2], "/tmp/o.png");
-        assert_eq!(arguments[4], "128");
+        .ok_or("an argument list")?;
         assert_eq!(
-            super::arguments("tool %%", Path::new("/a"), Path::new("/b"), 1)
-                .expect("an argument list")[1],
-            "%"
+            arguments.get(1).map(String::as_str),
+            Some("file:///home/u/a%20b.png")
         );
+        assert_eq!(arguments.get(2).map(String::as_str), Some("/tmp/o.png"));
+        assert_eq!(arguments.get(4).map(String::as_str), Some("128"));
+        let percent = super::arguments("tool %%", Path::new("/a"), Path::new("/b"), 1)
+            .ok_or("an argument list")?;
+        assert_eq!(percent.get(1).map(String::as_str), Some("%"));
+        Ok(())
     }
 
     #[test]
-    fn user_directories_come_before_system_ones() {
-        let scratch = tempdir("order");
+    fn user_directories_come_before_system_ones() -> TestResult {
+        let scratch = tempdir("order")?;
         let user = scratch.join("user/thumbnailers");
         let system = scratch.join("system/thumbnailers");
-        std::fs::create_dir_all(&user).expect("user directory");
-        std::fs::create_dir_all(&system).expect("system directory");
-        std::fs::write(user.join("same.thumbnailer"), VIDEO).expect("user file");
+        std::fs::create_dir_all(&user)?;
+        std::fs::create_dir_all(&system)?;
+        std::fs::write(user.join("same.thumbnailer"), VIDEO)?;
         std::fs::write(
             system.join("same.thumbnailer"),
             VIDEO.replace("ffmpegthumbnailer", "shadowed"),
-        )
-        .expect("system file");
+        )?;
         std::fs::write(
             system.join("other.thumbnailer"),
             VIDEO.replace("video/mp4", "application/pdf"),
-        )
-        .expect("other file");
+        )?;
         let found = discover(&[scratch.join("user"), scratch.join("system")]);
         assert_eq!(found.len(), 2, "the shadowed file is used once");
-        assert!(found[0].exec.contains("ffmpegthumbnailer"));
-        assert_eq!(found[1].mime_types, ["application/pdf", "video/x-matroska"]);
+        assert!(
+            found
+                .first()
+                .ok_or("a first thumbnailer")?
+                .exec
+                .contains("ffmpegthumbnailer")
+        );
+        assert_eq!(
+            found.get(1).ok_or("a second thumbnailer")?.mime_types,
+            ["application/pdf", "video/x-matroska"]
+        );
         drop(std::fs::remove_dir_all(&scratch));
+        Ok(())
     }
 
     #[test]
-    fn a_missing_tool_leaves_no_thumbnail_and_no_leftovers() {
+    fn a_missing_tool_leaves_no_thumbnail_and_no_leftovers() -> TestResult {
         let thumbnailer = Thumbnailer {
             exec: "/nonexistent/thumbnailer %i %o".to_owned(),
             mime_types: vec!["video/mp4".to_owned()],
             path: PathBuf::from("test.thumbnailer"),
         };
-        let scratch = tempdir("missing");
+        let scratch = tempdir("missing")?;
         let source = scratch.join("a.mp4");
-        std::fs::write(&source, b"not a video").expect("fixture");
+        std::fs::write(&source, b"not a video")?;
         assert!(run(&thumbnailer, &source, 256).is_none());
         let leftovers = std::fs::read_dir(std::env::temp_dir())
             .map(|entries| {
@@ -442,15 +456,16 @@ MimeType=video/mp4;video/x-matroska;
             .unwrap_or(0);
         assert_eq!(leftovers, 0, "the temporary output is removed");
         drop(std::fs::remove_dir_all(&scratch));
+        Ok(())
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
+    fn tempdir(tag: &str) -> Result<PathBuf, std::io::Error> {
         let path = std::env::temp_dir().join(format!(
             "fileflux-thumbnailers-test-{tag}-{}",
             std::process::id()
         ));
         drop(std::fs::remove_dir_all(&path));
-        std::fs::create_dir_all(&path).expect("scratch directory");
-        path
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 }

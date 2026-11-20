@@ -38,9 +38,7 @@ use super::thumbnailers::data_directories;
 /// per process.
 #[must_use]
 pub fn for_file(name: &OsStr) -> Option<PathBuf> {
-    let Some(mime) = mimes::of_name(name) else {
-        return None;
-    };
+    let mime = mimes::of_name(name)?;
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(found) = cache.get(mime) {
         return found.clone();
@@ -241,7 +239,7 @@ fn resolve_in(roots: &[PathBuf], themes: &[String], mime: &str) -> Option<PathBu
 /// (`application/x-blender` → `application-x-blender`), then the family
 /// glyph for its top level and kind.
 fn candidate_names(mime: &str) -> Vec<String> {
-    let mut names = vec![mime.replace('/', "-").replace('.', "-")];
+    let mut names = vec![mime.replace(['/', '.'], "-")];
     names.extend(family_names(mime).iter().map(|name| (*name).to_owned()));
     names
 }
@@ -404,14 +402,16 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     /// A scratch directory under the temporary directory, unique per
     /// process, empty at the start and removed by the test that made it.
-    fn scratch(tag: &str) -> PathBuf {
+    fn scratch(tag: &str) -> Result<PathBuf, std::io::Error> {
         let path =
             std::env::temp_dir().join(format!("fileflux-icons-test-{tag}-{}", std::process::id()));
         drop(std::fs::remove_dir_all(&path));
-        std::fs::create_dir_all(&path).expect("scratch directory");
-        path
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 
     /// One icon file inside a theme, creating its directories.
@@ -422,29 +422,28 @@ mod tests {
         context: &str,
         name: &str,
         extension: &str,
-    ) -> PathBuf {
+    ) -> Result<PathBuf, std::io::Error> {
         let directory = root.join(theme).join(size).join(context);
-        std::fs::create_dir_all(&directory).expect("theme directory");
+        std::fs::create_dir_all(&directory)?;
         let path = directory.join(format!("{name}.{extension}"));
-        std::fs::write(&path, b"icon bytes").expect("icon file");
-        path
+        std::fs::write(&path, b"icon bytes")?;
+        Ok(path)
     }
 
     /// A theme's `index.theme`, with an `Inherits=` chain.
-    fn write_index(root: &Path, theme: &str, inherits: &str) {
-        std::fs::create_dir_all(root.join(theme)).expect("theme directory");
+    fn write_index(root: &Path, theme: &str, inherits: &str) -> Result<(), std::io::Error> {
+        std::fs::create_dir_all(root.join(theme))?;
         std::fs::write(
             root.join(theme).join("index.theme"),
             format!("[Icon Theme]\nName={theme}\nInherits={inherits}\n"),
         )
-        .expect("index.theme");
     }
 
     /// A theme that has the MIME-specific icon resolves it: a `.blend` file
     /// gets the theme's Blender icon.
     #[test]
-    fn a_mime_specific_icon_resolves() {
-        let root = scratch("mime-icon");
+    fn a_mime_specific_icon_resolves() -> TestResult {
+        let root = scratch("mime-icon")?;
         let icon = write_icon(
             &root,
             "hicolor",
@@ -452,10 +451,10 @@ mod tests {
             "mimetypes",
             "application-x-blender",
             "png",
-        );
+        )?;
         assert_eq!(
             for_file_in(
-                &[root.clone()],
+                std::slice::from_ref(&root),
                 &["hicolor".to_owned()],
                 OsStr::new("scene.blend")
             ),
@@ -463,13 +462,14 @@ mod tests {
             "a Blender file gets the theme's Blender icon"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// A family glyph covers the types the theme does not name itself: a
     /// video resolves to `video-x-generic`.
     #[test]
-    fn a_family_glyph_covers_what_the_theme_does_not_name() {
-        let root = scratch("family");
+    fn a_family_glyph_covers_what_the_theme_does_not_name() -> TestResult {
+        let root = scratch("family")?;
         let icon = write_icon(
             &root,
             "hicolor",
@@ -477,10 +477,10 @@ mod tests {
             "mimetypes",
             "video-x-generic",
             "png",
-        );
+        )?;
         assert_eq!(
             for_file_in(
-                &[root.clone()],
+                std::slice::from_ref(&root),
                 &["hicolor".to_owned()],
                 OsStr::new("clip.mp4")
             ),
@@ -488,13 +488,14 @@ mod tests {
             "a video with no specific icon gets the family glyph"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// The `scalable` SVG wins over the same icon as a `48x48` PNG: an SVG
     /// renders sharp at every size.
     #[test]
-    fn the_scalable_svg_wins_over_the_same_icon_as_a_png() {
-        let root = scratch("scalable");
+    fn the_scalable_svg_wins_over_the_same_icon_as_a_png() -> TestResult {
+        let root = scratch("scalable")?;
         write_icon(
             &root,
             "hicolor",
@@ -502,7 +503,7 @@ mod tests {
             "mimetypes",
             "application-x-blender",
             "png",
-        );
+        )?;
         let svg = write_icon(
             &root,
             "hicolor",
@@ -510,10 +511,10 @@ mod tests {
             "mimetypes",
             "application-x-blender",
             "svg",
-        );
+        )?;
         assert_eq!(
             for_file_in(
-                &[root.clone()],
+                std::slice::from_ref(&root),
                 &["hicolor".to_owned()],
                 OsStr::new("scene.blend")
             ),
@@ -521,13 +522,14 @@ mod tests {
             "the scalable SVG renders sharp at every size, so it is preferred"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// A type no theme names answers `None`, and a name with no MIME type
     /// never probes at all: the caller keeps its bundled glyph.
     #[test]
-    fn a_type_no_theme_names_has_no_icon() {
-        let root = scratch("none");
+    fn a_type_no_theme_names_has_no_icon() -> TestResult {
+        let root = scratch("none")?;
         write_icon(
             &root,
             "hicolor",
@@ -535,10 +537,10 @@ mod tests {
             "mimetypes",
             "video-x-generic",
             "png",
-        );
+        )?;
         assert_eq!(
             for_file_in(
-                &[root.clone()],
+                std::slice::from_ref(&root),
                 &["hicolor".to_owned()],
                 OsStr::new("notes.txt")
             ),
@@ -547,7 +549,7 @@ mod tests {
         );
         assert_eq!(
             for_file_in(
-                &[root.clone()],
+                std::slice::from_ref(&root),
                 &["hicolor".to_owned()],
                 OsStr::new("Makefile")
             ),
@@ -555,12 +557,13 @@ mod tests {
             "a name with no MIME type never probes at all"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// The configured theme wins over `hicolor` when both have the icon.
     #[test]
-    fn the_configured_theme_wins_over_hicolor() {
-        let root = scratch("priority");
+    fn the_configured_theme_wins_over_hicolor() -> TestResult {
+        let root = scratch("priority")?;
         write_icon(
             &root,
             "hicolor",
@@ -568,7 +571,7 @@ mod tests {
             "mimetypes",
             "application-x-blender",
             "png",
-        );
+        )?;
         let configured = write_icon(
             &root,
             "Papirus",
@@ -576,10 +579,10 @@ mod tests {
             "mimetypes",
             "application-x-blender",
             "png",
-        );
+        )?;
         assert_eq!(
             for_file_in(
-                &[root.clone()],
+                std::slice::from_ref(&root),
                 &["Papirus".to_owned(), "hicolor".to_owned()],
                 OsStr::new("scene.blend")
             ),
@@ -587,6 +590,7 @@ mod tests {
             "the theme list is tried in order, the configured theme first"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// The pixel at `(x, y)` of `rendered`, `[r, g, b, a]`, or `None`
@@ -604,16 +608,14 @@ mod tests {
     /// colour GPUI's own SVG element, which paints an alpha mask, would
     /// flatten into one single-colour silhouette.
     #[test]
-    #[allow(clippy::expect_used)]
-    fn an_svg_icon_rasterizes_in_colour_at_the_asked_size() {
-        let root = scratch("render-svg");
+    fn an_svg_icon_rasterizes_in_colour_at_the_asked_size() -> TestResult {
+        let root = scratch("render-svg")?;
         let icon = root.join("red.svg");
         std::fs::write(
             &icon,
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><rect width=\"64\" height=\"64\" fill=\"#ff0000\"/></svg>",
-        )
-        .expect("icon SVG");
-        let rendered = render(&icon, 32).expect("the SVG rasterizes");
+        )?;
+        let rendered = render(&icon, 32).ok_or("the SVG rasterizes")?;
         assert_eq!((rendered.width, rendered.height), (32, 32));
         assert_eq!(
             pixel_at(&rendered, 16, 16),
@@ -621,42 +623,40 @@ mod tests {
             "the centre keeps the theme's own opaque red"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// The asked size is the icon's longest edge and the other edge keeps
     /// its aspect: a 100×40 SVG rendered at 32 is 32×13 (40 · 32⁄100 =
     /// 12.8, rounded).
     #[test]
-    #[allow(clippy::expect_used)]
-    fn the_asked_size_is_a_non_square_svg_longest_edge() {
-        let root = scratch("render-wide");
+    fn the_asked_size_is_a_non_square_svg_longest_edge() -> TestResult {
+        let root = scratch("render-wide")?;
         let icon = root.join("wide.svg");
         std::fs::write(
             &icon,
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"40\"><rect width=\"100\" height=\"40\" fill=\"#00ff00\"/></svg>",
-        )
-        .expect("icon SVG");
-        let rendered = render(&icon, 32).expect("the SVG rasterizes");
+        )?;
+        let rendered = render(&icon, 32).ok_or("the SVG rasterizes")?;
         assert_eq!(rendered.width, 32, "the longest edge becomes the size");
         assert_eq!(rendered.height, 13, "the short edge keeps its aspect");
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// A raster icon decodes with its own pixels, is never scaled up, and
     /// one larger than the box is scaled down to fit it.
     #[test]
-    #[allow(clippy::expect_used)]
-    fn a_png_icon_decodes_and_only_ever_scales_down() {
-        let root = scratch("render-png");
+    fn a_png_icon_decodes_and_only_ever_scales_down() -> TestResult {
+        let root = scratch("render-png")?;
         let small = root.join("small.png");
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             24,
             24,
             image::Rgba([10, 20, 30, 255]),
         ))
-        .save(&small)
-        .expect("small icon PNG");
-        let rendered = render(&small, 32).expect("the small PNG decodes");
+        .save(&small)?;
+        let rendered = render(&small, 32).ok_or("the small PNG decodes")?;
         assert_eq!(
             (rendered.width, rendered.height),
             (24, 24),
@@ -670,9 +670,8 @@ mod tests {
             24,
             image::Rgba([40, 50, 60, 255]),
         ))
-        .save(&wide)
-        .expect("wide icon PNG");
-        let rendered = render(&wide, 24).expect("the wide PNG decodes");
+        .save(&wide)?;
+        let rendered = render(&wide, 24).ok_or("the wide PNG decodes")?;
         assert_eq!(
             (rendered.width, rendered.height),
             (24, 12),
@@ -680,38 +679,40 @@ mod tests {
         );
         assert_eq!(pixel_at(&rendered, 12, 6), Some([40, 50, 60, 255]));
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// An icon file that is not there rasterizes to nothing, so the caller
     /// keeps its bundled glyph.
     #[test]
-    fn a_missing_icon_file_rasterizes_to_nothing() {
-        let root = scratch("render-missing");
+    fn a_missing_icon_file_rasterizes_to_nothing() -> TestResult {
+        let root = scratch("render-missing")?;
         assert!(render(&root.join("gone.svg"), 32).is_none());
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 
     /// The theme list follows the configured theme and its `Inherits=`
     /// chain, then the fixed fallbacks; without a configured theme the
     /// fallbacks alone apply, and a cycle is cut, not followed forever.
     #[test]
-    fn the_theme_list_follows_the_configured_theme_and_its_inherits_chain() {
-        let root = scratch("chain");
-        write_index(&root, "Custom", "Mid,hicolor");
-        write_index(&root, "Mid", "");
-        write_index(&root, "Loop", "Loop,Custom");
+    fn the_theme_list_follows_the_configured_theme_and_its_inherits_chain() -> TestResult {
+        let root = scratch("chain")?;
+        write_index(&root, "Custom", "Mid,hicolor")?;
+        write_index(&root, "Mid", "")?;
+        write_index(&root, "Loop", "Loop,Custom")?;
         assert_eq!(
-            theme_order(&[root.clone()], Some("Custom")),
+            theme_order(std::slice::from_ref(&root), Some("Custom")),
             ["Custom", "Mid", "hicolor", "Adwaita", "breeze", "Papirus"].map(str::to_owned),
             "the configured theme, its chain, then the fixed fallbacks"
         );
         assert_eq!(
-            theme_order(&[root.clone()], None),
+            theme_order(std::slice::from_ref(&root), None),
             ["Adwaita", "breeze", "Papirus", "hicolor"].map(str::to_owned),
             "without a configured theme the fallbacks alone apply"
         );
         assert_eq!(
-            theme_order(&[root.clone()], Some("Loop")),
+            theme_order(std::slice::from_ref(&root), Some("Loop")),
             [
                 "Loop", "Custom", "Mid", "hicolor", "Adwaita", "breeze", "Papirus"
             ]
@@ -719,5 +720,6 @@ mod tests {
             "a cycle is cut, not followed forever"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
     }
 }
