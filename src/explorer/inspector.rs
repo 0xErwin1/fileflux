@@ -495,6 +495,20 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     ]
 }
 
+/// What the preview box shows for a file: the image itself when the app
+/// decodes it, else the thumbnail an installed freedesktop thumbnailer made
+/// (a video's frame, a PDF's page, an office document's first page) once the
+/// background job has it. `None` keeps the type glyph.
+fn preview_source(this: &Explorer, entry: &Entry) -> Option<PathBuf> {
+    if fileflux::core::thumbnails::is_decodable_image(&entry.path) {
+        return Some(entry.path.clone());
+    }
+    this.tab()
+        .thumbs
+        .get(&entry.path)
+        .and_then(|thumb| thumb.found.clone())
+}
+
 fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
     let colors = bolt::colors(cx);
     let tile: AnyElement = if entry.is_directory() {
@@ -502,12 +516,16 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
     } else if entries::has_thumbnail(&entry.name) {
         let glyph = entries::file_glyph(&entry.name);
         let muted = colors.muted;
-        gpui::img(entry.path.clone())
-            .size_full()
-            .object_fit(gpui::ObjectFit::Contain)
-            .with_loading(move || glyph_only(glyph, muted))
-            .with_fallback(move || glyph_only(glyph, muted))
-            .into_any_element()
+        let picture = match preview_source(this, entry) {
+            Some(source) => gpui::img(source)
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .with_loading(move || glyph_only(glyph, muted))
+                .with_fallback(move || glyph_only(glyph, muted))
+                .into_any_element(),
+            None => glyph_only(glyph, muted),
+        };
+        picture
     } else {
         glyph_only(entries::file_glyph(&entry.name), colors.muted)
     };

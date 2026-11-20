@@ -108,18 +108,13 @@ const PHOTO_HEIGHT: f32 = 46.0;
 const FOLDER_VIEW_WIDTH: f32 = 59.0;
 const FOLDER_VIEW_HEIGHT: f32 = 50.0;
 
-/// Whether a file gets a real thumbnail: decided from the extension alone,
-/// never by reading the file. Only formats GPUI's image loader decodes
-/// (heic and svg stay on the glyph).
+/// Whether a file may get a real thumbnail: decided from the extension alone,
+/// never by reading the file. The raster images the app decodes itself, plus
+/// the types an installed freedesktop thumbnailer may cover — videos, PDFs,
+/// office documents, vector images — so a tile reserves the slot and the
+/// background job finds out whether there is a preview to put in it.
 pub(crate) fn has_thumbnail(name: &OsStr) -> bool {
-    let extension = Path::new(name)
-        .extension()
-        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    matches!(
-        extension.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-    )
+    fileflux::core::mimes::previewable(name)
 }
 
 /// Chooses the bundled Lucide glyph for a non-directory entry from the
@@ -1056,10 +1051,15 @@ mod tests {
     #[test]
     fn thumbnails_are_decided_by_extension_alone() {
         let eligible = |name: &str| has_thumbnail(std::ffi::OsStr::new(name));
-        for name in ["a.png", "a.JPG", "a.jpeg", "a.gif", "a.webp", "a.bmp"] {
+        for name in [
+            "a.png", "a.JPG", "a.jpeg", "a.gif", "a.webp", "a.bmp", "a.mp4", "a.MKV", "a.pdf",
+            "a.odt", "a.svg", "a.heic",
+        ] {
             assert!(eligible(name), "{name}");
         }
-        for name in ["a.heic", "a.svg", "a.txt", "png", ".png", "a.png.bak", "a"] {
+        // Code, archives and extensionless names keep their glyph: no
+        // thumbnailer claims them.
+        for name in ["a.txt", "a.rs", "a.zip", "png", ".png", "a.png.bak", "a"] {
             assert!(!eligible(name), "{name}");
         }
     }

@@ -291,6 +291,10 @@ pub enum Skip {
     TooLarge,
     /// The cache could not be written.
     CacheUnwritable,
+    /// No installed thumbnailer makes a preview of this file, or the one that
+    /// claims it failed. Nothing is recorded, so a thumbnailer installed
+    /// later is used.
+    NoPreview,
 }
 
 /// What [`Generator::ensure`] came to.
@@ -307,6 +311,8 @@ pub enum Outcome {
 enum Failure {
     TooLarge,
     Undecodable(String),
+    /// Not a format this program decodes and no thumbnailer claimed it.
+    Unsupported,
     Io(io::Error),
 }
 
@@ -362,6 +368,7 @@ impl Generator {
                 Outcome::Ready(thumbnail)
             }
             Err(Failure::TooLarge) => Outcome::Skipped(Skip::TooLarge),
+            Err(Failure::Unsupported) => Outcome::Skipped(Skip::NoPreview),
             Err(Failure::Undecodable(reason)) => {
                 log::info!(
                     "cannot decode {} for a thumbnail: {reason}",
@@ -433,9 +440,58 @@ impl Generator {
         if size > MAX_BYTES {
             return Err(Failure::TooLarge);
         }
-        let reader = || -> io::Result<_> {
-            image::ImageReader::open(&source.canonical)?.with_guessed_format()
+        let mut tags = Self::tags(source);
+        tags.push(("Thumb::Size".to_owned(), size.to_string()));
+        let pixels = match self.decode(&source.canonical) {
+            Ok((pixels, (width, height))) => {
+                tags.push(("Thumb::Image::Width".to_owned(), width.to_string()));
+                tags.push(("Thumb::Image::Height".to_owned(), height.to_string()));
+                pixels
+            }
+            // Not a format this program decodes: a video, a PDF, an office
+            // document or a vector image. The system's thumbnailers make its
+            // preview, the same ones pcmanfm and Nautilus use.
+            Err(Failure::Undecodable(reason)) => {
+                match self.thumbnailed_by_system(&source.canonical) {
+                    Some(pixels) => pixels,
+                    None if is_decodable_image(&source.canonical) => {
+                        // A broken image: the failure marker keeps it from being
+                        // decoded again until it changes.
+                        log::info!(
+                            "cannot decode {} for a thumbnail: {reason}",
+                            source.canonical.display()
+                        );
+                        return Err(Failure::Undecodable(reason));
+                    }
+                    None => {
+                        log::debug!(
+                            "no thumbnailer makes a preview of {} ({reason})",
+                            source.canonical.display()
+                        );
+                        return Err(Failure::Unsupported);
+                    }
+                }
+            }
+            Err(other) => return Err(other),
         };
+        tags.push(("Software".to_owned(), "Fileflux".to_owned()));
+        let dir = self.cache_root.join("large");
+        let name = thumbnail_file_name(&source.uri);
+        write_png(
+            &dir,
+            OsStr::new(&name),
+            pixels.dimensions(),
+            png::ColorType::Rgba,
+            pixels.as_raw(),
+            &tags,
+        )?;
+        Ok(dir.join(name))
+    }
+
+    /// The source decoded, made upright and shrunk to a `large` thumbnail,
+    /// with the pixel size it had.
+    fn decode(&self, path: &Path) -> Result<(image::RgbaImage, (u32, u32)), Failure> {
+        let reader = || -> io::Result<_> { image::ImageReader::open(path)?.with_guessed_format() };
         let (width, height) = reader()?
             .into_dimensions()
             .map_err(|error| Failure::Undecodable(error.to_string()))?;
@@ -454,27 +510,36 @@ impl Generator {
             decoded.thumbnail(LARGE_EDGE, LARGE_EDGE)
         } else {
             decoded
-        }
-        .into_rgba8();
-        let mut tags = Self::tags(source);
-        tags.extend([
-            ("Thumb::Size".to_owned(), size.to_string()),
-            ("Thumb::Image::Width".to_owned(), width.to_string()),
-            ("Thumb::Image::Height".to_owned(), height.to_string()),
-            ("Software".to_owned(), "Fileflux".to_owned()),
-        ]);
-        let dir = self.cache_root.join("large");
-        let name = thumbnail_file_name(&source.uri);
-        write_png(
-            &dir,
-            OsStr::new(&name),
-            small.dimensions(),
-            png::ColorType::Rgba,
-            small.as_raw(),
-            &tags,
-        )?;
-        Ok(dir.join(name))
+        };
+        Ok((small.into_rgba8(), (width, height)))
     }
+
+    /// The preview an installed freedesktop thumbnailer makes of `path`, if
+    /// one claims its MIME type. Blocking: it spawns a process.
+    fn thumbnailed_by_system(&self, path: &Path) -> Option<image::RgbaImage> {
+        let mime = super::mimes::of_path(path)?;
+        let thumbnailer = super::thumbnailers::for_mime(mime)?;
+        log::debug!(
+            "asking the thumbnailer {} for a preview of {}",
+            thumbnailer.path.display(),
+            path.display()
+        );
+        super::thumbnailers::run(thumbnailer, path, LARGE_EDGE)
+    }
+}
+
+/// Whether `path` names a raster image this program decodes: the formats the
+/// `image` feature set carries. A broken one of these is remembered as failed
+/// instead of being retried on every listing, and the details panel shows it
+/// whole instead of waiting for a thumbnail of it.
+#[must_use]
+pub fn is_decodable_image(path: &Path) -> bool {
+    super::mimes::of_path(path).is_some_and(|mime| {
+        matches!(
+            mime,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+        )
+    })
 }
 
 /// Writes a PNG with `tEXt` chunks as `dir/name`: the directories are made
