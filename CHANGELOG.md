@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A grid tile is its entry everywhere inside it: clicking the padding around a tile's icon or name now selects it, where before only the drawn icon and name did, and the hover wash and the click area are the same rectangle. The rubber band therefore starts only from real empty space — the gaps between tiles and rows, the margins, and the area right of the last column and below the last row — instead of from a tile's blank corners.
 - Dragging entries now needs the pointer to move 8 px from the press (the desktop's drag threshold, GPUI's own is 2 px). Before that the drag is inert: no preview, no drop-target highlight, no drop and no selection change, and releasing there acts as the click it was, so a slight slip while clicking can no longer move a file. The rubber band uses the same threshold to tell a drag from a click on empty space.
 
 ### Added

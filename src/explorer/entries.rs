@@ -872,10 +872,6 @@ pub(crate) fn handle_entry_click(
 ) {
     if let Err(error) = weak.update(cx, |this, cx| {
         this.entries_focus().focus(window, cx);
-        if this.suppress_click {
-            // The press was on the tile's padding: a rubber band, not a click.
-            return;
-        }
         if click_count >= 2 {
             this.open_path(&path, window, cx);
         } else if modifiers.shift {
