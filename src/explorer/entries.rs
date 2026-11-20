@@ -884,6 +884,13 @@ fn render_grid_row(
             tile_element
         };
         tile_element = dnd::block_while_dragging(tile_element, cx);
+        // Named for assistive technology and for the automation bridge: the
+        // tile is one entry, its label is what the user sees under the art,
+        // and selection is exposed as the selected state.
+        tile_element = tile_element
+            .role(gpui::accesskit::Role::ListItem)
+            .aria_label(name.clone())
+            .aria_selected(tile_selected);
         let mut tile_element = tile_element
             .child(
                 div()

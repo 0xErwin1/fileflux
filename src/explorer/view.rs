@@ -3860,6 +3860,10 @@ impl Explorer {
             .child(
                 div()
                     .id("explorer-status-count")
+                    // Named for assistive technology and for the automation
+                    // bridge, which otherwise cannot read the status text.
+                    .role(gpui::accesskit::Role::Label)
+                    .aria_label(count_text.clone())
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()

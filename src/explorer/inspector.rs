@@ -387,9 +387,12 @@ fn folder_glyph(cx: &Context<Explorer>) -> AnyElement {
     entries::folder_silhouette(colors.info, colors.strong, PREVIEW_FOLDER).into_any_element()
 }
 
-fn title(text: String, cx: &Context<Explorer>) -> Div {
+fn title(text: String, cx: &Context<Explorer>) -> gpui::Stateful<Div> {
     let colors = bolt::colors(cx);
     div()
+        .id("inspector-title")
+        .role(gpui::accesskit::Role::Label)
+        .aria_label(text.clone())
         .mx(px(16.0))
         .mt(px(0.0))
         .text_size(px(14.0))
