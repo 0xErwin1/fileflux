@@ -64,7 +64,7 @@ A sidebar of places on the left, the folder in the middle, and an optional [deta
 |---|---|
 | Toolbar | Sidebar toggle, back, forward, up, the path bar, grid/list toggle, details toggle, favorite star, reload (Ctrl+R), "more" menu (…) |
 | Folder subbar | Current folder name, "4 folders · 7 files" count, **Sort**, **Filter**, **New folder**, active filter chips |
-| Status bar | "N items" or "N selected · size", loading and error notices, a progress indicator for long operations, free space of the current volume |
+| Status bar | "N items" or "N selected · size" (with the file type when exactly one entry is selected), loading and error notices, a progress indicator for long operations, free space of the current volume |
 
 Drag the right edge of the sidebar or the left edge of the details panel (a 6 px handle with a tint line on hover) to resize them; double-click a handle to restore the default width (290 px sidebar, 300 px details). The sidebar is clamped to 200–600 px and always leaves the folder pane 360 px; the details panel to 240–600 px and never wider than the window leaves room for the entries. Narrow windows park the sidebar as an overlay, without a resize handle, keeping its width; the sidebar toggle shows or hides it at any width, and the path, search and view controls always stay reachable. The widths are remembered (`sidebar_width`, `details_width` in [settings](settings.md#files-and-locations)).
 
@@ -92,7 +92,7 @@ A segmented toggle in the toolbar switches between two presentations. The toggle
 
 | View | What you see |
 |---|---|
-| Grid | Fixed-size tiles with two-tone folders, image thumbnails and a size line (folders show "N items"). Rows are equal; the last partial row is left-aligned |
+| Grid | Fixed-size tiles with two-tone folders, file thumbnails and a size line (folders show "N items"). Rows are equal; the last partial row is left-aligned |
 | List | Columns Name, Size and Modified. Click a header to sort (folders stay first). Columns fill the pane; drag to resize. Folder item counts are filled in the background after the listing appears |
 
 Sizes use one SI formatter everywhere. Modified dates are shown in UTC.
@@ -167,7 +167,7 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | Ctrl+A | Select every entry visible under the filter |
 | Escape | Clear the selection |
 | Click on empty space | Clear the selection (Ctrl or Shift held: leave it) |
-| Drag on empty space | Draw a selection rectangle; the entries it touches are selected live |
+| Drag on empty space | Draw a selection rectangle; the entries it touches are selected live. Every point inside a tile is the entry, so the rectangle starts from the gaps between tiles, the margins and the space right of the last column and below the last row |
 | Ctrl+drag on empty space | Toggle the entries the rectangle touches, against the selection from before the drag |
 | Shift+drag on empty space | Add the entries the rectangle touches to the selection from before the drag |
 
@@ -282,14 +282,16 @@ A read-only panel on the right (300 px by default, resizable), toggled by the to
 | Selection | Shows |
 |---|---|
 | Nothing | Folder glyph, name, item total ("N of M" while a filter is active) and full location |
-| One entry | A preview (image files draw the image; others the folder or file glyph), name, kind ("Image · JPG"), size, modified time, permissions (`rw-r--r--`, or `unavailable`), item count for folders, and path (Trash entries show their original location) |
+| One entry | A preview (image files draw the image, videos and documents their thumbnail; others the folder or file icon), name, kind ("Image · JPG"), size, modified time, permissions (`rw-r--r--`, or `unavailable`), item count for folders, and path (Trash entries show their original location) |
 | Several | The count and the total size of the selected files |
 
-Only image files are previewed.
+Images, videos, PDFs, office documents and vector images are previewed; the rest show their file icon.
 
 ## Thumbnails
 
 Thumbnails follow the freedesktop Thumbnail Managing Standard. Fileflux reuses thumbnails other applications already made in `$XDG_CACHE_HOME/thumbnails` (default `~/.cache/thumbnails`) when their `Thumb::URI` and `Thumb::MTime` match the file. When there is none it generates a 256 px `large` PNG there, upright per the photo's EXIF orientation, off the UI thread and at most two at a time. Images that fail to decode are recorded under `fail/fileflux-<version>/` and not retried until they change. Fileflux never generates thumbnails for files inside the cache, on gvfs/FUSE/network mounts, or for images over 50 megapixels or 100 MB; those show the file-type icon.
+
+Formats Fileflux does not decode — videos, PDFs, office documents, vector images — are thumbnailed by the freedesktop thumbnailers installed on the system, the same `.thumbnailer` commands pcmanfm, Nautilus and Thunar run: `~/.local/share/thumbnailers` first, then every `$XDG_DATA_DIRS/*/thumbnailers` (usually `/usr/share/thumbnailers`). Install one for the types you care about, for example `ffmpegthumbnailer` (`video/mp4`, `video/x-matroska`, …) or a PDF one (`application/pdf`). Each command runs without a shell, is killed after 20 seconds, and its output is decoded and rewritten into the cache with the standard's tags so the other file managers reuse it. With no thumbnailer for a type, the tile shows the file's icon.
 
 ## Image viewer
 
