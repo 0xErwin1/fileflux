@@ -262,14 +262,34 @@ pub(crate) struct DraggedEntries {
     pub(crate) paths: Arc<Vec<PathBuf>>,
 }
 
+/// How far the drag card's top-left sits from the pointer, right and down,
+/// so the card never covers the pointer. pcmanfm paints the grabbed cell with
+/// the pointer inside it at the same relative spot; a small card reads better
+/// at a fixed offset than a snapshot would, since the card is not the cell.
+pub(crate) const PREVIEW_OFFSET: f32 = 12.0;
+
+/// The margin that puts the drag card `PREVIEW_OFFSET` right and down of the
+/// pointer.
+///
+/// GPUI prepaints a drag view at `pointer - grab`, where `grab` is the press
+/// point it hands to `on_drag` (`gpui-pre/src/window.rs`, the `active_drag`
+/// branch of the frame). Cancelling that term needs `grab + PREVIEW_OFFSET`,
+/// and it has to sit on a child: the layout engine places children by their
+/// margins and ignores the margin of the root element it lays out, which is
+/// why the card used to follow the grabbed tile's origin instead of the
+/// pointer.
+pub(crate) fn preview_margin(grab: Point<Pixels>) -> (Pixels, Pixels) {
+    (grab.x + px(PREVIEW_OFFSET), grab.y + px(PREVIEW_OFFSET))
+}
+
 /// The view that follows the pointer while dragging: the item's icon and
 /// name, or "N items".
 pub(crate) struct DragPreview {
     text: String,
     glyph: gpui_kit_assets::IconName,
     folder: bool,
-    /// Where inside the dragged element the pointer grabbed it: the preview
-    /// is drawn from the element's origin, so this puts it at the pointer.
+    /// Where inside the dragged element the pointer grabbed it, in pixels
+    /// from that element's origin.
     grab: Point<Pixels>,
 }
 
@@ -281,30 +301,33 @@ impl Render for DragPreview {
         }
         let colors = bolt::colors(cx);
         let tint = ChromeColors::tint(cx.theme());
-        div()
-            .ml(self.grab.x + px(14.0))
-            .mt(self.grab.y + px(14.0))
-            .flex()
-            .items_center()
-            .gap(Spacing::SM)
-            .px(px(10.0))
-            .py(px(6.0))
-            .max_w(px(280.0))
-            .bg(colors.raised)
-            .border_1()
-            .border_color(tint)
-            .text_size(px(13.0))
-            .text_color(colors.strong)
-            .child(
-                Icon::new(icon(self.glyph))
-                    .size(px(16.0))
-                    .color(if self.folder {
-                        colors.info
-                    } else {
-                        colors.muted
-                    }),
-            )
-            .child(div().min_w_0().truncate().child(self.text.clone()))
+        let (margin_x, margin_y) = preview_margin(self.grab);
+        div().flex().child(
+            div()
+                .ml(margin_x)
+                .mt(margin_y)
+                .flex()
+                .items_center()
+                .gap(Spacing::SM)
+                .px(px(10.0))
+                .py(px(6.0))
+                .max_w(px(280.0))
+                .bg(colors.raised)
+                .border_1()
+                .border_color(tint)
+                .text_size(px(13.0))
+                .text_color(colors.strong)
+                .child(
+                    Icon::new(icon(self.glyph))
+                        .size(px(16.0))
+                        .color(if self.folder {
+                            colors.info
+                        } else {
+                            colors.muted
+                        }),
+                )
+                .child(div().min_w_0().truncate().child(self.text.clone())),
+        )
     }
 }
 
@@ -539,6 +562,22 @@ impl Explorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::point;
+
+    #[test]
+    fn the_drag_card_keeps_a_fixed_offset_from_the_pointer() {
+        // The user's report: the card followed the grabbed tile's origin, so
+        // it drifted further from the pointer the deeper inside the tile the
+        // press landed. GPUI prepaints the card at `pointer - grab`; the
+        // margin adds `grab` back plus the fixed offset, whatever was grabbed.
+        for grab in [(0.0, 0.0), (56.0, 30.0), (111.0, 117.0)] {
+            let grab = point(px(grab.0), px(grab.1));
+            let pointer = point(px(400.0), px(320.0));
+            let (margin_x, margin_y) = preview_margin(grab);
+            let painted = point(pointer.x - grab.x + margin_x, pointer.y - grab.y + margin_y);
+            assert_eq!(painted, point(px(412.0), px(332.0)), "grab {grab:?}");
+        }
+    }
 
     #[test]
     fn a_press_stays_inert_until_the_pointer_leaves_the_threshold() {
