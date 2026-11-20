@@ -4,6 +4,7 @@
 mod explorer;
 mod gui;
 mod theme;
+mod ui_automation;
 mod viewer;
 
 use std::path::PathBuf;

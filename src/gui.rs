@@ -125,6 +125,9 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
     };
 
     cx.open_window(options, |window, cx| {
+        // A development build can be driven by `gpui-mcp`; a release build
+        // compiles this to nothing.
+        crate::ui_automation::install(window, cx);
         let explorer = cx.new(|cx| Explorer::new(start, startup, window, cx));
         explorer.update(cx, |explorer, cx| {
             explorer.initial_focus().focus(window, cx);

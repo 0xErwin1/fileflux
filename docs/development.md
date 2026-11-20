@@ -66,6 +66,20 @@ Rules:
 
 `scripts/native-smoke.py` (X11 or XWayland, standard library plus `libXtst`) launches the local build against a synthetic HOME/XDG fixture, drives its own window with XTest, and asserts the window title around path edits and failed submits. What it cannot automate it reports as `MANUAL` (exit 3); it never claims a visual check it did not perform.
 
+## Driving a running window from an agent
+
+`cargo build --features ui-automation` links the [gpui-mcp](https://github.com/themixednuts/gpui-mcp) bridge into the window, the same instrumentation DBFlux and ReqFlux carry. The feature is off by default: a release build compiles neither the bridge nor its dependencies, and `src/ui_automation.rs` keeps the gate so every window calls `install` unconditionally.
+
+With the feature on, an MCP client started as the same user finds the window, reads the element tree it rendered and injects input:
+
+```sh
+cargo build --features ui-automation
+./target/debug/fileflux ~/some/folder &
+gpui-mcp --app-id fileflux          # the stdio MCP server, from the DBFlux tree
+```
+
+Use it to check what a screenshot cannot: which element a click actually lands on, where a drag preview sits relative to the pointer, what the status bar renders for a given selection. The bridge reads frames in-process, so it works on Wayland; the server's native **screenshots** are X11-only, so on Wayland capture the window another way. Prefer this over XTest-driven checks above when the question is about the element tree rather than pixels, and keep both when the question is visual.
+
 ## Nix packages
 
 `flake.nix` outputs, for `x86_64-linux` and `aarch64-linux` (the prebuilt nightly only for `x86_64-linux`):
