@@ -20,8 +20,11 @@ use std::time::{Duration, Instant};
 use super::apps::split_exec;
 use super::thumbnails::thumbnail_uri;
 
-/// How long one thumbnailer may run before it is killed. libfm uses 30 s.
-pub const THUMBNAILER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long one thumbnailer may run before it is killed. libfm allows 30 s,
+/// because it also thumbnails files on network mounts; Fileflux skips those,
+/// so a command that has not answered in this long is stuck, and the thread
+/// waiting on it is one the folder scans need.
+pub const THUMBNAILER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the running thumbnailer is asked whether it finished.
 const POLL: Duration = Duration::from_millis(25);
 
