@@ -426,7 +426,7 @@ fn target(in_trash: bool, selected: usize, folder_is_empty: bool, terminal: bool
         terminal,
         can_paste: false,
         folder_selected: false,
-        single_file: false,
+        only_files: false,
         folder_favorite: false,
     }
 }
@@ -674,7 +674,7 @@ fn favorites_and_terminal_never_show_for_files_selections_or_the_trash() {
     );
     assert_eq!(
         offers(MenuTarget {
-            single_file: true,
+            only_files: true,
             ..target(false, 1, false, true)
         }),
         (false, false)
@@ -1193,14 +1193,14 @@ fn app(id: &str, name: &str, exec: &str) -> App {
 }
 
 #[test]
-fn open_with_is_offered_for_one_selected_file_only() {
+fn open_with_is_offered_for_selected_files_but_never_folders() {
     let offers = |target: MenuTarget| {
         menu_rows(&target)
             .iter()
             .any(|row| matches!(row, MenuRow::Item(spec) if spec.command == MenuCommand::OpenWith))
     };
     let one_file = MenuTarget {
-        single_file: true,
+        only_files: true,
         ..target(false, 1, false, false)
     };
     assert!(offers(one_file));
@@ -1208,7 +1208,17 @@ fn open_with_is_offered_for_one_selected_file_only() {
         !offers(target(false, 1, false, false)),
         "a folder or link target"
     );
-    assert!(!offers(target(false, 2, false, false)), "several entries");
+    assert!(
+        offers(MenuTarget {
+            only_files: true,
+            ..target(false, 3, false, false)
+        }),
+        "several files"
+    );
+    assert!(
+        !offers(target(false, 2, false, false)),
+        "several entries with a folder among them"
+    );
     assert!(!offers(target(false, 0, false, false)), "empty space");
     assert!(
         !offers(MenuTarget {
@@ -1269,7 +1279,7 @@ fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
         ],
         all_apps: Vec::new(),
     };
-    let dialog = DialogState::open_with(Path::new("/d/notes.txt"), &found);
+    let dialog = DialogState::open_with(&[PathBuf::from("/d/notes.txt")], &found);
     assert_eq!(
         dialog.text.title,
         "Open \u{201c}notes.txt\u{201d} with\u{2026}"
@@ -1288,7 +1298,7 @@ fn the_open_with_dialog_lists_the_apps_and_defaults_to_opening() {
     assert_eq!(
         dialog.action,
         DialogAction::OpenWith(OpenWithState {
-            path: PathBuf::from("/d/notes.txt"),
+            paths: vec![PathBuf::from("/d/notes.txt")],
             mime: "text/plain".to_owned(),
             apps: found.apps.clone(),
             all_apps: Vec::new(),
@@ -1315,7 +1325,7 @@ fn chooser(matching: &[(&str, &str)], all: &[(&str, &str)]) -> DialogState {
             .collect::<Vec<_>>()
     };
     DialogState::open_with(
-        Path::new("/d/notes.txt"),
+        &[PathBuf::from("/d/notes.txt")],
         &OpenWith {
             mime: "text/plain".to_owned(),
             apps: make(matching),
@@ -1368,7 +1378,7 @@ fn choosing_the_other_row_lists_every_application_by_name() {
     assert_eq!(
         dialog.open_with_pick(),
         Some(OpenWithPick::Launch {
-            path: PathBuf::from("/d/notes.txt"),
+            paths: vec![PathBuf::from("/d/notes.txt")],
             app: app("b.desktop", "Beta", "run %f"),
             remember: None,
         })
@@ -1391,7 +1401,7 @@ fn choosing_the_other_row_lists_every_application_by_name() {
     assert_eq!(
         dialog.open_with_pick(),
         Some(OpenWithPick::Launch {
-            path: PathBuf::from("/d/notes.txt"),
+            paths: vec![PathBuf::from("/d/notes.txt")],
             app: app("a.desktop", "Alpha", "run %f"),
             remember: None,
         }),
@@ -1445,7 +1455,7 @@ fn remember_is_off_by_default_and_names_the_type_when_chosen() {
     assert_eq!(
         dialog.open_with_pick(),
         Some(OpenWithPick::Launch {
-            path: PathBuf::from("/d/notes.txt"),
+            paths: vec![PathBuf::from("/d/notes.txt")],
             app: app("b.desktop", "Beta", "run %f"),
             remember: Some("text/plain".to_owned()),
         })
@@ -1478,23 +1488,304 @@ fn the_open_with_selection_moves_within_the_list() {
 #[test]
 fn launching_an_app_runs_its_exec_in_the_files_folder() {
     let chosen = app("v.desktop", "Viewer", "viewer --open %f");
-    let command = open_with_command(Path::new("/d/My Docs/a b.txt"), &chosen);
+    let command = open_with_commands(&[PathBuf::from("/d/My Docs/a b.txt")], &chosen);
     assert_eq!(
         command,
-        Ok(OpenWithCommand {
+        Ok(vec![OpenWithCommand {
             program: PathBuf::from("viewer"),
             args: vec![
                 OsString::from("--open"),
                 OsString::from("/d/My Docs/a b.txt")
             ],
             cwd: PathBuf::from("/d/My Docs"),
-        })
+        }])
     );
     let broken = app("x.desktop", "Broken", "\"never closed %f");
     assert_eq!(
-        open_with_command(Path::new("/d/a.txt"), &broken),
+        open_with_commands(&[PathBuf::from("/d/a.txt")], &broken),
         Err("Could not open with Broken: the Exec line has an unclosed quote".to_owned())
     );
+}
+
+fn files(names: &[&str]) -> Vec<PathBuf> {
+    names.iter().map(PathBuf::from).collect()
+}
+
+fn command(args: &[&str], cwd: &str) -> OpenWithCommand {
+    OpenWithCommand {
+        program: PathBuf::from("prog"),
+        args: args.iter().map(OsString::from).collect(),
+        cwd: PathBuf::from(cwd),
+    }
+}
+
+#[test]
+fn a_list_exec_starts_one_process_and_a_single_exec_one_per_file() {
+    let selection = files(&["/a/1.txt", "/b/2 x.txt", "/a/3.txt"]);
+    assert_eq!(
+        open_with_commands(&selection, &app("l.desktop", "Lister", "prog %F")),
+        Ok(vec![command(&["/a/1.txt", "/b/2 x.txt", "/a/3.txt"], "/a")]),
+        "every file in one process, in the first file's folder"
+    );
+    assert_eq!(
+        open_with_commands(&selection, &app("s.desktop", "Single", "prog %f")),
+        Ok(vec![
+            command(&["/a/1.txt"], "/a"),
+            command(&["/b/2 x.txt"], "/b"),
+            command(&["/a/3.txt"], "/a"),
+        ]),
+        "one process per file, each in its own folder"
+    );
+}
+
+fn numbered(range: std::ops::Range<usize>) -> Vec<PathBuf> {
+    range
+        .map(|n| PathBuf::from(format!("/d/{n}.txt")))
+        .collect()
+}
+
+fn viewer_group(exec: &str, paths: Vec<PathBuf>) -> AppGroup {
+    AppGroup {
+        app: Some(app("v.desktop", "Viewer", exec)),
+        paths,
+    }
+}
+
+#[test]
+fn more_than_twenty_processes_ask_before_starting() {
+    assert!(!launch_needs_confirmation(0));
+    assert!(!launch_needs_confirmation(1));
+    assert!(!launch_needs_confirmation(20));
+    assert!(launch_needs_confirmation(21));
+    // A list exec is one process however many files.
+    let list = plan_launches(&[viewer_group("viewer %F", numbered(0..37))]);
+    assert_eq!(process_count(&list), 1);
+    assert!(
+        launch_confirmation(list).is_err(),
+        "no dialog for one process"
+    );
+    // 20 files, one process each: no dialog; 37: a dialog.
+    let twenty = plan_launches(&[viewer_group("viewer %f", numbered(0..20))]);
+    assert!(launch_confirmation(twenty).is_err());
+    let dialog =
+        launch_confirmation(plan_launches(&[viewer_group("viewer %f", numbered(0..37))])).ok();
+    assert_eq!(
+        dialog.as_ref().map(|d| d.text.title.as_str()),
+        Some("Open 37 windows of Viewer?")
+    );
+    assert_eq!(dialog.as_ref().map(|d| d.text.confirm), Some("Open all"));
+    assert_eq!(
+        dialog.as_ref().map(DialogState::initial_focus),
+        Some(DialogChoice::Cancel),
+        "Enter starts nothing"
+    );
+    assert!(
+        matches!(dialog.map(|d| d.action), Some(DialogAction::OpenMany(l)) if process_count(&l) == 37)
+    );
+    // Processes of several applications add up, and the title names none.
+    let two = plan_launches(&[
+        viewer_group("viewer %f", numbered(0..15)),
+        AppGroup {
+            app: None,
+            paths: numbered(15..30),
+        },
+    ]);
+    assert_eq!(
+        launch_confirmation(two)
+            .ok()
+            .map(|dialog| dialog.text.title),
+        Some("Open 30 windows?".to_owned())
+    );
+}
+
+#[test]
+fn files_without_an_application_go_to_the_system_opener_one_each() {
+    let launches = plan_launches(&[AppGroup {
+        app: None,
+        paths: files(&["/d/a b.bin", "/e/c.bin"]),
+    }]);
+    let opener = |file: &str, cwd: &str| OpenWithCommand {
+        program: PathBuf::from("xdg-open"),
+        args: vec![OsString::from(file)],
+        cwd: PathBuf::from(cwd),
+    };
+    assert_eq!(
+        launches,
+        vec![AppLaunch {
+            app: "xdg-open".to_owned(),
+            commands: vec![opener("/d/a b.bin", "/d"), opener("/e/c.bin", "/e")],
+            error: None,
+        }]
+    );
+}
+
+#[test]
+fn applications_that_cannot_start_are_named_once_in_one_notice() {
+    assert_eq!(start_failure_notice(&[]), None);
+    assert_eq!(
+        start_failure_notice(&["Gimp".to_owned()]),
+        Some("Could not start Gimp".to_owned())
+    );
+    assert_eq!(
+        start_failure_notice(&["Gimp".to_owned(), "Viewer".to_owned()]),
+        Some("Could not start Gimp, Viewer".to_owned())
+    );
+    // A broken Exec and a program that is not there are both failures, each
+    // application listed once however many of its processes failed.
+    let launches = plan_launches(&[
+        AppGroup {
+            app: Some(app("b.desktop", "Broken", "\"never closed %f")),
+            paths: files(&["/d/a.txt"]),
+        },
+        AppGroup {
+            app: Some(app("m.desktop", "Missing", "/no/such/program-fileflux %f")),
+            paths: files(&["/d/a.txt", "/d/b.txt"]),
+        },
+    ]);
+    assert_eq!(
+        run_launches(&launches),
+        vec!["Broken".to_owned(), "Missing".to_owned()]
+    );
+}
+
+#[test]
+fn a_selection_splits_into_the_viewer_the_files_and_the_folders() {
+    let selection = vec![
+        (PathBuf::from("/d/a.txt"), false),
+        (PathBuf::from("/d/dir"), true),
+        (PathBuf::from("/d/p.png"), false),
+        (PathBuf::from("/d/q.png"), false),
+        (PathBuf::from("/d/b.pdf"), false),
+    ];
+    assert_eq!(
+        split_open(&selection),
+        OpenSplit {
+            viewer: Some(PathBuf::from("/d/p.png")),
+            files: files(&["/d/a.txt", "/d/b.pdf"]),
+            only_folders: false,
+        }
+    );
+    let folders = vec![(PathBuf::from("/d/x"), true), (PathBuf::from("/d/y"), true)];
+    let split = split_open(&folders);
+    assert!(split.only_folders && split.files.is_empty() && split.viewer.is_none());
+    assert!(!split_open(&[]).only_folders);
+}
+
+#[test]
+fn the_dialog_for_several_files_counts_them_and_remembers_only_a_shared_type() {
+    let found = |mime: &str| OpenWith {
+        mime: mime.to_owned(),
+        apps: vec![app("a.desktop", "Alpha", "alpha %F")],
+        all_apps: Vec::new(),
+    };
+    let selection = files(&["/d/a.txt", "/d/b.md", "/d/c.txt"]);
+    let mixed = DialogState::open_with(&selection, &found(""));
+    assert_eq!(mixed.text.title, "Open 3 files with\u{2026}");
+    assert_eq!(mixed.remember_label(), None, "different types: no default");
+    let mut mixed = mixed;
+    mixed.set_open_with_remember(true);
+    assert!(matches!(
+        mixed.open_with_pick(),
+        Some(OpenWithPick::Launch { remember: None, ref paths, .. }) if paths == &selection
+    ));
+    let mut same = DialogState::open_with(&selection, &found("text/plain"));
+    assert_eq!(same.text.title, "Open 3 files with\u{2026}");
+    assert_eq!(
+        same.remember_label().as_deref(),
+        Some("Remember for text/plain")
+    );
+    same.set_open_with_remember(true);
+    assert!(matches!(
+        same.open_with_pick(),
+        Some(OpenWithPick::Launch { remember: Some(ref mime), .. }) if mime == "text/plain"
+    ));
+}
+
+/// A program that records one start: the arguments after its first one
+/// (a directory), one `arg:` line each, in a file of its own there.
+fn recorder(dir: &Path) -> io::Result<PathBuf> {
+    let script = dir.join("record.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nout=\"$1/$$.run\"\nshift\nfor a in \"$@\"; do printf 'arg:%s\\n' \"$a\" >> \"$out.part\"; done\nmv \"$out.part\" \"$out\"\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+    Ok(script)
+}
+
+/// The recorded starts in `dir`, one string per start, once there are
+/// `runs` of them (or the wait runs out).
+fn wait_for_runs(dir: &Path, runs: usize) -> Vec<String> {
+    let mut found = Vec::new();
+    for _ in 0..200 {
+        found = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "run"))
+                    .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if found.len() >= runs {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // A short wait for a start that should not exist.
+    std::thread::sleep(Duration::from_millis(50));
+    found.sort();
+    found
+}
+
+#[test]
+fn a_desktop_file_is_started_once_for_a_list_code_and_once_per_file_for_a_single_one() -> TestResult
+{
+    let scratch = Scratch::new("spawn-many")?;
+    let script = recorder(&scratch.dir("bin")?)?;
+    let apps_dir = scratch.dir("applications")?;
+    let log_list = scratch.dir("list")?;
+    let log_each = scratch.dir("each")?;
+    for (name, log, code) in [("list", &log_list, "%F"), ("each", &log_each, "%f")] {
+        fs::write(
+            apps_dir.join(format!("{name}.desktop")),
+            format!(
+                "[Desktop Entry]\nType=Application\nName={name}\nExec=\"{}\" \"{}\" {code}\nMimeType=text/plain;\n",
+                script.display(),
+                log.display()
+            ),
+        )?;
+    }
+    let selection = vec![
+        scratch.file("docs/one two.txt", "1")?,
+        scratch.file("docs/%3.txt", "2")?,
+        scratch.file("docs/c.txt", "3")?,
+    ];
+    let found =
+        fileflux::core::apps::find_apps_for_all(&[apps_dir], &["text/plain".to_owned()], None);
+    assert_eq!(found.len(), 2);
+    for found in &found {
+        let groups = vec![AppGroup {
+            app: Some(found.clone()),
+            paths: selection.clone(),
+        }];
+        assert!(run_launches(&plan_launches(&groups)).is_empty());
+    }
+    let line = |path: &PathBuf| format!("arg:{}\n", path.display());
+    let list = wait_for_runs(&log_list, 1);
+    assert_eq!(
+        list,
+        vec![selection.iter().map(line).collect::<String>()],
+        "one run with every file"
+    );
+    let mut want: Vec<String> = selection.iter().map(line).collect();
+    want.sort();
+    assert_eq!(
+        wait_for_runs(&log_each, 3),
+        want,
+        "three runs, one file each"
+    );
+    Ok(())
 }
 
 #[test]
@@ -2866,7 +3157,7 @@ fn other_files_keep_the_default_application() {
 #[test]
 fn open_in_viewer_follows_open_and_leaves_open_with_in_place() {
     let one_file = MenuTarget {
-        single_file: true,
+        only_files: true,
         ..target(false, 1, false, false)
     };
     let mut rows = menu_rows(&one_file);

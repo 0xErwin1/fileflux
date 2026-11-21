@@ -208,7 +208,10 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         || pattern.is_some()
         || connect.is_some()
         || prompt.is_some()
-        || matches!(dialog.kind, DialogKind::DeviceBusy { .. });
+        || matches!(
+            dialog.kind,
+            DialogKind::DeviceBusy { .. } | DialogKind::OpenMany { .. }
+        );
     let body = div()
         .flex()
         .flex_col()

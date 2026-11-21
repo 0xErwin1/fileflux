@@ -60,7 +60,7 @@ use crate::explorer::folder_memory::{self, FolderMemory};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{ArrangeMenu, DialogQueue};
-use crate::explorer::ops::{OpenAction, Severity, UndoStack, open_action};
+use crate::explorer::ops::{OpenAction, OpenSplit, Severity, UndoStack, open_action, split_open};
 use crate::explorer::panes::{self, PaneLayout, Panes, PerPane, Side};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
@@ -2979,15 +2979,72 @@ impl Explorer {
     /// selected entries activate: a selection the current filter has
     /// hidden is never silently opened (see
     /// [`ExplorerState::activation_candidate`]).
+    ///
+    /// Several selected entries: only folders follow the rule above for the
+    /// first; otherwise the files open together (see
+    /// [`Explorer::open_files`]) and folders in the mix are left alone.
     pub(crate) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Enter belongs to the rename editor while it is open.
         if self.renaming.is_some() {
             return;
         }
+        // Displayed order; a link to a folder navigates like a folder.
+        let selection: Vec<(PathBuf, bool)> = self
+            .tab()
+            .state
+            .visible_selected()
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    open_action(entry) == OpenAction::Navigate,
+                )
+            })
+            .collect();
+        if selection.len() > 1 && !self.in_trash() {
+            let split = split_open(&selection);
+            if !split.only_folders {
+                self.open_files(split, window, cx);
+                return;
+            }
+        }
         let Some(path) = self.tab().state.activation_candidate() else {
             return;
         };
         self.open_path(&path, window, cx);
+    }
+
+    /// Opens several files at once: the first image in the viewer (which
+    /// walks the folder's images), a lone other file with the system opener
+    /// as for one file, several others grouped by their default application
+    /// and started per group (see [`Explorer::start_groups`]). The lookup of
+    /// the defaults runs off the UI thread.
+    fn open_files(&mut self, split: OpenSplit, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(image) = &split.viewer {
+            self.open_file(image, cx);
+        }
+        match split.files.as_slice() {
+            [] => {}
+            [one] => {
+                let one = one.clone();
+                self.open_file(&one, cx);
+            }
+            files => {
+                let files = files.to_vec();
+                let lookup = cx
+                    .background_executor()
+                    .spawn(async move { fileflux::core::apps::default_app_groups(&files) });
+                cx.spawn_in(window, async move |this, cx| {
+                    let groups = lookup.await;
+                    if let Err(error) =
+                        this.update_in(cx, |this, window, cx| this.start_groups(groups, window, cx))
+                    {
+                        log::debug!("the explorer closed before the defaults were found: {error}");
+                    }
+                })
+                .detach();
+            }
+        }
     }
 
     /// Opens one entry: a directory, or a symlink to one, navigates (to the

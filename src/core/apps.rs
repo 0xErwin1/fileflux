@@ -235,42 +235,101 @@ fn has_field_code(text: &str) -> bool {
 /// argument that held only dropped codes disappears. The path keeps its
 /// exact bytes.
 pub fn expand_exec(exec: &str, path: &Path) -> Result<Vec<OsString>, ExecError> {
-    let uri = format!("file://{}", encode_percent(path.as_os_str().as_bytes()));
-    let mut args = Vec::new();
-    for ExecToken {
-        text: token,
-        quoted,
-    } in split_exec_tokens(exec)?
-    {
-        if quoted && has_field_code(&token) {
-            return Err(ExecError::QuotedFieldCode);
-        }
-        let mut out: Vec<u8> = Vec::new();
-        let mut had_code = false;
-        let mut chars = token.chars();
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                let mut buffer = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
-                continue;
-            }
-            had_code = true;
-            match chars.next() {
-                Some('f' | 'F') => out.extend_from_slice(path.as_os_str().as_bytes()),
-                Some('u' | 'U') => out.extend_from_slice(uri.as_bytes()),
-                Some('%') => out.push(b'%'),
-                _ => {}
-            }
-        }
-        if out.is_empty() && had_code {
-            continue;
-        }
-        args.push(OsString::from_vec(out));
-    }
-    if args.first().is_none_or(|program| program.is_empty()) {
+    let mut invocations = expand_exec_many(exec, &[path])?;
+    if invocations.is_empty() {
         return Err(ExecError::Empty);
     }
-    Ok(args)
+    Ok(invocations.swap_remove(0))
+}
+
+/// One argument of an `Exec=` line with its field codes found.
+struct ExecArg {
+    text: String,
+    /// The argument holds `%F` or `%U`: it stands for every file.
+    list: bool,
+}
+
+/// `token` for one file: the codes replaced as in [`expand_exec`]; `None`
+/// when the argument held only dropped codes.
+fn render_arg(token: &str, path: &Path, uri: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut had_code = false;
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            let mut buffer = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
+            continue;
+        }
+        had_code = true;
+        match chars.next() {
+            Some('f' | 'F') => out.extend_from_slice(path.as_os_str().as_bytes()),
+            Some('u' | 'U') => out.extend_from_slice(uri),
+            Some('%') => out.push(b'%'),
+            _ => {}
+        }
+    }
+    (!(out.is_empty() && had_code)).then_some(out)
+}
+
+/// The processes to start to run `exec` on `paths`, as argument lists (the
+/// program first), by the Desktop Entry rules. An `Exec=` with `%F` or `%U`
+/// takes every file in **one** process: such an argument becomes one
+/// argument per file (`%U` as percent-encoded `file://` URIs). One with only
+/// `%f` or `%u` gets **one process per file**, in the order of `paths`. The
+/// other codes behave as for one file ([`expand_exec`]); a single code next
+/// to a list code takes the first file. No shell is involved. No paths, no
+/// processes.
+pub fn expand_exec_many(exec: &str, paths: &[&Path]) -> Result<Vec<Vec<OsString>>, ExecError> {
+    let mut tokens = Vec::new();
+    for ExecToken { text, quoted } in split_exec_tokens(exec)? {
+        if quoted && has_field_code(&text) {
+            return Err(ExecError::QuotedFieldCode);
+        }
+        tokens.push(ExecArg {
+            list: has_list_code(&text),
+            text,
+        });
+    }
+    let Some(first) = paths.first() else {
+        return Ok(Vec::new());
+    };
+    let uri_of = |path: &Path| {
+        format!("file://{}", encode_percent(path.as_os_str().as_bytes())).into_bytes()
+    };
+    let one_process = tokens.iter().any(|token| token.list);
+    let single_files: &[&Path] = if one_process { &[first] } else { paths };
+    let mut invocations = Vec::new();
+    for path in single_files {
+        let mut args: Vec<OsString> = Vec::new();
+        for token in &tokens {
+            if token.list {
+                for each in paths {
+                    args.extend(
+                        render_arg(&token.text, each, &uri_of(each)).map(OsString::from_vec),
+                    );
+                }
+            } else {
+                args.extend(render_arg(&token.text, path, &uri_of(path)).map(OsString::from_vec));
+            }
+        }
+        if args.first().is_none_or(|program| program.is_empty()) {
+            return Err(ExecError::Empty);
+        }
+        invocations.push(args);
+    }
+    Ok(invocations)
+}
+
+/// Whether `text` holds `%F` or `%U`.
+fn has_list_code(text: &str) -> bool {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && matches!(chars.next(), Some('F' | 'U')) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `exec` passes the file to the program (`%f`, `%F`, `%u`, `%U`)
@@ -507,6 +566,23 @@ fn matching_apps(found: &[Candidate], mime: &str, default_id: Option<&str>) -> V
     sorted_apps(apps, default_id)
 }
 
+/// The applications that handle **every** type of `mimes` (each by the rules
+/// of [`mime_matches`]). One type behaves as [`matching_apps`], default
+/// included; several types list no default.
+fn matching_apps_all(found: &[Candidate], mimes: &[String], default_id: Option<&str>) -> Vec<App> {
+    let apps = found
+        .iter()
+        .filter(|candidate| {
+            default_id == Some(candidate.app.id.as_str())
+                || mimes
+                    .iter()
+                    .all(|mime| mime_matches(&candidate.mime_types, mime))
+        })
+        .map(|candidate| candidate.app.clone())
+        .collect();
+    sorted_apps(apps, default_id)
+}
+
 fn all_apps(found: &[Candidate]) -> Vec<App> {
     sorted_apps(found.iter().map(|c| c.app.clone()).collect(), None)
 }
@@ -519,6 +595,13 @@ fn all_apps(found: &[Candidate]) -> Vec<App> {
 /// when it does not declare `mime`; the rest by name.
 pub fn find_apps(dirs: &[PathBuf], mime: &str, default_id: Option<&str>) -> Vec<App> {
     matching_apps(&candidates(dirs), mime, default_id)
+}
+
+/// The applications under `dirs` that can open every type of `mimes` (the
+/// intersection of their associations, see [`find_apps`] for the entries
+/// left out). `default_id` is listed first.
+pub fn find_apps_for_all(dirs: &[PathBuf], mimes: &[String], default_id: Option<&str>) -> Vec<App> {
+    matching_apps_all(&candidates(dirs), mimes, default_id)
 }
 
 /// Every application under `dirs` that can open a file, whatever types it
@@ -573,6 +656,9 @@ pub fn query_default(mime: &str) -> Option<String> {
 /// What the "Open with…" dialog offers for one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenWith {
+    /// The type of the file; of several files, their common type, or empty
+    /// when they differ (`apps` then holds the applications that handle
+    /// every one of the types).
     pub mime: String,
     /// The applications that handle `mime`, the default first.
     pub apps: Vec<App>,
@@ -770,21 +856,136 @@ pub fn remember_default(mime: &str, id: &str) -> std::io::Result<()> {
 /// files, so call it off the UI thread. The default is the one remembered in
 /// the user's `mimeapps.list`, else the one `xdg-mime` reports.
 pub fn open_with_candidates(path: &Path) -> OpenWith {
-    let mime = query_mime(path);
-    let dirs = application_dirs(
+    open_with_for_type(&query_mime(path))
+}
+
+/// Distinct MIME types of `mimes`, ignoring case, in first-seen order.
+fn distinct_mimes(mimes: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut distinct: Vec<String> = Vec::new();
+    for mime in mimes {
+        if !distinct.iter().any(|seen| seen.eq_ignore_ascii_case(&mime)) {
+            distinct.push(mime);
+        }
+    }
+    distinct
+}
+
+/// What the "Open with…" dialog offers for several files: the applications
+/// that handle every selected type. Blocking, like [`open_with_candidates`].
+/// With one shared type the answer is that of one file of the type.
+pub fn open_with_candidates_many(paths: &[PathBuf]) -> OpenWith {
+    let mimes = distinct_mimes(paths.iter().map(|path| query_mime(path)));
+    if let [mime] = mimes.as_slice() {
+        return open_with_for_type(mime);
+    }
+    let dirs = application_dirs_from_env();
+    let found = candidates(&dirs);
+    OpenWith {
+        apps: matching_apps_all(&found, &mimes, None),
+        all_apps: all_apps(&found),
+        mime: String::new(),
+    }
+}
+
+fn application_dirs_from_env() -> Vec<PathBuf> {
+    application_dirs(
         std::env::var_os("HOME").as_deref(),
         std::env::var_os("XDG_DATA_HOME").as_deref(),
         std::env::var_os("XDG_DATA_DIRS").as_deref(),
-    );
-    let default = mimeapps_path_from_env()
-        .and_then(|file| default_application(&file, &mime))
-        .or_else(|| query_default(&mime));
-    let found = candidates(&dirs);
+    )
+}
+
+fn default_id_for(mime: &str) -> Option<String> {
+    mimeapps_path_from_env()
+        .and_then(|file| default_application(&file, mime))
+        .or_else(|| query_default(mime))
+}
+
+fn open_with_for_type(mime: &str) -> OpenWith {
+    let found = candidates(&application_dirs_from_env());
+    let default = default_id_for(mime);
     OpenWith {
-        apps: matching_apps(&found, &mime, default.as_deref()),
+        apps: matching_apps(&found, mime, default.as_deref()),
         all_apps: all_apps(&found),
-        mime,
+        mime: mime.to_owned(),
     }
+}
+
+/// Files with the application that opens them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppGroup {
+    /// `None`: no application of ours can open them (the system opener does).
+    pub app: Option<App>,
+    pub paths: Vec<PathBuf>,
+}
+
+/// Groups files by application (by id), the groups in the order their
+/// first file appears and each group's files in the given order. Files
+/// without an application form the last-seen `None` group.
+pub fn group_by_app(files: Vec<(PathBuf, Option<App>)>) -> Vec<AppGroup> {
+    let mut groups: Vec<AppGroup> = Vec::new();
+    for (path, app) in files {
+        let existing = groups
+            .iter_mut()
+            .find(|group| group.app.as_ref().map(|a| &a.id) == app.as_ref().map(|a| &a.id));
+        match existing {
+            Some(group) => group.paths.push(path),
+            None => groups.push(AppGroup {
+                app,
+                paths: vec![path],
+            }),
+        }
+    }
+    groups
+}
+
+/// The default application of each file: the application `default_of`
+/// names for the file's type, when it is installed under `dirs` and can be
+/// offered (see [`find_apps`]).
+pub fn default_apps(
+    dirs: &[PathBuf],
+    files: &[(PathBuf, String)],
+    default_of: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(PathBuf, Option<App>)> {
+    let found = candidates(dirs);
+    files
+        .iter()
+        .map(|(path, mime)| {
+            let app = default_of(mime).and_then(|id| {
+                found
+                    .iter()
+                    .find(|candidate| candidate.app.id == id)
+                    .map(|candidate| candidate.app.clone())
+            });
+            (path.clone(), app)
+        })
+        .collect()
+}
+
+/// `paths` grouped by their default application, from the process
+/// environment. Blocking (`xdg-mime`, `.desktop` files): off the UI thread.
+pub fn default_app_groups(paths: &[PathBuf]) -> Vec<AppGroup> {
+    let mut by_mime: Vec<(String, Option<String>)> = Vec::new();
+    let files: Vec<(PathBuf, String)> = paths
+        .iter()
+        .map(|path| (path.clone(), query_mime(path)))
+        .collect();
+    for (_, mime) in &files {
+        if !by_mime.iter().any(|(seen, _)| seen == mime) {
+            by_mime.push((mime.clone(), default_id_for(mime)));
+        }
+    }
+    let default_of = |mime: &str| -> Option<String> {
+        by_mime
+            .iter()
+            .find(|(seen, _)| seen == mime)
+            .and_then(|(_, id)| id.clone())
+    };
+    group_by_app(default_apps(
+        &application_dirs_from_env(),
+        &files,
+        &default_of,
+    ))
 }
 
 #[cfg(test)]
@@ -1477,6 +1678,290 @@ mod tests {
         let written = std::fs::read_to_string(&real)?;
         assert!(written.contains("text/plain=zed.desktop;"), "{written}");
         assert!(written.contains("image/png=a.desktop;"), "{written}");
+        Ok(())
+    }
+
+    // --- several files at once --------------------------------------------
+
+    fn many(exec: &str, paths: &[&str]) -> Result<Vec<Vec<String>>, ExecError> {
+        let paths: Vec<&Path> = paths.iter().map(Path::new).collect();
+        Ok(expand_exec_many(exec, &paths)?
+            .into_iter()
+            .map(|argv| {
+                argv.into_iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect())
+    }
+
+    fn rows(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|arg| (*arg).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_list_code_gets_every_file_in_one_process() -> TestResult {
+        let files = ["/d/a b.txt", "/d/100%.txt", "/d/c.txt"];
+        assert_eq!(
+            many("viewer --new %F", &files)?,
+            rows(&[&["viewer", "--new", "/d/a b.txt", "/d/100%.txt", "/d/c.txt"]])
+        );
+        assert_eq!(
+            many("viewer %U", &files)?,
+            rows(&[&[
+                "viewer",
+                "file:///d/a%20b.txt",
+                "file:///d/100%25.txt",
+                "file:///d/c.txt"
+            ]])
+        );
+        // One file: the same as the single-file expansion.
+        assert_eq!(many("viewer %F", &["/d/a"])?, rows(&[&["viewer", "/d/a"]]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_code_gets_one_process_per_file() -> TestResult {
+        let files = ["/d/a b.txt", "/d/c.txt"];
+        assert_eq!(
+            many("viewer %f", &files)?,
+            rows(&[&["viewer", "/d/a b.txt"], &["viewer", "/d/c.txt"]])
+        );
+        assert_eq!(
+            many("viewer --open=%u", &files)?,
+            rows(&[
+                &["viewer", "--open=file:///d/a%20b.txt"],
+                &["viewer", "--open=file:///d/c.txt"]
+            ])
+        );
+        assert_eq!(many("viewer %f", &["/d/a"])?, rows(&[&["viewer", "/d/a"]]));
+        Ok(())
+    }
+
+    #[test]
+    fn the_other_codes_and_percent_signs_are_as_for_one_file() -> TestResult {
+        let files = ["/d/a", "/d/b"];
+        // %i %c %k are dropped (as in the single-file expansion), %% stays.
+        assert_eq!(
+            many("viewer %i %c %k 100%% %F", &files)?,
+            rows(&[&["viewer", "100%", "/d/a", "/d/b"]])
+        );
+        assert_eq!(
+            many("viewer 100%% %f", &files)?,
+            rows(&[&["viewer", "100%", "/d/a"], &["viewer", "100%", "/d/b"]])
+        );
+        // A list code and a single code together: one process, the single
+        // code takes the first file.
+        assert_eq!(
+            many("viewer --first=%f %F", &files)?,
+            rows(&[&["viewer", "--first=/d/a", "/d/a", "/d/b"]])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_utf8_paths_keep_their_bytes_in_every_invocation() -> TestResult {
+        let raw = [b'/', b'd', b'/', 0xff, b'.', b't'];
+        let odd = Path::new(OsStr::from_bytes(&raw));
+        let plain = Path::new("/d/x");
+        let all = expand_exec_many("viewer %F", &[odd, plain])?;
+        assert_eq!(
+            all,
+            vec![vec![
+                OsString::from("viewer"),
+                OsString::from_vec(raw.to_vec()),
+                OsString::from("/d/x")
+            ]]
+        );
+        let each = expand_exec_many("viewer %f", &[odd, plain])?;
+        let second_args: Vec<Option<&OsString>> = each.iter().map(|argv| argv.get(1)).collect();
+        assert_eq!(
+            second_args,
+            vec![
+                Some(&OsString::from_vec(raw.to_vec())),
+                Some(&OsString::from("/d/x"))
+            ]
+        );
+        let uris = expand_exec_many("viewer %U", &[odd])?;
+        assert_eq!(
+            uris,
+            vec![vec![
+                OsString::from("viewer"),
+                OsString::from("file:///d/%FF.t")
+            ]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_quoted_field_code_is_still_refused_for_many_files() {
+        let files = [Path::new("/d/a"), Path::new("/d/b")];
+        assert_eq!(
+            expand_exec_many(r#"sh -c "echo %F""#, &files),
+            Err(ExecError::QuotedFieldCode)
+        );
+        assert_eq!(expand_exec_many("", &files), Err(ExecError::Empty));
+        assert_eq!(expand_exec_many("viewer %F", &[]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn the_single_file_expansion_is_unchanged() -> TestResult {
+        assert_eq!(argv("viewer %F", "/d/a b")?, vec!["viewer", "/d/a b"]);
+        assert_eq!(
+            argv("viewer %U", "/d/a b")?,
+            vec!["viewer", "file:///d/a%20b"]
+        );
+        Ok(())
+    }
+
+    fn found_in(scratch: &Scratch) -> Vec<PathBuf> {
+        vec![scratch.0.join("applications")]
+    }
+
+    #[test]
+    fn apps_for_several_types_handle_every_one_of_them() -> TestResult {
+        let scratch = Scratch::new("intersection")?;
+        scratch.write(
+            "applications/both.desktop",
+            &entry("Both", "text/plain;image/png;", ""),
+        )?;
+        scratch.write("applications/png.desktop", &entry("Png", "image/png;", ""))?;
+        scratch.write(
+            "applications/text.desktop",
+            &entry("Text", "text/plain;", ""),
+        )?;
+        scratch.write(
+            "applications/none.desktop",
+            &entry("None", "audio/ogg;", ""),
+        )?;
+        let dirs = found_in(&scratch);
+        let names = |mimes: &[&str], default: Option<&str>| -> Vec<String> {
+            let mimes: Vec<String> = mimes.iter().map(|m| (*m).to_owned()).collect();
+            find_apps_for_all(&dirs, &mimes, default)
+                .into_iter()
+                .map(|app| app.name)
+                .collect()
+        };
+        assert_eq!(names(&["text/plain", "image/png"], None), ["Both"]);
+        assert_eq!(
+            names(&["image/png", "text/plain", "image/png"], None),
+            ["Both"]
+        );
+        // The text/* fallback of the single-file logic applies to every type.
+        assert_eq!(
+            names(&["text/markdown", "text/x-rust"], None),
+            ["Both", "Text"]
+        );
+        assert_eq!(
+            names(&["text/plain", "audio/ogg"], None),
+            Vec::<String>::new()
+        );
+        // One type: exactly what find_apps lists (default first, even when
+        // it does not declare the type).
+        assert_eq!(
+            names(&["image/png"], Some("none.desktop")),
+            ["None", "Both", "Png"]
+        );
+        let single = find_apps(&dirs, "image/png", Some("none.desktop"));
+        assert_eq!(
+            single
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
+            ["None", "Both", "Png"]
+        );
+        Ok(())
+    }
+
+    fn app(id: &str) -> App {
+        App {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            exec: format!("{id} %F"),
+        }
+    }
+
+    #[test]
+    fn files_group_by_their_default_app_in_first_seen_order() {
+        let groups = group_by_app(vec![
+            (PathBuf::from("/d/1.txt"), Some(app("edit"))),
+            (PathBuf::from("/d/2.pdf"), Some(app("pdf"))),
+            (PathBuf::from("/d/3.bin"), None),
+            (PathBuf::from("/d/4.txt"), Some(app("edit"))),
+            (PathBuf::from("/d/5.bin"), None),
+        ]);
+        let shown: Vec<(Option<&str>, Vec<&str>)> = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.app.as_ref().map(|app| app.id.as_str()),
+                    group
+                        .paths
+                        .iter()
+                        .map(|p| p.to_str().unwrap_or(""))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (Some("edit"), vec!["/d/1.txt", "/d/4.txt"]),
+                (Some("pdf"), vec!["/d/2.pdf"]),
+                (None, vec!["/d/3.bin", "/d/5.bin"]),
+            ]
+        );
+        assert!(group_by_app(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn the_default_app_of_each_file_comes_from_its_type() -> TestResult {
+        let scratch = Scratch::new("defaults")?;
+        scratch.write(
+            "applications/edit.desktop",
+            &entry("Edit", "text/plain;", ""),
+        )?;
+        scratch.write(
+            "applications/pdf.desktop",
+            &entry("Pdf", "application/pdf;", ""),
+        )?;
+        scratch.write(
+            "applications/term.desktop",
+            &entry("Term", "text/plain;", "Terminal=true\n"),
+        )?;
+        let dirs = found_in(&scratch);
+        let files = vec![
+            (PathBuf::from("/d/a.txt"), "text/plain".to_owned()),
+            (PathBuf::from("/d/b.pdf"), "application/pdf".to_owned()),
+            (PathBuf::from("/d/c.dat"), "application/x-none".to_owned()),
+            (PathBuf::from("/d/d.txt"), "text/plain".to_owned()),
+            (
+                PathBuf::from("/d/e.sh"),
+                "application/x-shellscript".to_owned(),
+            ),
+        ];
+        let default_of = |mime: &str| match mime {
+            "text/plain" => Some("edit.desktop".to_owned()),
+            "application/pdf" => Some("pdf.desktop".to_owned()),
+            // Names an app that is not installed, and one that cannot run.
+            "application/x-shellscript" => Some("term.desktop".to_owned()),
+            _ => None,
+        };
+        let groups = group_by_app(default_apps(&dirs, &files, &default_of));
+        let shown: Vec<(Option<&str>, usize)> = groups
+            .iter()
+            .map(|g| (g.app.as_ref().map(|a| a.id.as_str()), g.paths.len()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (Some("edit.desktop"), 2),
+                (Some("pdf.desktop"), 1),
+                (None, 2)
+            ]
+        );
         Ok(())
     }
 }

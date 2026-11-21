@@ -176,7 +176,7 @@ mod tests {
         }
     }
 
-    fn target(selected: usize, single_file: bool) -> MenuTarget {
+    fn target(selected: usize, only_files: bool) -> MenuTarget {
         MenuTarget {
             in_trash: false,
             selected,
@@ -184,7 +184,7 @@ mod tests {
             terminal: false,
             can_paste: false,
             folder_selected: false,
-            single_file,
+            only_files,
             folder_favorite: false,
         }
     }

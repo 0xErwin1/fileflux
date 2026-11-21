@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bolt::controls::InputState;
-use fileflux::core::apps::{App, OpenWith, expand_exec, filter_apps};
+use fileflux::core::apps::{App, AppGroup, OpenWith, expand_exec_many, filter_apps};
 use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
@@ -1319,7 +1319,7 @@ pub(crate) enum MenuCommand {
     /// Recent view: go to the folder that holds the single selected entry,
     /// with the entry selected there.
     OpenContainingFolder,
-    /// Choose the application to open the single selected file with.
+    /// Choose the application to open the selected files with.
     OpenWith,
     Rename,
     CopyPath,
@@ -1498,9 +1498,9 @@ pub(crate) struct MenuTarget {
     pub(crate) can_paste: bool,
     /// Exactly one entry is selected and it is a folder (not a link to one).
     pub(crate) folder_selected: bool,
-    /// Exactly one entry is selected and it is not a folder: "Open with…"
+    /// At least one entry is selected and none is a folder: "Open with…"
     /// applies.
-    pub(crate) single_file: bool,
+    pub(crate) only_files: bool,
     /// The one selected folder is a favorite already.
     pub(crate) folder_favorite: bool,
 }
@@ -1649,7 +1649,7 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
                 ));
             }
         }
-        if target.single_file {
+        if target.only_files {
             rows.push(item(
                 MenuCommand::OpenWith,
                 "Open with\u{2026}",
@@ -1833,11 +1833,19 @@ pub(crate) enum DialogKind {
     EmptyTrash { count: usize },
     /// Choose the application to open `file` (of type `mime`) with.
     OpenWith {
+        /// The file's name; with several files, how many there are.
         file: String,
+        /// How many files are opened (their type is `mime`, empty when they
+        /// differ).
+        count: usize,
         mime: String,
         /// The list of every application shows instead of the ones for `mime`.
         other: bool,
     },
+    /// Opening would start `count` processes (more than
+    /// [`CONFIRM_LAUNCHES_ABOVE`]); `app` names the application when it is
+    /// one for all of them.
+    OpenMany { app: Option<String>, count: usize },
     /// A paste found `name` already in `folder`; the two lines describe the
     /// item there and the one arriving.
     Conflict {
@@ -1880,8 +1888,10 @@ pub(crate) enum DialogAction {
     DeleteFromTrash(Vec<OsString>),
     /// The Trash names the dialog counted; nothing else is deleted.
     EmptyTrash(Vec<OsString>),
-    /// Run the selected application on the file.
+    /// Run the selected application on the files.
     OpenWith(OpenWithState),
+    /// Start these launches, which the dialog counted and named.
+    OpenMany(Vec<AppLaunch>),
     /// A running paste waits for the answer. `apply_all` is the checkbox
     /// "Apply to all remaining conflicts".
     Conflict {
@@ -1905,7 +1915,8 @@ pub(crate) enum DialogAction {
 /// application that takes a file, narrowed by `filter`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenWithState {
-    pub(crate) path: PathBuf,
+    pub(crate) paths: Vec<PathBuf>,
+    /// The type shared by every file; empty when they differ.
     pub(crate) mime: String,
     /// The applications that handle `mime`, the default first.
     pub(crate) apps: Vec<App>,
@@ -1949,10 +1960,10 @@ impl OpenWithState {
 pub(crate) enum OpenWithPick {
     /// The "Other application…" row: show every application instead.
     Other,
-    /// Run `app` on `path`; `remember` is the MIME type to make `app` the
-    /// default for.
+    /// Run `app` on `paths`; `remember` is the MIME type to make `app` the
+    /// default for (only when every file has that one type).
     Launch {
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         app: App,
         remember: Option<String>,
     },
@@ -1987,12 +1998,12 @@ impl DialogState {
         }
     }
 
-    /// The "Open with…" chooser for `path`: the applications for its type
-    /// in the order found (the default first, selected), then the
+    /// The "Open with…" chooser for `paths`: the applications for their
+    /// type(s) in the order found (the default first, selected), then the
     /// "Other application…" row.
-    pub(crate) fn open_with(path: &Path, found: &OpenWith) -> DialogState {
+    pub(crate) fn open_with(paths: &[PathBuf], found: &OpenWith) -> DialogState {
         let state = OpenWithState {
-            path: path.to_path_buf(),
+            paths: paths.to_vec(),
             mime: found.mime.clone(),
             apps: found.apps.clone(),
             all_apps: found.all_apps.clone(),
@@ -2003,7 +2014,11 @@ impl DialogState {
             filter_input: None,
         };
         let kind = DialogKind::OpenWith {
-            file: display_name(path),
+            file: match paths {
+                [path] => display_name(path),
+                many => format!("{} files", many.len()),
+            },
+            count: paths.len(),
             mime: found.mime.clone(),
             other: false,
         };
@@ -2103,8 +2118,10 @@ impl DialogState {
     }
 
     /// The checkbox label of the "Open with…" chooser.
+    /// Only when the files share one type: a default is per type.
     pub(crate) fn remember_label(&self) -> Option<String> {
         self.open_with_state()
+            .filter(|state| !state.mime.is_empty())
             .map(|state| format!("Remember for {}", state.mime))
     }
 
@@ -2117,9 +2134,9 @@ impl DialogState {
         }
         let app = state.rows().into_iter().nth(state.selected)?;
         Some(OpenWithPick::Launch {
-            path: state.path.clone(),
+            paths: state.paths.clone(),
             app,
-            remember: state.remember.then(|| state.mime.clone()),
+            remember: (state.remember && !state.mime.is_empty()).then(|| state.mime.clone()),
         })
     }
 
@@ -2400,14 +2417,39 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             "Replace it, skip this item, or keep both?".to_owned(),
             "Replace",
         ),
-        DialogKind::OpenWith { file, mime, other } => (
-            format!("Open \u{201c}{file}\u{201d} with\u{2026}"),
+        DialogKind::OpenWith {
+            file,
+            count,
+            mime,
+            other,
+        } => (
+            if *count == 1 {
+                format!("Open \u{201c}{file}\u{201d} with\u{2026}")
+            } else {
+                format!("Open {file} with\u{2026}")
+            },
             if *other {
                 "Every application. Type to filter, Up and Down choose, Enter opens.".to_owned()
-            } else {
+            } else if mime.is_empty() {
+                "Applications that handle every selected type. Up and Down choose, Enter opens."
+                    .to_owned()
+            } else if *count == 1 {
                 format!("Applications for {mime}. Up and Down choose, Enter opens.")
+            } else {
+                format!("Applications for {mime} files. Up and Down choose, Enter opens.")
             },
             "Open",
+        ),
+        DialogKind::OpenMany { app, count } => (
+            match app {
+                Some(app) => format!("Open {count} windows of {app}?"),
+                None => format!("Open {count} windows?"),
+            },
+            format!(
+                "This starts {count} separate programs, one click. \
+                 Open them all, or cancel to start none."
+            ),
+            "Open all",
         ),
         DialogKind::Archive { extract: false } => (
             if count == 1 {
@@ -2507,6 +2549,7 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         ],
         // Every application is a row of its own: none is folded away.
         DialogKind::OpenWith { .. } => names.to_vec(),
+        DialogKind::OpenMany { .. } => Vec::new(),
         // The field says what the dialog is about.
         DialogKind::Archive { .. } | DialogKind::SelectPattern | DialogKind::Connect => Vec::new(),
         // The lines gio printed before asking, as they are.
@@ -2547,21 +2590,188 @@ pub(crate) struct OpenWithCommand {
     pub(crate) cwd: PathBuf,
 }
 
-/// What running `app` on `path` starts: its `Exec=` line expanded for the
-/// file, in the file's folder.
-pub(crate) fn open_with_command(path: &Path, app: &App) -> Result<OpenWithCommand, String> {
-    let argv = expand_exec(&app.exec, path)
+/// One process of an application per command, started together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppLaunch {
+    /// The application's name, for the notice when it cannot start.
+    pub(crate) app: String,
+    pub(crate) commands: Vec<OpenWithCommand>,
+    /// Why its `Exec=` line cannot be run: nothing starts, and it counts as
+    /// a failure to start.
+    pub(crate) error: Option<String>,
+}
+
+/// What running `app` on `paths` starts: one command when its `Exec=` takes
+/// a list (`%F`, `%U`), one per file when it takes a single file. Each runs
+/// in the folder of the file it opens (of the first, for the list).
+pub(crate) fn open_with_commands(
+    paths: &[PathBuf],
+    app: &App,
+) -> Result<Vec<OpenWithCommand>, String> {
+    let files: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let invocations = expand_exec_many(&app.exec, &files)
         .map_err(|error| format!("Could not open with {}: {error}", app.name))?;
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| format!("Could not open with {}: nothing to run", app.name))?;
-    Ok(OpenWithCommand {
-        program: PathBuf::from(program),
-        args: args.to_vec(),
-        cwd: path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-    })
+    invocations
+        .into_iter()
+        .enumerate()
+        .map(|(index, argv)| {
+            let (program, args) = argv
+                .split_first()
+                .ok_or_else(|| format!("Could not open with {}: nothing to run", app.name))?;
+            let file = paths.get(index).or(paths.first());
+            Ok(OpenWithCommand {
+                program: PathBuf::from(program),
+                args: args.to_vec(),
+                cwd: file
+                    .and_then(|path| path.parent())
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+            })
+        })
+        .collect()
+}
+
+/// The system opener, for files no application of ours was found for.
+const SYSTEM_OPENER: &str = "xdg-open";
+
+/// The launches for files grouped by application, in group order. Files
+/// without an application go to `xdg-open`, one process each.
+pub(crate) fn plan_launches(groups: &[AppGroup]) -> Vec<AppLaunch> {
+    let mut launches = Vec::new();
+    for group in groups {
+        match &group.app {
+            Some(app) => launches.push(match open_with_commands(&group.paths, app) {
+                Ok(commands) => AppLaunch {
+                    app: app.name.clone(),
+                    commands,
+                    error: None,
+                },
+                Err(error) => AppLaunch {
+                    app: app.name.clone(),
+                    commands: Vec::new(),
+                    error: Some(error),
+                },
+            }),
+            None => launches.push(AppLaunch {
+                error: None,
+                app: SYSTEM_OPENER.to_owned(),
+                commands: group
+                    .paths
+                    .iter()
+                    .map(|path| OpenWithCommand {
+                        program: PathBuf::from(SYSTEM_OPENER),
+                        args: vec![path.as_os_str().to_owned()],
+                        cwd: path
+                            .parent()
+                            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+                    })
+                    .collect(),
+            }),
+        }
+    }
+    launches
+}
+
+/// One click starting more processes than this asks first.
+pub(crate) const CONFIRM_LAUNCHES_ABOVE: usize = 20;
+
+/// How many processes `launches` start.
+pub(crate) fn process_count(launches: &[AppLaunch]) -> usize {
+    launches.iter().map(|launch| launch.commands.len()).sum()
+}
+
+/// Whether starting `processes` needs the user's confirmation.
+pub(crate) fn launch_needs_confirmation(processes: usize) -> bool {
+    processes > CONFIRM_LAUNCHES_ABOVE
+}
+
+/// The confirmation dialog for `launches`, when they start too many
+/// processes for one click.
+pub(crate) fn launch_confirmation(launches: Vec<AppLaunch>) -> Result<DialogState, Vec<AppLaunch>> {
+    let count = process_count(&launches);
+    if !launch_needs_confirmation(count) {
+        return Err(launches);
+    }
+    let app = match launches.as_slice() {
+        [only] => Some(only.app.clone()),
+        _ => None,
+    };
+    Ok(DialogState::new(
+        DialogKind::OpenMany { app, count },
+        &[],
+        DialogAction::OpenMany(launches),
+    ))
+}
+
+/// Starts every command of `launches`, detached (see
+/// [`fileflux::core::custom_actions::spawn_detached`]), and returns the
+/// names of the applications of which a command could not start, each once,
+/// in launch order. Blocking only for the `fork`s.
+pub(crate) fn run_launches(launches: &[AppLaunch]) -> Vec<String> {
+    let mut failed: Vec<String> = Vec::new();
+    for launch in launches {
+        if let Some(error) = &launch.error {
+            log::warn!("{error}");
+            failed.push(launch.app.clone());
+        }
+        for command in &launch.commands {
+            let started = fileflux::core::custom_actions::spawn_detached(
+                command.program.as_os_str(),
+                &command.args,
+                Some(&command.cwd),
+            );
+            if let Err(error) = started {
+                log::warn!("could not start {}: {error}", launch.app);
+                if !failed.contains(&launch.app) {
+                    failed.push(launch.app.clone());
+                }
+            }
+        }
+    }
+    failed
+}
+
+/// The one notice for every application that could not start; `None` when
+/// all did.
+pub(crate) fn start_failure_notice(apps: &[String]) -> Option<String> {
+    if apps.is_empty() {
+        return None;
+    }
+    Some(format!("Could not start {}", apps.join(", ")))
+}
+
+/// What Enter does to a selection of several entries.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OpenSplit {
+    /// The first image: it opens the viewer, which walks the folder's
+    /// images.
+    pub(crate) viewer: Option<PathBuf>,
+    /// The other files, for their default applications.
+    pub(crate) files: Vec<PathBuf>,
+    /// Nothing but folders is selected: they follow the rule of one entry.
+    pub(crate) only_folders: bool,
+}
+
+/// Splits `selection` (path, is a folder) in displayed order. Folders in a
+/// mixed selection are left alone: nothing navigates away from the files
+/// being opened.
+pub(crate) fn split_open(selection: &[(PathBuf, bool)]) -> OpenSplit {
+    let mut viewer = None;
+    let mut files = Vec::new();
+    for (path, is_folder) in selection {
+        if *is_folder {
+            continue;
+        }
+        if is_image_path(path) {
+            viewer.get_or_insert_with(|| path.clone());
+        } else {
+            files.push(path.clone());
+        }
+    }
+    OpenSplit {
+        viewer,
+        files,
+        only_folders: !selection.is_empty() && selection.iter().all(|(_, folder)| *folder),
+    }
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use gpui::{
     Window,
 };
 
-use fileflux::core::apps::{self, App, OpenWith};
+use fileflux::core::apps::{self, AppGroup, OpenWith};
 use fileflux::core::images::is_image_path;
 
 use super::arrange::ArrangeCommand;
@@ -31,11 +31,11 @@ use super::devices::{device_menu_rows, job_paths, with_device_rows};
 use super::folder_memory;
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
-    ARM_DELAY, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx,
-    MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick, RenameCheck,
-    RenameStep, Report, Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row, check_rename,
-    dismissed_notice, menu_rows, no_trash_dialog, open_target, open_with_command, rename_seed,
-    rename_step, stem_range,
+    ARM_DELAY, AppLaunch, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job,
+    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick,
+    RenameCheck, RenameStep, Report, Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row,
+    check_rename, dismissed_notice, launch_confirmation, menu_rows, no_trash_dialog, open_target,
+    plan_launches, rename_seed, rename_step, run_launches, start_failure_notice, stem_range,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
@@ -981,6 +981,10 @@ impl Explorer {
             DialogAction::EmptyTrash(names) => {
                 ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
             }
+            DialogAction::OpenMany(launches) => {
+                self.start_launches(launches, cx);
+                return;
+            }
             DialogAction::OpenWith(_)
             | DialogAction::Archive(_)
             | DialogAction::SelectPattern(_)
@@ -1132,7 +1136,7 @@ impl Explorer {
             terminal: self.terminal.is_some(),
             can_paste: self.can_paste(cx),
             folder_selected: matches!(selected.as_slice(), [(_, true)]),
-            single_file: matches!(selected.as_slice(), [(_, false)]),
+            only_files: !selected.is_empty() && selected.iter().all(|(_, folder)| !folder),
             folder_favorite: matches!(
                 selected.as_slice(),
                 [(path, true)] if self.favorites.contains(&Location::Directory(path.clone()))
@@ -1175,7 +1179,7 @@ impl Explorer {
         };
         let one_image =
             matches!(self.selected_visible_paths().as_slice(), [path] if is_image_path(path));
-        if target.single_file && one_image && !target.in_trash {
+        if target.only_files && one_image && !target.in_trash {
             add_viewer_row(&mut rows);
         }
         if target.selected > 0 {
@@ -1694,26 +1698,36 @@ impl Explorer {
 
     // --- clipboard, open, terminal -------------------------------------------------------
 
-    /// "Open with…": looks up the applications for the single selected
-    /// file off the UI thread, then asks which one to run.
+    /// "Open with…": looks up the applications for the selected files (all
+    /// files, no folder) off the UI thread, then asks which one to run.
+    /// Several files list the applications that handle every one of their
+    /// types.
     pub(crate) fn open_with(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.in_trash() {
             return;
         }
-        let selected = self.selected_visible_paths();
-        let [path] = selected.as_slice() else {
+        let paths = self.selected_visible_paths();
+        // The menu's rule: a link to a folder counts as a file.
+        let all_files = self
+            .selected_with_kind()
+            .iter()
+            .all(|(_, is_folder)| !is_folder);
+        if paths.is_empty() || !all_files {
             return;
-        };
-        let path = path.clone();
+        }
         let lookup = {
-            let path = path.clone();
-            cx.background_executor()
-                .spawn(async move { apps::open_with_candidates(&path) })
+            let paths = paths.clone();
+            cx.background_executor().spawn(async move {
+                match paths.as_slice() {
+                    [path] => apps::open_with_candidates(path),
+                    many => apps::open_with_candidates_many(many),
+                }
+            })
         };
         cx.spawn_in(window, async move |this, cx| {
             let found = lookup.await;
             if let Err(error) = this.update_in(cx, |this, window, cx| {
-                this.offer_open_with(&path, &found, window, cx);
+                this.offer_open_with(&paths, &found, window, cx);
             }) {
                 log::debug!("the explorer closed before the applications were found: {error}");
             }
@@ -1723,17 +1737,20 @@ impl Explorer {
 
     fn offer_open_with(
         &mut self,
-        path: &Path,
+        paths: &[PathBuf],
         found: &OpenWith,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if found.all_apps.is_empty() && found.apps.is_empty() {
-            let text = format!("No application found for {} ({})", quoted(path), found.mime);
+            let text = match paths {
+                [path] => format!("No application found for {} ({})", quoted(path), found.mime),
+                many => format!("No application found for {} files", many.len()),
+            };
             self.say(Severity::Info, text, window, cx);
             return;
         }
-        self.offer_dialog(DialogState::open_with(path, found), window, cx);
+        self.offer_dialog(DialogState::open_with(paths, found), window, cx);
     }
 
     /// Up / Down in the "Open with…" list.
@@ -1784,7 +1801,7 @@ impl Explorer {
             None => {}
             Some(OpenWithPick::Other) => self.show_other_apps(window, cx),
             Some(OpenWithPick::Launch {
-                path,
+                paths,
                 app,
                 remember,
             }) => {
@@ -1800,7 +1817,14 @@ impl Explorer {
                         }
                     }
                 }
-                self.run_open_with(&path, &app, cx);
+                self.start_groups(
+                    vec![AppGroup {
+                        app: Some(app),
+                        paths,
+                    }],
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -1849,24 +1873,39 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Runs the chosen application of a closed "Open with…" dialog.
-    fn run_open_with(&mut self, path: &Path, app: &App, cx: &mut Context<Self>) {
-        match open_with_command(path, app) {
-            Ok(command) => {
-                let failure = format!("Could not open {} with {}", quoted(path), app.name);
-                self.launch(
-                    command.program,
-                    command.args,
-                    Some(command.cwd),
-                    failure,
-                    cx,
-                );
-            }
-            Err(message) => {
-                self.tab_mut().state.set_notice(message);
-                cx.notify();
-            }
+    /// Starts files with their applications: one launch per group (see
+    /// [`plan_launches`]). More processes than
+    /// [`ops::CONFIRM_LAUNCHES_ABOVE`] ask first.
+    pub(crate) fn start_groups(
+        &mut self,
+        groups: Vec<AppGroup>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match launch_confirmation(plan_launches(&groups)) {
+            Ok(dialog) => self.offer_dialog(dialog, window, cx),
+            Err(launches) => self.start_launches(launches, cx),
         }
+    }
+
+    /// Starts `launches` off the UI thread; the applications that could not
+    /// start are named in one notice.
+    pub(crate) fn start_launches(&mut self, launches: Vec<AppLaunch>, cx: &mut Context<Self>) {
+        let started = cx
+            .background_executor()
+            .spawn(async move { run_launches(&launches) });
+        cx.spawn(async move |this, cx| {
+            let failed = started.await;
+            if let Some(notice) = start_failure_notice(&failed)
+                && let Err(closed) = this.update(cx, |this, cx| {
+                    this.tab_mut().state.set_notice(notice);
+                    cx.notify();
+                })
+            {
+                log::debug!("the explorer closed before the launch result: {closed}");
+            }
+        })
+        .detach();
     }
 
     /// Ctrl+Shift+C: the selected paths, one per line.

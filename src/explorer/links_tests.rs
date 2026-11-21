@@ -62,7 +62,7 @@ fn folder_menu(selection: &[(&str, bool)], in_folder: bool, can_paste: bool) -> 
         terminal: false,
         can_paste,
         folder_selected: matches!(selection.as_slice(), [(_, true)]),
-        single_file: matches!(selection.as_slice(), [(_, false)]),
+        only_files: matches!(selection.as_slice(), [(_, false)]),
         folder_favorite: false,
     };
     let mut rows = menu_rows(&target, &Arrangement::default());

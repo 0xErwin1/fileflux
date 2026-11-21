@@ -306,7 +306,7 @@ mod tests {
             terminal: true,
             can_paste: true,
             folder_selected: false,
-            single_file: selected == 1,
+            only_files: selected == 1,
             folder_favorite: false,
         }
     }

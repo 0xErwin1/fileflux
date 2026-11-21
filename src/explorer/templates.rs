@@ -132,7 +132,7 @@ mod tests {
             terminal: true,
             can_paste: true,
             folder_selected: false,
-            single_file: false,
+            only_files: false,
             folder_favorite: false,
         }
     }
