@@ -12,10 +12,11 @@ Mount, unmount and eject drives from the sidebar, and browse phones and network 
 
 The **Devices** section shows mounted volumes (one entry per device, with a usage meter; the root filesystem reads "System") and, under them, filesystems that are not mounted yet: muted, with "Not mounted" under the name. Unmounted filesystems come from `lsblk -J` on removable, USB and hot-plug disks and on non-system disks.
 
-Left out: swap, RAID/LVM members, loop, zram and optical devices, empty card readers, and partitions that hold a system mount (`/`, `/boot`, `/efi`, `/usr`, `/var`, `/nix`, `/etc`, `/home`, `/opt`, `/swap`, `/root`) or active swap, together with the encrypted container above them.
+Left out: swap, RAID/LVM members, loop and zram devices, empty card readers and empty optical drives, and partitions that hold a system mount (`/`, `/boot`, `/efi`, `/usr`, `/var`, `/nix`, `/etc`, `/home`, `/opt`, `/swap`, `/root`) or active swap, together with the encrypted container above them.
 
 - **Dual boot:** the other partitions of the system disk (a Windows or data partition) are listed and can be mounted and unmounted, but the system disk is never ejected.
 - An encrypted (LUKS) container nobody unlocked shows as **Locked**; click it, or right-click → **Unlock and mount** (see [Encrypted drives](#encrypted-drives)). Once unlocked, the volume inside it is listed like any other, and the container itself is hidden.
+- **Optical discs:** a disc in a drive (`lsblk` type `rom`, e.g. `/dev/sr0`) is listed with a disc icon and the disc's label ("Disc" when it has none), mounted or not. It mounts and unmounts like any volume. An **audio CD** (media but no filesystem) is listed as "Audio CD · not mountable"; a click only says so. A drive with no disc is not listed.
 - A device without a label is called "<size> Volume".
 
 ## Actions
@@ -33,7 +34,9 @@ Everything goes through `udisksctl`: no root, no shell, always with `--no-user-i
 | Mount | An unmounted, unlocked filesystem |
 | Unlock and mount | A locked LUKS container (needs `gio`) |
 | Unmount | A mount under `/run/media` or `/media`, or any mount on a removable or hot-plug disk; never a system or `fstab` mount elsewhere |
-| Eject | Removable or hot-plug disks only |
+| Eject | Removable or hot-plug disks, and discs in optical drives |
+
+**Eject on a disc** never powers the drive off. The disc is unmounted first (`udisksctl unmount`), then the tray opens: `eject <device>` (util-linux) when it is installed, otherwise `gio mount -e <device>`; with neither, the eject fails with "neither eject nor gio was found". The same guards as any eject apply: running operations on the disc are waited for, tabs on it move away, and the toast says "Ejected <name>".
 
 Unmount and Eject on an unlocked volume lock its container afterwards.
 

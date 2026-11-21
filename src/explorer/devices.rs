@@ -19,7 +19,7 @@ use fileflux::core::devices::UnmountVia;
 use fileflux::core::devices::{
     BlockNode, Device, DeviceError, DevicePlan, DeviceState, devices, eject_plan, fallback_target,
     find_tool, gio_unmount_plan, list_blocks, mount, path_is_on_mounts, path_uses_mounts,
-    real_location, run_power_off, run_unmount, unmount_plan, unmount_program,
+    real_location, run_power_off, run_tray_eject, run_unmount, unmount_plan, unmount_program,
 };
 use fileflux::core::places::{FuseRoots, Volume, VolumeKind, discover_volumes};
 use fileflux::core::watch::{
@@ -134,6 +134,7 @@ pub(crate) fn caption(device: &Device, working: Option<&'static str>) -> &'stati
     match (working, &device.state) {
         (Some(word), _) => word,
         (None, DeviceState::Locked) => "Locked",
+        (None, DeviceState::Audio) => "Audio CD \u{b7} not mountable",
         (None, _) => "Not mounted",
     }
 }
@@ -262,7 +263,7 @@ pub(crate) fn refusal<'a>(
             .iter()
             .any(|path| path_uses_mounts(path, &mounts))
             .then(|| {
-                let verb = if plan.power_off.is_some() {
+                let verb = if plan.is_eject() {
                     "ejected"
                 } else {
                     "unmounted"
@@ -332,7 +333,7 @@ pub(crate) fn plan_notice(
     result: &Result<(), DeviceError>,
     lock_failed: bool,
 ) -> (Severity, String) {
-    let eject = plan.power_off.is_some();
+    let eject = plan.is_eject();
     match result {
         Err(error) if lock_failed => {
             let tail = if eject {
@@ -347,6 +348,9 @@ pub(crate) fn plan_notice(
                     plan.label
                 ),
             )
+        }
+        Ok(()) if plan.tray_eject.is_some() => {
+            (Severity::Success, format!("Ejected {}", plan.label))
         }
         Ok(()) if eject => (
             Severity::Success,
@@ -380,11 +384,7 @@ pub(crate) fn queued_notice(plan: &DevicePlan, count: usize) -> Option<String> {
     if count == 0 {
         return None;
     }
-    let verb = if plan.power_off.is_some() {
-        "eject"
-    } else {
-        "unmount"
-    };
+    let verb = if plan.is_eject() { "eject" } else { "unmount" };
     Some(format!(
         "Will {verb} {} when {count} operation{} finish{}",
         plan.label,
@@ -485,6 +485,9 @@ pub(crate) struct DeviceHub {
     pub(crate) polling: bool,
     /// `gio`, when installed: the only way to unmount a gvfs mount.
     pub(crate) gio: Option<PathBuf>,
+    /// `eject` (util-linux), when installed: opens a disc drive's tray;
+    /// `gio` does it otherwise.
+    pub(crate) eject: Option<PathBuf>,
     /// The thread that reports device changes; `None` when inotify is
     /// unavailable.
     pub(crate) watcher: Option<DeviceWatcher>,
@@ -514,6 +517,7 @@ impl DeviceHub {
             udisksctl: find_tool("udisksctl", path.as_deref()),
             lsblk: find_tool("lsblk", path.as_deref()),
             gio: find_tool("gio", path.as_deref()),
+            eject: find_tool("eject", path.as_deref()),
             watcher,
             signals,
             was_active: true,
@@ -591,7 +595,7 @@ impl DeviceHub {
     /// running.
     pub(crate) fn refusal_for(&self, device: &Device) -> Option<String> {
         let going = self.draining().find(|plan| {
-            plan.power_off.as_deref() == Some(device.disk.as_path())
+            plan.ejected() == Some(device.disk.as_path())
                 || plan.unmount.iter().any(|step| step.device == device.path)
         });
         if let Some(plan) = going {
@@ -607,7 +611,7 @@ impl DeviceHub {
     /// waited for or cancelled: the user retries once the prompt is done.
     pub(crate) fn busy_before(&self, plan: &DevicePlan) -> Option<String> {
         self.list.iter().find_map(|device| {
-            let touched = plan.power_off.as_deref() == Some(device.disk.as_path())
+            let touched = plan.ejected() == Some(device.disk.as_path())
                 || plan.unmount.iter().any(|step| step.device == device.path);
             let busy = matches!(
                 self.working.get(&device.path),
@@ -767,6 +771,9 @@ impl Explorer {
         match self.devices.find(&path).map(|device| device.state.clone()) {
             Some(DeviceState::Unmounted) => self.mount_device(path, window, cx),
             Some(DeviceState::Locked) => self.unlock_device(path, window, cx),
+            Some(DeviceState::Audio) => {
+                self.say(Severity::Info, "An audio CD cannot be mounted", window, cx);
+            }
             Some(DeviceState::Mounted(mount)) => {
                 self.navigate(Transition::Visit(Location::Directory(mount)), window, cx);
             }
@@ -1003,7 +1010,7 @@ impl Explorer {
                     DialogKind::DeviceBusy {
                         label: plan.label.clone(),
                         count: busy.len(),
-                        eject: plan.power_off.is_some(),
+                        eject: plan.is_eject(),
                     },
                     &titles,
                     DialogAction::DeviceWhenIdle(plan),
@@ -1123,10 +1130,11 @@ impl Explorer {
         }
         let udisksctl = self.devices.udisksctl.clone();
         let gio = self.devices.gio.clone();
-        let eject = plan.power_off.is_some();
+        let eject_tool = self.devices.eject.clone();
+        let eject = plan.is_eject();
         let key = plan
-            .power_off
-            .clone()
+            .ejected()
+            .map(Path::to_path_buf)
             .or_else(|| plan.unmount.first().map(|step| step.device.clone()));
         if let Some(key) = &key {
             if self.devices.working.contains_key(key) {
@@ -1255,6 +1263,15 @@ impl Explorer {
                         .await;
                     return Some(done);
                 }
+                if let Some(device) = plan.tray_eject.clone() {
+                    let done = cx
+                        .background_executor()
+                        .spawn(async move {
+                            run_tray_eject(eject_tool.as_deref(), gio.as_deref(), &device)
+                        })
+                        .await;
+                    return Some(done);
+                }
                 Some(Ok(()))
             }
             .await;
@@ -1341,6 +1358,7 @@ mod tests {
             mounts,
             ejectable,
             container: None,
+            optical: false,
         }
     }
 
@@ -1372,6 +1390,7 @@ mod tests {
                 via: UnmountVia::Udisks,
             }],
             power_off: Some(p("/dev/sdb")),
+            tray_eject: None,
         }
     }
 
@@ -1555,6 +1574,10 @@ mod tests {
             "Not mounted"
         );
         assert_eq!(caption(&device(DeviceState::Locked, true), None), "Locked");
+        assert_eq!(
+            caption(&device(DeviceState::Audio, true), None),
+            "Audio CD \u{b7} not mountable"
+        );
         assert_eq!(
             caption(
                 &device(DeviceState::Unmounted, true),
@@ -1827,6 +1850,7 @@ mod tests {
         let eject = plan("KINGSTON", "/run/media/u/USB");
         let unmount = DevicePlan {
             power_off: None,
+            tray_eject: None,
             ..plan("DATA", "/run/media/u/DATA")
         };
         let draining = [eject, unmount];
@@ -1913,6 +1937,7 @@ mod tests {
         assert!(!text.contains("safely"));
         let unmount = DevicePlan {
             power_off: None,
+            tray_eject: None,
             ..eject
         };
         assert_eq!(
@@ -2457,6 +2482,7 @@ mod tests {
         // A device of another disk does not hold it.
         let other = DevicePlan {
             power_off: Some(p("/dev/sdz")),
+            tray_eject: None,
             unmount: Vec::new(),
             ..eject
         };
@@ -2471,6 +2497,7 @@ mod tests {
         let eject = plan("KINGSTON", "/run/media/u/USB");
         let unmount = DevicePlan {
             power_off: None,
+            tray_eject: None,
             ..eject.clone()
         };
         assert_eq!(
@@ -2491,6 +2518,40 @@ mod tests {
         assert_eq!(
             plan_notice(&unmount, &failed, false).1,
             "Could not unmount KINGSTON: busy"
+        );
+    }
+
+    #[test]
+    fn a_disc_eject_says_ejected_and_is_a_drain_like_any_eject() {
+        let disc = DevicePlan {
+            power_off: None,
+            tray_eject: Some(p("/dev/sr0")),
+            ..plan("DVD", "/run/media/u/DVD")
+        };
+        assert_eq!(
+            plan_notice(&disc, &Ok(()), false),
+            (Severity::Success, "Ejected DVD".to_owned())
+        );
+        let failed = Err(DeviceError::Failed {
+            reason: "unable to eject".to_owned(),
+        });
+        assert_eq!(
+            plan_notice(&disc, &failed, false).1,
+            "Could not eject DVD: unable to eject"
+        );
+        assert_eq!(
+            queued_notice(&disc, 1).as_deref(),
+            Some("Will eject DVD when 1 operation finishes")
+        );
+        assert_eq!(
+            refusal([&disc], &[p("/run/media/u/DVD/a.txt")]).as_deref(),
+            Some("DVD is being ejected")
+        );
+        // The plan of a USB disk is unchanged.
+        let usb = plan("KINGSTON", "/run/media/u/USB");
+        assert_eq!(
+            plan_notice(&usb, &Ok(()), false).1,
+            "KINGSTON can be removed safely"
         );
     }
 }

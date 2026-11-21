@@ -416,6 +416,8 @@ fn unmounted_row(
     let colors = bolt::colors(cx);
     let glyph = if device.state == DeviceState::Locked {
         gpui_kit_assets::IconName::Lock
+    } else if device.optical {
+        gpui_kit_assets::IconName::Disc
     } else if device.ejectable {
         gpui_kit_assets::IconName::Usb
     } else {
@@ -468,6 +470,9 @@ fn volume_glyph(volume: &Volume, device: Option<&Device>) -> gpui_kit_assets::Ic
         VolumeKind::Phone => gpui_kit_assets::IconName::Smartphone,
         VolumeKind::Share => gpui_kit_assets::IconName::Network,
         VolumeKind::Remote => gpui_kit_assets::IconName::Server,
+        VolumeKind::Disk if device.is_some_and(|device| device.optical) => {
+            gpui_kit_assets::IconName::Disc
+        }
         VolumeKind::Disk if volume.removable || device.is_some_and(|device| device.ejectable) => {
             gpui_kit_assets::IconName::Usb
         }
@@ -1077,6 +1082,36 @@ mod tests {
         assert_eq!(glyph(VolumeKind::Remote, false), IconName::Server);
         assert_eq!(glyph(VolumeKind::Disk, true), IconName::Usb);
         assert_eq!(glyph(VolumeKind::Disk, false), IconName::HardDrive);
+    }
+
+    #[test]
+    fn a_disc_has_the_disc_icon_whatever_the_removable_flag() {
+        let disc = Device {
+            path: PathBuf::from("/dev/sr0"),
+            disk: PathBuf::from("/dev/sr0"),
+            label: "DVD".to_owned(),
+            fstype: Some("iso9660".to_owned()),
+            size: 1,
+            state: DeviceState::Unmounted,
+            mounts: Vec::new(),
+            ejectable: true,
+            container: None,
+            optical: true,
+        };
+        for removable in [true, false] {
+            assert_eq!(
+                volume_glyph(&volume(VolumeKind::Disk, removable), Some(&disc)),
+                gpui_kit_assets::IconName::Disc
+            );
+        }
+        let usb = Device {
+            optical: false,
+            ..disc
+        };
+        assert_eq!(
+            volume_glyph(&volume(VolumeKind::Disk, false), Some(&usb)),
+            gpui_kit_assets::IconName::Usb
+        );
     }
 
     #[test]

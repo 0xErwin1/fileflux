@@ -78,6 +78,8 @@ pub enum DeviceState {
     Mounted(PathBuf),
     /// An encrypted container nobody unlocked: [`Device::can_unlock`].
     Locked,
+    /// An audio CD: media without a filesystem, nothing to mount.
+    Audio,
 }
 
 /// A filesystem the sidebar can show: mounted or not.
@@ -100,6 +102,9 @@ pub struct Device {
     /// The LUKS container this device was unlocked from (`/dev/sdb1` for
     /// `/dev/mapper/luks-…`): locked again after the device is unmounted.
     pub container: Option<PathBuf>,
+    /// An optical drive with a disc in it: ejected by opening the tray, never
+    /// powered off.
+    pub optical: bool,
 }
 
 impl Device {
@@ -175,11 +180,25 @@ pub struct DevicePlan {
     pub label: String,
     /// Unmounted first to last.
     pub unmount: Vec<UnmountStep>,
-    /// Powered off after the last unmount (eject only).
+    /// Powered off after the last unmount (eject of a disk only).
     pub power_off: Option<PathBuf>,
+    /// The optical drive whose tray opens after the last unmount (eject of a
+    /// disc only, never together with `power_off`): `eject <device>`, or
+    /// `gio mount -e <device>` without it.
+    pub tray_eject: Option<PathBuf>,
 }
 
 impl DevicePlan {
+    /// Whether this is an eject: the disk is powered off or the tray opens.
+    pub fn is_eject(&self) -> bool {
+        self.ejected().is_some()
+    }
+
+    /// The device an eject takes away.
+    pub fn ejected(&self) -> Option<&Path> {
+        self.power_off.as_deref().or(self.tray_eject.as_deref())
+    }
+
     /// Every mount point the plan takes away.
     pub fn mounts(&self) -> Vec<PathBuf> {
         self.unmount
@@ -314,6 +333,60 @@ fn is_virtual(node: &BlockNode) -> bool {
         || matches!(node.kind.as_str(), "loop" | "rom")
 }
 
+/// An optical drive (`lsblk` type `rom`), with or without a disc.
+fn is_optical(node: &BlockNode) -> bool {
+    node.kind == "rom"
+}
+
+/// A disc in the drive: `lsblk` reports a size, or a filesystem, only then.
+fn has_media(node: &BlockNode) -> bool {
+    node.size > 0
+        || node
+            .fstype
+            .as_deref()
+            .is_some_and(|fstype| !fstype.is_empty())
+}
+
+/// The disc in an optical drive: a data disc (a filesystem such as iso9660
+/// or udf) mounts like any volume; an audio CD (media, no filesystem) is
+/// listed as [`DeviceState::Audio`]. An empty drive is not listed.
+fn optical_device(node: &BlockNode, out: &mut Vec<Device>) {
+    if !has_media(node) || holds_system(node) {
+        return;
+    }
+    let fstype = node.fstype.as_deref().filter(|fstype| !fstype.is_empty());
+    if fstype.is_some_and(is_not_a_filesystem) {
+        return;
+    }
+    let label = node.label.clone().filter(|label| !label.trim().is_empty());
+    let (state, label) = match fstype {
+        Some(_) => (
+            node.mountpoints
+                .first()
+                .map_or(DeviceState::Unmounted, |mount| {
+                    DeviceState::Mounted(mount.clone())
+                }),
+            label.unwrap_or_else(|| "Disc".to_owned()),
+        ),
+        None => (
+            DeviceState::Audio,
+            label.unwrap_or_else(|| "Audio CD".to_owned()),
+        ),
+    };
+    out.push(Device {
+        path: node.path.clone(),
+        disk: node.path.clone(),
+        label,
+        fstype: fstype.map(str::to_owned),
+        size: node.size,
+        state,
+        mounts: node.mountpoints.clone(),
+        ejectable: true,
+        container: None,
+        optical: true,
+    });
+}
+
 fn is_ejectable_disk(disk: &BlockNode) -> bool {
     disk.removable || disk.hotplug
 }
@@ -397,6 +470,7 @@ fn collect_devices(
         ejectable: !holds_system(disk)
             && (is_ejectable_disk(disk) || node.removable || node.hotplug),
         container: container.map(Path::to_path_buf),
+        optical: false,
     });
 }
 
@@ -408,6 +482,10 @@ fn collect_devices(
 pub fn devices(nodes: &[BlockNode]) -> Vec<Device> {
     let mut out = Vec::new();
     for disk in nodes {
+        if is_optical(disk) {
+            optical_device(disk, &mut out);
+            continue;
+        }
         if is_virtual(disk) {
             continue;
         }
@@ -444,6 +522,7 @@ pub fn unmount_plan(device: &Device) -> Option<DevicePlan> {
         label: device.label.clone(),
         unmount,
         power_off: None,
+        tray_eject: None,
     })
 }
 
@@ -488,6 +567,9 @@ fn mounted_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
 /// filesystem (an empty card reader has nothing to eject).
 pub fn eject_plan(nodes: &[BlockNode], disk: &Path, label: &str) -> Option<DevicePlan> {
     let node = nodes.iter().find(|node| node.path == disk)?;
+    if is_optical(node) {
+        return disc_eject_plan(node, label);
+    }
     if is_virtual(node) || holds_system(node) || !is_ejectable_disk(node) {
         return None;
     }
@@ -507,6 +589,23 @@ pub fn eject_plan(nodes: &[BlockNode], disk: &Path, label: &str) -> Option<Devic
         label: label.to_owned(),
         unmount,
         power_off: Some(node.path.clone()),
+        tray_eject: None,
+    })
+}
+
+/// Unmounting a disc, then opening the tray. Never a power-off. `None` for
+/// an empty drive or one that holds a system mount.
+fn disc_eject_plan(node: &BlockNode, label: &str) -> Option<DevicePlan> {
+    if !has_media(node) || holds_system(node) {
+        return None;
+    }
+    let mut unmount = Vec::new();
+    mounted_below(node, &mut unmount);
+    Some(DevicePlan {
+        label: label.to_owned(),
+        unmount,
+        power_off: None,
+        tray_eject: Some(node.path.clone()),
     })
 }
 
@@ -761,6 +860,32 @@ pub fn power_off_args(disk: &Path) -> Vec<OsString> {
     udisks_args("power-off", disk)
 }
 
+/// The tool that opens a drive's tray, and its argv: `eject <device>`
+/// (util-linux) when installed, else `gio mount -e <device>`. The device path
+/// is absolute, so it is never read as an option.
+pub fn tray_eject_command(
+    eject: Option<&Path>,
+    gio: Option<&Path>,
+    device: &Path,
+) -> Result<(PathBuf, Vec<OsString>), DeviceError> {
+    if let Some(eject) = eject {
+        return Ok((eject.to_path_buf(), vec![device.as_os_str().to_owned()]));
+    }
+    match gio {
+        Some(gio) => Ok((
+            gio.to_path_buf(),
+            vec![
+                OsString::from("mount"),
+                OsString::from("-e"),
+                device.as_os_str().to_owned(),
+            ],
+        )),
+        None => Err(DeviceError::Failed {
+            reason: "neither eject nor gio was found".to_owned(),
+        }),
+    }
+}
+
 /// The mount point in a successful `udisksctl mount` output
 /// (`Mounted /dev/sdb1 at /run/media/user/LABEL`).
 pub fn parse_mount_output(stdout: &str) -> Option<PathBuf> {
@@ -988,6 +1113,7 @@ pub fn gio_unmount_plan(label: &str, mount: &Path) -> DevicePlan {
             via: UnmountVia::Gio,
         }],
         power_off: None,
+        tray_eject: None,
     }
 }
 
@@ -1053,14 +1179,54 @@ pub fn run_power_off(udisksctl: &Path, disk: &Path) -> Result<(), DeviceError> {
     }
 }
 
+/// Opens the tray of `device` through [`tray_eject_command`].
+pub fn run_tray_eject(
+    eject: Option<&Path>,
+    gio: Option<&Path>,
+    device: &Path,
+) -> Result<(), DeviceError> {
+    let (program, args) = tray_eject_command(eject, gio, device)?;
+    let output = run_tool(&program, &args, UDISKS_TIMEOUT)?;
+    if output.success {
+        return Ok(());
+    }
+    Err(DeviceError::Failed {
+        reason: output
+            .stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("the eject tool failed without a message")
+            .to_owned(),
+    })
+}
+
 /// Runs `plan`: its unmounts in order, then the power-off. The first
-/// failure stops the plan.
+/// failure stops the plan. A disc's tray eject needs [`run_plan_with`].
 pub fn run_plan(udisksctl: &Path, plan: &DevicePlan) -> Result<(), DeviceError> {
+    run_plan_with(Some(udisksctl), None, None, plan)
+}
+
+/// Runs `plan` with every tool it may need: each unmount step through its
+/// own tool, then the power-off or the tray eject. The first failure stops
+/// the plan.
+pub fn run_plan_with(
+    udisksctl: Option<&Path>,
+    gio: Option<&Path>,
+    eject: Option<&Path>,
+    plan: &DevicePlan,
+) -> Result<(), DeviceError> {
     for step in &plan.unmount {
-        run_unmount(udisksctl, step)?;
+        run_unmount(unmount_program(step, udisksctl, gio)?, step)?;
     }
     if let Some(disk) = &plan.power_off {
+        let udisksctl = udisksctl.ok_or_else(|| DeviceError::Failed {
+            reason: "udisksctl was not found".to_owned(),
+        })?;
         run_power_off(udisksctl, disk)?;
+    }
+    if let Some(device) = &plan.tray_eject {
+        run_tray_eject(eject, gio, device)?;
     }
     Ok(())
 }
@@ -1388,6 +1554,7 @@ mod tests {
                     via: UnmountVia::Udisks,
                 }],
                 power_off: None,
+                tray_eject: None,
             })
         );
         assert_eq!(
@@ -1423,6 +1590,7 @@ mod tests {
                     },
                 ],
                 power_off: Some(PathBuf::from("/dev/sdb")),
+                tray_eject: None,
             })
         );
     }
@@ -1436,6 +1604,7 @@ mod tests {
                 label: "Secret".to_owned(),
                 unmount: Vec::new(),
                 power_off: Some(PathBuf::from("/dev/sdc")),
+                tray_eject: None,
             })
         );
     }
@@ -1917,6 +2086,7 @@ mod tests {
                 },
             ],
             power_off: Some(PathBuf::from("/dev/sdb")),
+            tray_eject: None,
         }
     }
 
@@ -2250,6 +2420,7 @@ mod tests {
                     },
                 ],
                 power_off: Some(PathBuf::from("/dev/sdf")),
+                tray_eject: None,
             })
         );
         // Unlocked but not mounted: only the lock.
@@ -2361,5 +2532,227 @@ mod tests {
         assert!(is_unlocked(&nodes, Path::new("/dev/sdg1")));
         assert!(!is_unlocked(&nodes, Path::new("/dev/sde1")));
         assert!(!is_unlocked(&nodes, Path::new("/dev/nope")));
+    }
+
+    // --- optical media ------------------------------------------------------
+
+    /// Four drives: a mounted data DVD, an empty drive, an unmounted data
+    /// DVD and an audio CD. `lsblk` calls every one of them type `rom`.
+    const DISCS: &str = r#"{"blockdevices":[
+      {"name":"sr0","path":"/dev/sr0","label":"UBUNTU_24","fstype":"iso9660","size":4700000000,"mountpoints":["/run/media/iperez/UBUNTU_24"],"rm":true,"hotplug":true,"type":"rom","pkname":null,"uuid":"2024-04-01"},
+      {"name":"sr1","path":"/dev/sr1","label":null,"fstype":null,"size":0,"mountpoints":[null],"rm":true,"hotplug":true,"type":"rom","pkname":null,"uuid":null},
+      {"name":"sr2","path":"/dev/sr2","label":null,"fstype":"udf","size":8500000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"rom","pkname":null,"uuid":"udf-1"},
+      {"name":"sr3","path":"/dev/sr3","label":null,"fstype":null,"size":734003200,"mountpoints":[null],"rm":true,"hotplug":true,"type":"rom","pkname":null,"uuid":null}
+    ]}"#;
+
+    fn discs() -> Vec<BlockNode> {
+        parse_lsblk(DISCS).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_data_disc_is_listed_with_its_label_mounted_or_not() -> TestResult {
+        let list = devices(&discs());
+        let mounted = find(&list, "/dev/sr0").ok_or("device not listed")?;
+        assert_eq!(mounted.label, "UBUNTU_24");
+        assert_eq!(mounted.fstype.as_deref(), Some("iso9660"));
+        assert_eq!(
+            mounted.state,
+            DeviceState::Mounted(PathBuf::from("/run/media/iperez/UBUNTU_24"))
+        );
+        assert!(mounted.optical && mounted.ejectable && mounted.can_unmount());
+        assert_eq!(mounted.disk, PathBuf::from("/dev/sr0"));
+        let unmounted = find(&list, "/dev/sr2").ok_or("device not listed")?;
+        assert_eq!(unmounted.label, "Disc");
+        assert_eq!(unmounted.state, DeviceState::Unmounted);
+        assert!(unmounted.can_mount() && unmounted.can_eject() && unmounted.optical);
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_drive_is_hidden_and_has_no_eject_plan() {
+        let nodes = discs();
+        assert!(find(&devices(&nodes), "/dev/sr1").is_none());
+        assert_eq!(eject_plan(&nodes, Path::new("/dev/sr1"), "Drive"), None);
+    }
+
+    #[test]
+    fn an_audio_cd_is_listed_but_cannot_be_mounted() -> TestResult {
+        let list = devices(&discs());
+        let cd = find(&list, "/dev/sr3").ok_or("device not listed")?;
+        assert_eq!(cd.label, "Audio CD");
+        assert_eq!(cd.fstype, None);
+        assert_eq!(cd.state, DeviceState::Audio);
+        assert!(!cd.can_mount() && !cd.can_unlock() && !cd.can_unmount());
+        assert!(cd.can_eject());
+        Ok(())
+    }
+
+    #[test]
+    fn a_disc_never_changes_what_the_other_devices_list_or_eject() {
+        let base = parsed();
+        let mut with_discs = parsed();
+        with_discs.extend(discs());
+        let before = devices(&base);
+        let after: Vec<Device> = devices(&with_discs)
+            .into_iter()
+            .filter(|device| !device.optical)
+            .collect();
+        assert_eq!(after, before);
+        assert!(before.iter().all(|device| !device.optical));
+        for disk in [
+            "/dev/sdb",
+            "/dev/sdc",
+            "/dev/sdd",
+            "/dev/loop0",
+            "/dev/nvme0n1",
+        ] {
+            assert_eq!(
+                eject_plan(&with_discs, Path::new(disk), "x"),
+                eject_plan(&base, Path::new(disk), "x"),
+                "{disk}"
+            );
+        }
+        let usb = eject_plan(&base, Path::new("/dev/sdb"), "KINGSTON");
+        assert_eq!(
+            usb.as_ref()
+                .map(|plan| (plan.power_off.clone(), plan.tray_eject.clone())),
+            Some((Some(PathBuf::from("/dev/sdb")), None))
+        );
+        assert_eq!(eject_plan(&base, Path::new("/dev/loop0"), "x"), None);
+    }
+
+    #[test]
+    fn ejecting_a_mounted_disc_unmounts_it_then_opens_the_tray_without_power_off() {
+        assert_eq!(
+            eject_plan(&discs(), Path::new("/dev/sr0"), "UBUNTU_24"),
+            Some(DevicePlan {
+                label: "UBUNTU_24".to_owned(),
+                unmount: vec![UnmountStep {
+                    device: PathBuf::from("/dev/sr0"),
+                    mounts: vec![PathBuf::from("/run/media/iperez/UBUNTU_24")],
+                    via: UnmountVia::Udisks,
+                }],
+                power_off: None,
+                tray_eject: Some(PathBuf::from("/dev/sr0")),
+            })
+        );
+        let plan = eject_plan(&discs(), Path::new("/dev/sr3"), "Audio CD");
+        assert_eq!(
+            plan.map(|plan| (plan.unmount.len(), plan.tray_eject, plan.power_off)),
+            Some((0, Some(PathBuf::from("/dev/sr3")), None))
+        );
+        let plan = eject_plan(&discs(), Path::new("/dev/sr2"), "Disc");
+        assert!(plan.is_some_and(|plan| plan.unmount.is_empty() && plan.is_eject()));
+    }
+
+    #[test]
+    fn the_tray_is_opened_by_eject_when_installed_else_by_gio() {
+        let dev = Path::new("/dev/sr0");
+        let os = |s: &str| OsString::from(s);
+        assert_eq!(
+            tray_eject_command(
+                Some(Path::new("/bin/eject")),
+                Some(Path::new("/bin/gio")),
+                dev
+            ),
+            Ok((PathBuf::from("/bin/eject"), vec![os("/dev/sr0")]))
+        );
+        assert_eq!(
+            tray_eject_command(None, Some(Path::new("/bin/gio")), dev),
+            Ok((
+                PathBuf::from("/bin/gio"),
+                vec![os("mount"), os("-e"), os("/dev/sr0")]
+            ))
+        );
+        assert_eq!(
+            tray_eject_command(None, None, dev),
+            Err(DeviceError::Failed {
+                reason: "neither eject nor gio was found".to_owned()
+            })
+        );
+    }
+
+    fn disc_plan() -> DevicePlan {
+        eject_plan(&discs(), Path::new("/dev/sr0"), "UBUNTU_24").unwrap_or(DevicePlan {
+            label: String::new(),
+            unmount: Vec::new(),
+            power_off: None,
+            tray_eject: None,
+        })
+    }
+
+    #[test]
+    fn a_disc_plan_runs_udisks_unmount_then_eject_and_never_power_off() -> TestResult {
+        let fixture = Fixture::new()?;
+        let log = fixture.0.join("argv.log");
+        let body = |name: &str| format!("echo \"{name} $@\" >> '{}'", log.display());
+        let ctl = fixture.script("udisksctl", &body("udisksctl"))?;
+        let eject = fixture.script("eject", &body("eject"))?;
+        let gio = fixture.script("gio", &body("gio"))?;
+        run_plan_with(Some(&ctl), Some(&gio), Some(&eject), &disc_plan())?;
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            "udisksctl unmount --block-device=/dev/sr0 --no-user-interaction\neject /dev/sr0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disc_plan_without_eject_falls_back_to_gio() -> TestResult {
+        let fixture = Fixture::new()?;
+        let log = fixture.0.join("argv.log");
+        let body = |name: &str| format!("echo \"{name} $@\" >> '{}'", log.display());
+        let ctl = fixture.script("udisksctl", &body("udisksctl"))?;
+        let gio = fixture.script("gio", &body("gio"))?;
+        run_plan_with(Some(&ctl), Some(&gio), None, &disc_plan())?;
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            "udisksctl unmount --block-device=/dev/sr0 --no-user-interaction\ngio mount -e /dev/sr0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_unmount_keeps_the_tray_closed_and_a_failing_eject_is_reported() -> TestResult {
+        let fixture = Fixture::new()?;
+        let log = fixture.0.join("argv.log");
+        let busy = fixture.script(
+            "busy",
+            &format!(
+                "echo \"$@\" >> '{}'\necho 'GDBus.Error:org.freedesktop.UDisks2.Error.DeviceBusy: target is busy' >&2; exit 1",
+                log.display()
+            ),
+        )?;
+        let eject = fixture.script("eject", &format!("echo eject >> '{}'", log.display()))?;
+        assert_eq!(
+            run_plan_with(Some(&busy), None, Some(&eject), &disc_plan()),
+            Err(DeviceError::Failed {
+                reason: "target is busy".to_owned()
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            "unmount --block-device=/dev/sr0 --no-user-interaction\n"
+        );
+        let ctl = fixture.script("udisksctl", "exit 0")?;
+        let stuck = fixture.script("stuck", "echo 'eject: unable to eject' >&2; exit 1")?;
+        assert_eq!(
+            run_plan_with(Some(&ctl), None, Some(&stuck), &disc_plan()),
+            Err(DeviceError::Failed {
+                reason: "eject: unable to eject".to_owned()
+            })
+        );
+        assert_eq!(
+            run_plan_with(Some(&ctl), None, None, &disc_plan()),
+            Err(DeviceError::Failed {
+                reason: "neither eject nor gio was found".to_owned()
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_existing_runner_still_cannot_eject_a_tray() {
+        assert!(run_plan(Path::new("/bin/true"), &disc_plan()).is_err());
     }
 }

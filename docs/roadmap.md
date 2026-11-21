@@ -29,7 +29,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 | Item | What is missing | Today |
 |---|---|---|
 | Tabs | Drag a tab to another window (the file explorer has one window; this needs more than one) | Tabs reorder within the window and move between the two panes |
-| Optical media | List and mount discs | Excluded from Devices |
 | Translations | A translated interface | English only |
 
 ## Disk usage analyzer
