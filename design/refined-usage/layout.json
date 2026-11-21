@@ -1,0 +1,25 @@
+{
+  "arrangement": "column",
+  "positions": {
+    "system": {
+      "x": 0,
+      "y": 0
+    },
+    "01-split-chart-list.html": {
+      "x": 0,
+      "y": 1343
+    },
+    "02-table-first.html": {
+      "x": 0,
+      "y": 2368
+    },
+    "03-chrome-density.html": {
+      "x": 0,
+      "y": 3393
+    },
+    "04-details-panel.html": {
+      "x": 0,
+      "y": 4278
+    }
+  }
+}

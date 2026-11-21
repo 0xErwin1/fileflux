@@ -1,0 +1,35 @@
+{
+  "title": "Disk usage, toolbar density and the details panel",
+  "brief": "Rebuild on the Bolt-faithful design system: fix the shipped disk usage view (numbers stacked on the bars, chart empty until measuring ended, Analyze hidden in the folder menu), the crowded toolbar, and the details panel whose group was a row of chips. Artboards embed the app's real Archivo and JetBrains Mono faces.",
+  "feature": "odd/tasks/roadmap.md",
+  "artboards": [
+    {
+      "file": "01-split-chart-list.html",
+      "title": "Split chart and ranked list",
+      "tradeoff": "The chart is always visible and shares the row selection; it costs 380px of list width on narrow windows",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "02-table-first.html",
+      "title": "Table first, chart as a drawer",
+      "tradeoff": "Maximum room for names and sizes with a 0.01% share column; the chart is one click away instead of always on screen",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "03-chrome-density.html",
+      "title": "Chrome density",
+      "tradeoff": "Six toolbar groups and device-level actions; refresh and favorite move one click deeper into the overflow",
+      "width": 1440,
+      "height": 1000
+    },
+    {
+      "file": "04-details-panel.html",
+      "title": "Details panel",
+      "tradeoff": "Access as a three-column grid and the group as a menu; the panel needs 520px to keep the columns readable",
+      "width": 1440,
+      "height": 1000
+    }
+  ]
+}
