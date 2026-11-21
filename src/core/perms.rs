@@ -54,6 +54,10 @@ pub enum Access {
     WriteOnly,
     Read,
     ReadWrite,
+    /// A folder class that fits none of the choices (for example `r--`,
+    /// which cannot be entered): shown as found, never offered, and never
+    /// equal to a choice, so picking any choice changes it.
+    Custom,
 }
 
 impl Access {
@@ -67,6 +71,7 @@ impl Access {
             Access::WriteOnly => "Write only",
             Access::Read => "Read only",
             Access::ReadWrite => "Read and write",
+            Access::Custom => "Custom",
         }
     }
 
@@ -84,6 +89,22 @@ pub fn access_of(mode: u32, class: Class) -> Access {
         (true, false) => Access::Read,
         (false, true) => Access::WriteOnly,
         (false, false) => Access::None,
+    }
+}
+
+/// The access a class has in `mode` of a file or a folder. A folder's
+/// choices carry the x bit (`---`, `r-x`, `rwx`): any other combination with
+/// read, write or x is [`Access::Custom`], not the choice it resembles.
+#[must_use]
+pub fn entry_access(mode: u32, is_dir: bool, class: Class) -> Access {
+    let access = access_of(mode, class);
+    if !is_dir {
+        return access;
+    }
+    let execute = mode >> class.shift() & 0b001 != 0;
+    match (access, execute) {
+        (Access::None, false) | (Access::Read | Access::ReadWrite, true) => access,
+        _ => Access::Custom,
     }
 }
 
@@ -182,6 +203,7 @@ impl Edit {
         };
         for class in Class::ALL {
             let shared = match summary.access(class) {
+                Some(Merged::Same(Access::Custom)) => None,
                 Some(Merged::Same(access)) => Some(access),
                 _ => None,
             };
@@ -206,6 +228,8 @@ pub fn apply_mode(mode: u32, is_dir: bool, edit: &Edit) -> u32 {
             Access::WriteOnly => 0b010,
             Access::Read => 0b100,
             Access::ReadWrite => 0b110,
+            // Never a choice: the class keeps its bits.
+            Access::Custom => continue,
         };
         // A folder needs x to be entered; a file keeps the x it had, unless
         // the class now has no access at all.
@@ -296,9 +320,21 @@ pub fn summarize(states: &[EntryState]) -> Summary {
         files: editable.len() - folders,
         folders,
         symlinks: states.len() - editable.len(),
-        owner: merge(editable.iter().map(|s| access_of(s.mode, Class::Owner))),
-        group: merge(editable.iter().map(|s| access_of(s.mode, Class::Group))),
-        others: merge(editable.iter().map(|s| access_of(s.mode, Class::Others))),
+        owner: merge(
+            editable
+                .iter()
+                .map(|s| entry_access(s.mode, s.is_dir, Class::Owner)),
+        ),
+        group: merge(
+            editable
+                .iter()
+                .map(|s| entry_access(s.mode, s.is_dir, Class::Group)),
+        ),
+        others: merge(
+            editable
+                .iter()
+                .map(|s| entry_access(s.mode, s.is_dir, Class::Others)),
+        ),
         exec: merge(
             editable
                 .iter()
@@ -407,10 +443,16 @@ pub fn user_groups(ids: &Ids, names: &[(u32, String)]) -> Vec<Group> {
 /// The groups of the running process, named from `/etc/group`.
 pub fn current_groups() -> io::Result<Vec<Group>> {
     let status = fs::read_to_string("/proc/self/status")?;
-    let ids = parse_status_ids(&status)
-        .ok_or_else(|| io::Error::other("the process groups are not in /proc/self/status"))?;
     let names = parse_id_file(&fs::read_to_string("/etc/group").unwrap_or_default());
-    Ok(user_groups(&ids, &names))
+    groups_from_status(&status, &names)
+}
+
+/// The groups a `/proc/<pid>/status` text lists; an error when it has no
+/// group ids at all.
+pub fn groups_from_status(status: &str, names: &[(u32, String)]) -> io::Result<Vec<Group>> {
+    let ids = parse_status_ids(status)
+        .ok_or_else(|| io::Error::other("the process groups are not in /proc/self/status"))?;
+    Ok(user_groups(&ids, names))
 }
 
 /// The name of `id` in an id file's parsed lines.
@@ -502,6 +544,8 @@ enum Outcome {
 
 struct Walk<'a> {
     change: &'a Change,
+    /// How many previous states to record.
+    max_undo: usize,
     cancel: &'a AtomicBool,
     on_item: &'a mut dyn FnMut(&Path, u64),
     out: Applied,
@@ -549,7 +593,7 @@ impl Walk<'_> {
         if target == before && gid.is_none() {
             return Ok(Outcome::Unchanged);
         }
-        if self.out.previous.len() < MAX_UNDO_ITEMS {
+        if self.out.previous.len() < self.max_undo {
             self.out.previous.push(Previous {
                 path: path.to_path_buf(),
                 dev: meta.dev(),
@@ -648,11 +692,19 @@ pub fn apply(
     cancel: &AtomicBool,
     on_item: &mut dyn FnMut(&Path, u64),
 ) -> Applied {
-    apply_inner(roots, change, enclosed, cancel, on_item, None)
+    apply_inner(
+        roots,
+        change,
+        enclosed,
+        cancel,
+        on_item,
+        None,
+        MAX_UNDO_ITEMS,
+    )
 }
 
-/// [`apply`], with the device the enclosed walk stays on overridable so a
-/// test can stand in for a mount.
+/// [`apply`], with the device the enclosed walk stays on and the undo cap
+/// overridable so a test can stand in for a mount or a huge tree.
 fn apply_inner(
     roots: &[PathBuf],
     change: &Change,
@@ -660,9 +712,11 @@ fn apply_inner(
     cancel: &AtomicBool,
     on_item: &mut dyn FnMut(&Path, u64),
     device: Option<u64>,
+    max_undo: usize,
 ) -> Applied {
     let mut walk = Walk {
         change,
+        max_undo,
         cancel,
         on_item,
         out: Applied::default(),
@@ -699,10 +753,15 @@ fn apply_inner(
 
 /// Puts back what [`apply`] recorded, newest first (so a folder is opened up
 /// before the entries below it are reached), only for entries that are
-/// still the same inode.
-pub fn restore(items: &[Previous], cancel: &AtomicBool) -> Applied {
+/// still the same inode. `on_item` is told each entry as it is handled, with
+/// the running count.
+pub fn restore(
+    items: &[Previous],
+    cancel: &AtomicBool,
+    on_item: &mut dyn FnMut(&Path, u64),
+) -> Applied {
     let mut out = Applied::default();
-    for item in items.iter().rev() {
+    for (index, item) in items.iter().rev().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             out.cancelled = true;
             break;
@@ -715,6 +774,7 @@ pub fn restore(items: &[Previous], cancel: &AtomicBool) -> Applied {
                 message: error.to_string(),
             }),
         }
+        on_item(&item.path, index as u64 + 1);
     }
     out
 }
@@ -1042,6 +1102,61 @@ mod tests {
         assert_eq!(name_of(&names, 1), None);
     }
 
+    #[test]
+    fn a_folder_class_with_read_or_write_but_no_x_is_custom_not_read_only() {
+        let folder = |mode: u32| summarize(&[state("/d", 0o040000 | mode, true, false, 10)]);
+        assert_eq!(folder(0o750).group, Some(Merged::Same(Access::Read)));
+        assert_eq!(folder(0o770).group, Some(Merged::Same(Access::ReadWrite)));
+        assert_eq!(folder(0o700).group, Some(Merged::Same(Access::None)));
+        for mode in [0o740, 0o720, 0o760, 0o710, 0o730] {
+            assert_eq!(
+                folder(mode).group,
+                Some(Merged::Same(Access::Custom)),
+                "{mode:o}"
+            );
+        }
+        // A file keeps the plain read/write reading: x is not part of it.
+        let file = summarize(&[state("/f", 0o100640, false, false, 10)]);
+        assert_eq!(file.group, Some(Merged::Same(Access::Read)));
+        assert_eq!(Access::Custom.label(), "Custom");
+        assert!(!Access::CHOICES.contains(&Access::Custom));
+    }
+
+    #[test]
+    fn picking_read_on_a_folder_without_x_is_a_change_that_gives_r_x() {
+        let summary = summarize(&[state("/d", 0o040740, true, false, 10)]);
+        let draft = Edit {
+            group: Some(Access::Read),
+            ..Edit::default()
+        };
+        let changed = draft.changed_against(&summary);
+        assert_eq!(changed, draft, "Read is not what the folder has");
+        assert_eq!(apply_mode(0o040740, true, &changed) & 0o777, 0o750);
+        // A folder that really is r-x still has nothing to change.
+        let same = summarize(&[state("/d", 0o040750, true, false, 10)]);
+        assert!(draft.changed_against(&same).is_empty());
+        // The enclosed rule never applies the custom value itself.
+        assert_eq!(Edit::default().effective(&summary).group, None);
+        assert_eq!(
+            Edit::default().effective(&summary).owner,
+            Some(Access::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn the_group_list_fails_visibly_when_the_status_cannot_be_parsed() {
+        let names = vec![(5, "tty".to_owned())];
+        let groups = groups_from_status("Gid:\t5\t5\t5\t5\nGroups:\t\n", &names);
+        assert_eq!(
+            groups
+                .map(|groups| groups.iter().map(Group::label).collect::<Vec<_>>())
+                .ok(),
+            Some(vec!["tty".to_owned()])
+        );
+        let broken = groups_from_status("Name:\tx\n", &names);
+        assert!(broken.is_err_and(|error| error.to_string().contains("/proc/self/status")));
+    }
+
     // --- filesystem ----------------------------------------------------------------
 
     /// A scratch directory under the system temp dir; unreadable folders are
@@ -1256,6 +1371,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_, _| {},
             Some(u64::MAX),
+            MAX_UNDO_ITEMS,
         );
         assert_eq!(applied.other_filesystems, 1);
         assert_eq!(mode_of(&inner)?, 0o600, "nothing below sub was entered");
@@ -1397,7 +1513,7 @@ mod tests {
             0o2750,
             "chown clears setgid; the editor puts it back"
         );
-        let back = restore(&applied.previous, &AtomicBool::new(false));
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, _| {});
         assert!(back.failures.is_empty(), "{:?}", back.failures);
         assert_eq!(fs::metadata(&file)?.gid(), original);
         assert_eq!(mode_of(&file)?, 0o2750);
@@ -1426,7 +1542,7 @@ mod tests {
             "the folder cannot even be entered now"
         );
         assert_eq!(applied.changed, 3);
-        let back = restore(&applied.previous, &AtomicBool::new(false));
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, _| {});
         assert!(back.failures.is_empty(), "{:?}", back.failures);
         assert_eq!(mode_of(&top)?, 0o2775);
         assert_eq!(mode_of(&sub)?, 0o750);
@@ -1446,7 +1562,7 @@ mod tests {
         let applied = run(std::slice::from_ref(&file), &change, false);
         fs::remove_file(&file)?;
         put(&file, 0o600)?;
-        let back = restore(&applied.previous, &AtomicBool::new(false));
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, _| {});
         assert_eq!(back.failures.len(), 1);
         assert!(
             back.failures
@@ -1471,9 +1587,150 @@ mod tests {
         let applied = run(std::slice::from_ref(&file), &change, false);
         fs::remove_file(&file)?;
         symlink(&target, &file)?;
-        let back = restore(&applied.previous, &AtomicBool::new(false));
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, _| {});
         assert_eq!(back.failures.len() + back.symlinks, 1);
         assert_eq!(mode_of(&target)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn root_dir_symlink_enclosed_is_skipped() -> TestResult {
+        let dir = scratch("rootlink")?;
+        let target = dir.root.join("target");
+        fs::create_dir(&target)?;
+        let inner = target.join("inner");
+        put(&inner, 0o600)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        let link = dir.root.join("link");
+        symlink(&target, &link)?;
+        let change = Change {
+            edit: edit(None, None, Some(Access::Read)),
+            gid: None,
+        };
+        let applied = run(std::slice::from_ref(&link), &change, true);
+        assert_eq!(applied.symlinks, 1);
+        assert_eq!(applied.changed, 0);
+        assert!(applied.failures.is_empty() && applied.previous.is_empty());
+        assert_eq!(mode_of(&target)?, 0o700, "the linked folder is untouched");
+        assert_eq!(mode_of(&inner)?, 0o600, "and so is what is inside it");
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_exec_toggle_and_folder_read() -> TestResult {
+        let dir = scratch("mixed")?;
+        let exec = dir.root.join("exec");
+        let plain = dir.root.join("plain");
+        let folder = dir.root.join("folder");
+        put(&exec, 0o755)?;
+        put(&plain, 0o640)?;
+        fs::create_dir(&folder)?;
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
+        let change = Change {
+            edit: Edit {
+                group: Some(Access::Read),
+                exec: Some(true),
+                ..Edit::default()
+            },
+            gid: None,
+        };
+        let roots = [exec.clone(), plain.clone(), folder.clone()];
+        let applied = run(&roots, &change, false);
+        assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+        assert_eq!(mode_of(&exec)?, 0o755);
+        assert_eq!(mode_of(&plain)?, 0o750);
+        assert_eq!(mode_of(&folder)?, 0o750);
+        assert_eq!((applied.changed, applied.unchanged), (2, 1));
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, _| {});
+        assert!(back.failures.is_empty(), "{:?}", back.failures);
+        assert_eq!(mode_of(&exec)?, 0o755);
+        assert_eq!(mode_of(&plain)?, 0o640);
+        assert_eq!(mode_of(&folder)?, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_twice_recorded_once_and_restored() -> TestResult {
+        let dir = scratch("hardlink")?;
+        let first = dir.root.join("first");
+        let second = dir.root.join("second");
+        put(&first, 0o644)?;
+        fs::hard_link(&first, &second)?;
+        let change = Change {
+            edit: edit(None, None, Some(Access::None)),
+            gid: None,
+        };
+        let applied = run(&[first.clone(), second.clone()], &change, false);
+        assert_eq!((applied.changed, applied.unchanged), (1, 1));
+        assert_eq!(applied.previous.len(), 1, "one inode, one record");
+        assert_eq!(mode_of(&second)?, 0o640);
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, _| {});
+        assert!(back.failures.is_empty(), "{:?}", back.failures);
+        assert_eq!(back.changed, 1);
+        assert_eq!(mode_of(&first)?, 0o644);
+        assert_eq!(mode_of(&second)?, 0o644);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_folder_without_x_then_children() -> TestResult {
+        let dir = scratch("nox")?;
+        let top = dir.root.join("top");
+        let sub = top.join("sub");
+        fs::create_dir_all(&sub)?;
+        let file = sub.join("f");
+        put(&file, 0o600)?;
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o740))?;
+        fs::set_permissions(&top, fs::Permissions::from_mode(0o700))?;
+        let change = Change {
+            edit: edit(None, Some(Access::Read), None),
+            gid: None,
+        };
+        let applied = run(std::slice::from_ref(&top), &change, true);
+        assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+        assert_eq!(mode_of(&sub)?, 0o750, "the folder gained its x");
+        assert_eq!(mode_of(&file)?, 0o640);
+        let mut seen = 0;
+        let back = restore(&applied.previous, &AtomicBool::new(false), &mut |_, n| {
+            seen = n;
+        });
+        assert!(back.failures.is_empty(), "{:?}", back.failures);
+        assert_eq!(seen, applied.previous.len() as u64, "progress advances");
+        assert_eq!(mode_of(&sub)?, 0o740);
+        assert_eq!(mode_of(&file)?, 0o600);
+        assert_eq!(mode_of(&top)?, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn the_undo_record_stops_at_the_cap_and_says_so() -> TestResult {
+        let dir = scratch("cap")?;
+        let top = dir.root.join("top");
+        fs::create_dir_all(&top)?;
+        for name in ["a", "b", "c"] {
+            put(&top.join(name), 0o644)?;
+        }
+        let change = Change {
+            edit: edit(None, None, Some(Access::None)),
+            gid: None,
+        };
+        let go = |cap: usize| {
+            apply_inner(
+                std::slice::from_ref(&top),
+                &change,
+                true,
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+                None,
+                cap,
+            )
+        };
+        let capped = go(2);
+        assert_eq!(capped.changed, 4, "everything still changed");
+        assert_eq!(capped.previous.len(), 2);
+        assert!(capped.undo_dropped);
+        let exact = go(4);
+        assert!(exact.changed == 0 && exact.previous.is_empty() && !exact.undo_dropped);
         Ok(())
     }
 }

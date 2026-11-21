@@ -48,6 +48,8 @@ pub(crate) struct Loaded {
     pub(crate) summary: Summary,
     /// The groups the user belongs to.
     pub(crate) groups: Vec<Group>,
+    /// The process's groups could not be read: the group stays read-only.
+    pub(crate) groups_available: bool,
     pub(crate) user_names: Vec<(u32, String)>,
     pub(crate) group_names: Vec<(u32, String)>,
     /// Entries that could not be read at all.
@@ -99,6 +101,13 @@ impl Editor {
         }
     }
 
+    /// Whether "Apply to enclosed files" would change anything: not when
+    /// every class is mixed (or custom) and nothing is drafted.
+    pub(crate) fn can_apply_enclosed(&self) -> bool {
+        let change = self.enclosed_change();
+        !change.edit.is_empty() || change.gid.is_some()
+    }
+
     pub(crate) fn dirty(&self) -> bool {
         !self.draft.is_empty() || self.group_choice.is_some()
     }
@@ -139,6 +148,17 @@ pub(crate) fn editor_decision(
     }
 }
 
+/// The groups to offer, and whether they could be read at all.
+fn groups_or_unavailable(read: std::io::Result<Vec<Group>>) -> (Vec<Group>, bool) {
+    match read {
+        Ok(groups) => (groups, true),
+        Err(error) => {
+            log::warn!("could not read the user's groups: {error}");
+            (Vec::new(), false)
+        }
+    }
+}
+
 /// Reads the entries (blocking: the background executor).
 pub(crate) fn load(paths: &[PathBuf]) -> Loaded {
     let states: Vec<_> = paths
@@ -147,12 +167,11 @@ pub(crate) fn load(paths: &[PathBuf]) -> Loaded {
         .collect();
     let read =
         |file: &str| perms::parse_id_file(&std::fs::read_to_string(file).unwrap_or_default());
+    let (groups, groups_available) = groups_or_unavailable(perms::current_groups());
     Loaded {
         summary: perms::summarize(&states),
-        groups: perms::current_groups().unwrap_or_else(|error| {
-            log::debug!("could not read the user's groups: {error}");
-            Vec::new()
-        }),
+        groups,
+        groups_available,
         user_names: read("/etc/passwd"),
         group_names: read("/etc/group"),
         unreadable: paths.len() - states.len(),
@@ -264,7 +283,14 @@ pub(crate) fn run(job: PermsJob, sink: &Sink) -> Report {
 /// Restores what a change recorded (blocking).
 pub(crate) fn undo(items: &[perms::Previous], sink: &Sink) -> Report {
     sink.set_total(items.len() as u64);
-    let applied = perms::restore(items, sink.cancel_flag());
+    let applied = perms::restore(items, sink.cancel_flag(), &mut |path, done| {
+        sink.advance(
+            done,
+            &path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        );
+    });
     let mut report = report_from(applied, "permissions", "Restored");
     // An undo is not itself undoable.
     report.undo = None;
@@ -408,6 +434,7 @@ fn class_note(shown: Option<Merged<Access>>, draft: Option<Access>) -> Option<&'
         (Some(_), _) => None,
         (None, Some(Merged::Mixed)) => Some("mixed"),
         (None, Some(Merged::Same(Access::WriteOnly))) => Some("write only"),
+        (None, Some(Merged::Same(Access::Custom))) => Some("custom"),
         _ => None,
     }
 }
@@ -610,6 +637,11 @@ fn group_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
     let summary = &editor.loaded.summary;
     let current = editor.group_choice.map(Merged::Same).or(summary.gid);
     let shown = name_or_id(&editor.loaded.group_names, current);
+    if !editor.loaded.groups_available {
+        return section(vec![
+            label(format!("Group: {shown} (groups unavailable)"), cx).into_any_element(),
+        ]);
+    }
     let mut children = vec![
         label("Group".to_owned(), cx).into_any_element(),
         chip(
@@ -689,7 +721,8 @@ fn actions_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
     ];
     let mut children = Vec::new();
     if editor.loaded.summary.folders > 0 {
-        let text = if editor.armed {
+        let can_enclosed = editor.can_apply_enclosed();
+        let text = if editor.armed && can_enclosed {
             "Press again to apply to everything inside"
         } else {
             "Apply to enclosed files\u{2026}"
@@ -697,6 +730,7 @@ fn actions_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
         buttons.push(
             Button::new("perm-enclosed", text)
                 .ghost()
+                .disabled(!can_enclosed)
                 .on_click(cx.listener(|this, _, window, cx| {
                     let Some(editor) = this.editor_mut() else {
                         return;
@@ -711,7 +745,7 @@ fn actions_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
                 }))
                 .into_any_element(),
         );
-        if editor.armed {
+        if editor.armed && can_enclosed {
             children.push(
                 label(
                     "Folders get the shown access (r-x or rwx); files inside get the same read and write access. Symbolic links are skipped and other filesystems are not entered."
@@ -769,6 +803,7 @@ mod tests {
             Loaded {
                 summary: summarize(states),
                 groups: Vec::new(),
+                groups_available: true,
                 user_names: Vec::new(),
                 group_names: Vec::new(),
                 unreadable: 0,
@@ -1085,6 +1120,88 @@ mod tests {
             loaded.summary.gid,
             Some(Merged::Same(fs::metadata(&file)?.gid()))
         );
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_without_x_can_be_fixed_with_a_plain_apply() {
+        let mut editor = editor(&[state(0o040740, true, 10)]);
+        assert_eq!(editor.change(), Change::default());
+        editor.draft.set(Class::Group, Some(Access::Read));
+        let change = editor.change();
+        assert_eq!(change.edit.group, Some(Access::Read), "Apply is enabled");
+        assert_eq!(
+            perms::apply_mode(0o040740, true, &change.edit) & 0o777,
+            0o750
+        );
+        assert_eq!(
+            class_note(editor.loaded.summary.group, None),
+            Some("custom")
+        );
+    }
+
+    #[test]
+    fn enclosed_stays_disabled_until_something_would_change() {
+        let mut editor = editor(&[
+            state(0o040700, true, 10),
+            state(0o040070, true, 10),
+            state(0o100007, false, 10),
+        ]);
+        assert!(!editor.can_apply_enclosed());
+        editor.draft.set(Class::Others, Some(Access::Read));
+        assert!(editor.can_apply_enclosed());
+        editor.draft = Edit::default();
+        editor.group_choice = Some(10);
+        assert!(editor.can_apply_enclosed());
+        editor.group_choice = None;
+        editor.draft.exec = Some(true);
+        assert!(editor.can_apply_enclosed());
+    }
+
+    #[test]
+    fn unreadable_process_groups_are_reported_not_silently_empty() {
+        let (groups, available) = groups_or_unavailable(Err(std::io::Error::other("no /proc")));
+        assert!(groups.is_empty() && !available);
+        let one = Group { gid: 7, name: None };
+        let (groups, available) = groups_or_unavailable(Ok(vec![one.clone()]));
+        assert_eq!(groups, [one]);
+        assert!(available);
+    }
+
+    #[test]
+    fn undoing_advances_the_progress_per_restored_entry() -> TestResult {
+        let root = scratch_dir("undoprogress")?;
+        let a = root.join("a");
+        let b = root.join("b");
+        for file in [&a, &b] {
+            fs::write(file, "x")?;
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644))?;
+        }
+        let sink = Sink::new(super::super::progress::Unit::Items);
+        let mut report = run(
+            PermsJob {
+                paths: vec![a.clone(), b.clone()],
+                change: Change {
+                    edit: Edit {
+                        others: Some(Access::None),
+                        ..Edit::default()
+                    },
+                    gid: None,
+                },
+                enclosed: false,
+            },
+            &sink,
+        );
+        let Some(UndoAction::Permissions { items }) = report.undo.take() else {
+            return Err("a change must be undoable".into());
+        };
+        let undo_sink = Sink::new(super::super::progress::Unit::Items);
+        let undone = undo(&items, &undo_sink);
+        let snapshot = undo_sink.snapshot();
+        assert_eq!((snapshot.done, snapshot.total), (2, 2));
+        assert_eq!(mode_of(&a)?, 0o644);
+        assert!(undone.undo.is_none());
         fs::remove_dir_all(&root)?;
         Ok(())
     }
