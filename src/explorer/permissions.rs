@@ -13,11 +13,14 @@
 //! mode cannot be changed on Linux) and are reported as skipped.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bolt::controls::Button;
 use bolt::primitives::Icon;
 use fileflux::core::Location;
+use fileflux::core::elevate::{self, Elevation, Identity, Outcome, Unavailable};
+use fileflux::core::idnames::owner_choices;
 use fileflux::core::perms::{
     self, Access, Applied, Change, Class, Edit, Exec, Group, Merged, Summary,
 };
@@ -25,9 +28,11 @@ use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Styled, Window, div,
     prelude::*, px,
 };
+use gpui_component::tooltip::Tooltip;
 
 use super::ops::{Job, Notice, Report, Severity, UndoAction};
-use super::progress::Sink;
+use super::progress::{Sink, Unit};
+use super::tabs::Affected;
 use super::view::{Explorer, TabId};
 
 /// How long a selection must rest before its entries are read, so arrowing
@@ -55,7 +60,61 @@ pub(crate) struct Loaded {
     pub(crate) group_names: Vec<(u32, String)>,
     /// Entries that could not be read at all.
     pub(crate) unreadable: usize,
+    /// The users the owner menu lists.
+    pub(crate) owners: Vec<(u32, String)>,
+    /// The programs an owner change runs, or why it is unavailable.
+    pub(crate) elevation: Result<Elevation, Unavailable>,
+    /// Which file the single selected entry was when it was read: the owner
+    /// change refuses a path that is another file by the time it runs.
+    pub(crate) identity: Option<Identity>,
 }
+
+/// One owner change, owned by the background executor.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerJob {
+    pub(crate) path: PathBuf,
+    pub(crate) uid: u32,
+    pub(crate) owner: String,
+    pub(crate) expected: Identity,
+    pub(crate) elevation: Elevation,
+}
+
+/// What the disabled owner menu says while a change waits for polkit.
+pub(crate) const OWNER_BUSY_TOOLTIP: &str = "An owner change is waiting for authorization";
+
+/// At most one owner change runs at a time. It lives outside the [`Editor`]
+/// (rebuilt whenever the selection changes), so a second polkit dialog
+/// cannot start while the first is open.
+pub(crate) struct OwnerGate(AtomicBool);
+
+/// Held while an owner change runs; dropping it lets the next one start.
+pub(crate) struct OwnerClaim<'a>(&'a OwnerGate);
+
+impl OwnerGate {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// The claim, or `None` when a change is already running.
+    pub(crate) fn claim(&self) -> Option<OwnerClaim<'_>> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(OwnerClaim(self))
+    }
+}
+
+impl Drop for OwnerClaim<'_> {
+    fn drop(&mut self) {
+        self.0.0.store(false, Ordering::Release);
+    }
+}
+
+static OWNER_GATE: OwnerGate = OwnerGate::new();
 
 /// The editor of one selection: what was read and the user's draft.
 #[derive(Clone, Debug)]
@@ -66,6 +125,7 @@ pub(crate) struct Editor {
     pub(crate) draft: Edit,
     pub(crate) group_choice: Option<u32>,
     pub(crate) group_list_open: bool,
+    pub(crate) owner_list_open: bool,
     /// The enclosed action was pressed once and waits for a second press.
     pub(crate) armed: bool,
 }
@@ -78,8 +138,34 @@ impl Editor {
             draft: Edit::default(),
             group_choice: None,
             group_list_open: false,
+            owner_list_open: false,
             armed: false,
         }
+    }
+
+    /// Whether the owner can be changed here: exactly one file or folder
+    /// (each change is its own polkit prompt), read with an identity.
+    pub(crate) fn owner_editable(&self) -> bool {
+        self.paths.len() == 1
+            && self.loaded.summary.files + self.loaded.summary.folders == 1
+            && self.loaded.identity.is_some()
+    }
+
+    /// The owner change for choosing `uid`; `None` when it is not possible
+    /// (several entries, pkexec missing) or `uid`
+    /// already owns the entry.
+    pub(crate) fn owner_job(&self, uid: u32) -> Option<OwnerJob> {
+        let elevation = self.loaded.elevation.clone().ok()?;
+        if !self.owner_editable() || self.loaded.summary.uid == Some(Merged::Same(uid)) {
+            return None;
+        }
+        Some(OwnerJob {
+            path: self.paths.first()?.clone(),
+            uid,
+            owner: name_or_id(&self.loaded.user_names, Some(Merged::Same(uid))),
+            expected: self.loaded.identity.clone()?,
+            elevation,
+        })
     }
 
     /// What Apply changes: the classes whose choice differs from what the
@@ -169,13 +255,61 @@ pub(crate) fn load(paths: &[PathBuf]) -> Loaded {
     let read =
         |file: &str| perms::parse_id_file(&std::fs::read_to_string(file).unwrap_or_default());
     let (groups, groups_available) = groups_or_unavailable(perms::current_groups());
+    let user_names = read("/etc/passwd");
     Loaded {
         summary: perms::summarize(&states),
         groups,
         groups_available,
-        user_names: read("/etc/passwd"),
+        owners: owner_choices(&user_names),
+        user_names,
         group_names: read("/etc/group"),
         unreadable: paths.len() - states.len(),
+        elevation: Elevation::detect(),
+        identity: match paths {
+            [only] => Identity::of(only).ok(),
+            _ => None,
+        },
+    }
+}
+
+/// Changes an owner through polkit (blocking: the background executor; the
+/// authentication dialog is polkit's own).
+pub(crate) fn run_owner(job: &OwnerJob, sink: &Sink) -> Report {
+    sink.set_total(1);
+    let outcome = elevate::change_owner(
+        &job.elevation,
+        job.uid,
+        &job.path,
+        &job.expected,
+        elevate::spawn_and_wait,
+    );
+    sink.advance(1, "");
+    owner_report(&outcome, job)
+}
+
+/// The toast for an owner change; the panel reads the entry again whatever
+/// happened. There is no undo.
+pub(crate) fn owner_report(outcome: &Outcome, job: &OwnerJob) -> Report {
+    let name = job
+        .path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let (severity, text) = match outcome {
+        Outcome::Changed => (
+            Severity::Success,
+            format!("Changed the owner of {name} to {}", job.owner),
+        ),
+        Outcome::Cancelled(reason) => (Severity::Warning, reason.clone()),
+        Outcome::Failed(reason) => (
+            Severity::Error,
+            format!("Could not change the owner of {name}: {reason}"),
+        ),
+    };
+    Report {
+        notice: Some(Notice { severity, text }),
+        cancelled: matches!(outcome, Outcome::Cancelled(_)),
+        permissions_changed: true,
+        ..Report::default()
     }
 }
 
@@ -396,6 +530,44 @@ impl Explorer {
         }
     }
 
+    /// Starts an owner change for the editor's entry (the menu's choice).
+    fn change_owner(&mut self, uid: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor_mut() else {
+            return;
+        };
+        editor.owner_list_open = false;
+        let Some(job) = editor.owner_job(uid) else {
+            cx.notify();
+            return;
+        };
+        let Some(claim) = OWNER_GATE.claim() else {
+            cx.notify();
+            return;
+        };
+        let parent = job
+            .path
+            .parent()
+            .map(|parent| Location::Directory(parent.to_path_buf()));
+        let affected = parent.map_or(Affected::Everything, |parent| {
+            Affected::Folders(vec![parent])
+        });
+        let touches = vec![job.path.clone()];
+        self.start_work(
+            "Changing owner",
+            Unit::Items,
+            false,
+            (affected, touches),
+            move |sink| {
+                // Released when the change ends, however it ends.
+                let _claim = claim;
+                run_owner(&job, &sink)
+            },
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
     fn editor_mut(&mut self) -> Option<&mut Editor> {
         self.tab_mut().perms.as_mut()
     }
@@ -547,17 +719,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElem
         return rows;
     }
 
-    // Owner: shown, never changed (that needs root).
-    rows.push(section(vec![
-        label(
-            format!(
-                "Owner: {}",
-                name_or_id(&editor.loaded.user_names, summary.uid)
-            ),
-            cx,
-        )
-        .into_any_element(),
-    ]));
+    rows.push(owner_section(editor, cx));
 
     // One column per choice, labelled once: the same three buttons repeated
     // per class read as a wall of chips.
@@ -670,6 +832,124 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElem
         ]));
     }
     rows
+}
+
+/// The owner row: a menu of users like the group's, enabled for one entry
+/// when pkexec exists; choosing a user asks polkit to authorize the change.
+fn owner_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
+    let colors = bolt::colors(cx);
+    let summary = &editor.loaded.summary;
+    let shown = name_or_id(&editor.loaded.user_names, summary.uid);
+    if !editor.owner_editable() {
+        return section(vec![
+            label(format!("Owner: {shown}"), cx).into_any_element(),
+        ]);
+    }
+    let unavailable = editor.loaded.elevation.as_ref().err().copied();
+    let busy = OWNER_GATE.is_busy();
+    let enabled = unavailable.is_none() && !busy;
+    let open = enabled && editor.owner_list_open;
+    let mut trigger = div()
+        .id("perm-owner-current")
+        .h(px(30.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .border_1()
+        .border_color(if open { colors.line_2 } else { colors.line })
+        .bg(colors.background)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.0))
+                .text_color(if enabled { colors.strong } else { colors.muted })
+                .child(shown),
+        )
+        .child(
+            Icon::new(super::icon(if open {
+                gpui_kit_assets::IconName::ChevronUp
+            } else {
+                gpui_kit_assets::IconName::ChevronDown
+            }))
+            .size(px(12.0))
+            .color(colors.muted),
+        );
+    if enabled {
+        trigger = trigger
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(editor) = this.editor_mut() {
+                    editor.owner_list_open = !editor.owner_list_open;
+                }
+                cx.notify();
+            }));
+    } else if let Some(reason) = unavailable
+        .map(|reason| reason.to_string())
+        .or_else(|| busy.then(|| OWNER_BUSY_TOOLTIP.to_owned()))
+    {
+        trigger = trigger.tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx));
+    }
+    let mut children = vec![
+        label("Owner".to_owned(), cx).into_any_element(),
+        trigger.into_any_element(),
+    ];
+    if open {
+        let current = summary.uid;
+        let choices = editor
+            .loaded
+            .owners
+            .iter()
+            .map(|(uid, name)| {
+                let uid = *uid;
+                let chosen = current == Some(Merged::Same(uid));
+                let mut row = div()
+                    .id(("perm-owner-choice", u64::from(uid)))
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(if chosen {
+                        colors.strong
+                    } else {
+                        colors.foreground
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()));
+                if chosen {
+                    row = row.bg(colors.info.opacity(0.14));
+                }
+                row.on_click(cx.listener(move |this, _, window, cx| {
+                    this.change_owner(uid, window, cx);
+                }))
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        children.push(
+            div()
+                .id("perm-owner-list")
+                .mt(px(4.0))
+                .max_h(px(198.0))
+                .overflow_y_scroll()
+                .border_1()
+                .border_color(colors.line)
+                .children(choices)
+                .into_any_element(),
+        );
+    }
+    children.push(
+        label(
+            "Choosing a user asks for administrator authorization. Not recursive; it cannot be undone."
+                .to_owned(),
+            cx,
+        )
+        .into_any_element(),
+    );
+    section(children)
 }
 
 fn group_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
@@ -890,6 +1170,9 @@ mod tests {
                 user_names: Vec::new(),
                 group_names: Vec::new(),
                 unreadable: 0,
+                owners: Vec::new(),
+                elevation: Err(Unavailable::Pkexec),
+                identity: None,
             },
         )
     }
@@ -1205,6 +1488,119 @@ mod tests {
             Some(Merged::Same(fs::metadata(&file)?.gid()))
         );
         fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    fn owner_editor(paths: Vec<PathBuf>, elevated: bool) -> Editor {
+        let mut editor = Editor::new(
+            paths,
+            Loaded {
+                summary: summarize(&[state(0o100644, false, 10)]),
+                groups: Vec::new(),
+                groups_available: true,
+                user_names: vec![(1000, "ana".to_owned()), (0, "root".to_owned())],
+                group_names: Vec::new(),
+                unreadable: 0,
+                owners: Vec::new(),
+                elevation: if elevated {
+                    Ok(Elevation {
+                        pkexec: p("/usr/bin/pkexec"),
+                        chown: p("/usr/bin/chown"),
+                    })
+                } else {
+                    Err(Unavailable::Pkexec)
+                },
+                identity: Some(Identity {
+                    dev: 1,
+                    ino: 2,
+                    born: None,
+                    owner: 1000,
+                    symlink: false,
+                }),
+            },
+        );
+        editor.loaded.summary.files = 1;
+        editor
+    }
+
+    #[test]
+    fn the_owner_job_needs_one_entry_pkexec_a_different_user_and_no_job_running() {
+        let editor = owner_editor(vec![p("/x")], true);
+        let job = editor.owner_job(0);
+        assert_eq!(
+            job.as_ref().map(|job| (job.uid, job.owner.as_str())),
+            Some((0, "root"))
+        );
+        // The uid the entry already has (state() gives 1000) is no change.
+        assert!(editor.owner_job(1000).is_none());
+        assert!(owner_editor(vec![p("/x")], false).owner_job(0).is_none());
+        assert!(
+            owner_editor(vec![p("/x"), p("/y")], true)
+                .owner_job(0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_symlink_selection_offers_no_owner_change() {
+        let mut editor = owner_editor(vec![p("/x")], true);
+        editor.loaded.summary.files = 0;
+        editor.loaded.summary.symlinks = 1;
+        assert!(!editor.owner_editable());
+        assert!(editor.owner_job(0).is_none());
+    }
+
+    #[test]
+    fn only_one_owner_change_runs_at_a_time_and_the_claim_is_released_on_drop() {
+        let gate = OwnerGate::new();
+        assert!(!gate.is_busy());
+        let first = gate.claim();
+        assert!(first.is_some());
+        assert!(gate.is_busy());
+        assert!(gate.claim().is_none(), "a second change must wait");
+        drop(first);
+        assert!(!gate.is_busy());
+        assert!(gate.claim().is_some());
+    }
+
+    #[test]
+    fn the_owner_menu_says_why_it_is_disabled_while_a_change_waits() {
+        assert_eq!(
+            OWNER_BUSY_TOOLTIP,
+            "An owner change is waiting for authorization"
+        );
+    }
+
+    #[test]
+    fn the_owner_toast_says_what_happened_and_the_panel_reads_again() -> TestResult {
+        let job = owner_editor(vec![p("/d/f.txt")], true)
+            .owner_job(0)
+            .ok_or("the owner job exists")?;
+        let notice = |outcome: Outcome| {
+            let report = owner_report(&outcome, &job);
+            assert!(report.permissions_changed);
+            assert!(report.undo.is_none(), "an owner change has no undo");
+            report.notice
+        };
+        assert_eq!(
+            notice(Outcome::Changed),
+            Some(Notice {
+                severity: Severity::Success,
+                text: "Changed the owner of f.txt to root".to_owned(),
+            })
+        );
+        let cancelled = notice(Outcome::Cancelled(
+            "Authentication was cancelled".to_owned(),
+        ));
+        assert_eq!(cancelled.map(|n| n.severity), Some(Severity::Warning));
+        let failed = notice(Outcome::Failed("chown failed (exit 1)".to_owned()));
+        assert_eq!(
+            failed,
+            Some(Notice {
+                severity: Severity::Error,
+                text: "Could not change the owner of f.txt: chown failed (exit 1)".to_owned(),
+            })
+        );
         Ok(())
     }
 

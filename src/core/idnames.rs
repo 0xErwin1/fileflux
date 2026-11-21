@@ -85,6 +85,29 @@ fn names_of(text: &str) -> HashMap<u32, Arc<str>> {
     names
 }
 
+/// The users an owner menu offers, from the parsed `/etc/passwd`: people
+/// first (uid 1000 up, by name), then root, then the system accounts
+/// (by name). Each uid once, the first line winning like `getpwuid`; the
+/// overflow uid 65534 counts as a system account.
+#[must_use]
+pub fn owner_choices(users: &[(u32, String)]) -> Vec<(u32, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut choices: Vec<(u32, String)> = users
+        .iter()
+        .filter(|(uid, _)| seen.insert(*uid))
+        .cloned()
+        .collect();
+    let rank = |uid: u32| match uid {
+        1000..=65533 => 0,
+        0 => 1,
+        _ => 2,
+    };
+    choices.sort_by(|(a_uid, a_name), (b_uid, b_name)| {
+        (rank(*a_uid), a_name, a_uid).cmp(&(rank(*b_uid), b_name, b_uid))
+    });
+    choices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +149,20 @@ mod tests {
         let mut ids = IdResolver::from_texts("", "");
         assert_eq!(&*ids.user(0), "0");
         assert_eq!(&*ids.group(0), "0");
+    }
+
+    #[test]
+    fn owner_choices_list_people_then_root_then_system_accounts_once_each() {
+        let users = parse_id_file(
+            "root:x:0:0::/root:/bin/sh\ndaemon:x:1:1::/:/sbin/nologin\nzoe:x:1001:100::/h:/bin/sh\nana:x:1000:100::/h:/bin/sh\nana2:x:1000:100::/h:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n",
+        );
+        let choices = owner_choices(&users);
+        let names: Vec<&str> = choices.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, ["ana", "zoe", "root", "daemon", "nobody"]);
+    }
+
+    #[test]
+    fn owner_choices_of_nothing_is_empty() {
+        assert!(owner_choices(&[]).is_empty());
     }
 }

@@ -12,6 +12,7 @@ pub mod clipboard;
 pub mod custom_actions;
 pub mod devices;
 pub mod du;
+pub mod elevate;
 pub mod folder_views;
 pub mod fs;
 pub mod glob;
