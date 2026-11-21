@@ -319,14 +319,51 @@ mod tests {
         list.iter().map(OsString::from).collect()
     }
 
-    fn scratch(name: &str) -> Result<PathBuf, std::io::Error> {
+    /// A scratch directory under the system temp dir, removed when dropped
+    /// so test runs leave nothing behind.
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("could not remove {}: {error}", self.0.display());
+            }
+        }
+    }
+
+    fn scratch(name: &str) -> Result<Scratch, std::io::Error> {
         let dir =
             std::env::temp_dir().join(format!("fileflux-cli-unit-{name}-{}", std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
         std::fs::create_dir_all(&dir)?;
-        Ok(dir)
+        Ok(Scratch(dir))
+    }
+
+    #[test]
+    fn a_unit_scratch_directory_is_removed_when_dropped() -> Result<(), std::io::Error> {
+        let path = {
+            let dir = scratch("cleanup")?;
+            std::fs::write(dir.join("left-over"), b"x")?;
+            dir.to_path_buf()
+        };
+        assert!(!path.exists(), "{} was left behind", path.display());
+        Ok(())
     }
 
     /// A current directory that resolves to `dir`.

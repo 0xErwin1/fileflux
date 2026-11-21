@@ -17,13 +17,39 @@ fn fileflux(args: &[&str], cwd: &Path) -> Output {
         .expect("the fileflux binary runs")
 }
 
-fn scratch(name: &str) -> std::path::PathBuf {
+/// A scratch directory under the system temp dir, removed when dropped so
+/// test runs leave nothing behind.
+struct Scratch(std::path::PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("could not remove {}: {error}", self.0.display());
+        }
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("fileflux-cli-{name}-{}", std::process::id()));
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("stale scratch directory is removed");
     }
     std::fs::create_dir_all(&dir).expect("scratch directory is created");
-    dir
+    Scratch(dir)
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -146,4 +172,14 @@ fn the_desktop_entry_lists_every_image_mime_type() {
     }
     assert!(claimed.contains(&"inode/directory"));
     assert!(entry.lines().any(|line| line == "Exec=fileflux %F"));
+}
+
+#[test]
+fn a_scratch_directory_is_removed_when_the_test_is_done() {
+    let path = {
+        let dir = scratch("cleanup");
+        std::fs::write(dir.join("left-over"), b"x").expect("a file is written");
+        dir.to_path_buf()
+    };
+    assert!(!path.exists(), "{} was left behind", path.display());
 }

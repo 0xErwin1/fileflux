@@ -1812,8 +1812,7 @@ mod tests {
             &[(1, Some(link.clone()), None)],
             std::slice::from_ref(&mount),
         );
-        std::fs::remove_file(&link)?;
-        std::fs::remove_dir(&mount)?;
+        std::fs::remove_dir_all(&root)?;
         assert_eq!(
             busy,
             [7],
