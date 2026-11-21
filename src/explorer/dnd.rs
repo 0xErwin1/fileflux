@@ -27,6 +27,7 @@ use gpui_component::ActiveTheme as _;
 
 use super::icon;
 use super::ops::paste::ClipMode;
+use super::panes::Side;
 use super::rubber::past_threshold;
 use super::view::Explorer;
 
@@ -47,6 +48,68 @@ pub(crate) enum DropTarget {
     Folder(PathBuf),
     /// The sidebar's Trash row.
     Trash,
+}
+
+/// Where a drop lands, as far as what it means is concerned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DropZone {
+    /// A folder or the Trash: today's move, copy, link and trash drops.
+    Target(DropTarget),
+    /// The "Open in split" strip at the right edge of the files area.
+    SplitStrip,
+    /// The tab strip of `side`, in the gap `gap` (0 is before the first
+    /// tab).
+    TabStrip { side: Side, gap: usize },
+}
+
+/// What a drop does, once the zone it landed in is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DropAction {
+    /// A drop into a target: [`plan_drop`]'s decision, unchanged.
+    Plan(DropPlan),
+    /// Show `folder` in the pane that does not have the focus; nothing is
+    /// copied or moved.
+    OpenInSplit(PathBuf),
+    /// Open `folder` in a new tab of `side` at the gap `gap`; nothing is
+    /// copied or moved.
+    OpenInTab {
+        folder: PathBuf,
+        side: Side,
+        gap: usize,
+    },
+}
+
+/// Decides a drop in `zone`. `folder` says the (single) dragged path is a
+/// folder. The two open zones take exactly one folder dragged inside this
+/// window and ignore everything else; a [`DropZone::Target`] is exactly
+/// [`plan_drop`].
+pub(crate) fn resolve_drop(
+    origin: DragOrigin,
+    sources: &[PathBuf],
+    folder: bool,
+    zone: &DropZone,
+    ctrl: bool,
+    shift: bool,
+    same_device: impl FnOnce(&Path) -> bool,
+) -> DropAction {
+    let dragged_folder = match sources {
+        [one] if folder && origin == DragOrigin::Internal => Some(one.clone()),
+        _ => None,
+    };
+    match (zone, dragged_folder) {
+        (DropZone::Target(target), _) => {
+            DropAction::Plan(plan_drop(origin, sources, target, ctrl, shift, same_device))
+        }
+        (DropZone::SplitStrip, Some(folder)) => DropAction::OpenInSplit(folder),
+        (DropZone::TabStrip { side, gap }, Some(folder)) => DropAction::OpenInTab {
+            folder,
+            side: *side,
+            gap: *gap,
+        },
+        (DropZone::SplitStrip | DropZone::TabStrip { .. }, None) => {
+            DropAction::Plan(DropPlan::Ignore)
+        }
+    }
 }
 
 /// Whether a drop on a target does anything.
@@ -277,6 +340,36 @@ pub(crate) struct DraggedEntries {
     /// The visible selection (or the one unselected entry), shared by every
     /// tile of a frame.
     pub(crate) paths: Arc<Vec<PathBuf>>,
+    /// The entry that was grabbed is a folder.
+    pub(crate) folder: bool,
+}
+
+impl DraggedEntries {
+    /// The folder, when exactly one folder is being dragged: the only drag
+    /// the "Open in split" strip and the tab strip take.
+    pub(crate) fn sole_folder(&self) -> Option<&Path> {
+        match self.paths.as_slice() {
+            [one] if self.folder => Some(one.as_path()),
+            _ => None,
+        }
+    }
+}
+
+/// The folder a drag payload carries, if it is a drag of exactly one folder.
+pub(crate) fn dragged_folder(value: &dyn Any) -> Option<&Path> {
+    value
+        .downcast_ref::<DraggedEntries>()
+        .and_then(DraggedEntries::sole_folder)
+}
+
+/// Whether a folder drag is on screen and past its threshold: the strips
+/// that open a folder show only then.
+pub(crate) fn folder_drag_live(this: &Explorer, cx: &App) -> bool {
+    this.folder_drag.is_some()
+        && cx.has_active_drag()
+        && cx
+            .try_global::<GateCell>()
+            .is_none_or(|gate| gate.0.get().is_armed())
 }
 
 /// The element id the automation bridge reads the drag card by.
@@ -378,11 +471,21 @@ pub(crate) fn drag_source<E: StatefulInteractiveElement>(
         Arc::new(vec![path.clone()])
     };
     let payload_explorer = weak.clone();
+    let drag_explorer = weak.clone();
     let dragged_path = path.clone();
     element
         .on_drag(
-            DraggedEntries { paths },
+            DraggedEntries { paths, folder },
             move |dragged, grab, _window, cx| {
+                if dragged.sole_folder().is_some()
+                    && let Err(error) = drag_explorer.update(cx, |this, cx| {
+                        // The press focused the pane the folder lives in.
+                        this.folder_drag = Some(this.tabs.focus());
+                        cx.notify();
+                    })
+                {
+                    log::debug!("a folder drag began in a closed explorer: {error}");
+                }
                 let one = dragged.paths.len() == 1;
                 let preview = DragPreview {
                     text: preview_text(&dragged.paths),
@@ -446,6 +549,50 @@ fn external_payload(
         .collect();
     let files = file_kinds(&dragged.paths, dragged_path, dragged_is_dir, &directories);
     Some(ExternalDragPayload::Files(FileDragPaths::new(files)))
+}
+
+/// The width of the "Open in split" strip.
+const SPLIT_STRIP_WIDTH: f32 = 132.0;
+
+/// The "Open in split" strip: a column along the right edge of the files
+/// area that takes a dragged folder (see [`DropZone::SplitStrip`]). It sits
+/// over whatever is there and hides it from the pointer, so a folder dropped
+/// on it is never also dropped on an entry underneath. The caller draws it
+/// only while [`folder_drag_live`].
+pub(crate) fn split_strip(cx: &mut Context<Explorer>) -> gpui::Stateful<gpui::Div> {
+    let colors = bolt::colors(cx);
+    let tint = ChromeColors::tint(cx.theme());
+    let wash = cx.theme().list_active;
+    div()
+        .id("explorer-split-strip")
+        .role(gpui::accesskit::Role::Group)
+        .aria_label("Open in split")
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(SPLIT_STRIP_WIDTH))
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(Spacing::SM)
+        .bg(colors.raised.opacity(0.92))
+        .border_l_2()
+        .border_color(tint.opacity(0.5))
+        .text_size(px(13.0))
+        .text_color(colors.strong)
+        .child(
+            Icon::new(icon(gpui_kit_assets::IconName::PanelRight))
+                .size(px(16.0))
+                .color(tint),
+        )
+        .child("Open in split")
+        .can_drop(|value, _, _| dragged_folder(value).is_some())
+        .drag_over::<DraggedEntries>(move |style, _, _, _| style.bg(wash).border_color(tint))
+        .on_drop::<DraggedEntries>(cx.listener(|this, dragged: &DraggedEntries, window, cx| {
+            this.drop_dragged(dragged, &DropZone::SplitStrip, window, cx);
+        }))
 }
 
 /// While something is dragged, an entry that is not a target hides what is
@@ -555,9 +702,9 @@ fn drop_on(
 }
 
 impl Explorer {
-    /// A drop landed: asks [`plan_drop`] what it means (Ctrl and Shift are
-    /// read at the moment of the drop) and hands it to the paste engine or
-    /// the Trash job. Nothing here moves a byte by itself.
+    /// A drop landed on a target: asks [`resolve_drop`] what it means (Ctrl
+    /// and Shift are read at the moment of the drop) and hands it to the
+    /// paste engine or the Trash job. Nothing here moves a byte by itself.
     pub(crate) fn drop_entries(
         &mut self,
         origin: DragOrigin,
@@ -566,24 +713,75 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.drop_in_zone(
+            origin,
+            sources,
+            false,
+            &DropZone::Target(target.clone()),
+            window,
+            cx,
+        );
+    }
+
+    /// Entries of this window dropped on the "Open in split" strip or the
+    /// tab strip (see [`DropZone`]).
+    pub(crate) fn drop_dragged(
+        &mut self,
+        dragged: &DraggedEntries,
+        zone: &DropZone,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drop_in_zone(
+            DragOrigin::Internal,
+            dragged.paths.to_vec(),
+            dragged.folder,
+            zone,
+            window,
+            cx,
+        );
+    }
+
+    fn drop_in_zone(
+        &mut self,
+        origin: DragOrigin,
+        sources: Vec<PathBuf>,
+        folder: bool,
+        zone: &DropZone,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let modifiers = window.modifiers();
-        let plan = plan_drop(
+        let action = resolve_drop(
             origin,
             &sources,
-            target,
+            folder,
+            zone,
             modifiers.control,
             modifiers.shift,
             |dest| same_device(&sources, dest),
         );
-        match plan {
-            DropPlan::Ignore => {}
-            DropPlan::Paste { mode, dest } => {
+        let from = self.folder_drag.take();
+        match action {
+            DropAction::Plan(DropPlan::Ignore) => {}
+            DropAction::Plan(DropPlan::Paste { mode, dest }) => {
                 self.start_paste(sources, dest, mode, None, window, cx)
             }
-            DropPlan::Link { dest } => {
+            DropAction::Plan(DropPlan::Link { dest }) => {
                 self.start_links(sources, Some(dest), Naming::Source, window, cx)
             }
-            DropPlan::Trash => self.trash_paths(sources, window, cx),
+            DropAction::Plan(DropPlan::Trash) => self.trash_paths(sources, window, cx),
+            DropAction::OpenInSplit(folder) => {
+                // The pane the drop landed in took the focus first; "the
+                // other pane" is the other one of the pane the drag began in.
+                if let Some(from) = from {
+                    self.tabs.focus_side(from);
+                }
+                self.open_in_split(folder, window, cx);
+            }
+            DropAction::OpenInTab { folder, side, gap } => {
+                self.open_folder_tab_at(folder, side, gap, window, cx);
+            }
         }
         cx.notify();
     }
@@ -1036,7 +1234,197 @@ mod tests {
         assert!(dragged_paths(&tab).is_none());
         let entries = DraggedEntries {
             paths: Arc::new(vec![PathBuf::from("/a")]),
+            folder: false,
         };
         assert!(dragged_paths(&entries).is_some());
+    }
+
+    fn resolve(
+        origin: DragOrigin,
+        sources: &[&str],
+        folder: bool,
+        zone: &DropZone,
+        ctrl: bool,
+        shift: bool,
+    ) -> DropAction {
+        let sources: Vec<PathBuf> = sources.iter().map(|s| p(s)).collect();
+        resolve_drop(origin, &sources, folder, zone, ctrl, shift, |_| true)
+    }
+
+    #[test]
+    fn an_existing_move_drop_still_resolves_to_a_move() {
+        let zone = DropZone::Target(folder("/h/docs"));
+        assert_eq!(
+            resolve(
+                DragOrigin::Internal,
+                &["/h/a.txt"],
+                false,
+                &zone,
+                false,
+                false
+            ),
+            DropAction::Plan(DropPlan::Paste {
+                mode: ClipMode::Cut,
+                dest: p("/h/docs"),
+            })
+        );
+        // A dragged folder dropped on a folder is still a move, not an open.
+        assert_eq!(
+            resolve(
+                DragOrigin::Internal,
+                &["/h/music"],
+                true,
+                &zone,
+                false,
+                false
+            ),
+            DropAction::Plan(DropPlan::Paste {
+                mode: ClipMode::Cut,
+                dest: p("/h/docs"),
+            })
+        );
+        // The decision is the one plan_drop makes.
+        for (ctrl, shift) in [(false, false), (true, false), (false, true), (true, true)] {
+            let sources = vec![p("/h/a.txt")];
+            let target = folder("/h/docs");
+            assert_eq!(
+                resolve_drop(
+                    DragOrigin::Internal,
+                    &sources,
+                    false,
+                    &DropZone::Target(target.clone()),
+                    ctrl,
+                    shift,
+                    |_| false
+                ),
+                DropAction::Plan(plan_drop(
+                    DragOrigin::Internal,
+                    &sources,
+                    &target,
+                    ctrl,
+                    shift,
+                    |_| false
+                ))
+            );
+        }
+        assert_eq!(
+            resolve(
+                DragOrigin::Internal,
+                &["/h/a.txt"],
+                false,
+                &DropZone::Target(DropTarget::Trash),
+                false,
+                false
+            ),
+            DropAction::Plan(DropPlan::Trash)
+        );
+    }
+
+    #[test]
+    fn one_dragged_folder_on_the_split_strip_opens_in_the_split() {
+        assert_eq!(
+            resolve(
+                DragOrigin::Internal,
+                &["/h/music"],
+                true,
+                &DropZone::SplitStrip,
+                false,
+                false
+            ),
+            DropAction::OpenInSplit(p("/h/music"))
+        );
+        // Modifiers do not turn the open into a copy, move or link.
+        assert_eq!(
+            resolve(
+                DragOrigin::Internal,
+                &["/h/music"],
+                true,
+                &DropZone::SplitStrip,
+                true,
+                true
+            ),
+            DropAction::OpenInSplit(p("/h/music"))
+        );
+    }
+
+    #[test]
+    fn the_strip_and_the_tab_strip_take_exactly_one_internal_folder() {
+        let tabs = DropZone::TabStrip {
+            side: Side::Right,
+            gap: 2,
+        };
+        for zone in [DropZone::SplitStrip, tabs.clone()] {
+            let ignore = DropAction::Plan(DropPlan::Ignore);
+            // A file, several items, nothing, or files from another app.
+            assert_eq!(
+                resolve(
+                    DragOrigin::Internal,
+                    &["/h/a.txt"],
+                    false,
+                    &zone,
+                    false,
+                    false
+                ),
+                ignore
+            );
+            assert_eq!(
+                resolve(
+                    DragOrigin::Internal,
+                    &["/h/a", "/h/b"],
+                    true,
+                    &zone,
+                    false,
+                    false
+                ),
+                ignore
+            );
+            assert_eq!(
+                resolve(DragOrigin::Internal, &[], true, &zone, false, false),
+                ignore
+            );
+            assert_eq!(
+                resolve(
+                    DragOrigin::External,
+                    &["/h/music"],
+                    true,
+                    &zone,
+                    false,
+                    false
+                ),
+                ignore
+            );
+        }
+        assert_eq!(
+            resolve(
+                DragOrigin::Internal,
+                &["/h/music"],
+                true,
+                &tabs,
+                false,
+                false
+            ),
+            DropAction::OpenInTab {
+                folder: p("/h/music"),
+                side: Side::Right,
+                gap: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_sole_folder_payload_is_a_folder_drag() {
+        let one = |paths: &[&str], folder| DraggedEntries {
+            paths: Arc::new(paths.iter().map(|s| p(s)).collect()),
+            folder,
+        };
+        assert_eq!(one(&["/a"], true).sole_folder(), Some(Path::new("/a")));
+        assert_eq!(one(&["/a"], false).sole_folder(), None);
+        assert_eq!(one(&["/a", "/b"], true).sole_folder(), None);
+        assert_eq!(dragged_folder(&one(&["/a"], true)), Some(Path::new("/a")));
+        let tab = crate::explorer::tabs::DraggedTab {
+            id: 1,
+            side: Side::Left,
+        };
+        assert_eq!(dragged_folder(&tab), None);
     }
 }

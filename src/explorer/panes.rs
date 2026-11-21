@@ -61,6 +61,54 @@ pub(crate) fn split_refusal(width: f32) -> String {
     )
 }
 
+/// The narrowest a pane gets when the divider is dragged: its toolbar and a
+/// few columns of entries stay usable.
+pub(crate) const MIN_PANE_WIDTH: f32 = 460.0;
+/// The even split.
+pub(crate) const DEFAULT_SPLIT_RATIO: f32 = 0.5;
+
+/// The left pane's share of `available` (the two panes' width without the
+/// divider) once both panes keep [`MIN_PANE_WIDTH`]. When even that does not
+/// fit, or a value is not a number, the split is even.
+pub(crate) fn clamp_ratio(ratio: f32, available: f32) -> f32 {
+    if !ratio.is_finite() || !available.is_finite() || available < 2.0 * MIN_PANE_WIDTH {
+        return DEFAULT_SPLIT_RATIO;
+    }
+    let low = MIN_PANE_WIDTH / available;
+    ratio.clamp(low, 1.0 - low)
+}
+
+/// The ratio while the divider is dragged from `start_x` to `x`: the start
+/// ratio plus the travel as a share of `available`, clamped. A pointer that
+/// is not a number leaves the start ratio alone.
+pub(crate) fn dragged_ratio(start_ratio: f32, start_x: f32, x: f32, available: f32) -> f32 {
+    let travel = x - start_x;
+    let ratio = if travel.is_finite() && available > 0.0 {
+        start_ratio + travel / available
+    } else {
+        start_ratio
+    };
+    clamp_ratio(ratio, available)
+}
+
+/// The saved form of a ratio (thousandths of the left pane's share).
+pub(crate) fn permille_of(ratio: f32) -> u32 {
+    (ratio * 1000.0).round().clamp(0.0, 1000.0) as u32
+}
+
+/// The ratio a saved share stands for.
+pub(crate) fn ratio_of(permille: u32) -> f32 {
+    permille as f32 / 1000.0
+}
+
+/// A divider drag in progress: the ratio and the pointer's x when the button
+/// went down, so the ratio follows the travel instead of drifting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SplitDrag {
+    pub(crate) start_ratio: f32,
+    pub(crate) start_x: f32,
+}
+
 /// One of the two panes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -1090,5 +1138,44 @@ mod tests {
         assert_eq!(tabs, [dir("/c"), dir("/b"), dir("/r"), dir("/a")]);
         assert_eq!(active, [0, 1], "left /c, right /a");
         Ok(())
+    }
+
+    #[test]
+    fn the_ratio_keeps_both_panes_at_their_minimum_width() {
+        let available = 1000.0;
+        let lo = MIN_PANE_WIDTH / available;
+        assert!((clamp_ratio(0.5, available) - 0.5).abs() < 1e-6);
+        assert!((clamp_ratio(0.0, available) - lo).abs() < 1e-6);
+        assert!((clamp_ratio(1.0, available) - (1.0 - lo)).abs() < 1e-6);
+        assert!((clamp_ratio(-3.0, available) - lo).abs() < 1e-6);
+        assert!((clamp_ratio(f32::NAN, available) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_two_minimum_panes_splits_evenly() {
+        assert!((clamp_ratio(0.9, 2.0 * MIN_PANE_WIDTH - 1.0) - 0.5).abs() < 1e-6);
+        assert!((clamp_ratio(0.1, 0.0) - 0.5).abs() < 1e-6);
+        assert!((clamp_ratio(0.1, f32::NAN) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dragging_the_divider_moves_the_ratio_by_the_travel() {
+        let ratio = dragged_ratio(0.5, 1000.0, 1200.0, 2000.0);
+        assert!((ratio - 0.6).abs() < 1e-6);
+        let ratio = dragged_ratio(0.5, 1000.0, 800.0, 2000.0);
+        assert!((ratio - 0.4).abs() < 1e-6);
+        // Far past either end stops at the minimum width.
+        let lo = MIN_PANE_WIDTH / 2000.0;
+        assert!((dragged_ratio(0.5, 1000.0, -9000.0, 2000.0) - lo).abs() < 1e-6);
+        assert!((dragged_ratio(0.5, 1000.0, 9000.0, 2000.0) - (1.0 - lo)).abs() < 1e-6);
+        assert!((dragged_ratio(0.6, 1000.0, f32::NAN, 2000.0) - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_ratio_round_trips_through_its_saved_permille() {
+        assert_eq!(permille_of(DEFAULT_SPLIT_RATIO), 500);
+        for permille in [200, 333, 500, 641, 800] {
+            assert_eq!(permille_of(ratio_of(permille)), permille);
+        }
     }
 }

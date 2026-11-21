@@ -60,6 +60,10 @@ pub const DEFAULT_SIDEBAR_WIDTH: u32 = 290;
 /// The details panel's width bounds, in CSS pixels, and its default.
 pub const DETAILS_WIDTH_RANGE: (u32, u32) = (240, 600);
 pub const DEFAULT_DETAILS_WIDTH: u32 = 300;
+/// The split view's divider, as the left pane's share of the two panes in
+/// thousandths, its bounds and its default (an even split).
+pub const SPLIT_PERMILLE_RANGE: (u32, u32) = (100, 900);
+pub const DEFAULT_SPLIT_PERMILLE: u32 = 500;
 /// The window size bounds and defaults (the design brief's 1440×900).
 pub const WINDOW_WIDTH_RANGE: (u32, u32) = (480, 16_384);
 pub const WINDOW_HEIGHT_RANGE: (u32, u32) = (320, 16_384);
@@ -328,6 +332,10 @@ pub struct Preferences {
     /// The details panel's width; files written before it existed load the
     /// default.
     pub details_width: u32,
+    /// Where the split view's divider sits: the left pane's share of the two
+    /// panes, in thousandths. Files written before it existed load an even
+    /// split.
+    pub split_permille: u32,
     /// The optional columns of the list view, besides Name. A file written
     /// before the key existed loads the default (Size and Modified), so no
     /// settings migration is needed.
@@ -354,6 +362,7 @@ impl Default for Preferences {
             arrangement: ArrangementPrefs::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             details_width: DEFAULT_DETAILS_WIDTH,
+            split_permille: DEFAULT_SPLIT_PERMILLE,
             list_columns: ColumnPref::defaults(),
             grid_zoom: GridZoom::Medium,
             list_zoom: ListZoom::Medium,
@@ -377,6 +386,9 @@ impl Preferences {
         self.details_width = self
             .details_width
             .clamp(DETAILS_WIDTH_RANGE.0, DETAILS_WIDTH_RANGE.1);
+        self.split_permille = self
+            .split_permille
+            .clamp(SPLIT_PERMILLE_RANGE.0, SPLIT_PERMILLE_RANGE.1);
         self.list_columns.sort_unstable();
         self.list_columns.dedup();
         self.window_width = self
@@ -1449,6 +1461,39 @@ mod tests {
             .map(|entry| entry.expect("entry reads").file_name())
             .collect();
         assert_eq!(leftovers, [OsStr::new("settings.toml")]);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn the_split_ratio_defaults_to_even_round_trips_and_is_clamped() {
+        assert_eq!(Settings::default().preferences.split_permille, 500);
+        let dir = scratch("split-ratio");
+        let path = dir.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.preferences.split_permille = 640;
+        save_settings(&path, &settings).expect("settings save");
+        let text = std::fs::read_to_string(&path).expect("file reads");
+        assert!(text.contains("split_permille = 640"), "{text}");
+        let loaded = load_settings(&path, SystemTime::now());
+        assert_eq!(loaded.value, settings);
+        assert_eq!(loaded.value.version, SETTINGS_VERSION, "no version bump");
+
+        std::fs::write(&path, "version = 2\n[preferences]\nsidebar_width = 300\n")
+            .expect("fixture writes");
+        let old = load_settings(&path, SystemTime::now());
+        assert_eq!(old.notice, None);
+        assert_eq!(old.value.preferences.split_permille, 500);
+
+        let wild = Preferences {
+            split_permille: 3,
+            ..Preferences::default()
+        };
+        assert_eq!(wild.sanitized().split_permille, SPLIT_PERMILLE_RANGE.0);
+        let wild = Preferences {
+            split_permille: 9999,
+            ..Preferences::default()
+        };
+        assert_eq!(wild.sanitized().split_permille, SPLIT_PERMILLE_RANGE.1);
         drop(std::fs::remove_dir_all(&dir));
     }
 }

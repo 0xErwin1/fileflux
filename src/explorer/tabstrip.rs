@@ -15,6 +15,12 @@
 //! the gap the pointer is in; the empty end of the strip is the gap after
 //! the last tab. In a split view a one-tab pane shows its strip meanwhile,
 //! so a tab can be dropped onto the other pane.
+//!
+//! While exactly one folder is dragged from the entries the strip shows too
+//! (a one-tab pane included) and takes the folder in the empty end of the
+//! strip and in a narrow zone on each tab's edge — between tabs — opening it
+//! in a new tab at that gap. The middle of a tab is not a drop zone: it does
+//! nothing, as before.
 
 use bolt::primitives::Icon;
 use bolt::tokens::ChromeColors;
@@ -25,6 +31,7 @@ use gpui::{
 use gpui_component::ActiveTheme;
 use gpui_component::tooltip::Tooltip;
 
+use super::dnd::{self, DraggedEntries, DropZone};
 use super::icon;
 use super::panes::Side;
 use super::tabs::{DraggedTab, dragged_tab, gap_is_noop, tab_label, tab_tooltip};
@@ -36,20 +43,24 @@ pub(crate) const TAB_HEIGHT: f32 = 30.0;
 const TAB_MIN_WIDTH: f32 = 96.0;
 /// The widest a tab grows to.
 const TAB_MAX_WIDTH: f32 = 220.0;
+/// The width of the drop zone on each edge of a tab for a dragged folder.
+const FOLDER_EDGE: f32 = 12.0;
 /// Edge of the square close button.
 const CLOSE_SIZE: f32 = 18.0;
 
 /// The strip, or nothing while there is a single tab.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
-    let dragging = this.tab_drag.is_some() && cx.has_active_drag();
-    if this.tabs.len() < 2 && !(dragging && this.tabs.is_split()) {
+    let tab_dragging = this.tab_drag.is_some() && cx.has_active_drag();
+    let folder_dragging = dnd::folder_drag_live(this, cx);
+    let dragging = tab_dragging || folder_dragging;
+    if this.tabs.len() < 2 && !((tab_dragging && this.tabs.is_split()) || folder_dragging) {
         return None;
     }
     // The dragged tab's pane and position, so the gaps that would leave the
     // order as it is show no zone.
     let grabbed = this
         .tab_drag
-        .filter(|_| dragging)
+        .filter(|_| tab_dragging)
         .and_then(|id| this.tabs.locate(|tab| tab.id == id));
     // During a frame of a split view the focus is on the pane being drawn.
     let side = this.tabs.focus();
@@ -81,8 +92,9 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
                 id: tab.id,
                 side,
                 local,
-                grabbed: dragging.then_some(grabbed).flatten(),
-                dragging,
+                grabbed: tab_dragging.then_some(grabbed).flatten(),
+                tab_dragging,
+                folder_dragging,
             },
             index == active,
             location,
@@ -92,11 +104,12 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
         ));
     }
     if dragging {
-        // The empty end of the strip: the gap after the last tab. It only
-        // takes what the tabs leave over.
+        // The empty end of the strip: the gap after the last tab. It grows
+        // like a tab, so once the tabs reach their maximum width it takes
+        // the rest of the strip. A grow factor below one would leave it only
+        // that fraction of the free space: a sliver no pointer can hit.
         let end = this.tabs.focused().len();
-        let mut filler = div().h_full();
-        filler.style().flex_grow = Some(0.001);
+        let filler = div().h_full().flex_1().min_w(px(TAB_MIN_WIDTH / 2.0));
         let skip =
             grabbed.is_some_and(|(from_side, from)| from_side == side && gap_is_noop(from, end));
         if !skip {
@@ -116,7 +129,11 @@ struct Zones {
     local: usize,
     /// The dragged tab's pane and position, while a tab drag lasts.
     grabbed: Option<(Side, usize)>,
-    dragging: bool,
+    /// A tab is being dragged: every tab shows its two halves as zones.
+    tab_dragging: bool,
+    /// One folder is being dragged: every tab shows a narrow zone on each
+    /// edge.
+    folder_dragging: bool,
 }
 
 /// Which edge of a zone the drop indicator is drawn on.
@@ -134,14 +151,23 @@ where
     E: InteractiveElement + Styled,
 {
     let tint = ChromeColors::tint(cx.theme());
-    zone.can_drop(|value, _, _| dragged_tab(value).is_some())
-        .drag_over::<DraggedTab>(move |style, _, _, _| match edge {
-            Edge::Left => style.border_l_2().border_color(tint),
-            Edge::Right => style.border_r_2().border_color(tint),
-        })
-        .on_drop::<DraggedTab>(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-            this.drop_tab(*dragged, side, gap, window, cx);
-        }))
+    let marked = move |style: gpui::StyleRefinement| match edge {
+        Edge::Left => style.border_l_2().border_color(tint),
+        Edge::Right => style.border_r_2().border_color(tint),
+    };
+    zone.can_drop(|value, _, _| {
+        dragged_tab(value).is_some() || dnd::dragged_folder(value).is_some()
+    })
+    .drag_over::<DraggedTab>(move |style, _, _, _| marked(style))
+    .drag_over::<DraggedEntries>(move |style, _, _, _| marked(style))
+    .on_drop::<DraggedEntries>(
+        cx.listener(move |this, dragged: &DraggedEntries, window, cx| {
+            this.drop_dragged(dragged, &DropZone::TabStrip { side, gap }, window, cx);
+        }),
+    )
+    .on_drop::<DraggedTab>(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+        this.drop_tab(*dragged, side, gap, window, cx);
+    }))
 }
 
 /// The card that follows the pointer while a tab is dragged.
@@ -270,12 +296,19 @@ fn render_tab(
                 }))
                 .child(Icon::new(icon(gpui_kit_assets::IconName::X)).size(px(12.0))),
         )
-        .when(zones.dragging, |tab| {
+        .when(zones.tab_dragging || zones.folder_dragging, |tab| {
             let zone = |gap: usize, edge: Edge, cx: &mut Context<Explorer>| {
                 let noop = zones
                     .grabbed
                     .is_some_and(|(side, from)| side == zones.side && gap_is_noop(from, gap));
-                let base = div().absolute().top_0().bottom_0().w_1_2();
+                // Halves for a tab; a narrow edge for a folder, so the
+                // middle of a tab stays no drop zone.
+                let base = div().absolute().top_0().bottom_0();
+                let base = if zones.tab_dragging {
+                    base.w_1_2()
+                } else {
+                    base.w(px(FOLDER_EDGE))
+                };
                 let base = match edge {
                     Edge::Left => base.left_0(),
                     Edge::Right => base.right_0(),

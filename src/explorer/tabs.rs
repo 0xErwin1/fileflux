@@ -895,6 +895,7 @@ mod tests {
         assert_eq!(dragged_tab(&tab), Some(&tab));
         let entries = DraggedEntries {
             paths: std::sync::Arc::new(vec![PathBuf::from("/a")]),
+            folder: false,
         };
         assert_eq!(dragged_tab(&entries), None);
         assert_eq!(dragged_tab(&"text"), None);

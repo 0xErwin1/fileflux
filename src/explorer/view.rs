@@ -43,9 +43,9 @@ use fileflux::core::zoom::{CompactZoom, GridZoom, ListZoom, ZoomCommand};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Div, Entity, FocusHandle, Focusable,
-    InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, actions, deferred, div, prelude::*, px,
+    InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, ScrollStrategy, Stateful, Styled, Subscription,
+    Task, UniformListScrollHandle, WeakEntity, Window, actions, deferred, div, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::table::{TableEvent, TableState};
@@ -61,7 +61,7 @@ use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{ArrangeMenu, DialogQueue};
 use crate::explorer::ops::{OpenAction, OpenSplit, Severity, UndoStack, open_action, split_open};
-use crate::explorer::panes::{self, PaneLayout, Panes, PerPane, Side};
+use crate::explorer::panes::{self, PaneLayout, Panes, PerPane, Side, SplitDrag};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
     session_tab, view_from_pref, view_to_pref,
@@ -76,7 +76,7 @@ use crate::explorer::tabs::{Affected, DraggedTab, Placement};
 use crate::explorer::toasts;
 use crate::explorer::typeahead::{self, TypeAhead};
 use crate::explorer::zoom::{self, GridZoomExt as _, WheelTravel};
-use crate::explorer::{entries, overlay, progress, rubber, sidebar, tabstrip, toolbar, util};
+use crate::explorer::{dnd, entries, overlay, progress, rubber, sidebar, tabstrip, toolbar, util};
 
 /// How many images one background thumbnail lookup covers before the tiles
 /// it found are shown.
@@ -824,6 +824,17 @@ pub(crate) struct Explorer {
     pub(crate) details_width: f32,
     /// The panel handle being dragged, if any.
     pub(crate) panel_drag: Option<PanelDrag>,
+    /// The left pane's share of the two panes' width, as saved; the width
+    /// actually drawn is this clamped to what the window leaves (see
+    /// [`panes::clamp_ratio`]).
+    split_ratio: f32,
+    /// The split divider being dragged, if any.
+    split_drag: Option<SplitDrag>,
+    /// The pane an entries drag of exactly one folder began in, while that
+    /// drag lasts: the "Open in split" strip and the tab strips show for it,
+    /// and "the other pane" is counted from there. Cleared by the drop and,
+    /// for a drag that ended elsewhere, by the next pump tick.
+    pub(crate) folder_drag: Option<Side>,
     /// When and whether settings and session are written.
     persistence: Persistence,
     /// The view remembered for each folder, and when it is written.
@@ -1109,6 +1120,9 @@ impl Explorer {
             sidebar_width: preferences.sidebar_width as f32,
             details_width: preferences.details_width as f32,
             panel_drag: None,
+            split_ratio: panes::ratio_of(preferences.split_permille),
+            split_drag: None,
+            folder_drag: None,
             persistence,
             folders,
             default_presentation,
@@ -1238,6 +1252,7 @@ impl Explorer {
                 arrangement: arrangement_to_prefs(&active.state.own_presentation().1),
                 sidebar_width: self.sidebar_width.round() as u32,
                 details_width: self.details_width.round() as u32,
+                split_permille: panes::permille_of(self.split_ratio),
                 list_columns: self.list_columns.clone(),
                 grid_zoom: self.grid_zoom,
                 list_zoom: self.list_zoom,
@@ -1264,6 +1279,10 @@ impl Explorer {
     fn persist_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.tab_drag.is_some() && !cx.has_active_drag() {
             self.tab_drag = None;
+            cx.notify();
+        }
+        if self.folder_drag.is_some() && !cx.has_active_drag() {
+            self.folder_drag = None;
             cx.notify();
         }
         self.remember_changed_views();
@@ -3440,6 +3459,202 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Shows `folder` in the other pane: a view that is not split splits
+    /// with it (a window too narrow for two panes refuses with the same toast
+    /// as F3), a split view opens it in a new tab of the pane that does not
+    /// have the focus. Dropping a folder on the "Open in split" strip does
+    /// this.
+    pub(crate) fn open_in_split(
+        &mut self,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let width = f32::from(window.viewport_size().width);
+        if !panes::may_split(width) {
+            self.say(Severity::Info, panes::split_refusal(width), window, cx);
+            return;
+        }
+        let location = Location::Directory(folder.clone());
+        if self.refuses_entering(&location) {
+            self.push_toast(
+                crate::explorer::ops::trashed_folder_notice(),
+                &[],
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.when_not_ejecting(vec![folder], window, cx, move |this, window, cx| {
+            this.open_in_split_checked(location, window, cx);
+        });
+    }
+
+    fn open_in_split_checked(
+        &mut self,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tabs.is_split() {
+            if self.tabs.has_right() {
+                // The parked pane comes back; the folder opens in it below.
+                self.tabs.split(None);
+            } else {
+                let state = self.tab().state.for_new_tab(location.clone());
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                let mut tab = Tab::new(id, state, window, cx);
+                let scan = tab.state.begin(Transition::Visit(location));
+                self.tabs.split(Some(tab));
+                self.start_scan_in(id, scan, window, cx);
+                cx.notify();
+                return;
+            }
+        }
+        let real = self.tabs.focus();
+        self.tabs.focus_side(real.other());
+        self.open_tab_checked(location, Placement::Foreground, window, cx);
+        self.tabs.focus_side(real);
+        self.after_tab_switch(false, window, cx);
+    }
+
+    /// A folder dropped on the tab strip of `side`: a new tab on it opens
+    /// there in the gap `gap` (0 is before the first tab) and becomes that
+    /// pane's active tab.
+    pub(crate) fn open_folder_tab_at(
+        &mut self,
+        folder: PathBuf,
+        side: Side,
+        gap: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let location = Location::Directory(folder.clone());
+        if self.refuses_entering(&location) {
+            self.push_toast(
+                crate::explorer::ops::trashed_folder_notice(),
+                &[],
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.when_not_ejecting(vec![folder], window, cx, move |this, window, cx| {
+            if !this.tabs.focus_side(side) {
+                return;
+            }
+            let before = this.tabs.focused().len();
+            this.open_tab_checked(location, Placement::Foreground, window, cx);
+            let list = this.tabs.focused_mut();
+            let at = list.active_index();
+            list.move_tab(at, gap.min(before));
+            cx.notify();
+        });
+    }
+
+    /// The width the two panes share: the window without the shell and the
+    /// divider.
+    fn split_available(&self, window: &Window) -> f32 {
+        f32::from(window.viewport_size().width)
+            - self.shell_width(window)
+            - IslandMetrics::GAP.as_f32()
+    }
+
+    /// Starts dragging the split divider with the pointer at `x`.
+    fn begin_split_drag(&mut self, x: Pixels, window: &Window, cx: &mut Context<Self>) {
+        let available = self.split_available(window);
+        self.split_drag = Some(SplitDrag {
+            start_ratio: panes::clamp_ratio(self.split_ratio, available),
+            start_x: f32::from(x),
+        });
+        cx.notify();
+    }
+
+    /// The pointer moved with the divider held. A move without the left
+    /// button (it was released outside the window) ends the drag.
+    fn drag_split(
+        &mut self,
+        x: Pixels,
+        pressed: Option<MouseButton>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.split_drag else {
+            return;
+        };
+        if pressed != Some(MouseButton::Left) {
+            self.split_drag = None;
+        } else {
+            self.split_ratio = panes::dragged_ratio(
+                drag.start_ratio,
+                drag.start_x,
+                f32::from(x),
+                self.split_available(window),
+            );
+        }
+        cx.notify();
+    }
+
+    /// The button was released: the ratio stays and is saved.
+    fn end_split_drag(&mut self, cx: &mut Context<Self>) {
+        if self.split_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A double press on the divider: an even split again.
+    fn reset_split(&mut self, cx: &mut Context<Self>) {
+        self.split_ratio = panes::DEFAULT_SPLIT_RATIO;
+        self.split_drag = None;
+        cx.notify();
+    }
+
+    /// The divider between the panes: a column as wide as the gap between
+    /// islands, with the col-resize cursor and a tint line while hovered or
+    /// dragged. Press starts the drag, a double press centres it.
+    fn render_divider(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        const ID: &str = "explorer-split-divider";
+        let tint = bolt::tokens::ChromeColors::tint(cx.theme());
+        let dragging = self.split_drag.is_some();
+        let gap = IslandMetrics::GAP.as_f32();
+        div()
+            .id(ID)
+            .group(ID)
+            .relative()
+            .flex_none()
+            .w(IslandMetrics::GAP)
+            .h_full()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    if event.click_count >= 2 {
+                        this.reset_split(cx);
+                    } else {
+                        this.begin_split_drag(event.position.x, window, cx);
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px((gap - 2.0) / 2.0))
+                    .w(px(2.0))
+                    .bg(if dragging {
+                        tint
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .group_hover(ID, move |line| line.bg(tint)),
+            )
+    }
+
     /// Gives the focus to `side` (a press inside it, or F6) and drops what
     /// belongs to the pane that had it: the inline rename and the open menu.
     pub(crate) fn focus_pane(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
@@ -3902,28 +4117,44 @@ impl Render for Explorer {
             .child(self.render_toasts(window, cx))
             .children(overlays)
             .children(cards)
-            .children(self.panel_drag.is_some().then(|| {
-                // While a handle is dragged this shield takes the pointer:
-                // the col-resize cursor stays and nothing underneath reacts.
-                deferred(
-                    div()
-                        .id("explorer-resize-shield")
-                        .absolute()
-                        .size_full()
-                        .cursor_col_resize()
-                        .occlude()
-                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                            this.drag_panel(event.position.x, event.pressed_button, window, cx);
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                                this.end_panel_drag(cx);
-                            }),
-                        ),
-                )
-                .with_priority(3)
-            }))
+            .children(
+                (self.panel_drag.is_some() || self.split_drag.is_some()).then(|| {
+                    // While a handle is dragged this shield takes the pointer:
+                    // the col-resize cursor stays and nothing underneath reacts.
+                    deferred(
+                        div()
+                            .id("explorer-resize-shield")
+                            .absolute()
+                            .size_full()
+                            .cursor_col_resize()
+                            .occlude()
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, window, cx| {
+                                    this.drag_panel(
+                                        event.position.x,
+                                        event.pressed_button,
+                                        window,
+                                        cx,
+                                    );
+                                    this.drag_split(
+                                        event.position.x,
+                                        event.pressed_button,
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                    this.end_panel_drag(cx);
+                                    this.end_split_drag(cx);
+                                }),
+                            ),
+                    )
+                    .with_priority(3)
+                }),
+            )
     }
 }
 
@@ -3955,22 +4186,25 @@ impl Explorer {
         let width = f32::from(window.viewport_size().width);
         let layout = panes::layout(self.tabs.is_split(), width);
         let real = self.tabs.focus();
-        let area = div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .gap(IslandMetrics::GAP);
+        let area = div().flex_1().min_w_0().h_full().flex();
         if layout != PaneLayout::SideBySide {
             self.set_columns(real, window);
-            return area.child(self.render_pane(real, false, true, window, cx));
+            return area.child(self.render_pane(real, false, true, 1.0, window, cx));
         }
+        let ratio = panes::clamp_ratio(self.split_ratio, self.split_available(window));
         let mut area = area;
         for side in [Side::Left, Side::Right] {
             self.tabs.focus_side(side);
             self.set_columns(side, window);
-            let pane = self.render_pane(side, true, side == real, window, cx);
+            let weight = match side {
+                Side::Left => ratio,
+                Side::Right => 1.0 - ratio,
+            };
+            let pane = self.render_pane(side, true, side == real, weight, window, cx);
             area = area.child(pane);
+            if side == Side::Left {
+                area = area.child(self.render_divider(cx));
+            }
         }
         self.tabs.focus_side(real);
         area
@@ -3997,18 +4231,21 @@ impl Explorer {
         side: Side,
         split: bool,
         focused: bool,
+        weight: f32,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let tint = bolt::tokens::ChromeColors::tint(cx.theme());
         let island = self.render_document_island(window, cx);
-        let pane = div()
+        let mut pane = div()
             .id(("explorer-pane", side.index()))
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col();
+        // The panes share the free width in the divider's proportion.
+        pane.style().flex_grow = Some(weight);
         if !split {
             return pane.child(island);
         }
@@ -4056,6 +4293,15 @@ impl Explorer {
             )
             .right(px(self.details_width - sidebar::HANDLE_HIT))
         });
+        // One strip per window: on the right edge of the files area, that is
+        // the right pane of a split view.
+        let strip = (dnd::folder_drag_live(self, cx)
+            && (self.tabs.focus() == Side::Right
+                || panes::layout(
+                    self.tabs.is_split(),
+                    f32::from(window.viewport_size().width),
+                ) != PaneLayout::SideBySide))
+            .then(|| dnd::split_strip(cx));
         Island::new()
             .flex_1()
             .min_w_0()
@@ -4081,7 +4327,8 @@ impl Explorer {
                     .relative()
                     .child(entries::render(self, cx))
                     .children(panel)
-                    .children(handle),
+                    .children(handle)
+                    .children(strip),
             )
     }
 
