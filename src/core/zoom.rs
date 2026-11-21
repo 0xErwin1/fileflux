@@ -1,5 +1,5 @@
-//! Icon size levels of the two views (the zoom): the grid has four, the list
-//! three, and Medium is today's size in both. This module is the pure part:
+//! Icon size levels of the three views (the zoom): the grid has four, the list
+//! and the compact view three, and Medium is today's size in both. This module is the pure part:
 //! the levels, stepping, and what a zoom command does to one. The pixel
 //! sizes of each level live with the views that draw them.
 
@@ -73,6 +73,26 @@ impl Level for ListZoom {
     const MEDIUM: Self = Self::Medium;
 }
 
+/// The cell and icon size of the compact view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactZoom {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl CompactZoom {
+    /// Every level, smallest first.
+    pub const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+}
+
+impl Level for CompactZoom {
+    const LEVELS: &'static [Self] = &Self::ALL;
+    const MEDIUM: Self = Self::Medium;
+}
+
 /// What a zoom control asks for: one step in, one step out, or back to
 /// Medium.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +151,18 @@ mod tests {
         assert_eq!(Large.zoomed_out(), Medium);
         assert_eq!(ListZoom::default(), Medium);
         assert_eq!(ZoomCommand::Reset.apply(Large), Medium);
+    }
+
+    #[test]
+    fn compact_stepping_has_three_levels_and_defaults_to_medium() {
+        use CompactZoom::{Large, Medium, Small};
+        assert_eq!(CompactZoom::ALL, [Small, Medium, Large]);
+        assert_eq!(CompactZoom::default(), Medium);
+        assert_eq!(Small.zoomed_out(), Small);
+        assert_eq!(Small.zoomed_in(), Medium);
+        assert_eq!(Large.zoomed_in(), Large);
+        assert_eq!(Large.zoomed_out(), Medium);
+        assert_eq!(ZoomCommand::Reset.apply(Small), Medium);
     }
 
     #[test]

@@ -42,7 +42,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Location;
-use super::zoom::{GridZoom, ListZoom};
+use super::zoom::{CompactZoom, GridZoom, ListZoom};
 
 /// The `version` of the settings file this build reads and writes.
 pub const SETTINGS_VERSION: u32 = 2;
@@ -178,13 +178,14 @@ mod path_option {
 
 // --- preference types ---------------------------------------------------------
 
-/// Grid or list.
+/// Grid, list or compact.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     #[default]
     Grid,
     List,
+    Compact,
 }
 
 /// What the folder is sorted by.
@@ -323,6 +324,8 @@ pub struct Preferences {
     /// The row and icon size of the list view; Medium when absent, like
     /// [`Self::grid_zoom`].
     pub list_zoom: ListZoom,
+    /// The cell and icon size of the compact view; Medium when absent.
+    pub compact_zoom: CompactZoom,
     pub sidebar_collapsed: bool,
     /// The details panel (Ctrl+I) is open.
     pub details_open: bool,
@@ -340,6 +343,7 @@ impl Default for Preferences {
             list_columns: ColumnPref::defaults(),
             grid_zoom: GridZoom::Medium,
             list_zoom: ListZoom::Medium,
+            compact_zoom: CompactZoom::Medium,
             sidebar_collapsed: false,
             details_open: true,
             window_width: DEFAULT_WINDOW.0,
@@ -1283,6 +1287,53 @@ mod tests {
         let loaded = load_settings(&path, SystemTime::now());
         assert!(loaded.notice.is_some(), "the list has no larger level");
         assert_eq!(loaded.value, Settings::default());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The compact view is a new value of `default_view` and a new zoom key:
+    /// old files load their view unchanged, Medium compact zoom, no notice.
+    #[test]
+    fn compact_view_and_zoom_load_from_old_files_and_round_trip() {
+        assert_eq!(
+            Settings::default().preferences.compact_zoom,
+            CompactZoom::Medium
+        );
+        let dir = scratch("compact");
+        let path = dir.join("settings.toml");
+        for (text, view) in [
+            (
+                "version = 2\n[preferences]\ndefault_view = \"list\"\n",
+                ViewMode::List,
+            ),
+            (
+                "version = 2\n[preferences]\ndefault_view = \"grid\"\n",
+                ViewMode::Grid,
+            ),
+            (
+                "version = 2\n[preferences]\ndefault_view = \"compact\"\n",
+                ViewMode::Compact,
+            ),
+        ] {
+            std::fs::write(&path, text).expect("fixture writes");
+            let loaded = load_settings(&path, SystemTime::now());
+            assert_eq!(loaded.notice, None, "{text}");
+            assert_eq!(loaded.value.preferences.view, view, "{text}");
+            assert_eq!(
+                loaded.value.preferences.compact_zoom,
+                CompactZoom::Medium,
+                "{text}"
+            );
+        }
+        let mut settings = Settings::default();
+        settings.preferences.view = ViewMode::Compact;
+        settings.preferences.compact_zoom = CompactZoom::Large;
+        save_settings(&path, &settings).expect("settings save");
+        let text = std::fs::read_to_string(&path).expect("file reads");
+        assert!(text.contains("default_view = \"compact\""), "{text}");
+        assert!(text.contains("compact_zoom = \"large\""), "{text}");
+        let loaded = load_settings(&path, SystemTime::now());
+        assert_eq!(loaded.value, settings);
+        assert_eq!(loaded.value.version, SETTINGS_VERSION, "no version bump");
         drop(std::fs::remove_dir_all(&dir));
     }
 

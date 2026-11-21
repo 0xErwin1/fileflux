@@ -23,8 +23,8 @@ use super::panes::Side;
 use super::state::SelectionSnapshot;
 use super::state::View;
 use super::view::Explorer;
-use super::zoom::{GridZoomExt as _, ListZoomExt as _, TILE_GAP};
-use fileflux::core::zoom::GridZoom;
+use super::zoom::{CompactZoomExt as _, GridZoomExt as _, ListZoomExt as _, TILE_GAP};
+use fileflux::core::zoom::{CompactZoom, GridZoom};
 
 /// How far, in logical pixels, the pointer must move from the press before a
 /// press becomes a drag (a rectangle or a file drag): the desktop default
@@ -42,8 +42,44 @@ pub(crate) const SCROLLBAR_STRIP: f32 = 14.0;
 pub(crate) enum Layout {
     /// Fixed tiles of the `zoom` level, `columns` per row, left-aligned.
     Grid { columns: usize, zoom: GridZoom },
+    /// Fixed cells of the compact view, `columns` per row, left-aligned.
+    Compact { columns: usize, zoom: CompactZoom },
     /// Full-width rows of one height.
     List { row_height: f32 },
+}
+
+/// A left-aligned lattice of equal cells: `columns` per row, cells
+/// [`TILE_GAP`] apart across and touching vertically.
+#[derive(Clone, Copy)]
+struct Lattice {
+    columns: usize,
+    width: f32,
+    height: f32,
+}
+
+impl Layout {
+    /// The cell lattice of a tiled layout; `None` for the list.
+    fn lattice(self) -> Option<Lattice> {
+        match self {
+            Layout::Grid { columns, zoom } => {
+                let (width, height) = tile_size(zoom);
+                Some(Lattice {
+                    columns,
+                    width,
+                    height,
+                })
+            }
+            Layout::Compact { columns, zoom } => {
+                let metrics = zoom.metrics();
+                Some(Lattice {
+                    columns,
+                    width: metrics.cell_width,
+                    height: metrics.cell_height,
+                })
+            }
+            Layout::List { .. } => None,
+        }
+    }
 }
 
 /// What a press landed on.
@@ -122,18 +158,25 @@ pub(crate) fn entry_at(layout: Layout, count: usize, x: f32, y: f32) -> Option<u
     if x < 0.0 || y < 0.0 {
         return None;
     }
-    let index = match layout {
-        Layout::Grid { columns, zoom } => {
-            let (tile_width, tile_height) = tile_size(zoom);
-            let pitch = tile_width + TILE_GAP;
+    let index = match (layout.lattice(), layout) {
+        (
+            Some(Lattice {
+                columns,
+                width,
+                height,
+            }),
+            _,
+        ) => {
+            let pitch = width + TILE_GAP;
             let column = (x / pitch).floor() as usize;
             // The gap right of a tile is empty space.
-            if column >= columns || x - column as f32 * pitch >= tile_width {
+            if column >= columns || x - column as f32 * pitch >= width {
                 return None;
             }
-            (y / tile_height).floor() as usize * columns + column
+            (y / height).floor() as usize * columns + column
         }
-        Layout::List { row_height } => (y / row_height).floor() as usize,
+        (None, Layout::List { row_height }) => (y / row_height).floor() as usize,
+        (None, _) => return None,
     };
     (index < count).then_some(index)
 }
@@ -145,14 +188,21 @@ pub(crate) fn hits(layout: Layout, count: usize, rect: Rect) -> Vec<usize> {
     }
     let first_row = |row_height: f32| (rect.top / row_height).floor().max(0.0) as usize;
     let last_row = |row_height: f32| (rect.bottom / row_height).floor() as usize;
-    match layout {
-        Layout::List { row_height } => {
+    match (layout.lattice(), layout) {
+        (None, Layout::List { row_height }) => {
             let last = last_row(row_height).min(count - 1);
             (first_row(row_height)..=last).collect()
         }
-        Layout::Grid { columns, zoom } => {
+        (None, _) => Vec::new(),
+        (
+            Some(Lattice {
+                columns,
+                width: tile_width,
+                height: tile_height,
+            }),
+            _,
+        ) => {
             let columns = columns.max(1);
-            let (tile_width, tile_height) = tile_size(zoom);
             let pitch = tile_width + TILE_GAP;
             // A tile at column `c` spans `c * pitch .. c * pitch + tile_width`.
             let first_column = (((rect.left - tile_width) / pitch).floor() + 1.0).max(0.0) as usize;
@@ -299,6 +349,14 @@ impl Explorer {
                 Layout::Grid {
                     columns: self.rendered_columns().max(1),
                     zoom: self.grid_zoom,
+                },
+            ),
+            View::Compact => (
+                0.0,
+                self.tab().grid_scroll.clone(),
+                Layout::Compact {
+                    columns: self.rendered_columns().max(1),
+                    zoom: self.compact_zoom,
                 },
             ),
             View::List => (
@@ -482,7 +540,7 @@ impl Explorer {
         let step = edge_scroll(pointer_y, viewport.top, viewport.bottom);
         if step != 0.0 {
             let handle = match self.tab().state.view() {
-                View::Grid => self.tab().grid_scroll.clone(),
+                View::Grid | View::Compact => self.tab().grid_scroll.clone(),
                 View::List => self.tab().table.read(cx).vertical_scroll_handle.clone(),
             };
             let base = handle.0.borrow().base_handle.clone();
@@ -712,6 +770,61 @@ mod tests {
         assert_eq!(hits(LIST, 3, rect(0.0, 0.0, 5.0, 900.0)), vec![0, 1, 2]);
         assert!(hits(LIST, 3, rect(0.0, 100.0, 5.0, 900.0)).is_empty());
         assert!(hits(LIST, 3, rect(0.0, -9.0, 5.0, -1.0)).is_empty());
+    }
+
+    const COMPACT: Layout = Layout::Compact {
+        columns: 3,
+        zoom: CompactZoom::Medium,
+    };
+    const CELL_WIDTH: f32 = 190.0;
+    const CELL_HEIGHT: f32 = 32.0;
+    const CELL_PITCH: f32 = CELL_WIDTH + TILE_GAP;
+
+    #[test]
+    fn compact_points_map_to_cells_and_the_gaps_are_empty() {
+        // Seven entries in rows of three: the last row holds one.
+        let at = |x: f32, y: f32| entry_at(COMPACT, 7, x, y);
+        assert_eq!(at(0.0, 0.0), Some(0));
+        assert_eq!(at(CELL_WIDTH - 0.5, CELL_HEIGHT - 0.5), Some(0));
+        assert_eq!(at(CELL_PITCH + 1.0, 5.0), Some(1));
+        assert_eq!(at(2.0 * CELL_PITCH + 1.0, 5.0), Some(2));
+        assert_eq!(at(1.0, CELL_HEIGHT + 1.0), Some(3), "rows touch");
+        assert_eq!(at(1.0, 2.0 * CELL_HEIGHT + 1.0), Some(6));
+        assert_eq!(at(CELL_WIDTH + 1.0, 5.0), None, "the gap");
+        assert_eq!(at(3.0 * CELL_PITCH + 1.0, 5.0), None, "past the columns");
+        assert_eq!(
+            at(CELL_PITCH + 1.0, 2.0 * CELL_HEIGHT + 1.0),
+            None,
+            "past the last"
+        );
+        assert_eq!(at(-1.0, 5.0), None);
+        assert_eq!(classify(COMPACT, 7, CELL_WIDTH + 1.0, 5.0), Press::Empty);
+        assert_eq!(classify(COMPACT, 7, 4.0, 4.0), Press::Entry(0));
+    }
+
+    #[test]
+    fn compact_rubber_band_covers_the_intersected_cells() {
+        let band = rect(
+            CELL_PITCH + 4.0,
+            4.0,
+            2.0 * CELL_PITCH + 4.0,
+            CELL_HEIGHT + 4.0,
+        );
+        assert_eq!(hits(COMPACT, 7, band), vec![1, 2, 4, 5]);
+        assert_eq!(hits(COMPACT, 7, rect(5.0, 5.0, 9.0, 9.0)), vec![0]);
+        let gap = rect(CELL_WIDTH + 1.0, 5.0, CELL_WIDTH + TILE_GAP - 1.0, 9.0);
+        assert!(hits(COMPACT, 7, gap).is_empty());
+        assert_eq!(
+            hits(COMPACT, 7, rect(0.0, 0.0, 10_000.0, 10_000.0)),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert!(hits(COMPACT, 0, rect(0.0, 0.0, 99.0, 99.0)).is_empty());
+        let small = Layout::Compact {
+            columns: 2,
+            zoom: CompactZoom::Small,
+        };
+        // Small cells are 150 x 28.
+        assert_eq!(hits(small, 4, rect(0.0, 29.0, 200.0, 30.0)), vec![2, 3]);
     }
 
     #[test]

@@ -26,13 +26,15 @@ pub(crate) use super::arrange::{
     SortSpec,
 };
 
-/// The two presentations of the folder contents.
+/// The presentations of the folder contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     /// Icon grid, folders first.
     Grid,
     /// Details list: Name, Type, Size, Modified.
     List,
+    /// Small icon and single-line name in fixed-width cells flowing in rows.
+    Compact,
 }
 
 /// A navigation transition the user asked for, resolved against the
@@ -1727,7 +1729,7 @@ mod tests {
         use crate::explorer::arrange::ArrangeCommand;
         use fileflux::core::kinds::FileCategory;
         let mut state = mixed_state()?;
-        for view in [View::Grid, View::List] {
+        for view in [View::Grid, View::List, View::Compact] {
             state.set_view(view);
             assert_eq!(
                 displayed(&state),

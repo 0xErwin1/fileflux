@@ -147,7 +147,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     this.toggle_deep_search(window, cx);
                 })),
         )
-        // Grid/list view: one segmented control, the pressed segment raised
+        // Grid/list/compact view: one segmented control, the pressed segment raised
         // and tinted.
         .child(
             div()
@@ -174,6 +174,14 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     gpui_kit_assets::IconName::List,
                     "List view",
                     View::List,
+                ))
+                .child(view_segment(
+                    this,
+                    cx,
+                    "explorer-view-compact",
+                    gpui_kit_assets::IconName::LayoutList,
+                    "Compact view",
+                    View::Compact,
                 )),
         )
         // The split view toggle: tinted while two panes show.

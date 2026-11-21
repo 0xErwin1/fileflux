@@ -38,7 +38,7 @@ use fileflux::core::thumbnails::{Outcome, Skip};
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
-use fileflux::core::zoom::{GridZoom, ListZoom, ZoomCommand};
+use fileflux::core::zoom::{CompactZoom, GridZoom, ListZoom, ZoomCommand};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Div, Entity, FocusHandle, Focusable,
@@ -781,6 +781,7 @@ pub(crate) struct Explorer {
     pub(crate) grid_zoom: GridZoom,
     /// The row and icon size of the list view (the saved preference).
     pub(crate) list_zoom: ListZoom,
+    pub(crate) compact_zoom: CompactZoom,
     /// Ctrl+wheel movement not yet spent on a zoom step.
     wheel_travel: WheelTravel,
     /// What each pane's entries area measured: the inner width recorded by
@@ -1055,6 +1056,7 @@ impl Explorer {
             list_columns: preferences.list_columns.clone(),
             grid_zoom: preferences.grid_zoom,
             list_zoom: preferences.list_zoom,
+            compact_zoom: preferences.compact_zoom,
             wheel_travel: WheelTravel::default(),
             pane_geometry: PerPane::default(),
             sidebar_open: !preferences.sidebar_collapsed,
@@ -1181,6 +1183,7 @@ impl Explorer {
                 list_columns: self.list_columns.clone(),
                 grid_zoom: self.grid_zoom,
                 list_zoom: self.list_zoom,
+                compact_zoom: self.compact_zoom,
                 sidebar_collapsed: !self.sidebar_open,
                 details_open: self.inspector_open,
                 window_width: f32::from(size.width).round() as u32,
@@ -1986,6 +1989,13 @@ impl Explorer {
                     return;
                 }
             }
+            View::Compact => {
+                let before = self.compact_zoom;
+                self.compact_zoom = command.apply(before);
+                if self.compact_zoom == before {
+                    return;
+                }
+            }
         }
         cx.notify();
     }
@@ -2745,7 +2755,7 @@ impl Explorer {
                     cx.notify();
                 });
             }
-            View::Grid => {
+            View::Grid | View::Compact => {
                 self.tab().grid_scroll.scroll_to_item(
                     util::grid_row(position, self.rendered_columns().max(1)),
                     ScrollStrategy::Nearest,
@@ -2764,7 +2774,7 @@ impl Explorer {
             View::List => {
                 tab.table.update(cx, |table, cx| table.scroll_to_row(0, cx));
             }
-            View::Grid => {
+            View::Grid | View::Compact => {
                 tab.grid_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
         }
@@ -3597,10 +3607,7 @@ impl Explorer {
     /// In the grid, up and down move one row of tiles; in the list they
     /// move one entry.
     fn grid_step(&self) -> isize {
-        match self.tab().state.view() {
-            View::List => 1,
-            View::Grid => self.rendered_columns().max(1) as isize,
-        }
+        zoom::vertical_step(self.tab().state.view(), self.rendered_columns())
     }
 
     /// The document area: the one pane, or both panes of a split view.
@@ -3641,8 +3648,13 @@ impl Explorer {
     /// the very first frame). The arrow keys reuse the same geometry.
     fn set_columns(&mut self, side: Side, window: &Window) {
         let estimate = self.content_width(window);
+        let view = self.tab().state.view();
         let geometry = self.pane_geometry.get_mut(side);
-        geometry.columns = zoom::grid_columns(geometry.width.unwrap_or(estimate), self.grid_zoom);
+        let width = geometry.width.unwrap_or(estimate);
+        geometry.columns = match view {
+            View::Compact => zoom::compact_columns(width, self.compact_zoom),
+            View::Grid | View::List => zoom::grid_columns(width, self.grid_zoom),
+        };
     }
 
     /// One pane: its document island under a 3 px edge that is tinted while

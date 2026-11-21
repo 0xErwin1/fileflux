@@ -22,7 +22,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Alt+↑ | Up one folder | |
 | Ctrl+R | Reload | |
 | Ctrl+I | Toggle the details panel | Same as Properties |
-| Ctrl+= / Ctrl++ | Zoom in | One icon size larger in the view that is shown (grid: small, medium, large, larger; list: small, medium, large); `Ctrl+Shift+=` is the same chord on layouts where `+` is typed with Shift. Stops at the largest; see [Icon size](user-guide.md#icon-size) |
+| Ctrl+= / Ctrl++ | Zoom in | One icon size larger in the view that is shown (grid: small, medium, large, larger; list and compact: small, medium, large); `Ctrl+Shift+=` is the same chord on layouts where `+` is typed with Shift. Stops at the largest; see [Icon size](user-guide.md#icon-size) |
 | Ctrl+- | Zoom out | One size smaller; stops at the smallest |
 | Ctrl+0 | Reset zoom | Back to medium, the size Fileflux had before the zoom existed |
 | Ctrl+H | Show or hide hidden files | Dotfiles and the names in a folder's `.hidden` file. Hidden by default; showing them adds a "Hidden shown" chip |

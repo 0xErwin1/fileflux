@@ -827,7 +827,7 @@ impl Glyph {
     /// The Lucide catalog name the glyph draws through Bolt's
     /// [`bolt::icon::IconSource`]. A plain [`Glyph::File`] never reaches
     /// here — its icon comes from [`entries::file_glyph`] instead.
-    fn icon_name(self) -> gpui_kit_assets::IconName {
+    pub(crate) fn icon_name(self) -> gpui_kit_assets::IconName {
         match self {
             Glyph::Folder => gpui_kit_assets::IconName::Folder,
             Glyph::Symlink => gpui_kit_assets::IconName::FileSymlink,

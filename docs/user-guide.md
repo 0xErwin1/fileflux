@@ -90,18 +90,19 @@ Every tab's folder, including background tabs, is watched. Changes made elsewher
 
 ## Views
 
-A segmented toggle in the toolbar switches between two presentations. The toggle keeps the folder, search and selection.
+A segmented toggle in the toolbar switches between three presentations. The toggle keeps the folder, search and selection.
 
 | View | What you see |
 |---|---|
 | Grid | Fixed-size tiles with two-tone folders, file thumbnails and a size line (folders show "N items"). Rows are equal; the last partial row is left-aligned |
 | List | Columns Name, Size and Modified, plus the optional Type, Permissions, Owner and Group (see below). Click a header to sort (folders stay first). Columns fill the pane; drag to resize. Folder item counts are filled in the background after the listing appears |
+| Compact | A small icon and a single-line name (long names end in an ellipsis) in fixed-width cells that flow left to right and wrap into rows, with vertical scrolling. No size, date or thumbnail; images show their file icon. Selection, rubber band, drag and drop, context menus, type-ahead and the details panel work as in the grid |
 
 **List columns.** Name is always shown; Size and Modified are on by default. Right-click a column header, or open the empty-space menu's **Columns** submenu, to tick or untick Size, Modified, **Type** (the same label as the details panel: "Image · JPG", "Folder"), **Permissions** (`rw-r--r--`, as the details panel shows it), **Owner** (user name, the number when the id has no name) and **Group** (likewise). The menu stays open while you tick several. The choice is saved and applies to every tab and the next launch; a dragged width is remembered per column for the session. Clicking the Type, Permissions, Owner or Group header sorts by it (Permissions by the octal mode, Owner and Group by name without case; ties fall back to the name, folders stay first); the same keys are in the **Sort by** menu. Owner, Group and Permissions are read during the scan; entries that do not come from a folder scan (search results, Trash, Recent) show "—" in those three columns.
 
 ### Icon size
 
-Each view has its own icon size, in the GNOME Files fashion. The grid has four levels, **small**, **medium**, **large** and **larger**: the tile, its icon and its thumbnail grow together, and the number of columns follows the width of the pane at every level. The list has three, **small**, **medium** and **large**, which change the row height and the icon in the Name column. Medium is the size Fileflux drew before the zoom existed.
+Each view has its own icon size, in the GNOME Files fashion. The grid has four levels, **small**, **medium**, **large** and **larger**: the tile, its icon and its thumbnail grow together, and the number of columns follows the width of the pane at every level. The list has three, **small**, **medium** and **large**, which change the row height and the icon in the Name column. The compact view has three, **small**, **medium** and **large**, which change the cell width and height and the icon (16, 20 and 24 px); the number of cells per row follows the width of the pane. Medium is the size Fileflux drew before the zoom existed (for the compact view, its default).
 
 | How | What it does |
 |---|---|
@@ -109,9 +110,9 @@ Each view has its own icon size, in the GNOME Files fashion. The grid has four l
 | Ctrl+- | One level smaller |
 | Ctrl+0 | Back to medium |
 | Ctrl+wheel over the entries | Wheel up zooms in, wheel down zooms out; one level per notch (a touchpad's small movements add up to a notch) |
-| Empty-space menu, **Zoom** | **Zoom in**, **Zoom out**, **Reset zoom**; in the list it comes after **Columns**, in the grid after **Filter** |
+| Empty-space menu, **Zoom** | **Zoom in**, **Zoom out**, **Reset zoom**; in the list it comes after **Columns**, in the grid and the compact view after **Filter** |
 
-The keys and the wheel act on the view that is shown, and stop at the smallest and the largest level. The grid's and the list's levels are saved separately (`grid_zoom` and `list_zoom` in `settings.toml`) and apply to every tab and the next launch. In a split view both panes share the two levels.
+The keys and the wheel act on the view that is shown, and stop at the smallest and the largest level. The three views' levels are saved separately (`grid_zoom`, `list_zoom` and `compact_zoom` in `settings.toml`) and apply to every tab and the next launch. In a split view both panes share the levels.
 
 Sizes use one SI formatter everywhere. Modified dates are shown in the system's local time zone (`TZ`, else `/etc/localtime`).
 
@@ -119,7 +120,7 @@ File icons come from the freedesktop icon theme the desktop is configured to use
 
 ## Sort and filter
 
-Sort and filter live in the tab and apply to the grid and the list alike. Selection, arrow keys, ranges, Ctrl+A, Enter, the image viewer's list, paste targets and the details panel all follow the filtered and sorted result. A new tab inherits them.
+Sort and filter live in the tab and apply to the grid, the list and the compact view alike. Selection, arrow keys, ranges, Ctrl+A, Enter, the image viewer's list, paste targets and the details panel all follow the filtered and sorted result. A new tab inherits them.
 
 Use the subbar's **Sort** and **Filter** buttons, the same two pages in the empty-space context menu, or the list header.
 
@@ -194,7 +195,7 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | Ctrl+drag on empty space | Toggle the entries the rectangle touches, against the selection from before the drag |
 | Shift+drag on empty space | Add the entries the rectangle touches to the selection from before the drag |
 
-**Rubber-band selection** works in the grid and the list, in both panes. Press on empty space (the gaps between tiles, the blank part of a tile around its icon and name, the space right of the last tile or below the last row, the pane's margins; never on a tile's icon or name, a list row, a column header or the scrollbar), then drag. Without a modifier the rectangle replaces the selection; with Ctrl it toggles, and with Shift it adds, always relative to the selection you had when you pressed, so shrinking the rectangle gives entries back. Holding the pointer near, or beyond, the top or bottom edge scrolls the pane, faster the further out it is. Escape during the drag cancels it and restores the selection from before the press. Dragging from an entry still drags files, not a rectangle.
+**Rubber-band selection** works in the grid, the list and the compact view, in both panes. Press on empty space (the gaps between tiles, the blank part of a tile around its icon and name, the space right of the last tile or below the last row, the pane's margins; never on a tile's icon or name, a list row, a column header or the scrollbar), then drag. Without a modifier the rectangle replaces the selection; with Ctrl it toggles, and with Shift it adds, always relative to the selection you had when you pressed, so shrinking the rectangle gives entries back. Holding the pointer near, or beyond, the top or bottom edge scrolls the pane, faster the further out it is. Escape during the drag cancels it and restores the selection from before the press. Dragging from an entry still drags files, not a rectangle.
 
 **Select items matching…** (Ctrl+S) asks for a name pattern. Enter selects every visible entry whose name matches, replacing the selection; Escape cancels. `*` stands for any run of characters (also none), `?` for exactly one character, `[abc]` or `[a-c]` for one of the listed characters and `[!abc]` for any other. Every other character, such as `.`, `+` or `(`, stands for itself. The whole name must match and case is ignored, so `*.jpg` finds `Photo.JPG`. With no match, a toast says `No items match <pattern>` and the selection stays. The dialog remembers the last pattern until you quit.
 
@@ -318,7 +319,7 @@ When an item already exists in the destination, a modal asks "“report.pdf” a
 
 ## Drag and drop
 
-Drag selected entries from the grid or the list (dragging an unselected entry selects it alone first). A drag starts only once the pointer has moved 8 px from where you pressed, the desktop's usual threshold: before that there is no preview, no target lights up, nothing can be dropped and the selection does not change, and releasing there is just a click. A slip of the hand while clicking never moves a file. The preview shows the icon and name, or "N items". A drop is a paste with explicit sources, so it uses the same conflict dialog, progress card and undo as Ctrl+V.
+Drag selected entries from the grid, the list or the compact view (dragging an unselected entry selects it alone first). A drag starts only once the pointer has moved 8 px from where you pressed, the desktop's usual threshold: before that there is no preview, no target lights up, nothing can be dropped and the selection does not change, and releasing there is just a click. A slip of the hand while clicking never moves a file. The preview shows the icon and name, or "N items". A drop is a paste with explicit sources, so it uses the same conflict dialog, progress card and undo as Ctrl+V.
 
 - **Targets:** a folder tile or row, a sidebar Places, Favorites or Devices row, a breadcrumb segment, and the empty space of the shown folder. A valid target gets a selection wash and a tint border; invalid targets (the dragged item itself, anything inside it, a file, the Trash view) show nothing and refuse the drop.
 - **Action:** by default a drop **moves on the same device and copies across devices**. Hold **Ctrl** to copy or **Shift** to move (Ctrl wins), or **Ctrl+Shift** to create [links](#links) instead.

@@ -40,6 +40,7 @@ pub(crate) fn view_from_pref(view: ViewMode) -> View {
     match view {
         ViewMode::Grid => View::Grid,
         ViewMode::List => View::List,
+        ViewMode::Compact => View::Compact,
     }
 }
 
@@ -47,6 +48,7 @@ pub(crate) fn view_to_pref(view: View) -> ViewMode {
     match view {
         View::Grid => ViewMode::Grid,
         View::List => ViewMode::List,
+        View::Compact => ViewMode::Compact,
     }
 }
 
@@ -736,9 +738,11 @@ mod tests {
 
     #[test]
     fn views_and_the_trash_survive_the_stored_form() {
-        for view in [View::Grid, View::List] {
+        for view in [View::Grid, View::List, View::Compact] {
             assert_eq!(view_from_pref(view_to_pref(view)), view);
         }
+        assert_eq!(view_to_pref(View::Compact), ViewMode::Compact);
+        assert_eq!(view_from_pref(ViewMode::List), View::List, "old value");
         let tab = session_tab(&Location::Trash, View::List, &Arrangement::default());
         assert!(tab.trash && tab.path.is_none() && !tab.recent);
         let tab = session_tab(&Location::Recent, View::Grid, &Arrangement::default());

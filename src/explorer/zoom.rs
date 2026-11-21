@@ -5,8 +5,10 @@
 //! the zoom existed.
 
 use fileflux::core::thumbnails::Bucket;
-use fileflux::core::zoom::{GridZoom, ListZoom, ZoomCommand};
+use fileflux::core::zoom::{CompactZoom, GridZoom, ListZoom, ZoomCommand};
 use gpui_component::Size;
+
+use super::state::View;
 
 /// Gap between grid tiles, at every level.
 pub(crate) const TILE_GAP: f32 = 6.0;
@@ -98,6 +100,52 @@ pub(crate) fn grid_columns(inner_width: f32, zoom: GridZoom) -> usize {
     (((usable + TILE_GAP) / (tile + TILE_GAP)).floor() as usize).max(1)
 }
 
+/// The sizes of one compact level, in logical pixels: a fixed-width cell
+/// holding the icon and a single-line name. Cells sit [`TILE_GAP`] apart
+/// across and touch vertically, like the grid's rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CompactMetrics {
+    pub(crate) cell_width: f32,
+    pub(crate) cell_height: f32,
+    pub(crate) icon: f32,
+}
+
+/// The compact size table.
+pub(crate) trait CompactZoomExt {
+    fn metrics(self) -> CompactMetrics;
+}
+
+impl CompactZoomExt for CompactZoom {
+    fn metrics(self) -> CompactMetrics {
+        let (cell_width, cell_height, icon) = match self {
+            Self::Small => (150.0, 28.0, 16.0),
+            Self::Medium => (190.0, 32.0, 20.0),
+            Self::Large => (240.0, 36.0, 24.0),
+        };
+        CompactMetrics {
+            cell_width,
+            cell_height,
+            icon,
+        }
+    }
+}
+
+/// The compact column count for the entries area's inner width, never zero.
+pub(crate) fn compact_columns(inner_width: f32, zoom: CompactZoom) -> usize {
+    let cell = zoom.metrics().cell_width;
+    let usable = inner_width.max(cell);
+    (((usable + TILE_GAP) / (cell + TILE_GAP)).floor() as usize).max(1)
+}
+
+/// What Up and Down move by: one entry in the list, one row of cells in the
+/// grid and the compact view.
+pub(crate) fn vertical_step(view: View, columns: usize) -> isize {
+    match view {
+        View::List => 1,
+        View::Grid | View::Compact => columns.max(1) as isize,
+    }
+}
+
 /// The list size table: the table's own size steps give the row height.
 pub(crate) trait ListZoomExt {
     /// The table size whose row height this level draws; Medium is the
@@ -169,7 +217,7 @@ impl WheelTravel {
 mod tests {
     use super::*;
     use fileflux::core::thumbnails::Bucket;
-    use fileflux::core::zoom::{GridZoom, ListZoom, ZoomCommand};
+    use fileflux::core::zoom::{CompactZoom, GridZoom, ListZoom, ZoomCommand};
     use gpui_component::Size;
 
     #[test]
@@ -228,6 +276,47 @@ mod tests {
             assert_eq!(grid_columns(0.0, zoom), 1, "{zoom:?} never zero");
             assert_eq!(grid_columns(m.tile_width, zoom), 1, "{zoom:?} one tile");
         }
+    }
+
+    #[test]
+    fn compact_cells_grow_with_the_level_and_medium_has_a_20_px_icon() {
+        let sizes = CompactZoom::ALL.map(|zoom| {
+            let m = zoom.metrics();
+            (m.cell_width, m.cell_height, m.icon)
+        });
+        assert_eq!(
+            sizes,
+            [
+                (150.0, 28.0, 16.0),
+                (190.0, 32.0, 20.0),
+                (240.0, 36.0, 24.0)
+            ]
+        );
+        for zoom in CompactZoom::ALL {
+            let m = zoom.metrics();
+            assert!(m.icon < m.cell_height && m.icon < m.cell_width, "{zoom:?}");
+        }
+    }
+
+    #[test]
+    fn the_compact_column_count_follows_the_cell_width_of_each_level() {
+        let columns = CompactZoom::ALL.map(|zoom| compact_columns(1000.0, zoom));
+        assert_eq!(columns, [6, 5, 4]);
+        for zoom in CompactZoom::ALL {
+            let width = zoom.metrics().cell_width;
+            let two = 2.0 * width + TILE_GAP;
+            assert_eq!(compact_columns(two, zoom), 2, "{zoom:?} exactly two");
+            assert_eq!(compact_columns(two - 1.0, zoom), 1, "{zoom:?} one short");
+            assert_eq!(compact_columns(0.0, zoom), 1, "{zoom:?} never zero");
+        }
+    }
+
+    #[test]
+    fn up_and_down_move_by_a_row_of_cells_except_in_the_list() {
+        assert_eq!(vertical_step(View::List, 7), 1);
+        assert_eq!(vertical_step(View::Grid, 7), 7);
+        assert_eq!(vertical_step(View::Compact, 5), 5);
+        assert_eq!(vertical_step(View::Compact, 0), 1, "never zero");
     }
 
     #[test]

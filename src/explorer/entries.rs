@@ -23,7 +23,7 @@ use bolt::primitives::{Icon, WhenFocusVisible};
 use bolt::tokens::{Borders, ChromeColors, Spacing};
 use fileflux::core::places::format_bytes;
 use fileflux::core::thumbnails::Bucket;
-use fileflux::core::zoom::GridZoom;
+use fileflux::core::zoom::{CompactZoom, GridZoom};
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
@@ -39,8 +39,8 @@ use super::panes::Side;
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
 use super::zoom::{
-    GridMetrics, GridZoomExt as _, NAME_GAP, NAME_LINE, SUB_GAP, SUB_LINE, TILE_BOTTOM_PADDING,
-    TILE_GAP, TILE_TOP_PADDING,
+    CompactZoomExt as _, GridMetrics, GridZoomExt as _, NAME_GAP, NAME_LINE, SUB_GAP, SUB_LINE,
+    TILE_BOTTOM_PADDING, TILE_GAP, TILE_TOP_PADDING,
 };
 use super::{icon, util};
 
@@ -576,10 +576,13 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
 
     let weak = cx.entity().downgrade();
     let selected: Arc<BTreeSet<PathBuf>> = Arc::new(this.tab().state.selection().clone());
-    let list_view = this.tab().state.view() == View::List;
+    let view = this.tab().state.view();
+    let list_view = view == View::List;
+    let compact_view = view == View::Compact;
     let in_recent = this.tab().state.current().lists_files_from_elsewhere();
     let columns = this.rendered_columns().max(1);
     let zoom = this.grid_zoom;
+    let compact_zoom = this.compact_zoom;
     let item_count = if list_view {
         count
     } else {
@@ -638,7 +641,18 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             in_recent,
                             zoom,
                         };
-                        render_grid_row(&data, row, columns, &weak_for_rows, cx)
+                        if compact_view {
+                            render_compact_row(
+                                &data,
+                                compact_zoom,
+                                row,
+                                columns,
+                                &weak_for_rows,
+                                cx,
+                            )
+                        } else {
+                            render_grid_row(&data, row, columns, &weak_for_rows, cx)
+                        }
                     })
                     .collect::<Vec<_>>()
             },
@@ -971,6 +985,141 @@ fn render_grid_row(
             ));
         }
         row_element = row_element.child(tile_element);
+    }
+    row_element.into_any_element()
+}
+
+/// One compact row: [`grid_tile_range`] cells of the compact view, each a
+/// fixed-width cell with the entry's icon and a single-line name cut with an
+/// ellipsis. No thumbnails, no second line: icons only.
+fn render_compact_row(
+    data: &GridData<'_>,
+    zoom: CompactZoom,
+    row: usize,
+    columns: usize,
+    weak: &WeakEntity<Explorer>,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let metrics = zoom.metrics();
+    let colors = bolt::colors(cx);
+    let tint = ChromeColors::tint(cx.theme());
+    let mut row_element = div()
+        .id(ElementId::Name(
+            format!("explorer-compact-row-{row}").into(),
+        ))
+        .flex()
+        .gap(px(TILE_GAP))
+        .h(px(metrics.cell_height))
+        .min_w_0();
+    for index in grid_tile_range(row, data.visible.len(), columns) {
+        let Some(entry) = data.visible.get(index).and_then(|&i| data.snapshot.get(i)) else {
+            continue;
+        };
+        let path = entry.path.clone();
+        let name = entry.display_name().into_owned();
+        let is_folder = entry.kind == EntryKind::Directory && !entry.is_symlink;
+        let cell_selected = data.selected.contains(&path);
+        let glyph = super::table::entry_glyph(entry);
+        let color = match glyph {
+            super::table::Glyph::Folder => colors.info,
+            super::table::Glyph::BrokenLink => colors.warning,
+            super::table::Glyph::File | super::table::Glyph::Symlink => colors.muted,
+        };
+        let icon_element = match glyph {
+            super::table::Glyph::File => file_icon(&entry.name, color, metrics.icon),
+            glyph => file_glyph_element(glyph.icon_name(), color, metrics.icon),
+        };
+        let mut cell = ListRow::new(ElementId::Name(
+            format!("explorer-compact-{row}-{index}").into(),
+        ))
+        .selected(cell_selected)
+        .interactive(false)
+        .build(cx)
+        .cursor_pointer()
+        .w(px(metrics.cell_width))
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(Spacing::XS)
+        .border_1()
+        .border_color(if cell_selected && data.outlined {
+            tint.opacity(CONTEXT_OUTLINE_ALPHA)
+        } else if cell_selected {
+            tint.opacity(SELECTION_BORDER_ALPHA)
+        } else {
+            gpui::transparent_black()
+        })
+        .when(cell_selected && data.outlined, |cell| {
+            cell.bg(tint.opacity(CONTEXT_WASH_ALPHA))
+        })
+        .when(!cell_selected, |cell| {
+            cell.hover(|cell| cell.bg(hover_wash(&colors)).border_color(colors.line_2))
+        })
+        .when(data.cut.contains(&path), |cell| cell.opacity(CUT_OPACITY))
+        .on_click(entry_click(weak, path.clone()))
+        .on_mouse_up(MouseButton::Middle, entry_middle_click(weak, path.clone()))
+        .on_mouse_down(MouseButton::Right, entry_context_menu(weak, path.clone()));
+        let renaming_this = data.renaming.is_some_and(|view| view.path == path);
+        if let Some(selection) = data.drag.filter(|_| !renaming_this) {
+            let drag_glyph = if is_folder {
+                gpui_kit_assets::IconName::Folder
+            } else {
+                file_glyph(&entry.name)
+            };
+            cell = dnd::drag_source(
+                cell,
+                path.clone(),
+                drag_glyph,
+                is_folder,
+                cell_selected,
+                selection,
+                weak,
+            );
+        }
+        cell = if is_folder && data.drag.is_some() {
+            dnd::drop_target(cell, DropTarget::Folder(path.clone()), weak, cx)
+        } else {
+            cell
+        };
+        cell = dnd::block_while_dragging(cell, cx);
+        let cell = cell
+            .role(gpui::accesskit::Role::ListItem)
+            .aria_label(name.clone())
+            .aria_selected(cell_selected)
+            .child(div().flex_none().child(icon_element))
+            .child(match data.renaming.filter(|view| view.path == path) {
+                Some(view) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(super::overlay::renamer(view, weak, false, cx))
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .text_color(if cell_selected {
+                        colors.strong
+                    } else {
+                        colors.foreground
+                    })
+                    .child(name)
+                    .into_any_element(),
+            });
+        let cell = if cell_selected {
+            cell.child(WhenFocusVisible::new(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .border(Borders::FOCUS_RING)
+                    .border_color(tint),
+            ))
+        } else {
+            cell
+        };
+        row_element = row_element.child(cell);
     }
     row_element.into_any_element()
 }
