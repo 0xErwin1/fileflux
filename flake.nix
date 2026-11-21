@@ -132,7 +132,8 @@
             postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
               wrapProgram $out/bin/fileflux \
                 --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}" \
-                --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib"
+                --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib" \
+                --suffix PATH : "${lib.makeBinPath [ pkgs.libarchive ]}"
             '';
 
             meta = with lib; {
@@ -198,7 +199,12 @@
         {
           devShells.default = pkgs.mkShell {
             inherit buildInputs;
-            nativeBuildInputs = nativeBuildInputs ++ [ rustToolchain ];
+            # libarchive provides bsdtar, which Compress/Extract run and the
+            # archive tests exercise.
+            nativeBuildInputs = nativeBuildInputs ++ [
+              rustToolchain
+              pkgs.libarchive
+            ];
             LD_LIBRARY_PATH = runtimeLibraryPath;
             # Fontconfig is dlopened at runtime (see .cargo/config.toml); keep
             # it resolvable for direct binary runs outside cargo too.

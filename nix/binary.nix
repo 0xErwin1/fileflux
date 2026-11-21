@@ -31,6 +31,7 @@
   libxi,
   vulkan-loader,
   alsa-lib,
+  libarchive,
   stdenv_cc_libs ? stdenv.cc.cc.lib,
   # Which info file to read. Fileflux has no stable release channel yet, so
   # this is the rolling nightly.
@@ -155,7 +156,8 @@ stdenv.mkDerivation {
           fontconfig
         ]
       }" \
-      --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib"
+      --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib" \
+      --suffix PATH : "${lib.makeBinPath [ libarchive ]}"
   '';
 
   meta = with lib; {
