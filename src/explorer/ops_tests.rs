@@ -3365,3 +3365,20 @@ fn the_select_submenu_is_in_the_trash_recent_and_empty_space_but_not_on_a_select
         "an empty Trash still has no menu"
     );
 }
+
+#[test]
+fn ctrl_b_toggles_the_sidebar_from_anywhere_in_the_shell() {
+    // The hamburger buttons and Ctrl+B run the same action; it is bound in
+    // the shell context so it works whether the files, the search field or
+    // the sidebar has the focus.
+    let bindings = include_str!("view.rs");
+    assert!(
+        bindings.contains("KeyBinding::new(\"ctrl-b\", ToggleSidebar, shell)"),
+        "Ctrl+B must toggle the sidebar in the shell context"
+    );
+    assert_eq!(
+        bindings.matches("KeyBinding::new(\"ctrl-b\"").count(),
+        1,
+        "Ctrl+B has exactly one binding"
+    );
+}

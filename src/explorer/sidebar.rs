@@ -164,8 +164,11 @@ fn hamburger_row(cx: &mut Context<Explorer>) -> Stateful<Div> {
         .flex_none()
         .flex()
         .items_center()
-        .h(px(44.0))
-        .px(px(10.0))
+        // The same spot the leftmost pane's toolbar gives its hamburger
+        // while the sidebar is hidden (14 px in, centred in a 48 px row),
+        // so the button does not jump when the sidebar collapses.
+        .h(px(48.0))
+        .px(px(14.0))
         .child(
             Button::new("explorer-sidebar-hide", "Hide sidebar")
                 .ghost()

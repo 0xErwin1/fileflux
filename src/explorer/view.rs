@@ -111,6 +111,8 @@ actions!(
         Reload,
         /// Shows or hides the details panel.
         ToggleInspector,
+        /// Hides or shows the sidebar, like its hamburger button (Ctrl+B).
+        ToggleSidebar,
         /// Shows or hides the hidden (dot) files of the tab (Ctrl+H).
         ToggleHidden,
         /// One zoom level larger for the shown view (Ctrl+=, Ctrl++).
@@ -256,6 +258,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-up", NavigateUp, shell),
         KeyBinding::new("ctrl-r", Reload, shell),
         KeyBinding::new("ctrl-i", ToggleInspector, shell),
+        KeyBinding::new("ctrl-b", ToggleSidebar, shell),
         KeyBinding::new("ctrl-h", ToggleHidden, shell),
         KeyBinding::new("up", SelectUp, entries),
         KeyBinding::new("down", SelectDown, entries),
@@ -3485,7 +3488,8 @@ impl Explorer {
         }
     }
 
-    /// The hamburger buttons (the sidebar's and the leftmost pane's): hides
+    /// The hamburger buttons (the sidebar's and the leftmost pane's) and
+    /// Ctrl+B: hides
     /// or shows the sidebar. A narrow window opens or closes the overlay
     /// and leaves the docked preference alone.
     pub(crate) fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -3959,6 +3963,9 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &ToggleInspector, _window, cx| {
                 this.inspector_open = !this.inspector_open;
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.toggle_sidebar(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleHidden, _window, cx| {
                 this.arrange(ArrangeCommand::ToggleHidden, cx);
