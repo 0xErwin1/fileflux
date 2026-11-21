@@ -1,8 +1,10 @@
-//! Recursive search by file name, read-only.
+//! Recursive search by file name (and optionally content), read-only.
 //!
 //! [`search`] walks a folder breadth-first, so shallow matches stream out
-//! first, and reports the entries whose display name contains the query,
-//! case-insensitively, the same rule as the folder filter. It never changes
+//! first, and reports the entries whose display name matches the query: by
+//! default a case-insensitive substring, the same rule as the folder filter;
+//! [`QueryOptions`] make it case-sensitive, a regular expression, and let a
+//! file also match by one of its lines (see [`super::search_match`]). It never changes
 //! anything on disk and never follows a symlinked folder (a link is a result
 //! when its own name matches, but nothing is searched through it), so a link
 //! loop cannot trap it. By default it also stays on the root's device and
@@ -24,6 +26,8 @@ use std::time::{Duration, Instant};
 use super::Entry;
 use super::fs::{build_entry, read_hidden_names};
 use super::ops::is_transfer_temp;
+pub use super::search_match::QueryOptions;
+use super::search_match::{Matcher, Scan, scan_file};
 
 /// The most matches one search reports; the view says it stopped there.
 pub const MAX_RESULTS: usize = 10_000;
@@ -46,8 +50,11 @@ fn metadata_device(_path: &Path, meta: &Metadata) -> u64 {
 /// What to search for and how far to go.
 #[derive(Clone, Debug)]
 pub struct SearchOptions {
-    /// The text a name must contain, case-insensitively. Empty finds nothing.
+    /// The text (or regular expression) a name must match. Empty finds
+    /// nothing, and so does an invalid regular expression.
     pub query: String,
+    /// How the query is read: case, regular expression, contents.
+    pub query_options: QueryOptions,
     /// Skip dotfiles and the names a folder's `.hidden` file lists, and do
     /// not enter them: the rule of the folder listing.
     pub hide_hidden: bool,
@@ -66,6 +73,7 @@ impl SearchOptions {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
+            query_options: QueryOptions::default(),
             hide_hidden: true,
             cross_devices: false,
             cap: MAX_RESULTS,
@@ -108,8 +116,11 @@ pub fn search_with_device(
     cancel: &AtomicBool,
     emit: impl FnMut(Vec<Entry>),
 ) -> SearchSummary {
+    // An invalid pattern runs nothing; the caller reports the error.
+    let matcher =
+        Matcher::new(&options.query, options.query_options).unwrap_or_else(|_| Matcher::nothing());
     let mut walk = Walk {
-        needle: options.query.to_lowercase(),
+        matcher,
         options,
         device_of,
         cancel,
@@ -119,7 +130,7 @@ pub fn search_with_device(
         since_clock: 0,
         summary: SearchSummary::default(),
     };
-    if !walk.needle.is_empty() {
+    if !walk.matcher.is_empty() {
         walk.run(root);
     }
     walk.flush();
@@ -133,7 +144,7 @@ enum Stop {
 }
 
 struct Walk<'a, F: FnMut(Vec<Entry>)> {
-    needle: String,
+    matcher: Matcher,
     options: &'a SearchOptions,
     device_of: DeviceOf,
     cancel: &'a AtomicBool,
@@ -223,7 +234,18 @@ impl<F: FnMut(Vec<Entry>)> Walk<'_, F> {
             } else {
                 None
             };
-            if name.to_string_lossy().to_lowercase().contains(&self.needle) {
+            let by_name = self.matcher.is_match(&name.to_string_lossy());
+            // Only a regular file (the listing's own lstat type, so never
+            // through a link) is read, and only when its name did not match.
+            let by_content = !by_name
+                && self.options.query_options.contents
+                && file_type.is_file()
+                && match scan_file(&item.path(), &self.matcher, self.cancel) {
+                    Scan::Found => true,
+                    Scan::NotFound => false,
+                    Scan::Cancelled => return Err(Stop::Cancelled),
+                };
+            if by_name || by_content {
                 self.matched(item)?;
             }
             if let Some((path, meta)) = folder {

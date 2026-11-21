@@ -147,6 +147,72 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     this.toggle_deep_search(window, cx);
                 })),
         )
+        // How the subfolder search reads its query: three toggles, kept for
+        // the session. They apply to the subfolder search only.
+        .child(
+            div()
+                .id("explorer-search-options")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    Button::new("explorer-search-match-case", "Aa")
+                        .ghost()
+                        .tooltip("Match case")
+                        .selected(this.search_options.match_case)
+                        .toggled(this.search_options.match_case)
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.change_search_options(
+                                |options| options.match_case = !options.match_case,
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("explorer-search-regex", ".*")
+                        .ghost()
+                        .tooltip("Regular expression")
+                        .selected(this.search_options.regex)
+                        .toggled(this.search_options.regex)
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.change_search_options(
+                                |options| options.regex = !options.regex,
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("explorer-search-contents", "Search file contents")
+                        .ghost()
+                        .icon_only()
+                        .icon(icon(gpui_kit_assets::IconName::FileText))
+                        .tooltip("Search file contents")
+                        .selected(this.search_options.contents)
+                        .toggled(this.search_options.contents)
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.change_search_options(
+                                |options| options.contents = !options.contents,
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
+        )
+        // An invalid regular expression: why nothing ran.
+        .children(this.tab().search_error.clone().map(|error| {
+            div()
+                .id("explorer-search-error")
+                .flex_none()
+                .max_w(px(260.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(colors.danger)
+                .child(error)
+        }))
         // Grid/list/compact view: one segmented control, the pressed segment raised
         // and tinted.
         .child(

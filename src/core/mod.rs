@@ -25,6 +25,7 @@ pub mod perms;
 pub mod places;
 pub mod recent;
 pub mod search;
+pub mod search_match;
 pub mod settings;
 pub mod templates;
 pub mod terminal;

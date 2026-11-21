@@ -30,6 +30,7 @@ use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::recent;
 use fileflux::core::search::{SearchOptions, SearchSummary, search};
+use fileflux::core::search_match::{Matcher, QueryOptions};
 use fileflux::core::settings::{
     self, ColumnPref, Preferences, SETTINGS_VERSION, Session, Settings,
 };
@@ -463,6 +464,9 @@ pub(crate) struct Tab {
     /// "Search in subfolders": typing in the search field searches the folder
     /// and everything under it instead of filtering its listing.
     pub(crate) deep_search: bool,
+    /// Why the search field's query cannot run (an invalid regular
+    /// expression); shown beside the field, and no walk starts.
+    pub(crate) search_error: Option<String>,
     /// The wait before a typed query starts its search.
     deep_debounce: Option<Task<()>>,
     /// The running (or last) walk of this tab's search.
@@ -614,6 +618,7 @@ impl Tab {
             submitted_edit: None,
             search_input,
             deep_search: false,
+            search_error: None,
             deep_debounce: None,
             walk: None,
             table,
@@ -779,6 +784,9 @@ pub(crate) struct Explorer {
     pub(crate) list_columns: Vec<ColumnPref>,
     /// The icon size of the grid view (the saved preference).
     pub(crate) grid_zoom: GridZoom,
+    /// How subfolder searches read their query (Match case, Regular
+    /// expression, Search contents): kept for the session, not saved.
+    pub(crate) search_options: QueryOptions,
     /// The row and icon size of the list view (the saved preference).
     pub(crate) list_zoom: ListZoom,
     pub(crate) compact_zoom: CompactZoom,
@@ -1055,6 +1063,7 @@ impl Explorer {
             list_widths: ListWidths::default(),
             list_columns: preferences.list_columns.clone(),
             grid_zoom: preferences.grid_zoom,
+            search_options: QueryOptions::default(),
             list_zoom: preferences.list_zoom,
             compact_zoom: preferences.compact_zoom,
             wheel_travel: WheelTravel::default(),
@@ -2352,10 +2361,20 @@ impl Explorer {
     /// search of it, a search is refined in place (one history entry), and an
     /// emptied field leaves the search for its folder.
     fn apply_deep_query(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let options = self.search_options;
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
         let text = tab.search_input.read(cx).value().to_string();
+        // A query that cannot compile runs nothing and says why.
+        tab.search_error = Matcher::new(&text, options)
+            .err()
+            .map(|error| error.to_string());
+        if tab.search_error.is_some() {
+            self.stop_search(id, cx);
+            cx.notify();
+            return;
+        }
         match tab.state.current().clone() {
             Location::Search { root, .. } if text.is_empty() => {
                 if id == self.active_id() {
@@ -2377,6 +2396,42 @@ impl Explorer {
                 self.start_scan_in(id, scan, window, cx);
             }
             Location::Directory(_) | Location::Trash | Location::Recent => {}
+        }
+    }
+
+    /// Changes how the query is read and runs it again: the toolbar toggles
+    /// Match case, Regular expression and Search contents.
+    pub(crate) fn change_search_options(
+        &mut self,
+        change: impl FnOnce(&mut QueryOptions),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.search_options);
+        let id = self.active_id();
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        tab.deep_debounce = None;
+        if !tab.deep_search {
+            // Filtering the folder reads no options; they apply once the
+            // box searches subfolders.
+            cx.notify();
+            return;
+        }
+        let text = tab.search_input.read(cx).value().to_string();
+        let searching = matches!(tab.state.current(), Location::Search { .. });
+        if text.is_empty() {
+            cx.notify();
+        } else if searching && Matcher::new(&text, self.search_options).is_ok() {
+            // The same query again: refine_search would see no change.
+            if let Some(tab) = self.tabs.by_id_mut(id) {
+                tab.search_error = None;
+            }
+            self.restart_search_in(id, cx);
+            cx.notify();
+        } else {
+            self.apply_deep_query(id, window, cx);
         }
     }
 
@@ -2411,6 +2466,7 @@ impl Explorer {
             return;
         }
         tab.deep_search = on;
+        tab.search_error = None;
         tab.deep_debounce = None;
         tab.search_input.update(cx, |input, cx| {
             input.set_placeholder(
@@ -2457,9 +2513,11 @@ impl Explorer {
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = channel();
         let flag = Arc::clone(&cancel);
+        let query_options = self.search_options;
         let generation = run.generation;
         let walking = cx.background_executor().spawn(async move {
             let mut options = SearchOptions::new(run.query);
+            options.query_options = query_options;
             options.hide_hidden = run.hide_hidden;
             search(&run.root, &options, &flag, |batch| {
                 // Nobody collects any more: the search was dropped.

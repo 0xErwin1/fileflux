@@ -62,6 +62,9 @@ png = { version = "=0.18.1", default-features = false }
 # the `=` pins reuse the exact builds already in the lock, so no new crates
 # compile.
 resvg = { version = "=0.46.0" }
+# Regular-expression search of names and file contents; the version is the one
+# already in the lock through the GPUI stack, so no new crate compiles.
+regex = { version = "=1.13.1" }
 usvg = { version = "=0.46.0" }
 
 [features]

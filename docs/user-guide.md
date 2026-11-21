@@ -401,7 +401,13 @@ The search box normally filters the folder you are in. The toggle next to it (a 
 - **Using a result:** Enter opens it (a folder result navigates into it), and **Open containing folder** in the context menu goes to its folder with the file selected. Rename, copy, cut, Move to Trash, Delete permanently and Undo work on the selected results, and the search runs again afterwards so the list stays true. Results are a read-only view: nothing can be created, pasted or dropped into it.
 - **Tabs and history:** a search is one history entry however often you refine it; Back returns to the folder (and Forward to the search, which runs again). Its breadcrumb is the folder plus a "Search “query”" segment. **A search tab is not saved in the session**: the tab comes back on the folder it searched, with an empty box.
 
-Content search (text inside files) is not implemented; this searches names only.
+**Search options.** Three toggles next to the box change how the subfolder search reads the query; each re-runs the current query and the choice lasts for the session (it is not saved):
+
+- **Match case** (`Aa`): off by default, so "report" finds "REPORT.txt" (Unicode letters fold too, "árbol" finds "ÁRBOL"). On, case must match.
+- **Regular expression** (`.*`): the query is a [regex](https://docs.rs/regex/latest/regex/#syntax) matched against the file name. An invalid expression shows its error beside the toolbar and runs nothing; the box is not cleared. An empty query matches nothing.
+- **Search file contents** (the document icon): a file is a result when its name matches **or** one of its lines does. Match case and Regular expression apply to the lines too; a pattern never spans lines. Results found by content look like any other result. Only regular files of at most 10 MiB are read; binary files (a NUL byte in the first 8 KiB) and symbolic links are skipped, invalid UTF-8 is read lossily, and a file stops being read at its first match. The 10,000-result cap, streaming, Escape and the filesystem boundary are the same as for names.
+
+The toggles apply to the subfolder search only; filtering the current folder (Ctrl+F) is always a case-insensitive name substring.
 
 ## Recent files
 
@@ -413,6 +419,5 @@ Right-click a row of Places, Favorites or Devices: **Open**, **Open in new tab**
 
 ## Current scope
 
-- Search matches file names only, not their content.
 - Tabs cannot be reordered or dragged between windows.
 - Per-folder view memory is not implemented: the active tab's view, sort and filters are the default for the next launch.
