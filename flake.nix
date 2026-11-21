@@ -127,6 +127,14 @@
               install -Dm644 ${./assets/icon/fileflux-64.png} $out/share/icons/hicolor/64x64/apps/fileflux.png
               install -Dm644 ${./assets/icon/fileflux-128.png} $out/share/icons/hicolor/128x128/apps/fileflux.png
               install -Dm644 ${./assets/icon/fileflux-256.png} $out/share/icons/hicolor/256x256/apps/fileflux.png
+
+              # The helper `cargo install` put next to fileflux needs its
+              # polkit action, which names the helper's installed path.
+              # `substitute` writes into an existing directory only.
+              mkdir -p $out/share/polkit-1/actions
+              substitute ${./packaging/dev.fileflux.owner-helper.policy} \
+                $out/share/polkit-1/actions/dev.fileflux.owner-helper.policy \
+                --replace-fail /usr/bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
             '';
 
             postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

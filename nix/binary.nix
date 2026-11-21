@@ -104,6 +104,7 @@ stdenv.mkDerivation {
 
   # Tarball layout, from .github/workflows/nightly.yml:
   #   bin/fileflux
+  #   bin/fileflux-owner-helper (optional)
   #   share/applications/fileflux.desktop
   #   share/icons/hicolor/{scalable,16x16,...,256x256}/apps/fileflux.{svg,png}
   #   LICENSE
@@ -131,6 +132,18 @@ stdenv.mkDerivation {
       install -Dm644 "share/icons/hicolor/''${size}x''${size}/apps/fileflux.png" \
         "$out/share/icons/hicolor/''${size}x''${size}/apps/${appId}.png"
     done
+
+    # The root owner helper and its polkit action, when the tarball has the
+    # helper (older nightlies do not; Fileflux then falls back to
+    # `pkexec chown`). It sits next to the real executable, which is where
+    # Fileflux looks for it, and the action names its store path.
+    if [ -e bin/fileflux-owner-helper ]; then
+      install -Dm755 bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
+      mkdir -p $out/share/polkit-1/actions
+      substitute ${../packaging/dev.fileflux.owner-helper.policy} \
+        $out/share/polkit-1/actions/dev.fileflux.owner-helper.policy \
+        --replace-fail /usr/bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
+    fi
 
     install -Dm644 LICENSE $out/share/licenses/${appId}/LICENSE
 

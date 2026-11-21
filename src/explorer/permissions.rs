@@ -1522,6 +1522,7 @@ mod tests {
                     Ok(Elevation {
                         pkexec: p("/usr/bin/pkexec"),
                         chown: p("/usr/bin/chown"),
+                        helper: None,
                     })
                 } else {
                     Err(Unavailable::Pkexec)

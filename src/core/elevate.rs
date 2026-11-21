@@ -1,6 +1,11 @@
-//! Changing an owner needs root, so Fileflux asks polkit for it: it runs
-//! `pkexec chown --no-dereference --from=+<shown uid> +<uid> -- <path>` and polkit shows its own
-//! authentication dialog. Fileflux never asks for, stores or logs a password;
+//! Changing an owner needs root, so Fileflux asks polkit for it and polkit
+//! shows its own authentication dialog. When `fileflux-owner-helper` is
+//! installed next to the executable it runs
+//! `pkexec <helper> <path> <dev> <ino> <birth> <owner> <uid>`: the helper
+//! opens the path without following any symbolic link, compares the
+//! snapshot with that open file and changes the owner on it (see
+//! [`super::owner_helper`]). Without the helper it falls back to
+//! `pkexec chown --no-dereference --from=+<shown uid> +<uid> -- <path>`. Fileflux never asks for, stores or logs a password;
 //! the child has no stdin and only its exit code and `chown`'s own error text
 //! come back.
 //!
@@ -17,6 +22,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
+
+use super::owner_helper::{Born, Exit, HELPER_NAME, Request, Snapshot};
 
 /// Where `pkexec` may be: NixOS's setuid wrapper first (the store copy is
 /// not setuid), then the usual FHS places.
@@ -80,24 +87,49 @@ impl fmt::Display for RelativePath {
 
 impl std::error::Error for RelativePath {}
 
-/// The two programs an owner change runs, by absolute path.
+/// The helper installed in the same directory as the running executable
+/// (`exe`), if any: the directory is canonicalized and nothing else is
+/// searched, never `PATH`.
+pub fn helper_beside(
+    exe: &Path,
+    canonicalize: impl Fn(&Path) -> io::Result<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let dir = canonicalize(exe.parent()?).ok()?;
+    let helper = dir.join(HELPER_NAME);
+    exists(&helper).then_some(helper)
+}
+
+/// The programs an owner change runs, by absolute path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Elevation {
     pub pkexec: PathBuf,
+    /// The fallback when there is no helper.
     pub chown: PathBuf,
+    /// `fileflux-owner-helper`, when it is installed next to the executable.
+    pub helper: Option<PathBuf>,
 }
 
 impl Elevation {
     /// Looks for both programs in their fixed locations.
     pub fn detect() -> Result<Self, Unavailable> {
-        Self::detect_with(is_executable_file)
+        let mut found = Self::detect_with(is_executable_file)?;
+        found.helper = std::env::current_exe().ok().and_then(|exe| {
+            helper_beside(&exe, |dir| std::fs::canonicalize(dir), is_executable_file)
+        });
+        Ok(found)
     }
 
-    /// [`Self::detect`] with the file test given.
+    /// [`Self::detect`] with the file test given; it does not look for the
+    /// helper.
     pub fn detect_with(exists: impl Fn(&Path) -> bool + Copy) -> Result<Self, Unavailable> {
         let pkexec = resolve(PKEXEC_CANDIDATES, exists).ok_or(Unavailable::Pkexec)?;
         let chown = resolve(CHOWN_CANDIDATES, exists).ok_or(Unavailable::Chown)?;
-        Ok(Self { pkexec, chown })
+        Ok(Self {
+            pkexec,
+            chown,
+            helper: None,
+        })
     }
 
     /// The full command line, program first: `pkexec chown --no-dereference
@@ -121,6 +153,34 @@ impl Elevation {
             OsString::from("--"),
             path.as_os_str().to_owned(),
         ])
+    }
+
+    /// The command line for `uid`: through the helper when there is one
+    /// (`pkexec <helper> <path> <dev> <ino> <birth> <owner> <uid>`, the
+    /// snapshot being what `expected` saw), else [`Self::argv`].
+    pub fn command(
+        &self,
+        expected: &Identity,
+        uid: u32,
+        path: &Path,
+    ) -> Result<Vec<OsString>, RelativePath> {
+        let Some(helper) = &self.helper else {
+            return self.argv(expected.owner, uid, path);
+        };
+        if !path.is_absolute() {
+            return Err(RelativePath);
+        }
+        let request = Request {
+            path: path.as_os_str().to_owned(),
+            snapshot: expected.snapshot(),
+            new_uid: uid,
+        };
+        let mut argv = vec![
+            self.pkexec.clone().into_os_string(),
+            helper.clone().into_os_string(),
+        ];
+        argv.extend(request.to_args());
+        Ok(argv)
     }
 }
 
@@ -150,6 +210,17 @@ impl Identity {
             owner: meta.uid(),
             symlink: meta.file_type().is_symlink(),
         })
+    }
+
+    /// What the root helper compares: this identity and the shown owner.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            dev: self.dev,
+            ino: self.ino,
+            born: self.born.map(Born::from_system_time),
+            owner: self.owner,
+        }
     }
 
     /// Whether `now` is still the file this identity saw.
@@ -205,6 +276,31 @@ pub fn outcome_of(code: Option<i32>, stderr: &str) -> Outcome {
     }
 }
 
+/// Maps the exit of `pkexec <helper>`: 0 changed; 126 and 127 as for
+/// [`outcome_of`]; the helper's own codes ([`Exit`]) say why nothing changed.
+#[must_use]
+pub fn helper_outcome_of(code: Option<i32>, stderr: &str) -> Outcome {
+    match code {
+        Some(126 | 127) | Some(0) => outcome_of(code, stderr),
+        Some(code) => match Exit::from_code(code) {
+            Some(Exit::IdentityMismatch) => Outcome::Failed(
+                "Nothing was changed: the file was replaced since it was shown".to_owned(),
+            ),
+            Some(Exit::OwnerMismatch) => Outcome::Failed(
+                "Nothing was changed: its owner changed since it was shown".to_owned(),
+            ),
+            _ => Outcome::Failed(with_detail(
+                format!("the owner helper failed (exit {code})"),
+                stderr,
+            )),
+        },
+        None => Outcome::Failed(with_detail(
+            "the owner helper was ended by a signal".to_owned(),
+            stderr,
+        )),
+    }
+}
+
 fn with_detail(head: String, stderr: &str) -> String {
     let detail: String = stderr.trim().chars().take(MAX_REASON).collect();
     if detail.is_empty() {
@@ -223,14 +319,14 @@ fn with_detail(head: String, stderr: &str) -> String {
 /// its owner is not the requested one (`--from` skipped it) the failure
 /// names the owner found.
 ///
-/// Known debt: a folder *above* the file can still be swapped for a symbolic
-/// link during the polkit wait (`chown --no-dereference` only protects the
-/// last component). pkexec closes inherited file descriptors and clears the
-/// environment, so pinning the file with an fd is impossible through pkexec.
-/// A full fix needs a small root helper with its own polkit action that
-/// opens each component with `O_NOFOLLOW` / `openat2` `RESOLVE_NO_SYMLINKS`
-/// and uses `fchown`. `--from` and the post-change check limit and detect
-/// the swap.
+/// With the helper, a swapped folder above the file cannot redirect the
+/// change: the helper opens the path without following any link and changes
+/// the owner on the file it checked. The `chown` fallback is weaker (known
+/// debt): a folder *above* the file can be swapped for a symbolic link
+/// during the polkit wait (`chown --no-dereference` only protects the last
+/// component) and pkexec closes inherited descriptors, so no descriptor can
+/// be passed to it. `--from` and the post-change check limit and detect the
+/// swap.
 pub fn change_owner(
     elevation: &Elevation,
     uid: u32,
@@ -245,12 +341,17 @@ pub fn change_owner(
     if let Err(reason) = expected.check(&now) {
         return Outcome::Failed(reason.to_owned());
     }
-    let argv = match elevation.argv(expected.owner, uid, path) {
+    let argv = match elevation.command(expected, uid, path) {
         Ok(argv) => argv,
         Err(error) => return Outcome::Failed(error.to_string()),
     };
+    let map = if elevation.helper.is_some() {
+        helper_outcome_of
+    } else {
+        outcome_of
+    };
     match run(&argv) {
-        Ok(finished) => match outcome_of(finished.code, &finished.stderr) {
+        Ok(finished) => match map(finished.code, &finished.stderr) {
             Outcome::Changed => verify_after(expected, uid, path),
             other => other,
         },

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!--
+  Polkit action for fileflux-owner-helper, the small root program Fileflux
+  starts through pkexec to change the owner of one file or folder.
+
+  The exec.path annotation must be the absolute path of the installed helper.
+  /usr/bin is the default for a distribution package; the Nix package
+  replaces it with its store path at build time.
+-->
+<policyconfig>
+  <vendor>Fileflux</vendor>
+  <vendor_url>https://github.com/0xErwin1/fileflux</vendor_url>
+
+  <action id="dev.fileflux.change-owner">
+    <description>Change the owner of a file or folder</description>
+    <message>Authentication is required to change the owner of a file or folder</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/fileflux-owner-helper</annotate>
+  </action>
+</policyconfig>

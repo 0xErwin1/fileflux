@@ -6,6 +6,8 @@ rust-version = "1.99"
 description = "A file explorer in the Bolt family"
 license = "Apache-2.0"
 publish = false
+# `cargo run` starts the app, not the root owner helper next to it.
+default-run = "fileflux"
 
 [dependencies]
 # The GPUI stack follows DBFlux, like ReqFlux: gpui-pre 0.3.9 and
@@ -35,7 +37,7 @@ log = "0.4.34"
 # shell: volume usage (safe statvfs), local/relative modified dates, and
 # blocking inotify waits for live refresh.
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-rustix = { version = "1.1.6", features = ["event", "fs"] }
+rustix = { version = "1.1.6", features = ["event", "fs", "process"] }
 # The viewer rotates decoded pixels with `imageops` and hands them to GPUI as
 # a frame; the thumbnail generator decodes the formats the grid lists (jpeg,
 # png, webp, gif, bmp) to downscale them. The version is the one GPUI already
