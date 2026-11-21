@@ -78,6 +78,16 @@ cargo build --features ui-automation
 gpui-mcp --app-id fileflux          # the stdio MCP server, from the DBFlux tree
 ```
 
+For an agent, prefer the isolated sandbox over the desktop session:
+
+```sh
+scripts/ui-sandbox.sh start [folder]   # build with the feature, launch on Xvfb :97
+DISPLAY=:97 gpui-mcp --app-id fileflux  # screenshots need the same DISPLAY
+scripts/ui-sandbox.sh stop
+```
+
+The script runs Xvfb with openbox (native capture finds no window without a window manager), a private D-Bus session (on the real bus the single-instance check hands the folder to an already running Fileflux and exits), and a synthetic HOME and XDG config/data/state/cache. `XDG_RUNTIME_DIR` stays real because the discovery descriptors live there. `FILEFLUX_UI_DISPLAY` overrides the display.
+
 Use it to check what a screenshot cannot: which element a click actually lands on, where a drag preview sits relative to the pointer, what the status bar renders for a given selection. The bridge reads frames in-process, so it works on Wayland; the server's native **screenshots** are X11-only, so on Wayland capture the window another way. Prefer this over XTest-driven checks above when the question is about the element tree rather than pixels, and keep both when the question is visual.
 
 ## Nix packages
@@ -100,6 +110,7 @@ The hashes in `nix/nightly-info.nix` are placeholders on `main`; the nightly wor
 |---|---|
 | `scripts/install-desktop.sh` | Install or remove the desktop entry, optionally as default image viewer (`--default-images`, `--uninstall`). Writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list` |
 | `scripts/native-smoke.py` | Native smoke check described above |
+| `scripts/ui-sandbox.sh` | Isolated `ui-automation` session for the gpui-mcp server (`start [folder]`, `stop`, `status`), described above |
 | `packaging/fileflux.desktop` | The desktop entry the install script uses |
 | `examples/read_dir_bench.rs` | Directory-scan benchmark: `cargo run --release --example read_dir_bench [entries]` (creates and removes its own million-file fixture under the system temp dir) |
 | `design/` | Design reference: `system.md` (tokens and rules, with `system.html`) and `file-explorer/` HTML mockups (`01-familiar-grid` is the implemented look; `02`/`03` are alternatives; `04-refined-shell` shows the refined shell) |
