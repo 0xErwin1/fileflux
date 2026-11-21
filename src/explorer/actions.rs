@@ -97,6 +97,11 @@ pub(crate) enum MenuOn {
     /// The row of a device that is not mounted, by its element id and block
     /// device.
     Device { row: String, device: PathBuf },
+    /// The row of a network bookmark, by its element id.
+    Network {
+        row: String,
+        bookmark: fileflux::core::bookmarks::NetworkBookmark,
+    },
 }
 
 /// The open context menu.
@@ -943,6 +948,11 @@ impl Explorer {
             self.confirm_select_pattern(window, cx);
             return;
         }
+        match self.dialogs.current().map(|dialog| &dialog.action) {
+            Some(DialogAction::Connect(_)) => return self.confirm_connect(window, cx),
+            Some(DialogAction::MountPrompt(_)) => return self.confirm_mount_prompt(window, cx),
+            _ => {}
+        }
         let Some(dialog) = self.dialogs.close() else {
             return;
         };
@@ -964,7 +974,9 @@ impl Explorer {
             }
             DialogAction::OpenWith(_)
             | DialogAction::Archive(_)
-            | DialogAction::SelectPattern(_) => return,
+            | DialogAction::SelectPattern(_)
+            | DialogAction::Connect(_)
+            | DialogAction::MountPrompt(_) => return,
             DialogAction::DeviceWhenIdle(plan) => {
                 self.queue_device_plan(plan, window, cx);
                 return;
@@ -992,6 +1004,10 @@ impl Explorer {
             return;
         };
         self.dialog_closed(window, cx);
+        if let DialogAction::MountPrompt(prompt) = dialog.action {
+            // Cancel on gio's question stops connecting.
+            return self.cancel_mount(Some(prompt), window, cx);
+        }
         if let DialogAction::Conflict { job, apply_all } = dialog.action {
             // Escape or Cancel on a conflict question cancels the whole job.
             self.answer_conflict(job, answer_for(DialogChoice::Cancel, apply_all), window, cx);
@@ -1173,6 +1189,9 @@ impl Explorer {
             &mut rows,
             super::links::offer_for(in_folder, &selected, target.can_paste),
         );
+        if target.selected == 0 && !target.in_trash {
+            super::network::add_connect_row(&mut rows, self.devices.gio.is_some());
+        }
         if rows.is_empty() {
             cx.notify();
             return;
@@ -1242,7 +1261,7 @@ impl Explorer {
     }
 
     /// Opens the menu with `rows` and gives it the keyboard.
-    fn show_menu(
+    pub(crate) fn show_menu(
         &mut self,
         position: Point<Pixels>,
         rows: Vec<MenuRow>,
@@ -1458,6 +1477,10 @@ impl Explorer {
             return self.toggle_column(column, cx);
         }
         // A sidebar row's menu acts on that row's place, not on the entries.
+        let network_row = match self.menu.as_ref().map(|menu| &menu.on) {
+            Some(MenuOn::Network { bookmark, .. }) => Some(bookmark.clone()),
+            _ => None,
+        };
         let (sidebar, device_row) = match self.menu.as_ref().map(|menu| &menu.on) {
             Some(MenuOn::Sidebar {
                 location, device, ..
@@ -1466,6 +1489,17 @@ impl Explorer {
             _ => (None, None),
         };
         self.close_menu(window, cx);
+        if let Some(bookmark) = network_row {
+            return match command {
+                MenuCommand::ConnectBookmark => {
+                    self.connect_to(&bookmark.uri, bookmark.title.as_deref(), window, cx);
+                }
+                MenuCommand::RemoveBookmark => {
+                    self.remove_network_bookmark(bookmark.uri, window, cx)
+                }
+                _ => {}
+            };
+        }
         if let Some((location, device)) = sidebar {
             return self.run_sidebar_command(command, (location, device), window, cx);
         }
@@ -1483,6 +1517,8 @@ impl Explorer {
                 }
             }
             MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
+            MenuCommand::ConnectToServer => self.connect_to_server(window, cx),
+            MenuCommand::ConnectBookmark | MenuCommand::RemoveBookmark => {}
             MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
             MenuCommand::Zoom(zoom) => self.zoom(zoom, cx),
             MenuCommand::SelectAll => self.select_all(cx),

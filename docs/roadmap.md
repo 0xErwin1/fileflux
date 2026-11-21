@@ -23,7 +23,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Network | A "Connect to server" dialog; network bookmarks in the sidebar | Only mounts gvfs already made are browsed; `sftp://` and `smb://` bookmarks are hidden |
 | Encrypted drives | Unlock a LUKS container | Shown as Locked |
 | Desktop integration | The `org.freedesktop.FileManager1` D-Bus interface ("Show in folder" from other applications) and a single instance | Nothing |
 

@@ -883,6 +883,9 @@ pub(crate) struct Explorer {
     _watch_pump: Option<Task<()>>,
     /// The machine's devices and the actions on them: the Devices section.
     pub(crate) devices: DeviceHub,
+    /// Connect to Server: the network bookmarks, the session's recent
+    /// servers and the attempt in progress.
+    pub(crate) network: super::network::NetworkHub,
     /// The rubber-band press in flight, if any (see [`rubber`]).
     pub(crate) rubber_band: Option<rubber::Band>,
     /// The entry the left button went down on, until it goes up.
@@ -1105,6 +1108,7 @@ impl Explorer {
             folder_debounce: HashMap::new(),
             _watch_pump: None,
             devices: DeviceHub::from_env(),
+            network: super::network::NetworkHub::default(),
             rubber_band: None,
             entry_press: None,
         };
@@ -1115,6 +1119,7 @@ impl Explorer {
                     .update_in(cx, |this, window, cx| {
                         this.pump_watch_events(window, cx);
                         this.pump_devices(window, cx);
+                        this.pump_network(window, cx);
                         this.persist_tick(window, cx);
                     })
                     .is_err()
@@ -1154,6 +1159,7 @@ impl Explorer {
         .detach();
 
         this.attach_bookmark_watch();
+        this.reload_favorites(cx);
         this.sync_window_title(window);
         this.navigate(Transition::Visit(initial), window, cx);
         // The rest of a restored session opens behind the first tab, in

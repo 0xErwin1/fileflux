@@ -19,6 +19,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Dual pane](#dual-pane)
 - [Selection](#selection)
 - [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks)
+- [Network](#network)
 - [Open, Open with and terminal](#open-open-with-and-terminal)
 - [File operations](#file-operations)
 - [Trash](#trash)
@@ -208,9 +209,18 @@ A selected entry that the filter hides stays selected, but operations act only o
 The sidebar's Favorites are the local lines of `$XDG_CONFIG_HOME/gtk-3.0/bookmarks` (default `~/.config/gtk-3.0/bookmarks`), the file Nautilus, Thunar, Nemo and the GTK file chooser share.
 
 - A line is `file:///percent-encoded/path Optional Label`. The sidebar shows the label when there is one, else the folder name.
-- `sftp://`, `smb://` and other lines, comments and blank lines are kept untouched and not shown. Adding appends one line, removing drops only that folder's lines; order, labels and line endings stay.
+- `sftp://`, `smb://`, `ftp://` and `dav://` lines are the [network bookmarks](#network). Other lines, comments and blank lines are kept untouched and not shown. Adding appends one line, removing drops only that folder's lines; order, labels and line endings stay.
 - Changes are written atomically (a temporary file renamed over the original, through a symlink, keeping the file's permissions) after re-reading the file, so an edit made by another program meanwhile is not lost. An external edit shows in the sidebar live.
 - Older versions kept favorites in `settings.toml`: the first run moves them into the bookmarks and saves the settings without them. If the bookmarks cannot be written they stay in `settings.toml` and are retried at the next launch.
+
+## Network
+
+The sidebar's **Network** section connects to servers the way Nautilus and Thunar do, through `gio mount` (the `gio` tool of glib, which needs gvfs). Without `gio` on `PATH` its entries are muted and say so.
+
+- **Connect to Server…** (the Network section, or the empty-space menu of a folder) asks for an address: `sftp://user@host/path`, `smb://host/share`, `ftp://`, `ftps://`, `dav://` or `davs://`. The host is required; the user, port (`host:2222`, `[::1]:2222` for IPv6) and path are optional. The servers you connected to in this session are offered as quick picks (they are not saved).
+- Do not type the password in the address: an address with `user:password@` is refused. If the server needs a user, a domain or a password, `gio` asks and Fileflux shows each question in a dialog. The password field is masked. The password goes straight to `gio` and is never written to disk, to the logs or to a notice, and it is not kept once the attempt ends. An unknown SSH host key (or another question with choices) is shown with one button per choice.
+- **Cancel** in a question, or the **Connecting…** row of the sidebar, stops the attempt and kills `gio`. A failure shows `gio`'s message in a notice. When the mount is ready its folder (`$XDG_RUNTIME_DIR/gvfs/…`) opens. Only one connection is attempted at a time.
+- The network lines of the GTK bookmarks file are listed under Network, with their label or else the host and path. A click opens the mount, connecting first when it is not mounted. The row's menu has **Connect** and **Remove bookmark** (it deletes only that bookmark's lines). Unmount a connected server from the **Devices** section like any other gvfs mount. Adding a server as a bookmark from Fileflux is not offered yet: add the line to the bookmarks file or use another file manager.
 
 ## Open, Open with and terminal
 
@@ -415,7 +425,7 @@ The sidebar's Places section has a **Recent** row. It lists up to 200 files that
 
 ## Sidebar
 
-Right-click a row of Places, Favorites or Devices: **Open**, **Open in new tab**, **Open in terminal**, **Add to favorites** / **Remove from favorites**, **Copy path** and **Properties** (opens the folder with the details panel shown). The **Home Trash** row offers Open, Open in new tab and **Empty Trash…**, which asks first. Devices have extra actions: see [Devices](devices.md).
+Right-click a row of Places, Favorites or Devices (a Network bookmark's menu is described in [Network](#network)): **Open**, **Open in new tab**, **Open in terminal**, **Add to favorites** / **Remove from favorites**, **Copy path** and **Properties** (opens the folder with the details panel shown). The **Home Trash** row offers Open, Open in new tab and **Empty Trash…**, which asks first. Devices have extra actions: see [Devices](devices.md).
 
 ## Current scope
 

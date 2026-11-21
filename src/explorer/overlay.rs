@@ -190,10 +190,24 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         DialogAction::SelectPattern(state) => Some(state),
         _ => None,
     };
+    let connect = match &dialog.action {
+        DialogAction::Connect(state) => Some(state),
+        _ => None,
+    };
+    let prompt = match &dialog.action {
+        DialogAction::MountPrompt(state) => Some(state),
+        _ => None,
+    };
+    let secret_prompt = prompt.is_some_and(|state| state.prompt.is_secret());
+    // A question of gio is answered by its own buttons; Continue has nothing
+    // to send.
+    let question = matches!(prompt, Some(state) if state.input.is_none());
     // Waiting for a device to be free destroys nothing: not a danger button.
     let calm = open_with.is_some()
         || archive.is_some()
         || pattern.is_some()
+        || connect.is_some()
+        || prompt.is_some()
         || matches!(dialog.kind, DialogKind::DeviceBusy { .. });
     let body = div()
         .flex()
@@ -222,6 +236,73 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                 .w_full()
                 .small()
         }))
+        // "Connect to Server…": the address, the reason it was refused and
+        // the servers of this session as quick picks.
+        .children(connect.map(|state| {
+            Input::new(&state.input)
+                .id("explorer-connect-input")
+                .aria_label("Server address")
+                .w_full()
+                .small()
+                .error(state.error.clone())
+        }))
+        .children(
+            connect
+                .filter(|state| !state.recent.is_empty())
+                .map(|state| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(Spacing::SM)
+                        .child(div().text_color(colors.muted).child("Recent servers"))
+                        .children(state.recent.iter().enumerate().map(|(index, address)| {
+                            let pick_weak = weak.clone();
+                            Button::new(("explorer-connect-recent", index), address.clone())
+                                .secondary()
+                                .on_click(move |_event, window, cx| {
+                                    if let Err(error) = pick_weak.update(cx, |this, cx| {
+                                        this.pick_recent_server(index, window, cx);
+                                    }) {
+                                        log::debug!("the dialog outlived its explorer: {error}");
+                                    }
+                                })
+                        }))
+                }),
+        )
+        // A prompt of gio: the field (masked for a password) or, for a
+        // question, one button per choice.
+        .children(prompt.and_then(|state| state.input.as_ref()).map(|input| {
+            Input::new(input)
+                .id("explorer-mount-input")
+                .aria_label("Answer")
+                .secret(secret_prompt)
+                .w_full()
+                .small()
+        }))
+        .children(
+            prompt
+                .and_then(|state| match &state.prompt {
+                    fileflux::core::network::Prompt::Question { choices, .. } => Some(choices),
+                    fileflux::core::network::Prompt::Text { .. } => None,
+                })
+                .map(|choices| {
+                    div().flex().flex_col().gap(Spacing::SM).children(
+                        choices.iter().enumerate().map(|(index, (number, choice))| {
+                            let number = *number;
+                            let pick_weak = weak.clone();
+                            Button::new(("explorer-mount-choice", index), choice.clone())
+                                .secondary()
+                                .on_click(move |_event, window, cx| {
+                                    if let Err(error) = pick_weak.update(cx, |this, cx| {
+                                        this.answer_mount_choice(number, window, cx);
+                                    }) {
+                                        log::debug!("the dialog outlived its explorer: {error}");
+                                    }
+                                })
+                        }),
+                    )
+                }),
+        )
         .children(archive.map(|state| {
             Input::new(&state.input)
                 .id("explorer-archive-input")
@@ -394,13 +475,17 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                     confirm.danger()
                 }
             }
-            .disabled(!armed)
+            .disabled(!armed || question)
             .focus_handle(&this.dialog_confirm_focus)
             .on_click(press(DialogChoice::Confirm)),
         );
 
     let modal = Modal::new(text.title.clone()).id("explorer-dialog");
-    let modal = if pattern.is_some() {
+    let modal = if secret_prompt {
+        modal.icon(icon(gpui_kit_assets::IconName::Lock))
+    } else if connect.is_some() || prompt.is_some() {
+        modal.icon(icon(gpui_kit_assets::IconName::Network))
+    } else if pattern.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::SquareCheck))
     } else if archive.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::Archive))

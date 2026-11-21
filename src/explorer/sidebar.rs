@@ -85,6 +85,7 @@ pub(crate) fn render(
         .h_full()
         .child(places_section(this, cx))
         .child(favorites_section(this, cx))
+        .child(network_section(this, cx))
         .child(volumes_section(this, cx));
 
     if let Some(error) = &this.sidebar_error {
@@ -249,6 +250,114 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
         ));
     }
     section
+}
+
+/// The Network section: "Connect to Server…", the attempt in progress (a
+/// click cancels it) and the network bookmarks. Without `gio` the rows are
+/// muted and say why when clicked.
+fn network_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
+    let colors = bolt::colors(cx);
+    let gio = this.devices.gio.is_some();
+    let mut section = div().flex_none().flex().flex_col();
+    section = section.child(section_label("network-label", "Network", cx));
+    section = section.child(
+        network_row(
+            "network-connect".to_owned(),
+            ("Connect to Server\u{2026}", String::new()),
+            gpui_kit_assets::IconName::Plus,
+            gio,
+            this,
+            cx,
+        )
+        .on_click(cx.listener(|this, _event, window, cx| {
+            this.connect_to_server(window, cx);
+            this.close_sidebar_overlay(OverlayEvent::RowChosen);
+        })),
+    );
+    if let Some(label) = this.network.connecting() {
+        section = section.child(
+            network_row(
+                "network-connecting".to_owned(),
+                (
+                    &format!("Connecting to {label}\u{2026}"),
+                    "Click to cancel".to_owned(),
+                ),
+                gpui_kit_assets::IconName::X,
+                true,
+                this,
+                cx,
+            )
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.cancel_mount(None, window, cx);
+            })),
+        );
+    }
+    for (index, bookmark) in this.network.bookmarks.iter().enumerate() {
+        let (open, menu) = (bookmark.clone(), bookmark.clone());
+        let id = format!("network-bookmark-{index}");
+        let menu_row = id.clone();
+        section = section.child(
+            network_row(
+                id,
+                (&bookmark.display_name(), bookmark.uri.to_string()),
+                gpui_kit_assets::IconName::Network,
+                gio,
+                this,
+                cx,
+            )
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.connect_to(&open.uri, open.title.as_deref(), window, cx);
+                this.close_sidebar_overlay(OverlayEvent::RowChosen);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_network_menu(
+                        event.position,
+                        menu_row.clone(),
+                        menu.clone(),
+                        window,
+                        cx,
+                    );
+                }),
+            ),
+        );
+    }
+    if !gio {
+        section = section.child(
+            div()
+                .id("explorer-network-notice")
+                .px(Spacing::LG)
+                .py(Spacing::SM)
+                .text_size(px(11.0))
+                .line_height(px(15.0))
+                .text_color(colors.muted)
+                .child(super::network::MISSING_GIO),
+        );
+    }
+    section
+}
+
+/// One row of the Network section: icon and name, muted when `enabled` is
+/// false. The caller adds what a click does; a disabled row says why.
+fn network_row(
+    id: String,
+    (name, tooltip): (&str, String),
+    glyph: gpui_kit_assets::IconName,
+    enabled: bool,
+    this: &Explorer,
+    cx: &mut Context<Explorer>,
+) -> Stateful<Div> {
+    let colors = bolt::colors(cx);
+    row_shell(this, id, name.to_owned(), tooltip, (None, None), false, cx)
+        .when(!enabled, |row| row.text_color(colors.muted))
+        .child(
+            Icon::new(icon(glyph))
+                .size(TreeMetrics::ICON)
+                .color(colors.muted),
+        )
+        .child(name.to_owned())
 }
 
 /// The Devices section: the mount table's real storage volumes with a
@@ -498,7 +607,7 @@ fn row_shell(
     // The row its context menu is open on keeps the tint outline.
     let outlined = matches!(
         this.menu.as_ref().map(|menu| &menu.on),
-        Some(MenuOn::Sidebar { row, .. }) if *row == id
+        Some(MenuOn::Sidebar { row, .. } | MenuOn::Network { row, .. }) if *row == id
     );
     let menu_row = id.clone();
     let menu_target = (location.clone(), device.clone());

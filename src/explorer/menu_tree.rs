@@ -56,6 +56,8 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::Compress => IconName::Archive,
         MenuCommand::ExtractHere | MenuCommand::ExtractTo => IconName::PackageOpen,
         MenuCommand::Mount => IconName::HardDrive,
+        MenuCommand::ConnectToServer | MenuCommand::ConnectBookmark => IconName::Network,
+        MenuCommand::RemoveBookmark => IconName::StarFill,
         MenuCommand::Unmount | MenuCommand::Eject => IconName::Eject,
     })
 }

@@ -30,6 +30,11 @@ pub(crate) struct BookmarkSync {
 }
 
 impl BookmarkSync {
+    /// The bookmarks file, when there is one.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
@@ -177,11 +182,15 @@ impl Explorer {
         };
         let read = cx
             .background_executor()
-            .spawn(async move { bookmarks::read(&file) });
+            .spawn(async move { bookmarks::read_all(&file) });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             if let Err(closed) = this.update(cx, |this, cx| match read {
-                Ok(list) => {
+                Ok((list, network)) => {
+                    if network != this.network.bookmarks {
+                        this.network.bookmarks = network;
+                        cx.notify();
+                    }
                     let favorites = favorites_of(list, &this.legacy_favorites);
                     if favorites.bookmarks() != this.favorites.bookmarks() {
                         this.favorites = favorites;

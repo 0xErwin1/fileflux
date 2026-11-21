@@ -4,8 +4,10 @@
 //!
 //! One bookmark per line: `file:///percent-encoded/path Optional Label`.
 //! Local entries are the favorites (the label when present, else the folder
-//! name). Every other line (`sftp://`, `smb://`, comments, blanks, anything
-//! unknown) is kept byte for byte: this module only ever appends a line or
+//! name). The `sftp://`, `smb://`, `ftp://` and `dav://` entries are the
+//! network bookmarks (see [`super::network`]); one that carries a password is
+//! not listed. Every other line (comments, blanks, anything unknown) is kept
+//! byte for byte: this module only ever appends a line or
 //! drops the lines of the folder being removed, so another program's
 //! bookmarks, order and labels survive a change made here.
 //!
@@ -25,6 +27,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use super::network::ServerUri;
 use super::settings::{write_atomic_guarded, write_target};
 
 const GTK_DIR: &str = "gtk-3.0";
@@ -70,12 +73,30 @@ impl Bookmark {
     }
 }
 
+/// A network bookmark: a server address and the label after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkBookmark {
+    pub uri: ServerUri,
+    /// The text after the address, when there is one.
+    pub title: Option<String>,
+}
+
+impl NetworkBookmark {
+    /// What the sidebar shows: the title, else the host and path.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.uri.label(self.title.as_deref())
+    }
+}
+
 /// One line of the file with its terminator, as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Line {
     raw: Vec<u8>,
     /// Set for a `file://` entry.
     bookmark: Option<Bookmark>,
+    /// Set for a network entry.
+    network: Option<NetworkBookmark>,
 }
 
 /// A parsed bookmarks file: every line, understood or not.
@@ -140,12 +161,24 @@ fn parse_line(raw: &[u8]) -> Line {
     let uri = parts.next().unwrap_or_default();
     let label = parts.next().unwrap_or_default();
     let label = String::from_utf8_lossy(label).trim().to_owned();
+    let bookmark = local_path(uri);
+    let network = match bookmark {
+        Some(_) => None,
+        None => std::str::from_utf8(uri)
+            .ok()
+            .and_then(|uri| ServerUri::parse(uri).ok())
+            .map(|uri| NetworkBookmark {
+                uri,
+                title: (!label.is_empty()).then(|| label.clone()),
+            }),
+    };
     Line {
         raw: raw.to_vec(),
-        bookmark: local_path(uri).map(|path| Bookmark {
+        bookmark: bookmark.map(|path| Bookmark {
             path,
             label: (!label.is_empty()).then_some(label),
         }),
+        network,
     }
 }
 
@@ -172,6 +205,29 @@ impl BookmarkFile {
             }
         }
         seen
+    }
+
+    /// The network bookmarks in file order, without repeats of one address.
+    #[must_use]
+    pub fn network(&self) -> Vec<NetworkBookmark> {
+        let mut seen: Vec<NetworkBookmark> = Vec::new();
+        for bookmark in self.lines.iter().filter_map(|line| line.network.as_ref()) {
+            if !seen.iter().any(|known| known.uri == bookmark.uri) {
+                seen.push(bookmark.clone());
+            }
+        }
+        seen
+    }
+
+    /// Drops every line of the network bookmark `uri`; whether any went.
+    fn drop_network(&mut self, uri: &ServerUri) -> bool {
+        let before = self.lines.len();
+        self.lines.retain(|line| {
+            line.network
+                .as_ref()
+                .is_none_or(|bookmark| bookmark.uri != *uri)
+        });
+        self.lines.len() != before
     }
 
     fn contains(&self, folder: &Path) -> bool {
@@ -211,6 +267,7 @@ impl BookmarkFile {
                 path: folder.to_path_buf(),
                 label: None,
             }),
+            network: None,
         });
         true
     }
@@ -265,6 +322,26 @@ fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
 /// Any other I/O failure.
 pub fn read(path: &Path) -> io::Result<Vec<Bookmark>> {
     Ok(parse(&read_bytes(path)?).favorites())
+}
+
+/// The network bookmarks the file at `path` holds; a missing file holds none.
+///
+/// # Errors
+///
+/// Any other I/O failure.
+pub fn read_network(path: &Path) -> io::Result<Vec<NetworkBookmark>> {
+    Ok(parse(&read_bytes(path)?).network())
+}
+
+/// The favorites and the network bookmarks of the file at `path`, from one
+/// read.
+///
+/// # Errors
+///
+/// Any I/O failure other than a missing file.
+pub fn read_all(path: &Path) -> io::Result<(Vec<Bookmark>, Vec<NetworkBookmark>)> {
+    let file = parse(&read_bytes(path)?);
+    Ok((file.favorites(), file.network()))
 }
 
 /// How many times a change starts over on fresh content before giving up.
@@ -350,6 +427,17 @@ pub fn add_observed(
 /// Any I/O failure; the file is left as it was.
 pub fn remove(path: &Path, folder: &Path) -> io::Result<bool> {
     update(path, &mut || {}, |file| file.drop_folder(folder))
+}
+
+/// Removes every line of the network bookmark `uri`; `false` when there was
+/// none (and nothing is written, nothing created). Other lines stay byte for
+/// byte.
+///
+/// # Errors
+///
+/// Any I/O failure; the file is left as it was.
+pub fn remove_network(path: &Path, uri: &ServerUri) -> io::Result<bool> {
+    update(path, &mut || {}, |file| file.drop_network(uri))
 }
 
 /// Appends the `folders` that are not bookmarks yet, in order; returns how

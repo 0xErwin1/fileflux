@@ -1367,6 +1367,12 @@ pub(crate) enum MenuCommand {
     MakeLink,
     /// Links: symbolic links to the clipboard's entries in a folder.
     PasteAsLink,
+    /// Network: ask for a server address and connect to it.
+    ConnectToServer,
+    /// Network bookmarks: connect (when not mounted) and open.
+    ConnectBookmark,
+    /// Network bookmarks: delete the bookmark from the GTK bookmarks file.
+    RemoveBookmark,
     /// Devices: unmount the mounted filesystem.
     Unmount,
     /// Devices: unmount every partition of the disk and power it off.
@@ -1828,6 +1834,17 @@ pub(crate) enum DialogKind {
     Archive { extract: bool },
     /// "Select items matching…": a glob pattern.
     SelectPattern,
+    /// "Connect to Server…": a server address.
+    Connect,
+    /// A prompt of `gio mount` for the server called `host`: the question
+    /// `label` asks, whether the answer is a masked secret, and whether it
+    /// is a question with choices (answered by its own buttons).
+    MountPrompt {
+        host: String,
+        label: String,
+        secret: bool,
+        question: bool,
+    },
     /// Running operations use the device that is about to be unmounted or
     /// ejected; `count` of them, the device is called `label`.
     DeviceBusy {
@@ -1859,6 +1876,10 @@ pub(crate) enum DialogAction {
     Archive(super::archive::ArchiveDialog),
     /// The "Select items matching…" dialog: its field.
     SelectPattern(super::selection::SelectDialog),
+    /// The "Connect to Server…" dialog: its field.
+    Connect(super::network::ConnectDialog),
+    /// A prompt of `gio mount`: what it asks and the field for the answer.
+    MountPrompt(super::network::PromptDialog),
 }
 
 /// The "Open with…" chooser. Its rows are the applications for `mime` and
@@ -2091,7 +2112,9 @@ impl DialogState {
         match self.kind {
             DialogKind::OpenWith { .. }
             | DialogKind::Archive { .. }
-            | DialogKind::SelectPattern => DialogChoice::Confirm,
+            | DialogKind::SelectPattern
+            | DialogKind::Connect
+            | DialogKind::MountPrompt { .. } => DialogChoice::Confirm,
             DialogKind::Conflict { .. } => CONFLICT_DEFAULT,
             _ => DIALOG_DEFAULT,
         }
@@ -2210,6 +2233,20 @@ impl DialogQueue {
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
         self.waiting.len()
+    }
+
+    /// Drops every prompt of `gio mount` (the attempt ended, nobody is
+    /// waiting for an answer any more). Returns whether the open dialog
+    /// changed.
+    pub(crate) fn discard_mount_prompts(&mut self, now: Instant) -> bool {
+        let is_prompt =
+            |dialog: &DialogState| matches!(dialog.action, DialogAction::MountPrompt(_));
+        self.waiting.retain(|dialog| !is_prompt(dialog));
+        let open_is_it = self.current().is_some_and(is_prompt);
+        if open_is_it {
+            self.close_at(now);
+        }
+        open_is_it
     }
 
     /// Closes the open dialog, returns it, and opens the next in line.
@@ -2379,6 +2416,27 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
                 .to_owned(),
             "Select",
         ),
+        DialogKind::Connect => (
+            "Connect to Server".to_owned(),
+            "Type the address: sftp://, smb://, ftp://, ftps://, dav:// or davs://. \
+             Leave the password out: it is asked for next, and never saved."
+                .to_owned(),
+            "Connect",
+        ),
+        DialogKind::MountPrompt {
+            host,
+            label,
+            question,
+            ..
+        } => (
+            format!("Connect to {host}"),
+            if *question {
+                "Choose how to continue. Cancel stops connecting.".to_owned()
+            } else {
+                format!("{label} is needed to connect. Cancel stops connecting.")
+            },
+            "Continue",
+        ),
         DialogKind::DeviceBusy {
             label,
             count,
@@ -2423,7 +2481,9 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         // Every application is a row of its own: none is folded away.
         DialogKind::OpenWith { .. } => names.to_vec(),
         // The field says what the dialog is about.
-        DialogKind::Archive { .. } | DialogKind::SelectPattern => Vec::new(),
+        DialogKind::Archive { .. } | DialogKind::SelectPattern | DialogKind::Connect => Vec::new(),
+        // The lines gio printed before asking, as they are.
+        DialogKind::MountPrompt { .. } => names.to_vec(),
         _ => listed(names),
     };
     DialogText {

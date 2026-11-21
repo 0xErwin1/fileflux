@@ -20,6 +20,7 @@ pub mod kinds;
 pub mod links;
 pub mod mimes;
 pub mod navigation;
+pub mod network;
 pub mod ops;
 pub mod perms;
 pub mod places;

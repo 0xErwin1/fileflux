@@ -12,6 +12,7 @@ pub(crate) mod favorites;
 pub(crate) mod inspector;
 pub(crate) mod links;
 pub(crate) mod menu_tree;
+pub(crate) mod network;
 pub(crate) mod ops;
 pub(crate) mod overlay;
 pub(crate) mod panes;
