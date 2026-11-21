@@ -195,14 +195,15 @@ pub fn in_center(radius: f32) -> bool {
     radius < CENTER_HOLE
 }
 
-/// The colour of a segment as hue (0 to 1), saturation and lightness: a
-/// golden-angle hue per top-level branch, darker per ring.
+/// The colour of a segment as hue (0 to 1), saturation and lightness: the
+/// design's blues, stepped per top-level branch and darker per ring, so the
+/// chart reads as one family instead of a colour wheel.
 #[must_use]
 pub fn color(branch: usize, depth: u32) -> (f32, f32, f32) {
-    const GOLDEN_ANGLE: f32 = 137.507_77;
-    let hue = (branch as f32 * GOLDEN_ANGLE).rem_euclid(360.0) / 360.0;
-    let lightness = (0.55 - depth.saturating_sub(1) as f32 * 0.07).max(0.28);
-    (hue, 0.55, lightness)
+    let step = (branch % 4) as f32;
+    let hue = (0.600 + step * 0.006).rem_euclid(1.0);
+    let lightness = (0.66 - step * 0.07 - depth.saturating_sub(1) as f32 * 0.05).clamp(0.28, 0.70);
+    (hue, 0.78, lightness)
 }
 
 /// One ring for the chart shown while the analysis runs: the shares measured

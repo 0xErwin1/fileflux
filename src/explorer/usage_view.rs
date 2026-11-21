@@ -33,7 +33,14 @@ const CHART_SIZE: f32 = 340.0;
 /// The height of one list row.
 const ROW_HEIGHT: f32 = 28.0;
 /// The width of a row's proportional bar.
-const BAR_WIDTH: f32 = 120.0;
+const BAR_WIDTH: f32 = 170.0;
+/// The width of the size-on-disk column; wide enough for "999.9 GB".
+const SIZE_WIDTH: f32 = 96.0;
+/// The width of the items column.
+const ITEMS_WIDTH: f32 = 84.0;
+/// The two leading cells of a row: the chevron and the glyph.
+const LEAD_WIDTH: f32 = 16.0;
+const GLYPH_WIDTH: f32 = 14.0;
 
 fn hsla((h, s, l): (f32, f32, f32)) -> Hsla {
     Hsla { h, s, l, a: 1.0 }
@@ -689,6 +696,7 @@ fn list_panel(
         .flex_1()
         .min_w_0()
         .min_h_0()
+        .overflow_hidden()
         .flex()
         .flex_col();
     if rows.is_empty() {
@@ -717,8 +725,8 @@ fn list_panel(
             .border_b_1()
             .border_color(colors.line)
             .text_color(colors.muted)
-            .child(div().flex_none().w(px(16.0)))
-            .child(div().flex_none().w(px(14.0)))
+            .child(div().flex_none().w(px(LEAD_WIDTH)))
+            .child(div().flex_none().w(px(GLYPH_WIDTH)))
             .child(div().flex_1().min_w_0().truncate().child("Name"))
             .child(div().flex_none().w(px(BAR_WIDTH)).child("Share"))
             .child(
@@ -784,7 +792,7 @@ fn render_row(
                 format!("explorer-usage-chevron-{}", path.to_string_lossy()).into(),
             ))
             .flex_none()
-            .w(px(16.0))
+            .w(px(LEAD_WIDTH))
             .flex()
             .items_center()
             .justify_center()
@@ -811,7 +819,7 @@ fn render_row(
                 format!("explorer-usage-spacer-{}", path.to_string_lossy()).into(),
             ))
             .flex_none()
-            .w(px(16.0))
+            .w(px(LEAD_WIDTH))
     };
     let mut name = row.name.clone();
     if row.incomplete {
@@ -867,7 +875,8 @@ fn render_row(
         .child(
             div()
                 .flex_none()
-                .w(px(72.0))
+                .w(px(SIZE_WIDTH))
+                .whitespace_nowrap()
                 .text_right()
                 .text_color(colors.strong)
                 .child(format_bytes(row.bytes)),
@@ -875,7 +884,8 @@ fn render_row(
         .child(
             div()
                 .flex_none()
-                .w(px(84.0))
+                .w(px(ITEMS_WIDTH))
+                .whitespace_nowrap()
                 .text_right()
                 .text_color(colors.muted)
                 .child(match row.kind {

@@ -4060,7 +4060,15 @@ impl Explorer {
             .h_full()
             .children(tabstrip::render(self, cx))
             .child(toolbar::render(self, cx))
-            .child(self.render_subbar(cx))
+            .child(
+                if matches!(self.tab().state.current(), Location::Usage { .. }) {
+                    // The usage view carries its own header (title, trail, Stop);
+                    // sorting and filtering a measured tree means nothing.
+                    div().into_any_element()
+                } else {
+                    self.render_subbar(cx).into_any_element()
+                },
+            )
             .children(self.render_scope_line(cx))
             .child(
                 div()
