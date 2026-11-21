@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use bolt::controls::Button;
 use bolt::tokens::Spacing;
+use fileflux::core::pause::PauseGate;
 use fileflux::core::places::format_bytes;
 use gpui::{
     AnyElement, App, InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _,
@@ -54,12 +55,14 @@ pub(crate) struct ProgressState {
     pub(crate) unit: Unit,
 }
 
-/// The worker's side of an operation: shared progress and the cancel flag.
-/// Clones share both, so the UI keeps one clone to read and to cancel.
+/// The worker's side of an operation: shared progress, the cancel flag and
+/// the pause gate. Clones share all three, so the UI keeps one clone to
+/// read, to pause and to cancel.
 #[derive(Clone, Debug)]
 pub(crate) struct Sink {
     state: Arc<Mutex<ProgressState>>,
     cancel: Arc<AtomicBool>,
+    pause: Arc<PauseGate>,
 }
 
 impl Sink {
@@ -70,6 +73,7 @@ impl Sink {
                 ..ProgressState::default()
             })),
             cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(PauseGate::default()),
         }
     }
 
@@ -99,6 +103,26 @@ impl Sink {
     /// Asks the worker to stop before its next item.
     pub(crate) fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        // A paused worker is blocked in the gate: release it to see the flag.
+        self.pause.wake();
+    }
+
+    /// Asks the worker to block at its next chunk or item.
+    pub(crate) fn pause(&self) {
+        self.pause.pause();
+    }
+
+    pub(crate) fn resume(&self) {
+        self.pause.resume();
+    }
+
+    pub(crate) fn paused(&self) -> bool {
+        self.pause.is_paused()
+    }
+
+    /// The gate itself, for core operations that wait on it between chunks.
+    pub(crate) fn pause_gate(&self) -> &PauseGate {
+        &self.pause
     }
 
     pub(crate) fn cancelled(&self) -> bool {
@@ -109,6 +133,25 @@ impl Sink {
     pub(crate) fn cancel_flag(&self) -> &AtomicBool {
         &self.cancel
     }
+}
+
+/// Whether an operation of this kind has a pause control. Only byte
+/// transfers do: their loop checks the gate between chunks and items, and a
+/// pause there leaves exactly what a cancel cleans up. Item jobs and archive
+/// tools poll a bare cancel flag (or run an external program), so their
+/// card hides the button.
+pub(crate) fn pausable(unit: Unit) -> bool {
+    unit == Unit::Bytes
+}
+
+/// The pause button's text.
+pub(crate) fn pause_label(paused: bool) -> &'static str {
+    if paused { "Resume" } else { "Pause" }
+}
+
+/// The word that replaces speed and ETA on the card, if any.
+pub(crate) fn status_word(paused: bool, cancelling: bool) -> Option<&'static str> {
+    (paused && !cancelling).then_some("Paused")
 }
 
 /// Whether an operation that has run for `elapsed` shows its card.
@@ -177,6 +220,10 @@ pub(crate) struct ActiveOp {
     pub(crate) started: Instant,
     pub(crate) sink: Sink,
     pub(crate) cancellable: bool,
+    /// Time spent paused before the current pause, if any.
+    paused_for: Duration,
+    /// When the current pause began.
+    paused_since: Option<Instant>,
     /// Repaints the card while the operation runs; dropping it stops it.
     ticker: Option<Task<()>>,
 }
@@ -184,6 +231,16 @@ pub(crate) struct ActiveOp {
 impl ActiveOp {
     pub(crate) fn elapsed(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.started)
+    }
+
+    /// [`elapsed`](Self::elapsed) without the time spent paused: what speed
+    /// and ETA are computed from.
+    pub(crate) fn active_elapsed(&self, now: Instant) -> Duration {
+        let current = self
+            .paused_since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        self.elapsed(now)
+            .saturating_sub(self.paused_for.saturating_add(current))
     }
 }
 
@@ -211,6 +268,8 @@ impl Registry {
             started: Instant::now(),
             sink: sink.clone(),
             cancellable,
+            paused_for: Duration::ZERO,
+            paused_since: None,
             ticker: None,
         });
         (self.next_id, sink)
@@ -247,6 +306,35 @@ impl Registry {
         }
     }
 
+    /// Pauses a running, pausable operation. `false` when there is nothing
+    /// to pause (unknown id, not a byte transfer, already paused).
+    pub(crate) fn pause(&mut self, id: u64, now: Instant) -> bool {
+        let Some(op) = self.ops.iter_mut().find(|op| op.id == id) else {
+            return false;
+        };
+        if !pausable(op.sink.snapshot().unit) || op.paused_since.is_some() {
+            return false;
+        }
+        op.paused_since = Some(now);
+        op.sink.pause();
+        true
+    }
+
+    /// Resumes a paused operation. `false` when it was not paused.
+    pub(crate) fn resume(&mut self, id: u64, now: Instant) -> bool {
+        let Some(op) = self.ops.iter_mut().find(|op| op.id == id) else {
+            return false;
+        };
+        let Some(since) = op.paused_since.take() else {
+            return false;
+        };
+        op.paused_for = op
+            .paused_for
+            .saturating_add(now.saturating_duration_since(since));
+        op.sink.resume();
+        true
+    }
+
     /// The operations whose card is showing, oldest first.
     pub(crate) fn visible(&self, now: Instant) -> impl Iterator<Item = &ActiveOp> {
         self.ops
@@ -260,8 +348,9 @@ impl Registry {
         let first = visible.next()?;
         let more = visible.count();
         Some(if more == 0 {
+            let paused = if first.sink.paused() { " (paused)" } else { "" };
             format!(
-                "{} \u{b7} {}",
+                "{} \u{b7} {}{paused}",
                 first.title,
                 describe(&first.sink.snapshot())
             )
@@ -304,12 +393,20 @@ fn render_card(op: &ActiveOp, now: Instant, weak: &WeakEntity<Explorer>, cx: &Ap
     let colors = bolt::colors(cx);
     let tint = bolt::tokens::ChromeColors::tint(gpui_component::ActiveTheme::theme(cx));
     let state = op.sink.snapshot();
-    let elapsed = op.elapsed(now);
+    let elapsed = op.active_elapsed(now);
     let cancelling = op.sink.cancelled();
+    let paused = op.sink.paused();
     let bar = fraction(&state);
     let mut meta = vec![describe(&state)];
-    meta.extend(speed_label(&state, elapsed));
-    meta.extend(eta_label(&state, elapsed));
+    match status_word(paused, cancelling) {
+        Some(word) => meta.push(word.to_owned()),
+        None => {
+            meta.extend(speed_label(&state, elapsed));
+            meta.extend(eta_label(&state, elapsed));
+        }
+    }
+    let show_pause = pausable(state.unit) && op.cancellable;
+    let pause_weak = weak.clone();
     let id = op.id;
     let weak = weak.clone();
 
@@ -353,6 +450,20 @@ fn render_card(op: &ActiveOp, now: Instant, weak: &WeakEntity<Explorer>, cx: &Ap
                             op.title.clone()
                         }),
                 )
+                .when(show_pause, |row| {
+                    row.child(
+                        Button::new(("explorer-progress-pause", id), pause_label(paused))
+                            .ghost()
+                            .disabled(cancelling)
+                            .on_click(move |_event, _window, cx| {
+                                if let Err(error) = pause_weak.update(cx, |this, cx| {
+                                    this.toggle_pause_operation(id, cx);
+                                }) {
+                                    log::debug!("the card outlived its explorer: {error}");
+                                }
+                            }),
+                    )
+                })
                 .when(op.cancellable, |row| {
                     row.child(
                         Button::new(("explorer-progress-cancel", id), "Cancel")

@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use rustix::io::Errno;
 
+use super::pause::PauseGate;
 use super::places::FuseRoots;
 
 /// Longest file name the filesystems we target accept, in bytes.
@@ -450,7 +451,34 @@ pub fn transfer(
     progress: impl FnMut(Progress),
     cancel: &AtomicBool,
 ) -> TransferReport {
-    transfer_on(sources, dest_dir, mode, conflict, progress, cancel, &System)
+    transfer_pausable(
+        sources,
+        dest_dir,
+        mode,
+        conflict,
+        progress,
+        cancel,
+        &PauseGate::default(),
+    )
+}
+
+/// [`transfer`] that blocks at every cancel check (between items and every
+/// chunk) while `pause` is closed. A pause never interrupts a write: what
+/// the transfer has created stays what a cancel would clean up, a cancel
+/// while paused ends it the normal way once `pause` is woken, and a move's
+/// source is never removed while paused.
+pub fn transfer_pausable(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mode: Mode,
+    conflict: impl FnMut(&Path) -> Conflict,
+    progress: impl FnMut(Progress),
+    cancel: &AtomicBool,
+    pause: &PauseGate,
+) -> TransferReport {
+    transfer_gated(
+        sources, dest_dir, mode, conflict, progress, cancel, &System, pause,
+    )
 }
 
 /// `transfer` with the move's first `rename` attempt injectable, so the
@@ -477,7 +505,31 @@ fn transfer_with(
 }
 
 /// `transfer` over an injectable filesystem [`Backend`].
+#[cfg(test)]
 fn transfer_on(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mode: Mode,
+    conflict: impl FnMut(&Path) -> Conflict,
+    progress: impl FnMut(Progress),
+    cancel: &AtomicBool,
+    backend: &dyn Backend,
+) -> TransferReport {
+    transfer_gated(
+        sources,
+        dest_dir,
+        mode,
+        conflict,
+        progress,
+        cancel,
+        backend,
+        &PauseGate::default(),
+    )
+}
+
+/// [`transfer_on`] with a pause gate.
+#[allow(clippy::too_many_arguments)]
+fn transfer_gated(
     sources: &[PathBuf],
     dest_dir: &Path,
     mode: Mode,
@@ -485,12 +537,14 @@ fn transfer_on(
     mut progress: impl FnMut(Progress),
     cancel: &AtomicBool,
     backend: &dyn Backend,
+    pause: &PauseGate,
 ) -> TransferReport {
     let sizes: Vec<u64> = sources.iter().map(|source| tree_size(source)).collect();
     let mut ctx = Ctx {
         backend,
         progress: &mut progress,
         cancel,
+        pause,
         total: sizes.iter().sum(),
         done: 0,
         current: PathBuf::new(),
@@ -504,6 +558,7 @@ fn transfer_on(
     };
     let mut report = TransferReport::default();
     for (source, size) in sources.iter().zip(sizes) {
+        pause.wait_while_paused(cancel);
         let outcome = if report.cancelled || cancel.load(Ordering::Relaxed) {
             ItemOutcome::Failed(TransferError::Cancelled)
         } else {
@@ -638,6 +693,7 @@ struct Ctx<'a> {
     backend: &'a dyn Backend,
     progress: &'a mut dyn FnMut(Progress),
     cancel: &'a AtomicBool,
+    pause: &'a PauseGate,
     total: u64,
     done: u64,
     current: PathBuf,
@@ -776,7 +832,10 @@ impl Ctx<'_> {
         });
     }
 
+    /// The checkpoint between items and chunks: waits out a pause, then
+    /// reports a cancel (also one that arrived while paused).
     fn check_cancel(&self) -> Result<(), TransferError> {
+        self.pause.wait_while_paused(self.cancel);
         if self.cancel.load(Ordering::Relaxed) {
             Err(TransferError::Cancelled)
         } else {
@@ -962,6 +1021,9 @@ impl Ctx<'_> {
             self.copy_direct(src, target)?;
         }
         let leftover = if mode == Mode::Move {
+            // The copy is complete; a pause that arrived since holds the
+            // source back, never deleted while paused.
+            self.pause.wait_while_paused(self.cancel);
             remove_all(src).err()
         } else {
             None
@@ -1965,6 +2027,145 @@ mod tests {
         assert!(report.cancelled);
         assert!(names(&dest)?.is_empty());
         assert_eq!(fs::metadata(&src)?.len(), 3 * 1024 * 1024);
+        Ok(())
+    }
+
+    // ---- pause / resume ----
+
+    /// Runs a cross-device move or a copy of `src` that pauses itself after
+    /// the first chunk, checks the worker really stands still, then lets
+    /// `after_pause` decide (resume or cancel). Returns the report and how
+    /// many progress reports arrived while paused.
+    fn paused_transfer(
+        scratch: &Scratch,
+        src: &Path,
+        mode: Mode,
+        after_pause: impl FnOnce(&PauseGate, &AtomicBool, &Path) -> TestResult,
+    ) -> Result<(TransferReport, usize), Box<dyn Error>> {
+        let dest = scratch.dir("dest")?;
+        let gate = PauseGate::default();
+        let cancel = AtomicBool::new(false);
+        let reports = std::sync::atomic::AtomicUsize::new(0);
+        let tripped = AtomicBool::new(false);
+        let report = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+            let worker = scope.spawn(|| {
+                transfer_gated(
+                    std::slice::from_ref(&src.to_path_buf()),
+                    &dest,
+                    mode,
+                    no_conflict,
+                    |progress| {
+                        reports.fetch_add(1, Ordering::SeqCst);
+                        if progress.bytes_done > 0 && !tripped.swap(true, Ordering::SeqCst) {
+                            gate.pause();
+                        }
+                    },
+                    &cancel,
+                    &MoveVia(&xdev),
+                    &gate,
+                )
+            });
+            while !tripped.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            let at_pause = reports.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                reports.load(Ordering::SeqCst),
+                at_pause,
+                "worker stood still"
+            );
+            assert!(!worker.is_finished(), "worker is blocked, not done");
+            after_pause(&gate, &cancel, &dest)?;
+            let report = worker.join().map_err(|_| "worker panicked")?;
+            Ok((report, at_pause))
+        })?;
+        Ok((report.0, report.1))
+    }
+
+    #[test]
+    fn a_copy_paused_midway_and_resumed_is_byte_identical() -> TestResult {
+        let scratch = Scratch::new("pause-copy")?;
+        let src = scratch.path("big.bin");
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &bytes)?;
+        let (report, _) = paused_transfer(&scratch, &src, Mode::Copy, |gate, _, dest| {
+            // Paused mid-file: only a hidden partial exists, never the real name.
+            assert!(!names(dest)?.iter().any(|name| name == "big.bin"));
+            assert_eq!(names(dest)?.len(), 1, "one partial copy");
+            gate.resume();
+            Ok(())
+        })?;
+        assert!(!report.cancelled);
+        assert!(matches!(
+            report.items.first().map(|item| &item.outcome),
+            Some(ItemOutcome::Ok { .. })
+        ));
+        assert_eq!(fs::read(scratch.path("dest/big.bin"))?, bytes);
+        assert_eq!(names(&scratch.path("dest"))?, ["big.bin"]);
+        assert_eq!(fs::read(&src)?, bytes, "source untouched");
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_a_paused_copy_leaves_no_partial_file() -> TestResult {
+        let scratch = Scratch::new("pause-cancel")?;
+        let src = scratch.path("big.bin");
+        fs::write(&src, vec![7u8; 3 * 1024 * 1024])?;
+        let (report, _) = paused_transfer(&scratch, &src, Mode::Copy, |gate, cancel, _| {
+            cancel.store(true, Ordering::Relaxed);
+            gate.wake();
+            Ok(())
+        })?;
+        assert!(report.cancelled);
+        assert!(matches!(
+            report.items.first().map(|item| &item.outcome),
+            Some(ItemOutcome::Failed(TransferError::Cancelled))
+        ));
+        assert!(names(&scratch.path("dest"))?.is_empty(), "no half file");
+        assert_eq!(fs::metadata(&src)?.len(), 3 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cross_device_move_never_removes_its_source_while_paused() -> TestResult {
+        let scratch = Scratch::new("pause-move")?;
+        let src = scratch.path("big.bin");
+        let bytes = vec![9u8; 3 * 1024 * 1024];
+        fs::write(&src, &bytes)?;
+        let (report, _) = paused_transfer(&scratch, &src, Mode::Move, |gate, _, _| {
+            assert!(src.exists(), "source stays while the copy is paused");
+            gate.resume();
+            Ok(())
+        })?;
+        assert!(matches!(
+            report.items.first().map(|item| &item.outcome),
+            Some(ItemOutcome::Ok { .. })
+        ));
+        assert!(!src.exists(), "removed only after the finished copy");
+        assert_eq!(fs::read(scratch.path("dest/big.bin"))?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn a_transfer_without_a_pause_gate_still_runs() -> TestResult {
+        let scratch = Scratch::new("no-pause")?;
+        let dest = scratch.dir("dest")?;
+        let src = scratch.path("a.txt");
+        fs::write(&src, b"a")?;
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dest,
+            Mode::Copy,
+            no_conflict,
+            |_| {},
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            report.items.first().map(|item| &item.outcome),
+            Some(ItemOutcome::Ok { .. })
+        ));
         Ok(())
     }
 

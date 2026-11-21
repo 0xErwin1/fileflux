@@ -22,6 +22,7 @@ pub mod mimes;
 pub mod navigation;
 pub mod network;
 pub mod ops;
+pub mod pause;
 pub mod perms;
 pub mod places;
 pub mod recent;

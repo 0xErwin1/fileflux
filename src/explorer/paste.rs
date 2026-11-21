@@ -454,7 +454,7 @@ pub(crate) fn run_paste(job: PasteJob, sink: &Sink) -> Report {
         }
         choice
     };
-    let transferred = core_ops::transfer(
+    let transferred = core_ops::transfer_pausable(
         &sources,
         &dest,
         mode.transfer_mode(),
@@ -468,6 +468,7 @@ pub(crate) fn run_paste(job: PasteJob, sink: &Sink) -> Report {
             sink.advance(progress.bytes_done, &name);
         },
         sink.cancel_flag(),
+        sink.pause_gate(),
     );
 
     let (notice, details) = transfer_summary(mode, &dest, &transferred, &replaced);

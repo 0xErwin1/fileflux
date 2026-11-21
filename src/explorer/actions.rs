@@ -274,6 +274,16 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Pauses a running copy or move, or resumes a paused one (the card's
+    /// Pause/Resume button). Jobs without a pause control ignore it.
+    pub(crate) fn toggle_pause_operation(&mut self, id: u64, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if !self.progress.pause(id, now) {
+            self.progress.resume(id, now);
+        }
+        cx.notify();
+    }
+
     /// Applies a finished job: undo entry, toast, confirmation for what
     /// had no Trash, selection, and a re-read of the shown location.
     fn finish_job(
