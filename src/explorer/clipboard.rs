@@ -131,6 +131,8 @@ impl Explorer {
                 "Can't paste into Recent. Open a folder to paste into"
             } else if matches!(self.tab().state.current(), Location::Search { .. }) {
                 "Can't paste into search results. Open a folder to paste into"
+            } else if matches!(self.tab().state.current(), Location::Usage { .. }) {
+                "Can't paste into disk usage. Open a folder to paste into"
             } else {
                 "Can't paste into the Trash. Restore items instead"
             };

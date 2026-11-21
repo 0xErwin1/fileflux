@@ -706,7 +706,7 @@ fn row_shell(
                 Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
                 Location::Trash => Some(DropTarget::Trash),
                 // Nothing is dropped into the list of recent files.
-                Location::Recent | Location::Search { .. } => None,
+                Location::Recent | Location::Search { .. } | Location::Usage { .. } => None,
             };
             match target {
                 Some(target) => dnd::drop_target(row, target, &cx.entity().downgrade(), cx),

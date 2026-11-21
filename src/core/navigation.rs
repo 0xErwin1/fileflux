@@ -91,11 +91,12 @@ impl Navigation {
     /// Returns `false` without changing state in [`Location::Trash`] or
     /// [`Location::Recent`], at the
     /// filesystem root, or when the parent resolves to the current location.
-    /// A [`Location::Search`] goes up to the folder it searches.
+    /// A [`Location::Search`] or [`Location::Usage`] goes up to the folder it
+    /// searches or measures.
     pub fn up(&mut self) -> bool {
         let parent = match &self.current {
             Location::Directory(path) => path.parent().map(Path::to_path_buf),
-            Location::Search { root, .. } => Some(root.clone()),
+            Location::Search { root, .. } | Location::Usage { root } => Some(root.clone()),
             Location::Trash | Location::Recent => None,
         };
         let Some(parent) = parent else {
@@ -124,7 +125,7 @@ impl Navigation {
             Location::Directory(path) => path
                 .parent()
                 .is_some_and(|parent| Location::Directory(parent.to_path_buf()) != self.current),
-            Location::Search { .. } => true,
+            Location::Search { .. } | Location::Usage { .. } => true,
             Location::Trash | Location::Recent => false,
         }
     }

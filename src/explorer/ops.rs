@@ -291,7 +291,9 @@ pub(crate) fn inside_trash(path: &Path, root: &Path) -> bool {
 /// never done (`trash_root` is `None` while the trash is not known).
 pub(crate) fn refuses_entering(location: &Location, trash_root: Option<&Path>) -> bool {
     match (location, trash_root) {
-        (Location::Directory(path), Some(root)) => inside_trash(path, root),
+        (Location::Directory(path) | Location::Usage { root: path }, Some(root)) => {
+            inside_trash(path, root)
+        }
         _ => false,
     }
 }
@@ -339,6 +341,9 @@ pub(crate) struct Report {
     /// A permission or group change ran: the details panel reads the
     /// entries again.
     pub(crate) permissions_changed: bool,
+    /// Items that were removed (trashed or deleted for good): a disk usage
+    /// view subtracts their measured size.
+    pub(crate) removed: Vec<PathBuf>,
 }
 
 impl Report {
@@ -602,6 +607,7 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
     let mut items: Vec<TrashedEntry> = Vec::new();
     let mut needs_permanent = Vec::new();
     let mut details = Vec::new();
+    let mut removed: Vec<PathBuf> = Vec::new();
     let mut cancelled = false;
     for (index, path) in paths.iter().enumerate() {
         if sink.cancelled() {
@@ -627,7 +633,10 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
             })
         });
         match trashed {
-            Ok(entry) => items.push(entry),
+            Ok(entry) => {
+                removed.push(path.clone());
+                items.push(entry);
+            }
             Err(TrashError::NoTrash(_)) => needs_permanent.push(path.clone()),
             Err(error) => details.push(failure_line(path, error)),
         }
@@ -701,6 +710,7 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
     }
     Report {
         notice,
+        removed,
         undo: (!items.is_empty()).then_some(UndoAction::Trash { items }),
         needs_permanent,
         details,
@@ -759,7 +769,11 @@ fn delete_items(paths: &[PathBuf], sink: &Sink) -> Report {
     } else {
         format!("Deleted {}", plural_items(count))
     };
-    summarize(count, done, "delete", cancelled, details)
+    let removed = deleted.iter().map(|path| (*path).clone()).collect();
+    Report {
+        removed,
+        ..summarize(count, done, "delete", cancelled, details)
+    }
 }
 
 /// The shared summary of an item loop: what was done, what failed, and
@@ -1372,6 +1386,8 @@ pub(crate) enum MenuCommand {
     MakeLink,
     /// Links: symbolic links to the clipboard's entries in a folder.
     PasteAsLink,
+    /// Disk usage: analyze the single selected folder, or the shown one.
+    AnalyzeDiskUsage,
     /// Network: ask for a server address and connect to it.
     ConnectToServer,
     /// Network bookmarks: connect (when not mounted) and open.

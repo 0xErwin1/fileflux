@@ -177,7 +177,9 @@ pub fn presentation_for(
 ) -> FolderView {
     match location {
         Location::Directory(path) => memory.get(path).unwrap_or_else(|| current.clone()),
-        Location::Trash | Location::Recent | Location::Search { .. } => current.clone(),
+        Location::Trash | Location::Recent | Location::Search { .. } | Location::Usage { .. } => {
+            current.clone()
+        }
     }
 }
 

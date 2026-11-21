@@ -497,8 +497,14 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             &weak_for_drops,
             cx,
         ),
-        Location::Trash | Location::Recent | Location::Search { .. } => container,
+        Location::Trash | Location::Recent | Location::Search { .. } | Location::Usage { .. } => {
+            container
+        }
     };
+
+    if let Location::Usage { .. } = this.tab().state.current() {
+        return super::usage_view::render(this, cx);
+    }
 
     if this.tab().state.is_loading() && count == 0 {
         return container.justify_center().child(

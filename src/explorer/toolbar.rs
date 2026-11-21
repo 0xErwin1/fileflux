@@ -401,7 +401,10 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
         let target = crumb.target.clone();
         let drop = match &crumb.target {
             Location::Directory(path) => Some(DropTarget::Folder(path.clone())),
-            Location::Trash | Location::Recent | Location::Search { .. } => None,
+            Location::Trash
+            | Location::Recent
+            | Location::Search { .. }
+            | Location::Usage { .. } => None,
         };
         let mut segment = div()
             .id(("explorer-crumb", index))

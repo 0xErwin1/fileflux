@@ -33,6 +33,8 @@ pub(crate) mod templates;
 pub(crate) mod toasts;
 pub(crate) mod toolbar;
 pub(crate) mod typeahead;
+pub(crate) mod usage;
+pub(crate) mod usage_view;
 pub(crate) mod util;
 pub(crate) mod view;
 pub(crate) mod zoom;

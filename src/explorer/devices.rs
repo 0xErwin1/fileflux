@@ -635,7 +635,9 @@ impl DeviceHub {
 fn directory_of(location: &Location) -> Option<PathBuf> {
     match location {
         // A search reads the files under its root, so the root is "shown".
-        Location::Directory(path) | Location::Search { root: path, .. } => Some(path.clone()),
+        Location::Directory(path)
+        | Location::Search { root: path, .. }
+        | Location::Usage { root: path } => Some(path.clone()),
         Location::Trash | Location::Recent => None,
     }
 }

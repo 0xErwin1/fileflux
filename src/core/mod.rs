@@ -36,6 +36,8 @@ pub mod terminal;
 pub mod thumbnailers;
 pub mod thumbnails;
 pub mod trash;
+pub mod usage;
+pub mod usage_chart;
 pub mod watch;
 pub mod zoom;
 
@@ -54,14 +56,25 @@ pub enum Location {
         root: PathBuf,
         query: String,
     },
+    /// The disk usage of `root`: its children ranked by the space they
+    /// occupy, measured by [`usage`]. A view of measurements, not of
+    /// entries: nothing is created or pasted into it, and a saved session
+    /// reopens the folder `root` instead.
+    Usage {
+        root: PathBuf,
+    },
 }
 
 impl Location {
-    /// A list of files that live in other folders (Recent, search results):
-    /// each entry shows its folder, and nothing is created or pasted here.
+    /// A view that is not the entries of one folder (Recent, search results,
+    /// disk usage): nothing is created or pasted here. Recent and search
+    /// results also show each entry's folder.
     #[must_use]
     pub fn lists_files_from_elsewhere(&self) -> bool {
-        matches!(self, Self::Recent | Self::Search { .. })
+        matches!(
+            self,
+            Self::Recent | Self::Search { .. } | Self::Usage { .. }
+        )
     }
 }
 

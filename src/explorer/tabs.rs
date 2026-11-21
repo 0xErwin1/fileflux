@@ -269,6 +269,11 @@ pub(crate) fn tab_label(location: &Location, home: Option<&Path>) -> String {
         Location::Trash => "Trash".to_owned(),
         Location::Recent => "Recent".to_owned(),
         Location::Search { query, .. } => format!("Search: {query}"),
+        Location::Usage { root } => format!(
+            "Usage: {}",
+            root.file_name()
+                .map_or_else(|| root.to_string_lossy(), |name| name.to_string_lossy())
+        ),
         Location::Directory(path) if home == Some(path.as_path()) => "Home".to_owned(),
         Location::Directory(path) => path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
@@ -288,6 +293,7 @@ pub(crate) fn tab_tooltip(location: &Location, trash_root: Option<&Path>) -> Str
         Location::Search { root, query } => {
             format!("Search “{query}” in {}", root.to_string_lossy())
         }
+        Location::Usage { root } => format!("Disk usage of {}", root.to_string_lossy()),
         Location::Directory(path) => path.to_string_lossy().into_owned(),
     }
 }
@@ -352,6 +358,8 @@ impl Affected {
                 Location::Search { root, .. } => folders.iter().any(
                     |folder| matches!(folder, Location::Directory(path) if path.starts_with(root)),
                 ),
+                // A disk usage view is corrected by subtraction, not re-read.
+                Location::Usage { .. } => false,
                 _ => folders.contains(location),
             },
         }

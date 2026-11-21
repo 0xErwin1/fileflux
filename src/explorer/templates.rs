@@ -26,6 +26,7 @@ pub(crate) fn refusal(location: &Location) -> Option<&'static str> {
         Location::Search { .. } => {
             Some("Can't create files in search results. Open a folder first")
         }
+        Location::Usage { .. } => Some("Can't create files in disk usage. Open a folder first"),
     }
 }
 

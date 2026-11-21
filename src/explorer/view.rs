@@ -399,7 +399,7 @@ fn load_location(
             None => Ok(Listing::default()),
         },
         // The walk fills a search in afterwards (see `Explorer::start_walk`).
-        Location::Search { .. } => Ok(Listing::default()),
+        Location::Search { .. } | Location::Usage { .. } => Ok(Listing::default()),
         Location::Trash => match trash_root {
             Some(root) => fileflux::core::trash::read_trash(root),
             None => Err(io::Error::new(
@@ -478,6 +478,11 @@ pub(crate) struct Tab {
     deep_debounce: Option<Task<()>>,
     /// The running (or last) walk of this tab's search.
     walk: Option<SearchWalk>,
+    /// The disk usage analysis behind a [`Location::Usage`] (see
+    /// [`super::usage`]); `None` on any other location.
+    pub(crate) usage: Option<super::usage::UsageSession>,
+    /// The usage walk in flight; dropping it cancels the walk.
+    pub(crate) usage_run: Option<super::usage::UsageRun>,
     /// The details table's state entity: one per tab, so each tab keeps its
     /// own scroll offset; the delegate answers the tab's snapshot.
     pub(crate) table: Entity<TableState<EntryTableDelegate>>,
@@ -628,6 +633,8 @@ impl Tab {
             search_error: None,
             deep_debounce: None,
             walk: None,
+            usage: None,
+            usage_run: None,
             table,
             grid_scroll: UniformListScrollHandle::new(),
             scan_task: None,
@@ -1403,6 +1410,11 @@ impl Explorer {
             Location::Trash => "Home Trash".to_owned(),
             Location::Recent => "Recent".to_owned(),
             Location::Search { query, .. } => format!("Search \u{201c}{query}\u{201d}"),
+            Location::Usage { root } => format!(
+                "Disk usage of {}",
+                root.file_name()
+                    .map_or_else(|| root.to_string_lossy(), |name| name.to_string_lossy())
+            ),
             Location::Directory(path) => {
                 if self
                     .places
@@ -1429,6 +1441,8 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Scan> {
+        // Up inside a disk usage analysis goes to the parent folder's usage.
+        let transition = self.usage_up_transition(transition);
         // A folder in the Trash is not entered, whichever way it is reached
         // (opening it from the Trash view, the path bar, history): inside it
         // the normal folder menus and shortcuts would change trashed content
@@ -1674,6 +1688,9 @@ impl Explorer {
                     }
                 }
                 self.sync_search_input(id, window, cx);
+                // A disk usage view starts (or reuses) its analysis; any
+                // other location drops it, which cancels a walk.
+                self.sync_usage(id, cx);
                 // A search that just committed (empty) starts its walk.
                 let run = self
                     .tabs
@@ -1748,7 +1765,7 @@ impl Explorer {
             Location::Recent => recent_dir.clone(),
             // The Trash is not watched, nor are search results: a search
             // runs again after an operation instead.
-            Location::Trash | Location::Search { .. } => None,
+            Location::Trash | Location::Search { .. } | Location::Usage { .. } => None,
         };
         let target = tab
             .state
@@ -2518,7 +2535,10 @@ impl Explorer {
                 let scan = tab.state.begin_search(text);
                 self.start_scan_in(id, scan, window, cx);
             }
-            Location::Directory(_) | Location::Trash | Location::Recent => {}
+            Location::Directory(_)
+            | Location::Trash
+            | Location::Recent
+            | Location::Usage { .. } => {}
         }
     }
 
@@ -2986,6 +3006,9 @@ impl Explorer {
     pub(crate) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Enter belongs to the rename editor while it is open.
         if self.renaming.is_some() {
+            return;
+        }
+        if self.usage_open_selected(window, cx) {
             return;
         }
         // Displayed order; a link to a folder navigates like a folder.
@@ -3561,9 +3584,9 @@ impl SubmittedEdit {
 fn committed_path_text(location: &Location) -> String {
     match location {
         // The path field of a search holds the folder searched.
-        Location::Directory(path) | Location::Search { root: path, .. } => {
-            path.to_string_lossy().into_owned()
-        }
+        Location::Directory(path)
+        | Location::Search { root: path, .. }
+        | Location::Usage { root: path } => path.to_string_lossy().into_owned(),
         Location::Trash => "Trash".to_owned(),
         Location::Recent => "Recent".to_owned(),
     }
@@ -4060,6 +4083,11 @@ impl Explorer {
                     ""
                 }
             ))
+        } else if let Location::Usage { root } = self.tab().state.current() {
+            Some(format!(
+                "Space on disk under {}, largest first. Hard links count once; links and other drives are not entered. Freed space is an estimate: shared or snapshotted data may free less than it measures.",
+                root.to_string_lossy(),
+            ))
         } else if self.tab().state.current() == &Location::Recent {
             Some(
                 "Recent \u{2014} files other applications opened, newest first. Open containing folder shows where one lives."
@@ -4097,6 +4125,7 @@ impl Explorer {
     fn render_subbar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let colors = bolt::colors(cx);
         let meta = if self.tab().state.is_loading()
+            || self.usage().is_some()
             || (self.tab().state.search_status().searching
                 && self.tab().state.listing().entries.is_empty())
         {
@@ -4268,7 +4297,9 @@ impl Explorer {
     fn free_space_label(&self) -> Option<String> {
         let places = self.places.as_ref()?;
         let path = match self.tab().state.current() {
-            Location::Directory(path) | Location::Search { root: path, .. } => path.as_path(),
+            Location::Directory(path)
+            | Location::Search { root: path, .. }
+            | Location::Usage { root: path } => path.as_path(),
             Location::Trash => places.trash_root.as_path(),
             Location::Recent => return None,
         };
@@ -4312,6 +4343,10 @@ impl Explorer {
                 selected_kind.as_deref(),
             ),
         };
+        // A disk usage view reports its total instead of a listing count.
+        if let Some(session) = self.usage() {
+            count_text = session.status_text();
+        }
         // A single selected Trash entry keeps its recorded origin; a Recent
         // one, its folder.
         let origin_word = if self.in_trash() { "from" } else { "in" };

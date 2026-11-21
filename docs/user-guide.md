@@ -34,6 +34,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Thumbnails](#thumbnails)
 - [Image viewer](#image-viewer)
 - [Search in subfolders](#search-in-subfolders)
+- [Disk usage](#disk-usage)
 - [Recent files](#recent-files)
 - [Sidebar](#sidebar)
 - [Current scope](#current-scope)
@@ -475,6 +476,19 @@ The search box normally filters the folder you are in. The toggle next to it (a 
 - **Search file contents** (the document icon): a file is a result when its name matches **or** one of its lines does. Match case and Regular expression apply to the lines too; a pattern never spans lines. Results found by content look like any other result. Only regular files of at most 10 MiB are read; binary files (a NUL byte in the first 8 KiB) and symbolic links are skipped, invalid UTF-8 is read lossily, and a file stops being read at its first match. The 10,000-result cap, streaming, Escape and the filesystem boundary are the same as for names.
 
 The toggles apply to the subfolder search only; filtering the current folder (Ctrl+F) is always a case-insensitive name substring.
+
+## Disk usage
+
+**Analyze Disk Usage** shows where the space of a folder goes. Right-click the empty space of a folder, or a single selected folder, and choose it. A **Disk usage** view opens in the same tab: a ranked list on the right and a sunburst chart on the left, with the folder's total and item count in the status bar.
+
+- **The list** ranks the folder's children by their size on disk, largest first. Each row has an icon, the name, a bar for its share of the folder, the size, and the item count of a folder. A folder with a size that is only a lower bound reads "(incomplete)" after its name, because something below it could not be read. The chevron opens a folder in place, showing its children indented under it. A folder that holds more than 200 files lists its 200 largest and folds the rest into one "N other files" row; they still count in every total.
+- **The chart** draws rings: the first ring is the folder's children, the next ring the children of each of those, three rings in all. The angle of a slice is its share of its parent, and slices too thin to see are folded into one grey "Other" slice. Hover a slice for its name, size, share and item count. **Click a folder slice** to drill into it, **click the centre** to go up one folder, click a file slice to select it. The chart and the list share one selection.
+- **While it measures,** the rows fill in as each folder is counted and the status bar reads "Measuring… 12.4 GB in 80,000 items so far". The chart appears when the measuring ends. **Stop** ends the walk and keeps what was counted ("Stopped — … counted so far"); leaving the view cancels it too.
+- **Drilling down:** double-click a folder row (or press Enter on it, or click its slice) to see its own ranking. The whole tree was measured in one walk, so a folder inside the analysis opens instantly; the trail above the list goes back to any folder of it, and **Up** goes to the parent folder's usage (at the analysis root, to the folder itself). Double-clicking a file opens it as usual. **Analyze again** measures from scratch.
+- **Cleaning up:** right-click a row or a slice for **Open**, **Open containing folder**, **Copy path**, **Move to Trash** and **Delete permanently…**. They are the normal commands: Move to Trash needs no confirmation and can be undone from its toast or with Ctrl+Z; Delete permanently asks first and cannot be undone. Del and Shift+Del work on the selected row. After a removal the item leaves the totals of every folder above it (its measured size is subtracted) and the status bar reads "9.8 GB in 79,000 items **(estimate after cleanup)**". It is an estimate: with snapshots or shared blocks (btrfs reflinks) deleting a file may free less than its measured size, and an Undo or a paste is not added back: the line then says the numbers "may have changed since the analysis", and **Analyze again** measures them.
+- **What is counted:** allocated blocks, not the apparent size (a sparse file counts what it occupies); each hard-linked file once across the whole analysis, so only one name carries its bytes while the others still count as items; symbolic links never followed (a link counts its own few bytes); only the folder's own filesystem, so a mount below it is not entered. Folders that cannot be read are skipped and flagged incomplete.
+- **Read-only:** nothing can be created, pasted or dropped into the view, and it never changes anything by itself. The folder inside the Trash cannot be analyzed.
+- **Tabs and history:** Back and Forward step through the folders you drilled into. Its breadcrumb is the folder plus a "Disk usage" segment. **A disk usage tab is not saved in the session**: the tab comes back on the folder it measured.
 
 ## Recent files
 

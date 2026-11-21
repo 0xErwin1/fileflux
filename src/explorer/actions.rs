@@ -152,6 +152,10 @@ impl Explorer {
     /// Operations act on these only: a selection the filter hides is never
     /// trashed or deleted behind the user's back.
     pub(crate) fn selected_visible_paths(&self) -> Vec<PathBuf> {
+        // A disk usage view selects measured items, not listed entries.
+        if let Some(path) = self.usage_selected_path() {
+            return vec![path];
+        }
         self.tab()
             .state
             .visible_selected()
@@ -311,6 +315,11 @@ impl Explorer {
             self.offer_dialog(dialog, window, cx);
         }
         let context = self.op_contexts.remove(&id);
+        // The disk usage views correct their totals by what was removed.
+        self.usage_after_job(
+            &report.removed,
+            context.as_ref().map(|context| &context.affected),
+        );
         let origin = context.as_ref().map(|context| context.origin);
         if !report.select.is_empty()
             && let Some(tab) = origin.and_then(|origin| self.tabs.by_id_mut(origin))
@@ -1192,6 +1201,10 @@ impl Explorer {
             super::archive::add_rows(&mut rows, offer);
         }
         let in_folder = matches!(self.tab().state.current(), Location::Directory(_));
+        super::usage::add_analyze_row(
+            &mut rows,
+            super::usage::analyze_offer(in_folder, target.selected, target.folder_selected),
+        );
         if target.selected == 0
             && !target.in_trash
             && super::templates::refusal(self.tab().state.current()).is_none()
@@ -1562,6 +1575,17 @@ impl Explorer {
             | MenuCommand::Unlock
             | MenuCommand::Unmount
             | MenuCommand::Eject => {}
+            MenuCommand::AnalyzeDiskUsage => {
+                let folder =
+                    self.single_selected_folder()
+                        .or_else(|| match self.tab().state.current() {
+                            Location::Directory(folder) => Some(folder.clone()),
+                            _ => None,
+                        });
+                if let Some(folder) = folder {
+                    self.analyze_usage_of(folder, window, cx);
+                }
+            }
             MenuCommand::ConnectToServer => self.connect_to_server(window, cx),
             MenuCommand::ConnectBookmark | MenuCommand::RemoveBookmark => {}
             MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
@@ -2036,9 +2060,12 @@ impl Explorer {
         };
         let folder = match (folder, self.tab().state.current()) {
             (Some(folder), _) => folder,
-            (None, Location::Directory(folder) | Location::Search { root: folder, .. }) => {
-                folder.clone()
-            }
+            (
+                None,
+                Location::Directory(folder)
+                | Location::Search { root: folder, .. }
+                | Location::Usage { root: folder },
+            ) => folder.clone(),
             (None, Location::Trash | Location::Recent) => return,
         };
         let command = terminal.command(&folder);

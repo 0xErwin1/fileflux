@@ -92,6 +92,7 @@ pub(crate) fn refusal(location: &Location) -> Option<&'static str> {
         Location::Trash => Some("Can't make links in the Trash"),
         Location::Recent => Some("Can't make links in Recent. Open a folder first"),
         Location::Search { .. } => Some("Can't make links in search results. Open a folder first"),
+        Location::Usage { .. } => Some("Can't make links in disk usage. Open a folder first"),
     }
 }
 

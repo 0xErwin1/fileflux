@@ -181,7 +181,9 @@ pub(crate) fn session_tab(
         Location::Recent => settings::SessionTab::recent(view, arrangement),
         // A search is not restored: its tab comes back on the folder it
         // searched, with the box empty.
-        Location::Search { root, .. } => {
+        // Neither is a disk usage view: the tab comes back on the folder it
+        // measured.
+        Location::Search { root, .. } | Location::Usage { root } => {
             settings::SessionTab::directory(root.clone(), view, arrangement)
         }
     }

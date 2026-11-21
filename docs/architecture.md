@@ -40,6 +40,9 @@ One package, one library and one binary.
 | `apps` | "Open with…": `.desktop` discovery and `Exec=` parsing (no shell) |
 | `links` | Symbolic links: "Link to" naming, create-then-retry for a free name (never replaces), absolute targets |
 | `archive` | Compress and extract through `bsdtar` (no shell): suffix rules, member and symlink safety checks, temp-then-rename, cancel by killing the child |
+| `du` | The size of one folder: allocated blocks, each `(device, inode)` once, no symlink follow, one filesystem, an incomplete flag, a cancel flag and streamed running totals |
+| `usage` | The disk usage analyzer's model: one walk that measures every folder under a root (the `du` accounting rules, hard links once across the whole analysis), ranks children, finds a folder of the finished analysis for instant drill-down, and subtracts a removed item from its ancestors as an estimate; at most 200 files kept per folder, the rest folded into a bucket |
+| `usage_chart` | The sunburst geometry, pure: rings by depth, angle by share of the parent, thin slices folded into "Other", polar hit testing |
 | `images`, `kinds` | Which files are images; the file categories used by sort and filter |
 
 ### Explorer modules
@@ -48,6 +51,7 @@ One package, one library and one binary.
 |---|---|
 | State and arrangement | `state`, `entries`, `arrange`, `arrange_menu` |
 | Operations | `actions`, `ops`, `paste`, `clipboard`, `dnd`, `progress` |
+| Disk usage | `usage` (the session on a tab: ranking rows, drill-down reuse, the estimate after a cleanup, menus, the walk), `usage_view` (the chart and the list) |
 | Chrome | `view`, `toolbar`, `tabstrip`, `tabs`, `panes` (the two tab lists, focus, split layout and F5/Shift+F5 planning), `sidebar`, `table`, `inspector`, `permissions` (the details panel's permission and group editor), `overlay` |
 | Devices and persistence | `devices`, `persist`, `favorites` (the bookmarks watch), `toasts` (timeouts, stack limit, placement) |
 
@@ -59,6 +63,7 @@ The UI thread only draws and handles input. Everything that can block runs elsew
 |---|---|---|
 | Directory scans, Trash reads, places discovery | GPUI's background executor | A generation counter: a stale completion never overwrites a newer result |
 | Recursive search | A walk on the background executor, collected by the UI a few times a second | A cancel flag (`AtomicBool`) the walk checks before every entry, set when the search is replaced, stopped, or its tab navigates away or closes; a generation counter refuses the batches of a walk that is no longer the tab's |
+| Disk usage analysis | A walk of `core::usage` on the background executor, collected by the UI about every 150 ms | A cancel flag the walk checks before every entry, set when the tab leaves the view, a new walk replaces it, or Stop is pressed; the session ignores a walk that is no longer the tab's |
 | Arranging large folders (sort, filter, search) | Background executor jobs | The listing is indexed once. The previous order stays on screen and drives selection until the latest request completes; the latest change wins. Small folders are arranged in place |
 | Live refresh of folders | One shared watch thread (`WatchHub`): a dedicated thread blocked in `poll` on one inotify instance, not a worker of the executor | One watch per distinct folder however many tabs show it, released when the last tab leaves. Watches are identified by the kernel's watch descriptor, and replaced folders are re-watched |
 | Device refresh | One `DeviceWatcher` thread (`/dev`, `/dev/disk/by-id`, `/dev/bus/usb`, `/proc/self/mountinfo`, gvfs) | 300 ms of quiet before a re-read; at most one re-read in flight; a slow poll only when a watch cannot be established |

@@ -136,6 +136,17 @@ pub(crate) fn breadcrumbs(
             });
             return crumbs;
         }
+        Location::Usage { root } => {
+            // The folder measured, then the analysis as the last segment: a
+            // click on the folder leaves it.
+            let mut crumbs = breadcrumbs(&Location::Directory(root.clone()), home);
+            crumbs.push(Crumb {
+                label: "Disk usage".to_owned(),
+                kind: CrumbKind::Folder,
+                target: location.clone(),
+            });
+            return crumbs;
+        }
         Location::Directory(path) => path,
     };
     let (base, root_kind, rest) = match home.filter(|home| path.starts_with(home)) {

@@ -60,6 +60,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::ConnectToServer | MenuCommand::ConnectBookmark => IconName::Network,
         MenuCommand::RemoveBookmark => IconName::StarFill,
         MenuCommand::Unmount | MenuCommand::Eject => IconName::Eject,
+        MenuCommand::AnalyzeDiskUsage => IconName::ChartPie,
     })
 }
 

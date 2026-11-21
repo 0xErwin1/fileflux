@@ -83,10 +83,12 @@ pub(crate) fn add_rows(rows: &mut Vec<MenuRow>, group: Vec<MenuRow>, background:
 pub(crate) fn working_dir(shown: &Location, paths: &[PathBuf]) -> Option<PathBuf> {
     match shown {
         Location::Directory(folder) => Some(folder.clone()),
-        Location::Trash | Location::Recent | Location::Search { .. } => paths
-            .first()
-            .and_then(|path| path.parent())
-            .map(Path::to_path_buf),
+        Location::Trash | Location::Recent | Location::Search { .. } | Location::Usage { .. } => {
+            paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(Path::to_path_buf)
+        }
     }
 }
 

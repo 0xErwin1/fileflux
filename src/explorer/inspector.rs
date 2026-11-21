@@ -627,6 +627,7 @@ fn location_text(location: &Location) -> String {
         Location::Search { root, query } => {
             format!("Search “{query}” in {}", root.to_string_lossy())
         }
+        Location::Usage { root } => format!("Disk usage of {}", root.to_string_lossy()),
     }
 }
 

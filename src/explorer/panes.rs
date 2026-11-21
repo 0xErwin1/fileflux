@@ -478,6 +478,11 @@ pub(crate) fn plan_transfer(
                 "Can't {verb} into search results. Open a folder in the other pane first"
             ));
         }
+        Location::Usage { .. } => {
+            return Err(format!(
+                "Can't {verb} into disk usage. Open a folder in the other pane first"
+            ));
+        }
         Location::Trash => {
             return Err(format!(
                 "Can't {verb} into the Trash. Use Delete to trash items"

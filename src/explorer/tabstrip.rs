@@ -186,6 +186,7 @@ fn render_tab(
         Location::Recent => gpui_kit_assets::IconName::Clock,
         Location::Directory(_) => gpui_kit_assets::IconName::Folder,
         Location::Search { .. } => gpui_kit_assets::IconName::FolderSearch,
+        Location::Usage { .. } => gpui_kit_assets::IconName::ChartPie,
     };
     let close_group = group.clone();
     let weak = cx.weak_entity();

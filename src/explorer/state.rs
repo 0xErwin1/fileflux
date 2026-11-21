@@ -159,7 +159,10 @@ impl Favorites {
     pub(crate) fn contains(&self, location: &Location) -> bool {
         match location {
             Location::Directory(path) => self.0.iter().any(|favorite| favorite.path == *path),
-            Location::Trash | Location::Recent | Location::Search { .. } => false,
+            Location::Trash
+            | Location::Recent
+            | Location::Search { .. }
+            | Location::Usage { .. } => false,
         }
     }
 
@@ -441,8 +444,12 @@ impl ExplorerState {
         }
         let current = match self.nav.current() {
             Location::Directory(path) => Location::Directory(path.clone()),
-            // The Trash and the results of a search are not watched.
-            Location::Trash | Location::Recent | Location::Search { .. } => return None,
+            // The Trash, the results of a search and a disk usage view are
+            // not watched.
+            Location::Trash
+            | Location::Recent
+            | Location::Search { .. }
+            | Location::Usage { .. } => return None,
         };
         self.begin_scan(Transition::Visit(current), true, None)
     }
@@ -489,7 +496,10 @@ impl ExplorerState {
     pub(crate) fn pending_directory(&self) -> Option<&Path> {
         match &self.pending.as_ref()?.location {
             Location::Directory(path) => Some(path),
-            Location::Trash | Location::Recent | Location::Search { .. } => None,
+            Location::Trash
+            | Location::Recent
+            | Location::Search { .. }
+            | Location::Usage { .. } => None,
         }
     }
 
@@ -511,6 +521,11 @@ impl ExplorerState {
         // The results of a search are searched again, not re-read: see
         // [`Self::restart_search`].
         if matches!(current, Location::Search { .. }) {
+            return None;
+        }
+        // A disk usage view is corrected by subtracting what was removed,
+        // not re-read (see `Explorer::usage_removed`).
+        if matches!(current, Location::Usage { .. }) {
             return None;
         }
         self.begin_scan(Transition::Visit(current), true, None)
@@ -1427,7 +1442,9 @@ impl ExplorerState {
         }
         match self.nav.current() {
             Location::Directory(current) => Ok(Location::Directory(current.join(candidate))),
-            Location::Search { root, .. } => Ok(Location::Directory(root.join(candidate))),
+            Location::Search { root, .. } | Location::Usage { root } => {
+                Ok(Location::Directory(root.join(candidate)))
+            }
             Location::Trash | Location::Recent => Err(PathArgument::Unresolvable(
                 "relative paths need a current directory".to_owned(),
             )),
