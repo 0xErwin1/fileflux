@@ -611,6 +611,7 @@ pub(crate) fn device_row_menu_rows(partitions: &[DevicePartition]) -> Vec<MenuRo
             MenuCommand::OpenInNewTab,
             "Open in a new tab",
         )),
+        MenuRow::Item(MenuItemSpec::new(MenuCommand::OpenInSplit, "Open in split")),
         MenuRow::Item(MenuItemSpec::new(MenuCommand::Properties, "Properties")),
     ];
     if partitions.is_empty() {
@@ -1446,6 +1447,7 @@ mod tests {
             [
                 "Analyze disk usage",
                 "Open in a new tab",
+                "Open in split",
                 "Properties",
                 "-",
                 "vault1"
@@ -1459,6 +1461,6 @@ mod tests {
             }) if label == "vault1"
         ));
         // Without partitions there is no separator either.
-        assert_eq!(device_row_menu_rows(&[]).len(), 3);
+        assert_eq!(device_row_menu_rows(&[]).len(), 4);
     }
 }

@@ -540,6 +540,7 @@ fn a_sidebar_row_menu_offers_open_tab_favorite_copy_and_properties() {
         [
             "Open",
             "Open in new tab",
+            "Open in split",
             "Analyze Disk Usage",
             "-",
             "Add to favorites",
@@ -570,6 +571,7 @@ fn a_favorite_row_offers_remove_instead_of_add() {
         [
             "Open",
             "Open in new tab",
+            "Open in split",
             "Analyze Disk Usage",
             "-",
             "Remove from favorites",
@@ -595,6 +597,7 @@ fn a_sidebar_row_offers_open_in_terminal_only_when_a_terminal_exists() {
         [
             "Open",
             "Open in new tab",
+            "Open in split",
             "Open in terminal",
             "Analyze Disk Usage",
             "-",
@@ -619,6 +622,7 @@ fn a_single_selected_folder_offers_favorites_and_a_terminal_in_its_menu() {
         [
             "Open",
             "Open in new tab",
+            "Open in split",
             "Add to favorites",
             "Open in terminal",
             "-",
@@ -641,7 +645,7 @@ fn a_single_selected_folder_offers_favorites_and_a_terminal_in_its_menu() {
     };
     let rows = menu_rows(&favorite);
     assert_eq!(
-        flat(&rows).get(2).map(String::as_str),
+        flat(&rows).get(3).map(String::as_str),
         Some("Remove from favorites")
     );
     assert!(item(&rows, MenuCommand::AddFavorite).is_none());
@@ -1235,6 +1239,35 @@ fn open_with_is_offered_for_selected_files_but_never_folders() {
         _ => None,
     });
     assert_eq!(label, Some("Open with\u{2026}"));
+}
+
+#[test]
+fn open_in_split_follows_open_in_new_tab_for_one_selected_folder_only() {
+    let folder = MenuTarget {
+        folder_selected: true,
+        ..target(false, 1, false, false)
+    };
+    let rows = menu_rows(&folder);
+    let labels = flat(&rows);
+    let tab = labels.iter().position(|label| label == "Open in new tab");
+    assert_eq!(
+        labels.iter().position(|label| label == "Open in split"),
+        tab.map(|at| at + 1),
+        "the split row sits right after the tab row"
+    );
+    let spec = item(&rows, MenuCommand::OpenInSplit);
+    assert_eq!(
+        spec.map(|spec| (spec.enabled, spec.shortcut)),
+        Some((true, None))
+    );
+    for none in [
+        target(false, 1, false, false),
+        target(false, 0, false, false),
+        target(false, 2, false, false),
+        target(true, 1, false, false),
+    ] {
+        assert!(item(&menu_rows(&none), MenuCommand::OpenInSplit).is_none());
+    }
 }
 
 #[test]

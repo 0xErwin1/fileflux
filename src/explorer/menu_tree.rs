@@ -13,10 +13,51 @@ use bolt::composites::{
     BackAction, ChildAction, HoverIntent, HoverTick, MenuItem, MenuNav, MenuNode,
 };
 
-use super::actions::MenuState;
+use super::actions::{MenuOn, MenuState};
 use super::icon;
 use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow, SearchOption};
 use fileflux::core::zoom::ZoomCommand;
+
+/// What the title of a menu in new tab mode says after the target's name.
+const NEW_TAB_SUFFIX: &str = " \u{b7} in new tab";
+
+/// Where a menu command shows the location it navigates to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// In the shown tab, as the command always did.
+    Here,
+    /// In a new background tab (a menu opened with Shift held).
+    NewTab,
+}
+
+/// Whether `command`, run from a menu opened `on` something, changes the
+/// shown location. Only these commands open in a new tab under Shift; the
+/// rest behave as without it. "Open in new tab" and "Open in split" already
+/// choose their own destination, and the entries' and toolbar's Properties
+/// toggle the details panel without leaving the folder.
+fn command_navigates(on: &MenuOn, command: MenuCommand) -> bool {
+    match command {
+        MenuCommand::Open
+        | MenuCommand::OpenContainingFolder
+        | MenuCommand::AnalyzeDiskUsage
+        | MenuCommand::Mount => true,
+        // The sidebar and device menus show the place, then the panel.
+        MenuCommand::Properties => {
+            matches!(on, MenuOn::Sidebar { .. } | MenuOn::DeviceMenu { .. })
+        }
+        _ => false,
+    }
+}
+
+/// The one decision behind Shift+right-click: a menu in new tab mode
+/// (`new_tab`) shows what a navigating command opens in a new tab.
+pub(crate) fn shown_for(new_tab: bool, on: &MenuOn, command: MenuCommand) -> Shown {
+    if new_tab && command_navigates(on, command) {
+        Shown::NewTab
+    } else {
+        Shown::Here
+    }
+}
 
 /// The rows the target title takes at the top of the root level: the header
 /// and the separator under it.
@@ -35,6 +76,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
         MenuCommand::OpenInViewer => IconName::Image,
         MenuCommand::OpenInNewTab => IconName::ExternalLink,
+        MenuCommand::OpenInSplit => IconName::Columns2,
         MenuCommand::OpenContainingFolder => IconName::FolderOpen,
         MenuCommand::Rename => IconName::Pencil,
         MenuCommand::CopyPath | MenuCommand::CopyFolderPath => IconName::Link,
@@ -185,10 +227,24 @@ impl MenuState {
             nav: MenuNav::new(),
             hover: HoverIntent::new(),
             keyboard: false,
+            new_tab: false,
         };
         let root = menu.nodes();
         menu.nav.reset(&root);
         menu
+    }
+
+    /// Puts the menu in new tab mode when `on` (Shift was held as it
+    /// opened): its navigating commands open background tabs, and the title
+    /// says so.
+    pub(crate) fn in_new_tab(mut self, on: bool) -> Self {
+        self.new_tab = on;
+        if on && let Some(title) = self.title.as_mut() {
+            title.push_str(NEW_TAB_SUFFIX);
+        }
+        let root = self.nodes();
+        self.nav.reset(&root);
+        self
     }
 
     /// The cascade to draw, from the rows as they are now.
@@ -403,6 +459,70 @@ mod tests {
             .filter(|node| node.item.checked == Some(true))
             .map(|node| node.item.label.to_string())
             .collect()
+    }
+
+    #[test]
+    fn shift_puts_a_menu_in_new_tab_mode_and_the_title_says_so() {
+        let titled = |new_tab| {
+            MenuState::new(
+                MenuOn::EmptySpace,
+                Some("System".to_owned()),
+                point(px(0.0), px(0.0)),
+                Vec::new(),
+            )
+            .in_new_tab(new_tab)
+        };
+        let plain = titled(false);
+        assert!(!plain.new_tab);
+        assert_eq!(plain.title.as_deref(), Some("System"));
+        let shifted = titled(true);
+        assert!(shifted.new_tab);
+        assert_eq!(shifted.title.as_deref(), Some("System \u{b7} in new tab"));
+        let untitled = MenuState::new(MenuOn::Toolbar, None, point(px(0.0), px(0.0)), Vec::new())
+            .in_new_tab(true);
+        assert!(untitled.new_tab);
+        assert_eq!(untitled.title, None, "no title, nothing to annotate");
+    }
+
+    #[test]
+    fn only_navigating_commands_open_in_a_new_tab_under_shift() {
+        let sidebar = MenuOn::Sidebar {
+            row: "r".to_owned(),
+            location: Location::Trash,
+            device: None,
+        };
+        let navigating = [
+            (&MenuOn::Entries, MenuCommand::Open),
+            (&MenuOn::Entries, MenuCommand::OpenContainingFolder),
+            (&MenuOn::EmptySpace, MenuCommand::AnalyzeDiskUsage),
+            (&sidebar, MenuCommand::Open),
+            (&sidebar, MenuCommand::AnalyzeDiskUsage),
+            // The sidebar shows the place with the details panel.
+            (&sidebar, MenuCommand::Properties),
+        ];
+        for (on, command) in navigating {
+            assert_eq!(shown_for(true, on, command), Shown::NewTab, "{command:?}");
+            assert_eq!(shown_for(false, on, command), Shown::Here, "{command:?}");
+        }
+        let staying = [
+            (&MenuOn::Entries, MenuCommand::Copy),
+            (&MenuOn::Entries, MenuCommand::Cut),
+            (&MenuOn::Entries, MenuCommand::Rename),
+            (&MenuOn::Entries, MenuCommand::CopyPath),
+            (&MenuOn::Entries, MenuCommand::MoveToTrash),
+            (&MenuOn::Entries, MenuCommand::DeletePermanently),
+            // The entries' Properties toggles the panel; nothing navigates.
+            (&MenuOn::Entries, MenuCommand::Properties),
+            (&MenuOn::Toolbar, MenuCommand::Properties),
+            (&MenuOn::Toolbar, MenuCommand::Reload),
+            (&MenuOn::Entries, MenuCommand::OpenInNewTab),
+            (&MenuOn::Entries, MenuCommand::OpenInSplit),
+            (&sidebar, MenuCommand::OpenInSplit),
+            (&sidebar, MenuCommand::CopyPath),
+        ];
+        for (on, command) in staying {
+            assert_eq!(shown_for(true, on, command), Shown::Here, "{command:?}");
+        }
     }
 
     #[test]
@@ -678,19 +798,19 @@ mod tests {
             })
         };
         assert_eq!(
-            partition_row(4),
+            partition_row(5),
             Some(("vault1".to_owned(), Some("/home"), Some("186 GB"))),
             "the first partition names its mount point and free space"
         );
         assert_eq!(
-            partition_row(5),
+            partition_row(6),
             Some(("vault2".to_owned(), Some("/"), None)),
             "no statvfs answer, no invented number"
         );
         // The activation reads the row's index back, and a partition row is
         // no command.
-        assert_eq!(menu.custom_action_at(&[4]), Some(0));
-        assert_eq!(menu.custom_action_at(&[5]), Some(1));
-        assert!(menu.item_at(&[4]).is_none());
+        assert_eq!(menu.custom_action_at(&[5]), Some(0));
+        assert_eq!(menu.custom_action_at(&[6]), Some(1));
+        assert!(menu.item_at(&[5]).is_none());
     }
 }

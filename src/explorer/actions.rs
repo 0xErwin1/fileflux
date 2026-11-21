@@ -8,6 +8,7 @@
 //! show the summary toast, queue the selection, and re-read the shown
 //! location so the listing reflects what happened.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -30,14 +31,15 @@ use super::arrange::ArrangeCommand;
 use super::arrange_menu;
 use super::devices::{device_menu_rows, job_paths, with_device_rows};
 use super::folder_memory;
+use super::menu_tree::{Shown, shown_for};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, AppLaunch, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job,
-    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick,
-    RenameCheck, RenameStep, Report, SearchOption, Severity, Unavailable, UndoAction, UndoEntry,
-    add_viewer_row, check_rename, dismissed_notice, launch_confirmation, menu_rows,
-    no_trash_dialog, open_target, plan_launches, rename_seed, rename_step, run_launches,
-    search_option_rows, start_failure_notice, stem_range, toolbar_menu_rows,
+    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenAction, OpenTarget,
+    OpenWithPick, RenameCheck, RenameStep, Report, SearchOption, Severity, Unavailable, UndoAction,
+    UndoEntry, add_viewer_row, check_rename, dismissed_notice, launch_confirmation, menu_rows,
+    no_trash_dialog, open_action, open_target, plan_launches, rename_seed, rename_step,
+    run_launches, search_option_rows, start_failure_notice, stem_range, toolbar_menu_rows,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
@@ -135,6 +137,9 @@ pub(crate) struct MenuState {
     /// Whether the keyboard drove the highlight last: the focus ring shows
     /// on it.
     pub(crate) keyboard: bool,
+    /// Whether Shift was held as the menu opened: its navigating commands
+    /// open in a new background tab (see [`super::menu_tree::shown_for`]).
+    pub(crate) new_tab: bool,
 }
 
 /// What to select (and whether to start renaming) once the listing that
@@ -1331,7 +1336,8 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.menu = Some(MenuState::new(on, title, position, rows));
+        let new_tab = window.modifiers().shift;
+        self.menu = Some(MenuState::new(on, title, position, rows).in_new_tab(new_tab));
         cx.defer_in(window, |this, window, cx| {
             if this.menu.is_some() {
                 this.menu_focus.focus(window, cx);
@@ -1612,17 +1618,18 @@ impl Explorer {
         // A device menu's custom rows are its partitions (see
         // [`MenuOn::DeviceMenu`]): activating one opens that partition's
         // usage analysis.
-        if let Some(root) = self.menu.as_ref().and_then(|menu| match &menu.on {
+        if let Some((root, shown)) = self.menu.as_ref().and_then(|menu| match &menu.on {
             MenuOn::DeviceMenu { partitions, .. } => {
                 let index = menu.custom_action_at(path)?;
+                let shown = shown_for(menu.new_tab, &menu.on, MenuCommand::AnalyzeDiskUsage);
                 partitions
                     .get(index)
-                    .map(|partition| partition.mount.clone())
+                    .map(|partition| (partition.mount.clone(), shown))
             }
             _ => None,
         }) {
             self.close_menu(window, cx);
-            self.analyze_usage_of(root, window, cx);
+            self.show_location(Location::Usage { root }, shown, window, cx);
             return;
         }
         if let Some(index) = self
@@ -1690,6 +1697,10 @@ impl Explorer {
             Some(MenuOn::DeviceMenu { location, .. }) => Some(location.clone()),
             _ => None,
         };
+        // Shift held as the menu opened: what navigates opens a new tab.
+        let shown = self.menu.as_ref().map_or(Shown::Here, |menu| {
+            shown_for(menu.new_tab, &menu.on, command)
+        });
         self.close_menu(window, cx);
         if let Some(bookmark) = network_row {
             return match command {
@@ -1703,13 +1714,13 @@ impl Explorer {
             };
         }
         if let Some((location, device)) = sidebar {
-            return self.run_sidebar_command(command, (location, device), window, cx);
+            return self.run_sidebar_command(command, (location, device), shown, window, cx);
         }
         if let Some(device) = device_row {
-            return self.run_device_command(command, device, window, cx);
+            return self.run_device_command(command, device, shown, window, cx);
         }
         if let Some(location) = device_menu {
-            return self.run_device_row_command(command, location, window, cx);
+            return self.run_device_row_command(command, location, shown, window, cx);
         }
         match command {
             MenuCommand::SplitView => self.toggle_split(window, cx),
@@ -1739,7 +1750,7 @@ impl Explorer {
                             _ => None,
                         });
                 if let Some(folder) = folder {
-                    self.analyze_usage_of(folder, window, cx);
+                    self.show_location(Location::Usage { root: folder }, shown, window, cx);
                 }
             }
             MenuCommand::ConnectToServer => self.connect_to_server(window, cx),
@@ -1750,10 +1761,15 @@ impl Explorer {
             MenuCommand::SelectAll => self.select_all(cx),
             MenuCommand::InvertSelection => self.invert_selection(cx),
             MenuCommand::SelectMatching => self.select_matching(window, cx),
-            MenuCommand::Open => self.open_selected(window, cx),
+            MenuCommand::Open => self.open_selected_shown(shown, window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
-            MenuCommand::OpenContainingFolder => self.open_containing_folder(window, cx),
+            MenuCommand::OpenContainingFolder => self.open_containing_folder_in(shown, window, cx),
             MenuCommand::OpenInNewTab => self.open_selected_in_new_tab(window, cx),
+            MenuCommand::OpenInSplit => {
+                if let Some(folder) = self.single_selected_folder() {
+                    self.open_in_split(folder, window, cx);
+                }
+            }
             MenuCommand::OpenWith => self.open_with(window, cx),
             MenuCommand::Rename => self.start_rename(window, cx),
             MenuCommand::CopyPath => self.copy_selected_paths(cx),
@@ -1820,21 +1836,30 @@ impl Explorer {
         &mut self,
         command: MenuCommand,
         location: Location,
+        shown: Shown,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match command {
             MenuCommand::AnalyzeDiskUsage => {
                 if let Location::Directory(folder) = &location {
-                    self.analyze_usage_of(folder.clone(), window, cx);
+                    let usage = Location::Usage {
+                        root: folder.clone(),
+                    };
+                    self.show_location(usage, shown, window, cx);
                 }
             }
             MenuCommand::OpenInNewTab => {
                 self.open_tab(location, Placement::Background, window, cx);
             }
+            MenuCommand::OpenInSplit => {
+                if let Location::Directory(folder) = location {
+                    self.open_in_split(folder, window, cx);
+                }
+            }
             // Properties: show the folder, with the details panel open.
             MenuCommand::Properties => {
-                self.navigate(Transition::Visit(location), window, cx);
+                self.show_location(location, shown, window, cx);
                 self.inspector_open = true;
                 cx.notify();
             }
@@ -1848,24 +1873,28 @@ impl Explorer {
         &mut self,
         command: MenuCommand,
         (location, device): (Location, Option<PathBuf>),
+        shown: Shown,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match command {
             MenuCommand::Unmount | MenuCommand::Eject => {
                 if let Some(device) = device {
-                    self.run_device_command(command, device, window, cx);
+                    self.run_device_command(command, device, shown, window, cx);
                 }
             }
-            MenuCommand::Open => {
-                self.navigate(Transition::Visit(location), window, cx);
-            }
+            MenuCommand::Open => self.show_location(location, shown, window, cx),
             MenuCommand::OpenInNewTab => {
                 self.open_tab(location, Placement::Background, window, cx);
             }
+            MenuCommand::OpenInSplit => {
+                if let Location::Directory(folder) = location {
+                    self.open_in_split(folder, window, cx);
+                }
+            }
             MenuCommand::AnalyzeDiskUsage => {
                 if let Location::Directory(folder) = location {
-                    self.analyze_usage_of(folder, window, cx);
+                    self.show_location(Location::Usage { root: folder }, shown, window, cx);
                 }
             }
             MenuCommand::AddFavorite => self.set_favorite(&location, true, cx),
@@ -1883,7 +1912,7 @@ impl Explorer {
             }
             // Properties: show the folder, with the details panel open.
             MenuCommand::Properties => {
-                self.navigate(Transition::Visit(location), window, cx);
+                self.show_location(location, shown, window, cx);
                 self.inspector_open = true;
                 cx.notify();
             }
@@ -2230,6 +2259,103 @@ impl Explorer {
             rename: false,
         });
         self.navigate(Transition::Visit(Location::Directory(folder)), window, cx);
+    }
+
+    /// [`Self::open_containing_folder`], or the folder in a new background
+    /// tab (with the entry selected there) when `shown` says so.
+    pub(crate) fn open_containing_folder_in(
+        &mut self,
+        shown: Shown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if shown == Shown::Here {
+            return self.open_containing_folder(window, cx);
+        }
+        let selected = self.selected_visible_paths();
+        let [path] = selected.as_slice() else {
+            return;
+        };
+        let Some(folder) = path.parent() else {
+            return;
+        };
+        let select = vec![path.clone()];
+        self.open_tab_selecting(
+            Location::Directory(folder.to_path_buf()),
+            select,
+            window,
+            cx,
+        );
+    }
+
+    /// "Open" on the selection, or its folder in a new background tab when
+    /// `shown` says so. Files (and a mixed selection) open as ever: only a
+    /// destination that navigates moves to a tab.
+    pub(crate) fn open_selected_shown(
+        &mut self,
+        shown: Shown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if shown == Shown::Here {
+            return self.open_selected(window, cx);
+        }
+        if self.usage().is_some() {
+            if let Some(path) = self.usage_selected_path() {
+                self.usage_activate_in(&path, shown, window, cx);
+            }
+            return;
+        }
+        let navigates: Vec<bool> = self
+            .tab()
+            .state
+            .visible_selected()
+            .into_iter()
+            .map(|entry| open_action(entry) == OpenAction::Navigate)
+            .collect();
+        let folders_only = navigates.iter().all(|navigates| *navigates);
+        let candidate = self.tab().state.activation_candidate();
+        match candidate {
+            Some(path) if folders_only && !navigates.is_empty() => {
+                self.open_tab(Location::Directory(path), Placement::Background, window, cx);
+            }
+            _ => self.open_selected(window, cx),
+        }
+    }
+
+    /// Shows `location` in the shown tab, or in a new background tab.
+    pub(crate) fn show_location(
+        &mut self,
+        location: Location,
+        shown: Shown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match shown {
+            Shown::Here => {
+                self.navigate(Transition::Visit(location), window, cx);
+            }
+            Shown::NewTab => self.open_tab(location, Placement::Background, window, cx),
+        }
+    }
+
+    /// A new background tab on `location` that selects `select` once its
+    /// listing arrives.
+    fn open_tab_selecting(
+        &mut self,
+        location: Location,
+        select: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let known: HashSet<_> = self.tabs.iter().map(|tab| tab.id).collect();
+        self.open_tab(location, Placement::Background, window, cx);
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| !known.contains(&tab.id)) {
+            tab.pending = Some(PendingSelect {
+                paths: select,
+                rename: false,
+            });
+        }
     }
 
     /// "Open in viewer": the single selected image, even when it is not

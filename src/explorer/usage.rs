@@ -25,6 +25,7 @@ use fileflux::core::usage_chart::{self, Segment};
 use gpui::{Context, Pixels, Point, Task, UniformListScrollHandle, Window};
 
 use super::actions::MenuOn;
+use super::menu_tree::Shown;
 use super::ops::{MenuCommand, MenuItemSpec, MenuRow};
 use super::state::Transition;
 use super::tabs::Affected;
@@ -631,20 +632,6 @@ impl Explorer {
         session.selected.clone()
     }
 
-    /// "Analyze Disk Usage": the usage view of `folder`.
-    pub(crate) fn analyze_usage_of(
-        &mut self,
-        folder: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.navigate(
-            Transition::Visit(Location::Usage { root: folder }),
-            window,
-            cx,
-        );
-    }
-
     /// Up inside a finished analysis goes to the parent folder's usage.
     pub(crate) fn usage_up_transition(&self, transition: Transition) -> Transition {
         if transition == Transition::Up
@@ -806,11 +793,25 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.usage_activate_in(path, Shown::Here, window, cx);
+    }
+
+    /// [`Self::usage_activate`] that shows a drilled folder's usage where
+    /// `shown` says (a new background tab under Shift); a file opens as ever.
+    pub(crate) fn usage_activate_in(
+        &mut self,
+        path: &Path,
+        shown: Shown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let activation = self
             .usage()
             .map_or(Activation::None, |session| session.activation(path));
         match activation {
-            Activation::Drill(folder) => self.usage_drill(folder, window, cx),
+            Activation::Drill(folder) => {
+                self.show_location(Location::Usage { root: folder }, shown, window, cx);
+            }
             Activation::Open(file) => self.open_file(&file, cx),
             Activation::None => {}
         }

@@ -27,6 +27,7 @@ use fileflux::core::watch::{
 };
 use gpui::{ClipboardItem, Context, Window};
 
+use super::menu_tree::Shown;
 use super::ops::{
     DialogAction, DialogKind, Job, MenuCommand, MenuItemSpec, MenuRow, Severity, UndoAction,
 };
@@ -788,11 +789,12 @@ impl Explorer {
         &mut self,
         command: MenuCommand,
         path: PathBuf,
+        shown: Shown,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match command {
-            MenuCommand::Mount => self.mount_device(path, window, cx),
+            MenuCommand::Mount => self.mount_device_in(path, shown, window, cx),
             MenuCommand::Unlock => self.unlock_device(path, window, cx),
             MenuCommand::Unmount => self.unmount_device(&path, window, cx),
             MenuCommand::Eject => self.eject_device(&path, window, cx),
@@ -814,6 +816,18 @@ impl Explorer {
     pub(crate) fn mount_device(
         &mut self,
         path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mount_device_in(path, Shown::Here, window, cx);
+    }
+
+    /// [`Self::mount_device`] that shows the mount point where `shown` says
+    /// (a new background tab under Shift).
+    pub(crate) fn mount_device_in(
+        &mut self,
+        path: PathBuf,
+        shown: Shown,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -845,11 +859,7 @@ impl Explorer {
                 this.devices.last_poll = None;
                 match result {
                     Ok(mount_point) => {
-                        this.navigate(
-                            Transition::Visit(Location::Directory(mount_point)),
-                            window,
-                            cx,
-                        );
+                        this.show_location(Location::Directory(mount_point), shown, window, cx);
                     }
                     Err(error) => {
                         this.say(

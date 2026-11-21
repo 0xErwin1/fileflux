@@ -1331,6 +1331,9 @@ pub(crate) enum MenuCommand {
     OpenInViewer,
     /// Open the single selected folder in a new background tab.
     OpenInNewTab,
+    /// Show the folder in the other pane: splits the view when it is not
+    /// split, else opens it in a new tab of the pane that is not focused.
+    OpenInSplit,
     /// Recent view: go to the folder that holds the single selected entry,
     /// with the entry selected there.
     OpenContainingFolder,
@@ -1658,6 +1661,7 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
                 None,
                 false,
             ));
+            rows.push(item(MenuCommand::OpenInSplit, "Open in split", None, false));
             rows.push(if target.folder_favorite {
                 item(
                     MenuCommand::RemoveFavorite,
@@ -1829,6 +1833,8 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
         ]);
         return rows;
     }
+    // Recent and the Trash are no folder to put in the other pane.
+    rows.push(item(MenuCommand::OpenInSplit, "Open in split", false));
     if target.terminal {
         rows.push(item(MenuCommand::OpenTerminal, "Open in terminal", false));
     }
