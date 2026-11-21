@@ -93,6 +93,10 @@ fn row_nodes(rows: &[MenuRow]) -> Vec<MenuNode> {
             MenuRow::Separator => MenuNode::separator(),
             MenuRow::Header(label) => MenuNode::header(*label),
             MenuRow::Item(spec) => item_node(spec),
+            MenuRow::TemplateFile { label, .. } => MenuNode::new(MenuItem::new(label.clone())),
+            MenuRow::TemplateFolder { label, rows } => MenuNode::row(label.clone())
+                .icon(icon(gpui_kit_assets::IconName::FilePlus))
+                .children(row_nodes(rows)),
             MenuRow::Submenu(spec) => MenuNode::row(spec.label)
                 .icon(icon(submenu_icon(spec.menu)))
                 .children(row_nodes(&spec.rows)),
@@ -114,7 +118,7 @@ pub(crate) fn nodes(title: Option<&str>, rows: &[MenuRow]) -> Vec<MenuNode> {
 
 /// The item `path` points at, following submenu rows down from `rows`.
 /// `titled`: the root level starts with the title header and its separator.
-fn item_in<'a>(rows: &'a [MenuRow], titled: bool, path: &[usize]) -> Option<&'a MenuItemSpec> {
+fn row_in<'a>(rows: &'a [MenuRow], titled: bool, path: &[usize]) -> Option<&'a MenuRow> {
     let (last, parents) = path.split_last()?;
     let skip = |at: usize, level: usize| {
         if level == 0 && titled {
@@ -125,15 +129,13 @@ fn item_in<'a>(rows: &'a [MenuRow], titled: bool, path: &[usize]) -> Option<&'a 
     };
     let mut level = rows;
     for (depth, at) in parents.iter().enumerate() {
-        let MenuRow::Submenu(spec) = level.get(skip(*at, depth)?)? else {
-            return None;
+        level = match level.get(skip(*at, depth)?)? {
+            MenuRow::Submenu(spec) => &spec.rows,
+            MenuRow::TemplateFolder { rows, .. } => rows,
+            _ => return None,
         };
-        level = &spec.rows;
     }
-    match level.get(skip(*last, parents.len())?)? {
-        MenuRow::Item(spec) => Some(spec),
-        MenuRow::Header(_) | MenuRow::Separator | MenuRow::Submenu(_) => None,
-    }
+    level.get(skip(*last, parents.len())?)
 }
 
 impl MenuState {
@@ -166,7 +168,18 @@ impl MenuState {
     /// The item an activation `path` names; `None` for a submenu row, a
     /// header or a separator.
     pub(crate) fn item_at(&self, path: &[usize]) -> Option<&MenuItemSpec> {
-        item_in(&self.rows, self.title.is_some(), path)
+        match row_in(&self.rows, self.title.is_some(), path)? {
+            MenuRow::Item(spec) => Some(spec),
+            _ => None,
+        }
+    }
+
+    /// The template file an activation `path` names.
+    pub(crate) fn template_at(&self, path: &[usize]) -> Option<&std::path::Path> {
+        match row_in(&self.rows, self.title.is_some(), path)? {
+            MenuRow::TemplateFile { path, .. } => Some(path),
+            _ => None,
+        }
     }
 
     /// Up/Down: moves the highlight within the deepest open level, wrapping.
@@ -313,6 +326,49 @@ mod tests {
             .filter(|node| node.item.checked == Some(true))
             .map(|node| node.item.label.to_string())
             .collect()
+    }
+
+    #[test]
+    fn template_rows_cascade_and_activate_by_path() {
+        let templates = vec![
+            fileflux::core::templates::Template::Folder {
+                label: "Work".to_owned(),
+                children: vec![fileflux::core::templates::Template::File {
+                    label: "Contract".to_owned(),
+                    path: "/t/Work/Contract.odt".into(),
+                }],
+            },
+            fileflux::core::templates::Template::File {
+                label: "Letter".to_owned(),
+                path: "/t/Letter.odt".into(),
+            },
+        ];
+        let mut menu = empty_space(&Arrangement::default());
+        crate::explorer::templates::add_rows(&mut menu.rows, &templates);
+        let root = menu.nodes();
+        let at = labelled(&root, "New from template");
+        assert!(
+            at.and_then(|at| root.get(at))
+                .is_some_and(MenuNode::opens_flyout)
+        );
+        assert!(at.is_some(), "no template row");
+        let at = at.unwrap_or_default();
+        // Title header and separator come first.
+        assert_eq!(
+            menu.template_at(&[at, 1]),
+            Some(std::path::Path::new("/t/Letter.odt"))
+        );
+        assert_eq!(
+            menu.template_at(&[at, 0, 0]),
+            Some(std::path::Path::new("/t/Work/Contract.odt"))
+        );
+        assert_eq!(
+            menu.template_at(&[at, 0]),
+            None,
+            "a folder row is no template"
+        );
+        assert!(menu.item_at(&[at, 1]).is_none());
+        assert!(menu.item_at(&[2]).is_some(), "New folder still resolves");
     }
 
     #[test]

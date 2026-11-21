@@ -196,7 +196,7 @@ The sidebar's Favorites are the local lines of `$XDG_CONFIG_HOME/gtk-3.0/bookmar
 - **Open in terminal** (context menu on one selected folder, on a sidebar row and on empty space): starts your terminal in that folder (the shown folder on empty space), with no shell. The terminal is the first that exists of: `$TERMINAL`, `xdg-terminal-exec`, the desktop ids in `xdg-terminals.list`, a desktop entry with `Categories=TerminalEmulator` (known terminals first), then ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, kgx, konsole, xfce4-terminal, xterm. Terminals that ignore the working directory of the process get their own argument: `--working-directory=DIR` (ghostty, foot, gnome-terminal, kgx, xfce4-terminal), `--working-directory DIR` (alacritty), `--directory DIR` (kitty), `--workdir DIR` (konsole), `start --cwd DIR` (wezterm); xterm uses its working directory, and a terminal found through a desktop entry uses the entry's `X-TerminalArgDir` when it has one. `<desktop>-xdg-terminals.list` variants for `$XDG_CURRENT_DESKTOP` are tried first, and the lists are read from `$XDG_CONFIG_HOME` then `$XDG_CONFIG_DIRS`. The lookup reads `.desktop` files, so it runs off the UI thread at startup; the item is omitted until a terminal is found, and when none is.
 - **Open in viewer** (context menu, one selected image), and **Open in new tab**, **Add to favorites** / **Remove from favorites** (selected folder, not in the Trash).
 
-The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), **Paste as link** (on one selected folder), [Extract here, Extract to… and Compress…](#archives), Rename, [Make Link](#links), Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, Paste, [Paste as link](#links), **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
+The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), **Paste as link** (on one selected folder), [Extract here, Extract to… and Compress…](#archives), Rename, [Make Link](#links), Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, [**New from template ›**](#new-from-template), Paste, [Paste as link](#links), **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
 
 ## File operations
 
@@ -205,11 +205,20 @@ Everything that changes the disk runs off the UI thread, reports its result in a
 | Action | How |
 |---|---|
 | New folder / New file | The subbar's **New folder** chip, Ctrl+Shift+N or the menu. Creates "Untitled folder" or "Untitled file" (numbered when taken) and starts the inline rename |
+| New from template | **New from template ›** on empty space, after New file (see below) |
 | Rename | F2. The stem is preselected (folders select the whole name). Enter commits, Escape cancels, leaving the field commits. The name is kept exactly as typed. A refused name (empty, blank, contains `/`, already exists) stays in the field with the reason shown; leaving the field with a refused name cancels the rename and changes nothing. A name containing a control character cannot be edited inline: F2 says so and leaves the file untouched |
 | Copy path | Ctrl+Shift+C. **Copy folder path** on empty space |
 | Move to Trash | Del. See [Trash](#trash) |
 | Delete permanently | Shift+Del. Opens a confirmation naming the item or the count; **Cancel** is the default and Enter alone never deletes. Folders are removed recursively; symlinks are never followed |
 | Properties | Toggles the [details panel](#details-panel) (Ctrl+I) |
+
+### New from template
+
+The submenu lists the files of your templates folder: `XDG_TEMPLATES_DIR` in `$XDG_CONFIG_HOME/user-dirs.dirs` (default `~/.config`), else `~/Templates`. A value equal to your home folder switches templates off, as in xdg-user-dirs. The list is read each time the menu opens; the row is absent when the folder is missing or has nothing to offer, and in the Trash, Recent and search results.
+
+- Rows are named like the file without its extension (with it when two files of a level would read the same), folders first, in the explorer's natural order. Subfolders are nested submenus, up to three levels; a level shows at most 100 entries and a listing at most 500.
+- Hidden files, broken links, links to folders, and anything that is not a regular file or a folder are skipped, and so are folders with nothing to offer. A link to a regular file is offered under the link's name and its contents are copied.
+- Choosing a template copies its contents into the shown folder under the template's file name ("Report.odt"; "Report (2).odt" when taken, never overwriting anything), selects the copy and starts the inline rename. Filters and the search are cleared first, as for New file.
 
 **Long names.** A name is at most 255 bytes. Wherever Fileflux has to invent a numbered name ("name (2).ext") it shortens the part before the extension so the result still fits.
 
@@ -245,13 +254,14 @@ Symbolic links are created, never copied. They run as ordinary operations (progr
 
 ## Undo
 
-Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file, copy, move, compress, extract or link. The history is per session and survives navigation.
+Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file/template, copy, move, compress, extract or link. The history is per session and survives navigation.
 
 | Operation | What undo does |
 |---|---|
 | Rename | Renames back |
 | Move to Trash | Restores item by item, can be cancelled, never stops at the first problem, selects what it restored, and reports "restored / skipped / failed". Items that can still come back stay undoable |
 | New folder / file | A new, still-empty item goes to the Trash, never straight to deletion |
+| New from template | The created file goes to the Trash if it is still the file that was created (edits you made to it are kept in the Trash); a different file under the same name is left alone |
 | Copy | Moves the copies it created to the Trash (never deletes them) |
 | Move | Puts items back where they came from, only if each is still the item that was moved, never replacing anything that took the original place |
 | Compress / Extract | The created archive or folder goes to the Trash, only if it is still the item that was created |

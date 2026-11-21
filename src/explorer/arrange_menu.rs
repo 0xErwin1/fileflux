@@ -136,7 +136,11 @@ mod tests {
         rows.iter()
             .filter_map(|row| match row {
                 MenuRow::Item(spec) => Some(spec),
-                MenuRow::Header(_) | MenuRow::Separator | MenuRow::Submenu(_) => None,
+                MenuRow::Header(_)
+                | MenuRow::Separator
+                | MenuRow::Submenu(_)
+                | MenuRow::TemplateFile { .. }
+                | MenuRow::TemplateFolder { .. } => None,
             })
             .collect()
     }

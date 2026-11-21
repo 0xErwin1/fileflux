@@ -117,7 +117,9 @@ fn undo_paths(action: &UndoAction) -> Vec<PathBuf> {
             .iter()
             .flat_map(|entry| [entry.item.original.clone(), entry.item.files_path()])
             .collect(),
-        UndoAction::Create { path, .. } | UndoAction::Archive { path, .. } => vec![path.clone()],
+        UndoAction::Create { path, .. }
+        | UndoAction::Archive { path, .. }
+        | UndoAction::Template { path, .. } => vec![path.clone()],
         UndoAction::Links { items } => items.iter().map(|item| item.link.clone()).collect(),
         UndoAction::Permissions { items } => items.iter().map(|item| item.path.clone()).collect(),
         UndoAction::Copy { items } | UndoAction::Move { items } => items
@@ -132,6 +134,7 @@ fn undo_paths(action: &UndoAction) -> Vec<PathBuf> {
 pub(crate) fn job_paths(job: &Job, trash_root: &Path) -> Vec<PathBuf> {
     match job {
         Job::Create { dir, .. } => vec![dir.clone()],
+        Job::CreateFromTemplate { dir, template } => vec![dir.clone(), template.clone()],
         Job::Rename { path, .. } => vec![path.clone()],
         Job::Trash(paths) | Job::DeletePermanently(paths) => paths.clone(),
         Job::Restore(_) | Job::DeleteFromTrash(_) | Job::EmptyTrash(_) => {
@@ -1252,6 +1255,9 @@ mod tests {
                 MenuRow::Header(label) => format!("# {label}"),
                 MenuRow::Item(item) => item.label.to_owned(),
                 MenuRow::Submenu(spec) => spec.label.to_owned(),
+                MenuRow::TemplateFile { label, .. } | MenuRow::TemplateFolder { label, .. } => {
+                    label.clone()
+                }
             })
             .collect()
     }

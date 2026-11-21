@@ -483,6 +483,20 @@ impl Explorer {
 
     // --- create ------------------------------------------------------------------
 
+    /// A filter could hide a new entry; the new item must be visible to be
+    /// renamed.
+    fn reveal_new_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab().state.is_filtering() {
+            self.tab_mut().state.clear_query();
+            self.tab_mut().state.arrange(ArrangeCommand::ClearFilters);
+            let id = self.active_id();
+            self.arrange_tab(id, cx);
+            self.tab()
+                .search_input
+                .update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        }
+    }
+
     /// New folder / New file in the shown folder, then rename it in place.
     pub(crate) fn create_new(
         &mut self,
@@ -493,22 +507,40 @@ impl Explorer {
         let Location::Directory(dir) = self.tab().state.current().clone() else {
             return;
         };
-        // A filter could hide the new entry; the new item must be visible
-        // to be renamed.
-        if self.tab().state.is_filtering() {
-            self.tab_mut().state.clear_query();
-            self.tab_mut().state.arrange(ArrangeCommand::ClearFilters);
-            let id = self.active_id();
-            self.arrange_tab(id, cx);
-            self.tab()
-                .search_input
-                .update(cx, |input, cx| input.set_value(String::new(), window, cx));
-        }
+        self.reveal_new_entries(window, cx);
         let title = match kind {
             NewKind::Folder => "Creating folder",
             NewKind::File => "Creating file",
         };
         self.start_job(title, Job::Create { dir, kind }, false, window, cx);
+    }
+
+    /// "New from template": a copy of `template` in the shown folder, then
+    /// rename it in place. Refused wherever New file is.
+    pub(crate) fn create_from_template(
+        &mut self,
+        template: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = match self.tab().state.current().clone() {
+            Location::Directory(dir) => dir,
+            other => {
+                if let Some(text) = super::templates::refusal(&other) {
+                    self.say(Severity::Warning, text, window, cx);
+                }
+                return;
+            }
+        };
+        self.reveal_new_entries(window, cx);
+        let title = format!("Creating {}", quoted(&template));
+        self.start_job(
+            title,
+            Job::CreateFromTemplate { dir, template },
+            false,
+            window,
+            cx,
+        );
     }
 
     // --- inline rename ---------------------------------------------------------------
@@ -1018,6 +1050,7 @@ impl Explorer {
             UndoAction::Rename { .. }
                 | UndoAction::Create { .. }
                 | UndoAction::Archive { .. }
+                | UndoAction::Template { .. }
                 | UndoAction::Links { .. }
         );
         let job = Job::Undo(entry.action);
@@ -1099,6 +1132,16 @@ impl Explorer {
             super::archive::add_rows(&mut rows, offer);
         }
         let in_folder = matches!(self.tab().state.current(), Location::Directory(_));
+        if target.selected == 0
+            && !target.in_trash
+            && super::templates::refusal(self.tab().state.current()).is_none()
+        {
+            // Read when the menu opens, not on every draw.
+            let templates = fileflux::core::templates::templates_dir_from_env()
+                .map(|dir| fileflux::core::templates::list(&dir))
+                .unwrap_or_default();
+            super::templates::add_rows(&mut rows, &templates);
+        }
         super::links::add_rows(
             &mut rows,
             super::links::offer_for(in_folder, &selected, target.can_paste),
@@ -1335,6 +1378,16 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(template) = self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.template_at(path))
+            .map(Path::to_path_buf)
+        {
+            self.close_menu(window, cx);
+            self.create_from_template(template, window, cx);
+            return;
+        }
         let command = self
             .menu
             .as_ref()

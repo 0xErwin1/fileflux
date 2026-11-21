@@ -24,6 +24,7 @@ pub(crate) mod state;
 pub(crate) mod table;
 pub(crate) mod tabs;
 pub(crate) mod tabstrip;
+pub(crate) mod templates;
 pub(crate) mod toasts;
 pub(crate) mod toolbar;
 pub(crate) mod typeahead;

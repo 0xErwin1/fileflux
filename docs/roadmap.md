@@ -23,7 +23,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Templates | The entries of `~/Templates` in the New menu | New folder and New file only |
 | Selection | Invert selection; select by pattern | Ctrl+A and the rubber band |
 | Views | A compact view, an icon size control, and Type, Permissions and Owner columns | Grid and a list with Name, Size and Modified |
 | Search | File content, regular expressions, case sensitivity | Case-insensitive name substring, capped at 10,000 matches |

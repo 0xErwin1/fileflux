@@ -148,6 +148,10 @@ pub(crate) enum UndoAction {
     /// Undo of a compress or an extract: move the created archive or
     /// folder to the Trash, only if it is still the item that was created.
     Archive { path: PathBuf, identity: Identity },
+    /// Undo of "New from template": move the created file to the Trash,
+    /// whatever it holds now (the Trash keeps it), only if it is still the
+    /// file that was created.
+    Template { path: PathBuf, identity: Identity },
     /// Undo of "Make Link", "Paste as link" or a link drop: unlink the
     /// created links, each only if it is still the link that was created.
     Links {
@@ -359,6 +363,11 @@ pub(crate) enum Job {
         dir: PathBuf,
         kind: NewKind,
     },
+    /// "New from template": a copy of `template` in `dir`.
+    CreateFromTemplate {
+        dir: PathBuf,
+        template: PathBuf,
+    },
     Rename {
         path: PathBuf,
         new_name: OsString,
@@ -492,6 +501,7 @@ fn plural_items(count: usize) -> String {
 pub(crate) fn run_job(job: Job, ctx: &JobCtx, sink: &Sink) -> Report {
     match job {
         Job::Create { dir, kind } => create(&dir, kind),
+        Job::CreateFromTemplate { dir, template } => super::templates::run_create(&dir, &template),
         Job::Rename { path, new_name } => rename(&path, &new_name),
         Job::Trash(paths) => trash_items(&paths, ctx, sink),
         Job::DeletePermanently(paths) => delete_items(&paths, sink),
@@ -960,7 +970,9 @@ fn undo(action: &UndoAction, ctx: &JobCtx, sink: &Sink) -> Result<Report, String
         UndoAction::Copy { items } => Ok(paste::undo_copy(items, ctx, sink)),
         UndoAction::Move { items } => Ok(paste::undo_move(items, sink)),
         UndoAction::Permissions { items } => Ok(super::permissions::undo(items, sink)),
-        UndoAction::Archive { path, identity } => undo_archive(path, *identity, ctx),
+        UndoAction::Archive { path, identity } | UndoAction::Template { path, identity } => {
+            undo_archive(path, *identity, ctx)
+        }
         UndoAction::Links { items } => Ok(super::links::undo(items, sink)),
     }
 }
@@ -1411,6 +1423,17 @@ pub(crate) enum MenuRow {
     Item(MenuItemSpec),
     /// A row whose flyout opens on hover, Right or Enter.
     Submenu(SubmenuSpec),
+    /// A template of the New menu: activating it copies the file at `path`.
+    TemplateFile {
+        label: String,
+        path: PathBuf,
+    },
+    /// A folder of templates (or the "New from template" row itself): a
+    /// flyout with the `rows` of what it holds.
+    TemplateFolder {
+        label: String,
+        rows: Vec<MenuRow>,
+    },
     /// A caption naming the group of rows under it; never selectable.
     Header(&'static str),
     Separator,

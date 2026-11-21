@@ -24,6 +24,7 @@ pub mod places;
 pub mod recent;
 pub mod search;
 pub mod settings;
+pub mod templates;
 pub mod terminal;
 pub mod thumbnailers;
 pub mod thumbnails;

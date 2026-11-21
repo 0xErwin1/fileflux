@@ -403,6 +403,9 @@ fn flat(rows: &[MenuRow]) -> Vec<String> {
             MenuRow::Separator => "-".to_owned(),
             MenuRow::Header(label) => format!("# {label}"),
             MenuRow::Item(item) => item.label.to_owned(),
+            MenuRow::TemplateFile { label, .. } | MenuRow::TemplateFolder { label, .. } => {
+                label.clone()
+            }
         })
         .collect()
 }
@@ -1554,6 +1557,52 @@ fn undoing_a_creation_trashes_the_empty_item_and_refuses_changed_ones() -> TestR
     assert_eq!(
         text(&missing),
         "Can't undo: \u{201c}Untitled file\u{201d} no longer exists"
+    );
+    Ok(())
+}
+
+#[test]
+fn undoing_a_template_file_trashes_it_even_when_edited_but_not_when_replaced() -> TestResult {
+    let scratch = Scratch::new("undo-template")?;
+    let dir = scratch.dir("work")?;
+    let template = scratch.file("tpl/Letter.odt", "template")?;
+    let ctx = scratch.ctx();
+    let make = || {
+        run_job(
+            Job::CreateFromTemplate {
+                dir: dir.clone(),
+                template: template.clone(),
+            },
+            &ctx,
+            &sink(),
+        )
+    };
+
+    let created = make();
+    let action = created.undo.ok_or("no undo recorded")?;
+    fs::write(dir.join("Letter.odt"), "edited")?;
+    let undone = run_job(Job::Undo(action), &ctx, &sink());
+    assert_eq!(text(&undone), "Moved \u{201c}Letter.odt\u{201d} to Trash");
+    assert!(!dir.join("Letter.odt").exists());
+    assert_eq!(
+        fs::read_to_string(scratch.trash().join("files/Letter.odt"))?,
+        "edited",
+        "moved to the Trash, not deleted for good"
+    );
+
+    let created = make();
+    let action = created.undo.ok_or("no undo recorded")?;
+    fs::remove_file(dir.join("Letter.odt"))?;
+    fs::write(dir.join("Letter.odt"), "someone else's")?;
+    let refused = run_job(Job::Undo(action), &ctx, &sink());
+    assert!(
+        text(&refused).starts_with("Can't undo:"),
+        "a different file under the same name is left alone: {}",
+        text(&refused)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("Letter.odt"))?,
+        "someone else's"
     );
     Ok(())
 }

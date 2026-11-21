@@ -234,7 +234,9 @@ impl Affected {
             folders
         };
         match job {
-            Job::Create { dir, .. } => Self::Folders(vec![Location::Directory(dir.clone())]),
+            Job::Create { dir, .. } | Job::CreateFromTemplate { dir, .. } => {
+                Self::Folders(vec![Location::Directory(dir.clone())])
+            }
             Job::Rename { path, .. } => {
                 let mut folders = parents(std::slice::from_ref(path));
                 folders.push(Location::Recent);

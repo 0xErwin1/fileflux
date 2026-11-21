@@ -455,6 +455,8 @@ pub struct UserDirs {
     pub music: Option<PathBuf>,
     pub pictures: Option<PathBuf>,
     pub videos: Option<PathBuf>,
+    /// `XDG_TEMPLATES_DIR`; see [`super::templates`] for how it is used.
+    pub templates: Option<PathBuf>,
     pub warnings: Vec<String>,
 }
 
@@ -666,7 +668,11 @@ pub fn discover_with(
 
 /// Reads and parses `user-dirs.dirs` under the configuration home. A missing
 /// file is normal (all defaults apply); other read failures warn.
-fn read_user_dirs(config_home: &Path, home: &Path, warnings: &mut Vec<String>) -> UserDirs {
+pub(super) fn read_user_dirs(
+    config_home: &Path,
+    home: &Path,
+    warnings: &mut Vec<String>,
+) -> UserDirs {
     let config_file = config_home.join("user-dirs.dirs");
     match fs::read(&config_file) {
         Ok(bytes) => {
@@ -741,6 +747,7 @@ pub fn parse_user_dirs(content: &str, home: &Path) -> UserDirs {
             "XDG_MUSIC_DIR" => dirs.music = Some(path),
             "XDG_PICTURES_DIR" => dirs.pictures = Some(path),
             "XDG_VIDEOS_DIR" => dirs.videos = Some(path),
+            "XDG_TEMPLATES_DIR" => dirs.templates = Some(path),
             _ => {}
         }
     }
