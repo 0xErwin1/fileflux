@@ -28,7 +28,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Custom actions | User-defined context menu entries | Nothing |
 | Per-folder view memory | Remember view, sort and filters for each folder | The active tab's choice is the default for the next launch |
 | Tabs | Reorder tabs; drag a tab to another window | Fixed order |
 | Open with | Several files at once | One selected file |

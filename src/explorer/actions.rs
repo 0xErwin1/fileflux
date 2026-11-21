@@ -9,9 +9,7 @@
 //! location so the listing reflects what happened.
 
 use std::ffi::OsString;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bolt::composites::{BackAction, ChildAction, HOVER_OPEN_DELAY, HoverIntent, MenuNav};
@@ -1202,6 +1200,22 @@ impl Explorer {
         if target.selected == 0 && !target.in_trash {
             super::network::add_connect_row(&mut rows, self.devices.gio.is_some());
         }
+        // Custom actions: not in the Trash, and the empty space only offers
+        // them in a real folder (not in Recent or search results).
+        if !target.in_trash && (target.selected > 0 || in_folder) {
+            self.refresh_custom_actions();
+            let candidates: Vec<fileflux::core::custom_actions::Candidate<'_>> = self
+                .tab()
+                .state
+                .visible_selected()
+                .into_iter()
+                .map(fileflux::core::custom_actions::Candidate::of)
+                .collect();
+            if candidates.len() == target.selected {
+                let group = self.custom_action_rows(&candidates);
+                super::custom_actions::add_rows(&mut rows, group, target.selected == 0);
+            }
+        }
         if rows.is_empty() {
             cx.notify();
             return;
@@ -1450,6 +1464,15 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(index) = self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.custom_action_at(path))
+        {
+            self.close_menu(window, cx);
+            self.run_custom_action(index, cx);
+            return;
+        }
         if let Some(template) = self
             .menu
             .as_ref()
@@ -1986,7 +2009,7 @@ impl Explorer {
     /// Starts a detached program off the UI thread and reports a failure to
     /// start it. The child is reaped on a thread of its own: a terminal may
     /// outlive the call by hours.
-    fn launch(
+    pub(crate) fn launch(
         &mut self,
         program: PathBuf,
         args: Vec<OsString>,
@@ -1995,26 +2018,11 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         let started = cx.background_executor().spawn(async move {
-            let mut command = Command::new(&program);
-            command
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if let Some(cwd) = cwd {
-                command.current_dir(cwd);
-            }
-            let mut child = command.spawn().map_err(|error| {
-                io::Error::new(error.kind(), format!("{}: {error}", program.display()))
-            })?;
-            std::thread::Builder::new()
-                .name("fileflux-reap".to_owned())
-                .spawn(move || {
-                    if let Err(error) = child.wait() {
-                        log::debug!("waiting for a launched program failed: {error}");
-                    }
-                })?;
-            Ok::<(), io::Error>(())
+            fileflux::core::custom_actions::spawn_detached(
+                program.as_os_str(),
+                &args,
+                cwd.as_deref(),
+            )
         });
         cx.spawn(async move |this, cx| {
             if let Err(error) = started.await

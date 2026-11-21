@@ -1355,9 +1355,10 @@ mod tests {
                 MenuRow::Header(label) => format!("# {label}"),
                 MenuRow::Item(item) => item.label.to_owned(),
                 MenuRow::Submenu(spec) => spec.label.to_owned(),
-                MenuRow::TemplateFile { label, .. } | MenuRow::TemplateFolder { label, .. } => {
-                    label.clone()
-                }
+                MenuRow::TemplateFile { label, .. }
+                | MenuRow::TemplateFolder { label, .. }
+                | MenuRow::Custom { label, .. }
+                | MenuRow::CustomFolder { label, .. } => label.clone(),
             })
             .collect()
     }

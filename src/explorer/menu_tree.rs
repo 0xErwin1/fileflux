@@ -113,6 +113,10 @@ fn row_nodes(rows: &[MenuRow]) -> Vec<MenuNode> {
             MenuRow::TemplateFolder { label, rows } => MenuNode::row(label.clone())
                 .icon(icon(gpui_kit_assets::IconName::FilePlus))
                 .children(row_nodes(rows)),
+            MenuRow::Custom { label, .. } => MenuNode::new(MenuItem::new(label.clone())),
+            MenuRow::CustomFolder { label, rows } => MenuNode::row(label.clone())
+                .icon(icon(gpui_kit_assets::IconName::Terminal))
+                .children(row_nodes(rows)),
             MenuRow::Submenu(spec) => MenuNode::row(spec.label)
                 .icon(icon(submenu_icon(spec.menu)))
                 .children(row_nodes(&spec.rows)),
@@ -147,7 +151,7 @@ fn row_in<'a>(rows: &'a [MenuRow], titled: bool, path: &[usize]) -> Option<&'a M
     for (depth, at) in parents.iter().enumerate() {
         level = match level.get(skip(*at, depth)?)? {
             MenuRow::Submenu(spec) => &spec.rows,
-            MenuRow::TemplateFolder { rows, .. } => rows,
+            MenuRow::TemplateFolder { rows, .. } | MenuRow::CustomFolder { rows, .. } => rows,
             _ => return None,
         };
     }
@@ -194,6 +198,14 @@ impl MenuState {
     pub(crate) fn template_at(&self, path: &[usize]) -> Option<&std::path::Path> {
         match row_in(&self.rows, self.title.is_some(), path)? {
             MenuRow::TemplateFile { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The custom action an activation `path` names, by its index.
+    pub(crate) fn custom_action_at(&self, path: &[usize]) -> Option<usize> {
+        match row_in(&self.rows, self.title.is_some(), path)? {
+            MenuRow::Custom { index, .. } => Some(*index),
             _ => None,
         }
     }

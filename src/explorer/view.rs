@@ -872,6 +872,9 @@ pub(crate) struct Explorer {
     /// The terminal "Open in terminal" runs, once found (off the UI thread)
     /// and when the machine has one.
     pub(crate) terminal: Option<Terminal>,
+    /// The user's custom actions (`actions.toml`), re-read when a context
+    /// menu opens and the file changed.
+    pub(crate) custom_actions: fileflux::core::custom_actions::ActionsStore,
     /// The one watcher thread every tab's folders are watched through;
     /// `None` when inotify is unavailable (tabs then refresh on activation).
     pub(super) hub: Option<WatchHub>,
@@ -1106,6 +1109,9 @@ impl Explorer {
             toast_ids: RefCell::new(Vec::new()),
             toast_stack_height: Rc::new(Cell::new(0.0)),
             terminal: None,
+            custom_actions: fileflux::core::custom_actions::ActionsStore::new(
+                fileflux::core::custom_actions::actions_path_from_env(),
+            ),
             hub,
             watch_events,
             folder_debounce: HashMap::new(),

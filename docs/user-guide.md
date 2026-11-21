@@ -238,6 +238,39 @@ The sidebar's **Network** section connects to servers the way Nautilus and Thuna
 
 The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), **Paste as link** (on one selected folder), [Extract here, Extract to… and Compress…](#archives), Rename, [Make Link](#links), Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, [**New from template ›**](#new-from-template), Paste, [Paste as link](#links), **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
 
+## Custom actions
+
+You can add your own entries to the context menu. They are read from `actions.toml` (see [Settings and files](settings.md#custom-actions-actionstoml)); Fileflux ships none.
+
+```toml
+# Open a terminal in the folder you right-clicked (empty space).
+[[action]]
+name = "Open a terminal here"
+command = ["alacritty", "--working-directory", "%d"]
+appears_on = "background"
+
+# Compress the selection (one or more files or folders) with a tool of your choice.
+[[action]]
+name = "Compress with 7z"
+command = ["7z", "a", "archive.7z", "%F"]
+appears_on = "both"
+selection = "any"
+
+# Copy the path of one image to the clipboard.
+[[action]]
+name = "Copy path (wl-copy)"
+command = ["wl-copy", "%f"]
+appears_on = "files"
+selection = "one"
+mime = "image/*"
+```
+
+- **Fields.** `name` (the menu label) and `command` are required. `command` is a list: the program, then its arguments. It never goes through a shell; if you want one, write it out: `["sh", "-c", "echo \"$1\"", "sh", "%f"]`. `appears_on` is `files`, `folders`, `both` (the default) or `background` (the empty space of a folder). `selection` is `one`, `many` or `any` (the default) and counts the selected entries; it does not apply to `background`. `mime` (for example `image/*` or `image/png`; `inode/directory` for folders) and `glob` (for example `*.md`, case-insensitive, the same patterns as Select items matching…) narrow it further: every selected entry must match. The type is the one Fileflux shows for the file (from the name); an entry with no known type never matches `mime`.
+- **Placeholders.** `%f` is the first selected path, `%F` all of them (each as its own argument, so it must be an argument on its own: `"%F"`, not `"--files=%F"`), `%d` the folder that holds the first path, `%n` its name and `%%` a literal `%`. Inside a larger argument, such as `"--file=%f"`, only `%f`, `%d` and `%n` work. For a `background` action, `%f` and `%d` are the shown folder. Names that are not valid UTF-8 are passed unchanged. The program itself cannot contain placeholders.
+- **Menu.** The actions that match the selection appear after **Open with…**; with up to three they are plain rows, with more they are grouped in a **Custom actions ›** submenu. On the empty space they close the menu in a group of their own. Actions are not offered in the Trash, and `background` actions are not offered in Recent or search results. Entries listed there use their real paths.
+- **Running.** The program starts detached, with no input, its output discarded, in the shown folder (in the folder of the first result in Recent and search results). If it cannot start, a notice says `Could not run <name>: <reason>`.
+- **Reloading.** The file is checked every time a context menu opens, and read again only when it changed. If it has an error (bad TOML, an empty `command`, an unknown placeholder or value, a program that is not an executable on `PATH` or at the absolute path you gave), no custom actions are offered, one notice names the problem and its line, and the same message is written to the log as a warning. A missing or empty file simply offers nothing.
+
 ## File operations
 
 Everything that changes the disk runs off the UI thread, reports its result in a toast or an inline error, and never overwrites anything silently. Right-click an entry or the empty space (or use the toolbar "more" button, the Menu key or Shift+F10). The menu is headed by its target ("report.pdf", "3 items", "Home (this folder)") and the target keeps a tint outline while it is open.

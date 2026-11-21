@@ -158,9 +158,10 @@ mod tests {
             .map(|row| match row {
                 MenuRow::Item(spec) => spec.label.to_owned(),
                 MenuRow::Submenu(spec) => spec.label.to_owned(),
-                MenuRow::TemplateFile { label, .. } | MenuRow::TemplateFolder { label, .. } => {
-                    label.clone()
-                }
+                MenuRow::TemplateFile { label, .. }
+                | MenuRow::TemplateFolder { label, .. }
+                | MenuRow::Custom { label, .. }
+                | MenuRow::CustomFolder { label, .. } => label.clone(),
                 MenuRow::Header(label) => (*label).to_owned(),
                 MenuRow::Separator => "-".to_owned(),
             })

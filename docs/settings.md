@@ -15,9 +15,19 @@ Fileflux remembers your preferences, favorites and open tabs in two small TOML f
 | `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Preferences: default view (`grid`, `list` or `compact`; a file with the older values loads unchanged), default sort and filters (sort, `hide_hidden`, folders first, natural order, categories, date and size), sidebar and details panel widths (`sidebar_width`, `details_width`; a file without `details_width` loads the default), the optional list columns (`list_columns`, see below), the icon size of each view (`grid_zoom`, `list_zoom`, `compact_zoom`, see below), whether the sidebar starts collapsed, whether the details panel is open, and the window size |
 | `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder, Trash or Recent, view, sort and filters of each) and which one is active, and for the dual-pane view the second pane's tabs, its active tab, whether the view was split and which pane had the focus (a `[split]` table, written only once the view has been split; a file without it opens as a single pane, so older files load unchanged). A tab showing the results of a subfolder search is saved as the folder it searched: the query and results are not restored |
 
-Both files are created with mode `0600` because they list your folders.
+A third, optional file is written by you, never by Fileflux:
+
+| File | Location | Holds |
+|---|---|---|
+| `actions.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Your [custom actions](#custom-actions-actionstoml) |
+
+`settings.toml` and `session.toml` are created with mode `0600` because they list your folders.
 
 Favorites are **not** in `settings.toml`: they are the lines of the GTK bookmarks file, `$XDG_CONFIG_HOME/gtk-3.0/bookmarks` (default `~/.config/gtk-3.0/bookmarks`), shared with Nautilus, Thunar and the GTK file chooser. See [Favorites and GTK bookmarks](user-guide.md#favorites-and-gtk-bookmarks).
+
+## Custom actions (`actions.toml`)
+
+User-defined context menu entries, as `[[action]]` tables. Fileflux only reads this file. It is checked whenever a context menu opens and read again when its modification time or size changes, so edits apply without a restart. A missing file offers no actions. A file with any error offers none at all and shows one notice (and logs a warning) naming the error and its line; fix it and open a menu again. Unknown keys are errors, so a typo such as `appear_on` is caught. Fields, placeholders and examples are in the [user guide](user-guide.md#custom-actions).
 
 ## Defaults and migration
 

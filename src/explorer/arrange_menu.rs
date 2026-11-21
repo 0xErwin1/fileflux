@@ -268,7 +268,9 @@ mod tests {
                 | MenuRow::Separator
                 | MenuRow::Submenu(_)
                 | MenuRow::TemplateFile { .. }
-                | MenuRow::TemplateFolder { .. } => None,
+                | MenuRow::TemplateFolder { .. }
+                | MenuRow::Custom { .. }
+                | MenuRow::CustomFolder { .. } => None,
             })
             .collect()
     }

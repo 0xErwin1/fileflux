@@ -1465,6 +1465,17 @@ pub(crate) enum MenuRow {
         label: String,
         rows: Vec<MenuRow>,
     },
+    /// A custom action: `index` is its place in the actions the menu was
+    /// built from.
+    Custom {
+        label: String,
+        index: usize,
+    },
+    /// The "Custom actions" flyout, holding [`MenuRow::Custom`] rows.
+    CustomFolder {
+        label: String,
+        rows: Vec<MenuRow>,
+    },
     /// A caption naming the group of rows under it; never selectable.
     Header(&'static str),
     Separator,

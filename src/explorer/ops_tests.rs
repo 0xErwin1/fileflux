@@ -403,9 +403,10 @@ fn flat(rows: &[MenuRow]) -> Vec<String> {
             MenuRow::Separator => "-".to_owned(),
             MenuRow::Header(label) => format!("# {label}"),
             MenuRow::Item(item) => item.label.to_owned(),
-            MenuRow::TemplateFile { label, .. } | MenuRow::TemplateFolder { label, .. } => {
-                label.clone()
-            }
+            MenuRow::TemplateFile { label, .. }
+            | MenuRow::TemplateFolder { label, .. }
+            | MenuRow::Custom { label, .. }
+            | MenuRow::CustomFolder { label, .. } => label.clone(),
         })
         .collect()
 }
