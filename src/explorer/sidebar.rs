@@ -90,6 +90,7 @@ pub(crate) fn render(
         .child(places_section(this, cx))
         .child(favorites_section(this, cx))
         .child(network_section(this, cx))
+        .child(analyzed_section(this, cx))
         .child(volumes_section(this, cx));
 
     if let Some(error) = &this.sidebar_error {
@@ -216,6 +217,61 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
         this,
         cx,
     ))
+}
+
+/// The analysis the active tab is showing, so it can be re-entered after
+/// browsing elsewhere. Absent unless that tab is a usage view.
+fn analyzed_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
+    let mut section = div().flex_none().flex().flex_col();
+    let Some(session) = this.usage() else {
+        return section;
+    };
+    let colors = bolt::colors(cx);
+    let root = session.analysis_root.clone();
+    let label = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let state = if session.is_walking() {
+        "measuring"
+    } else {
+        "analyzed"
+    };
+    section = section
+        .child(section_label("analyzed-label", "Analyzed", cx))
+        .child(
+            div()
+                .id("explorer-analyzed-row")
+                .mx(Spacing::LG)
+                .h(px(26.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(Spacing::SM)
+                .text_size(px(12.0))
+                .text_color(colors.foreground)
+                .cursor_pointer()
+                .hover(|style| style.bg(colors.strong.opacity(0.06)))
+                .on_click(
+                    cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
+                        this.usage_drill(root.clone(), window, cx);
+                    }),
+                )
+                .child(
+                    Icon::new(super::icon(gpui_kit_assets::IconName::ChartPie))
+                        .size(px(14.0))
+                        .color(colors.info),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("Disk usage \u{00b7} {label}")),
+                )
+                .child(div().flex_none().text_color(colors.muted).child(state)),
+        );
+    section
 }
 
 /// The Favorites section: saved rows, with an empty hint.

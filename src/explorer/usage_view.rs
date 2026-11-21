@@ -81,7 +81,10 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .gap(Spacing::LG)
         .child(chart_panel(this, session, &weak, cx))
         .child(list_panel(this, session, &weak, cx));
-    container.child(header(session, cx)).child(body)
+    container
+        .child(header(session, cx))
+        .child(body)
+        .child(status(session, cx))
 }
 
 /// The trail of folders from the analysis root to the shown one (a click
@@ -151,14 +154,110 @@ fn header(session: &UsageSession, cx: &mut Context<Explorer>) -> Stateful<Div> {
             .tooltip("Measure the folder again")
             .on_click(cx.listener(|this, _event, _window, cx| this.reanalyze_usage(cx)))
     };
-    div()
+    let mut header = div()
         .id("explorer-usage-header")
         .flex_none()
         .flex()
         .items_center()
         .gap(Spacing::SM)
-        .child(trail)
-        .child(action)
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(16.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(colors.strong)
+                .child("Disk usage"),
+        )
+        .child(trail);
+    if session.stale {
+        header = header.child(
+            div()
+                .flex_none()
+                .text_size(px(11.0))
+                .text_color(colors.warning)
+                .child("freed space is an estimate"),
+        );
+    }
+    header.child(action)
+}
+
+/// The totals of the shown folder, and how much of the walk they cover: the
+/// numbers are read here, not guessed from the chart.
+fn status(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElement {
+    let colors = bolt::colors(cx);
+    let Some(summary) = session.summary() else {
+        return div().into_any_element();
+    };
+    let mut text = format!("{} in {} items", format_bytes(summary.bytes), summary.items);
+    if session.is_walking() {
+        let rows = session.rows();
+        let total = rows.len();
+        let done = rows.iter().filter(|row| !row.pending).count();
+        text.push_str(&format!(" \u{00b7} {done} of {total} children measured"));
+    } else if summary.incomplete {
+        text.push_str(" \u{00b7} some folders could not be read");
+    }
+    div()
+        .id("explorer-usage-status")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(Spacing::SM)
+        .text_size(px(11.0))
+        .text_color(colors.muted)
+        .child(text)
+        .into_any_element()
+}
+
+/// The three largest slices, spelled out under the chart: the colour alone
+/// says nothing without a name and a number.
+fn legend(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElement {
+    let colors = bolt::colors(cx);
+    let rows: Vec<ShownRow> = session
+        .rows()
+        .into_iter()
+        .filter(|row| row.depth == 0)
+        .take(3)
+        .collect();
+    if rows.is_empty() {
+        return div().into_any_element();
+    }
+    let mut list = div()
+        .id("explorer-usage-legend")
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .text_size(px(12.0));
+    for (index, row) in rows.iter().enumerate() {
+        let swatch = if row.kind == ShownKind::Other {
+            colors.line_2
+        } else {
+            hsla(usage_chart::color(index, 1))
+        };
+        list = list.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().flex_none().w(px(8.0)).h(px(8.0)).bg(swatch))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(colors.foreground)
+                        .child(row.name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(colors.strong)
+                        .child(format_bytes(row.bytes)),
+                ),
+        );
+    }
+    list.into_any_element()
 }
 
 // --- the chart ---------------------------------------------------------------
@@ -211,30 +310,32 @@ fn chart_panel(
             },
         )
         .size_full();
-        return panel.child(
-            div()
-                .id("explorer-usage-chart")
-                .relative()
-                .w(px(CHART_SIZE))
-                .h(px(CHART_SIZE))
-                .child(canvas)
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(2.0))
-                        .child(div().text_color(colors.muted).child("measuring"))
-                        .child(
-                            div()
-                                .text_color(colors.strong)
-                                .child(format_bytes(measured)),
-                        ),
-                ),
-        );
+        return panel
+            .child(
+                div()
+                    .id("explorer-usage-chart")
+                    .relative()
+                    .w(px(CHART_SIZE))
+                    .h(px(CHART_SIZE))
+                    .child(canvas)
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(2.0))
+                            .child(div().text_color(colors.muted).child("measuring"))
+                            .child(
+                                div()
+                                    .text_color(colors.strong)
+                                    .child(format_bytes(measured)),
+                            ),
+                    ),
+            )
+            .child(legend(session, cx));
     };
     if session.segments.is_empty() {
         return panel.child(
@@ -293,37 +394,39 @@ fn chart_panel(
         .hover
         .and_then(|hover| chart_tooltip(tree, session, hover, cx));
     let _ = this;
-    panel.child(
-        div()
-            .id("explorer-usage-chart")
-            .relative()
-            .w(px(CHART_SIZE))
-            .h(px(CHART_SIZE))
-            .child(canvas)
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .max_w(px(110.0))
-                            .truncate()
-                            .text_color(colors.strong)
-                            .child(centre_name),
-                    )
-                    .child(
-                        div()
-                            .text_color(colors.muted)
-                            .child(format_bytes(tree.total(root))),
-                    ),
-            )
-            .children(tooltip),
-    )
+    panel
+        .child(
+            div()
+                .id("explorer-usage-chart")
+                .relative()
+                .w(px(CHART_SIZE))
+                .h(px(CHART_SIZE))
+                .child(canvas)
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .max_w(px(110.0))
+                                .truncate()
+                                .text_color(colors.strong)
+                                .child(centre_name),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.muted)
+                                .child(format_bytes(tree.total(root))),
+                        ),
+                )
+                .children(tooltip),
+        )
+        .child(legend(session, cx))
 }
 
 fn segment_color(segment: &Segment, highlighted: bool) -> Hsla {
