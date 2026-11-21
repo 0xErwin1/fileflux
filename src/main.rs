@@ -11,13 +11,27 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fileflux::cli::{self, CliError, Command, Target};
+use fileflux::dbus;
 
 /// Exit status for a command line that cannot be honored.
 const USAGE_ERROR: u8 = 2;
 
 fn main() -> ExitCode {
     match launch() {
-        Ok(Launch::Window(target)) => gui::open(target),
+        Ok(Launch::Window { target, forward }) => {
+            gui::init_logging();
+            // Only the explorer is a single instance; a viewer launch stays
+            // its own process, as before.
+            let desktop = match &target {
+                Target::Explorer(_) => match dbus::claim(&dbus::Endpoint::Session, &forward) {
+                    dbus::Role::Primary(primary) => Some(primary),
+                    dbus::Role::Forwarded => return ExitCode::SUCCESS,
+                    dbus::Role::Standalone => None,
+                },
+                Target::Viewer(_) => None,
+            };
+            gui::open(target, desktop)
+        }
         Ok(Launch::Done) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("fileflux: {error}");
@@ -32,7 +46,12 @@ fn main() -> ExitCode {
 /// What the binary does after reading its command line.
 enum Launch {
     /// Open the explorer or the viewer, as the resolved command line asks.
-    Window(Target),
+    /// `forward` is what a running instance is handed instead: the absolute
+    /// command-line paths.
+    Window {
+        target: Target,
+        forward: Vec<PathBuf>,
+    },
     /// Help or version was printed; no window opens.
     Done,
 }
@@ -55,7 +74,14 @@ fn launch() -> Result<Launch, CliError> {
             for note in &resolved.notes {
                 eprintln!("fileflux: {note}");
             }
-            Ok(Launch::Window(resolved.target))
+            let forward = paths
+                .iter()
+                .map(|path| cli::absolute_path(path, std::env::current_dir, home.as_deref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Launch::Window {
+                target: resolved.target,
+                forward,
+            })
         }
     }
 }

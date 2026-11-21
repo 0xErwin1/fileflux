@@ -20,11 +20,19 @@ use crate::explorer::{Explorer, bind_keys};
 use crate::theme;
 use crate::viewer;
 
-/// Initializes logging, installs the Bolt theme and opens the explorer
+/// Initializes logging; call once, before anything logs.
+pub(crate) fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+}
+
+/// Installs the Bolt theme and opens the explorer
 /// window at the resolved directory (home when none) or the image viewer,
 /// running until the last window closes.
-pub(crate) fn open(target: Target) -> std::process::ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+pub(crate) fn open(
+    target: Target,
+    desktop: Option<fileflux::dbus::Primary>,
+) -> std::process::ExitCode {
+    let desktop = desktop.map(Rc::new);
 
     let startup_error: Rc<RefCell<Option<anyhow::Error>>> = Rc::default();
 
@@ -46,6 +54,9 @@ pub(crate) fn open(target: Target) -> std::process::ExitCode {
             })
             .detach();
 
+            if let Some(desktop) = &desktop {
+                cx.set_global(crate::explorer::desktop::DesktopLink(Rc::clone(desktop)));
+            }
             let opened = match &*target {
                 Target::Explorer(start) => open_explorer_window(start.clone(), cx),
                 Target::Viewer(launch) => viewer::open_window(launch, cx),

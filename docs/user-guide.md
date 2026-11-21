@@ -11,6 +11,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 ## Contents
 
 - [Command line](#command-line)
+- [Single instance and Show in folder](#single-instance-and-show-in-folder)
 - [Window layout](#window-layout)
 - [Navigation](#navigation)
 - [Views](#views)
@@ -58,6 +59,12 @@ fileflux [OPTIONS] IMAGE...
 Image formats: png, jpg/jpeg, gif, webp, bmp, tif/tiff, ico, svg, qoi, tga, hdr, exr.
 
 Use `--` before a directory whose name starts with `-`. A path on the command line opens only that folder and leaves your saved tabs alone (see [Settings](settings.md#what-is-saved-and-when)).
+
+## Single instance and Show in folder
+
+Fileflux runs once per desktop session. Starting it again with a path hands the path to the window that is already open and exits with status 0: a folder opens in a new tab, and a file opens its folder in a new tab with the file selected. Starting it without a path just raises the running window. Image paths still open the [image viewer](#image-viewer) in their own window. Without a session bus (or when D-Bus fails) Fileflux simply opens as before.
+
+The running window also answers the `org.freedesktop.FileManager1` interface, which is what "Show in folder" or "Open containing folder" in other applications (browsers, chat clients) calls: `ShowFolders` opens each folder in a new tab, `ShowItems` opens the parent folder of the items in a new tab and selects them, and `ShowItemProperties` does the same and shows the details panel. Only `file://` URIs are accepted; other schemes are ignored. Fileflux never takes this name from another file manager that already owns it (GNOME Files, Dolphin): the request is refused and the other manager keeps answering. No D-Bus service file is installed, so Fileflux does not start by itself on such a request; it answers only while it is running.
 
 ## Window layout
 

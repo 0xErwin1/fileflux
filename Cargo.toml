@@ -66,6 +66,12 @@ resvg = { version = "=0.46.0" }
 # already in the lock through the GPUI stack, so no new crate compiles.
 regex = { version = "=1.13.1" }
 usvg = { version = "=0.46.0" }
+# The D-Bus side of the desktop integration (single instance and
+# org.freedesktop.FileManager1). The 5.19.0 build with exactly the `async-io`
+# feature set is the one the GPUI stack's portal code (ashpd) already
+# compiles, so no new crate and no feature change; `blocking-api` is left off
+# on purpose, the module drives the async API with `zbus::block_on`.
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io"] }
 
 [features]
 default = []

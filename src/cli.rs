@@ -264,6 +264,17 @@ pub fn resolve_start(
     }
 }
 
+/// The absolute form of a command-line path (`~` expanded, relative paths
+/// anchored at `cwd`, lexically), without looking at the filesystem: what a
+/// second launch forwards to the running instance.
+pub fn absolute_path(
+    path: &Path,
+    cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+    home: Option<&Path>,
+) -> Result<PathBuf, CliError> {
+    absolutize(path, cwd, home)
+}
+
 /// Expands `~` and anchors relative paths, lexically.
 fn absolutize(
     path: &Path,

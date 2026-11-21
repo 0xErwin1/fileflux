@@ -881,6 +881,9 @@ pub(crate) struct Explorer {
     pub(super) folder_debounce: HashMap<PathBuf, Debounce>,
     /// The retained loop that drains the watcher channel.
     _watch_pump: Option<Task<()>>,
+    /// The bus requests of the desktop integration, when this process owns
+    /// the instance name (see [`super::desktop`]).
+    pub(crate) desktop: Option<std::rc::Rc<fileflux::dbus::Primary>>,
     /// The machine's devices and the actions on them: the Devices section.
     pub(crate) devices: DeviceHub,
     /// Connect to Server: the network bookmarks, the session's recent
@@ -1107,6 +1110,9 @@ impl Explorer {
             watch_events,
             folder_debounce: HashMap::new(),
             _watch_pump: None,
+            desktop: cx
+                .try_global::<super::desktop::DesktopLink>()
+                .map(|link| std::rc::Rc::clone(&link.0)),
             devices: DeviceHub::from_env(),
             network: super::network::NetworkHub::default(),
             rubber_band: None,
@@ -1120,6 +1126,7 @@ impl Explorer {
                         this.pump_watch_events(window, cx);
                         this.pump_devices(window, cx);
                         this.pump_network(window, cx);
+                        this.pump_desktop(window, cx);
                         this.persist_tick(window, cx);
                     })
                     .is_err()

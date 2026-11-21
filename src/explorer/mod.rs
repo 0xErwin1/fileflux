@@ -5,6 +5,7 @@ pub(crate) mod archive;
 pub(crate) mod arrange;
 pub(crate) mod arrange_menu;
 pub(crate) mod clipboard;
+pub(crate) mod desktop;
 pub(crate) mod devices;
 pub(crate) mod dnd;
 pub(crate) mod entries;

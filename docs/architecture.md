@@ -14,7 +14,8 @@ One package, one library and one binary.
 
 | Part | Path | Role |
 |---|---|---|
-| Library `fileflux` | `src/lib.rs` | Exposes `fileflux::cli` and `fileflux::core`. No GPUI dependency in these modules |
+| Library `fileflux` | `src/lib.rs` | Exposes `fileflux::cli`, `fileflux::core` and `fileflux::dbus`. No GPUI dependency in these modules |
+| D-Bus | `src/dbus.rs` | Single instance (`io.github.fileflux.Fileflux`) and `org.freedesktop.FileManager1`, served on zbus's own thread; requests reach the UI thread through a channel that `src/explorer/desktop.rs` drains |
 | Binary `fileflux` | `src/main.rs`, `src/gui.rs`, `src/theme.rs` | Parses the command line through `fileflux::cli`, starts GPUI, installs Bolt's dark theme, opens the explorer or the viewer inside `gpui_component`'s `Root` |
 | Explorer | `src/explorer/` | The window: state, views, sidebar, toolbar, tabs, dialogs, progress, key bindings |
 | Viewer | `src/viewer/` | The image viewer window: navigation, zoom, rotation, info panel |
