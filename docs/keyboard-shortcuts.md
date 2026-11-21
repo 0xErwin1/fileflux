@@ -22,6 +22,9 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Alt+↑ | Up one folder | |
 | Ctrl+R | Reload | |
 | Ctrl+I | Toggle the details panel | Same as Properties |
+| Ctrl+= / Ctrl++ | Zoom in | One icon size larger in the view that is shown (grid: small, medium, large, larger; list: small, medium, large); `Ctrl+Shift+=` is the same chord on layouts where `+` is typed with Shift. Stops at the largest; see [Icon size](user-guide.md#icon-size) |
+| Ctrl+- | Zoom out | One size smaller; stops at the smallest |
+| Ctrl+0 | Reset zoom | Back to medium, the size Fileflux had before the zoom existed |
 | Ctrl+H | Show or hide hidden files | Dotfiles and the names in a folder's `.hidden` file. Hidden by default; showing them adds a "Hidden shown" chip |
 | ↑ ↓ ← → | Move the selection | In the order the list is sorted |
 | Home / End | First / last entry | |
@@ -74,6 +77,7 @@ Mouse: the wheel and the back/forward buttons navigate, Ctrl+wheel zooms around 
 | Click / Ctrl+click / Shift+click | Select / toggle / select a range |
 | Middle-click a folder, sidebar row or breadcrumb | Open in a background tab |
 | Middle-click a tab | Close it |
+| Ctrl+wheel over the entries | Zoom | Wheel up zooms in, wheel down zooms out, one level per wheel notch; the list does not scroll while Ctrl is held |
 | Drop with Ctrl | Copy |
 | Drop with Shift | Move |
 | Drop with Ctrl+Shift | Link: creates symbolic links to the dropped entries in the target folder (see [Links](user-guide.md#links)) |

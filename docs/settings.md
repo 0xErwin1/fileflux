@@ -12,7 +12,7 @@ Fileflux remembers your preferences, favorites and open tabs in two small TOML f
 
 | File | Location | Holds |
 |---|---|---|
-| `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Preferences: default view (grid or list), default sort and filters (sort, `hide_hidden`, folders first, natural order, categories, date and size), sidebar and details panel widths (`sidebar_width`, `details_width`; a file without `details_width` loads the default), the optional list columns (`list_columns`, see below), whether the sidebar starts collapsed, whether the details panel is open, and the window size |
+| `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Preferences: default view (grid or list), default sort and filters (sort, `hide_hidden`, folders first, natural order, categories, date and size), sidebar and details panel widths (`sidebar_width`, `details_width`; a file without `details_width` loads the default), the optional list columns (`list_columns`, see below), the icon size of each view (`grid_zoom`, `list_zoom`, see below), whether the sidebar starts collapsed, whether the details panel is open, and the window size |
 | `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder, Trash or Recent, view, sort and filters of each) and which one is active, and for the dual-pane view the second pane's tabs, its active tab, whether the view was split and which pane had the focus (a `[split]` table, written only once the view has been split; a file without it opens as a single pane, so older files load unchanged). A tab showing the results of a subfolder search is saved as the folder it searched: the query and results are not restored |
 
 Both files are created with mode `0600` because they list your folders.
@@ -40,6 +40,18 @@ list_columns = ["size", "modified", "type", "owner"]
 ```
 
 A file without the key (every file written before it existed, in version 1 or 2) shows today's three columns, Name, Size and Modified, so the version stays 2 and an older build can still read the file. `list_columns = []` shows Name alone. The columns are always drawn in the order above, whatever order the file lists them in, and repeats are dropped. An unknown name makes the file invalid like any other wrongly typed value: it is kept aside and the defaults load. Sorting by Type, Permissions, Owner or Group is saved with the rest of the sort as `sort_key = "type"`, `"permissions"`, `"owner"` or `"group"`.
+
+## Icon size
+
+`grid_zoom` and `list_zoom` (under `[preferences]`) hold the icon size of each view, set with Ctrl+=, Ctrl+-, Ctrl+0 or Ctrl+wheel (see [Icon size](user-guide.md#icon-size)). The grid takes `"small"`, `"medium"`, `"large"` or `"larger"`; the list takes `"small"`, `"medium"` or `"large"`:
+
+```toml
+[preferences]
+grid_zoom = "large"
+list_zoom = "medium"
+```
+
+A file without the keys (every file written before they existed, in version 1 or 2) draws medium, the size of before, so the version stays 2 and an older build can still read the file. A name the view has no level for, such as `list_zoom = "larger"`, makes the file invalid like any other wrongly typed value: it is kept aside and the defaults load.
 
 ## What is saved and when
 

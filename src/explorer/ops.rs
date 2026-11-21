@@ -36,6 +36,7 @@ use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
 };
 use fileflux::core::watch::nearest_existing_ancestor;
+use fileflux::core::zoom::ZoomCommand;
 use fileflux::core::{Entry, Location};
 use gpui::Entity;
 
@@ -1348,6 +1349,8 @@ pub(crate) enum MenuCommand {
     /// Shows or hides one optional column of the list view; the menu stays
     /// open and redraws its checks.
     ToggleColumn(ColumnPref),
+    /// A step of the shown view's icon size; the menu closes.
+    Zoom(ZoomCommand),
     /// Sidebar rows: pin the row's folder to the Favorites.
     AddFavorite,
     /// Sidebar rows: unpin the row's folder from the Favorites.
@@ -1381,6 +1384,8 @@ pub(crate) enum ArrangeMenu {
     Select,
     /// The optional columns of the list view.
     Columns,
+    /// Zoom in, Zoom out, Reset zoom: the icon size of the shown view.
+    Zoom,
 }
 
 impl ArrangeMenu {
@@ -1391,6 +1396,7 @@ impl ArrangeMenu {
             Self::Filter => "Filter",
             Self::Select => "Select",
             Self::Columns => "Columns",
+            Self::Zoom => "Zoom",
         }
     }
 }

@@ -38,6 +38,7 @@ use fileflux::core::thumbnails::{Outcome, Skip};
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
+use fileflux::core::zoom::{GridZoom, ListZoom, ZoomCommand};
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Div, Entity, FocusHandle, Focusable,
@@ -72,6 +73,7 @@ use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::tabs::{Affected, Placement};
 use crate::explorer::toasts;
 use crate::explorer::typeahead::{self, TypeAhead};
+use crate::explorer::zoom::{self, GridZoomExt as _, WheelTravel};
 use crate::explorer::{entries, overlay, progress, rubber, sidebar, tabstrip, toolbar, util};
 
 /// How many images one background thumbnail lookup covers before the tiles
@@ -109,6 +111,12 @@ actions!(
         ToggleInspector,
         /// Shows or hides the hidden (dot) files of the tab (Ctrl+H).
         ToggleHidden,
+        /// One zoom level larger for the shown view (Ctrl+=, Ctrl++).
+        ZoomEntriesIn,
+        /// One zoom level smaller for the shown view (Ctrl+-).
+        ZoomEntriesOut,
+        /// Back to the Medium zoom level of the shown view (Ctrl+0).
+        ZoomEntriesReset,
         /// Creates a folder in the shown folder and renames it in place.
         NewFolder,
         /// Renames the selected entry in place (F2).
@@ -293,6 +301,12 @@ pub(crate) fn bind_keys(cx: &mut App) {
     // open menu, text fields included: none of these chords types text.
     let tabs = Some("FilefluxExplorer && !Modal && !FilefluxMenu");
     cx.bind_keys([
+        // "+" is Shift+= on most layouts and a key of its own on others.
+        KeyBinding::new("ctrl-=", ZoomEntriesIn, tabs),
+        KeyBinding::new("ctrl-+", ZoomEntriesIn, tabs),
+        KeyBinding::new("ctrl-shift-=", ZoomEntriesIn, tabs),
+        KeyBinding::new("ctrl--", ZoomEntriesOut, tabs),
+        KeyBinding::new("ctrl-0", ZoomEntriesReset, tabs),
         KeyBinding::new("ctrl-t", NewTab, tabs),
         KeyBinding::new("ctrl-w", CloseTab, tabs),
         KeyBinding::new("ctrl-tab", NextTab, tabs),
@@ -763,6 +777,12 @@ pub(crate) struct Explorer {
     /// The optional columns of the list view, besides Name (the saved
     /// preference).
     pub(crate) list_columns: Vec<ColumnPref>,
+    /// The icon size of the grid view (the saved preference).
+    pub(crate) grid_zoom: GridZoom,
+    /// The row and icon size of the list view (the saved preference).
+    pub(crate) list_zoom: ListZoom,
+    /// Ctrl+wheel movement not yet spent on a zoom step.
+    wheel_travel: WheelTravel,
     /// What each pane's entries area measured: the inner width recorded by
     /// the draw-nothing measuring canvas every frame (`None` until the first
     /// layout reached it, so the first frame draws with the estimate below)
@@ -1033,6 +1053,9 @@ impl Explorer {
             pane_focus: PerPane::new(cx.focus_handle(), cx.focus_handle()),
             list_widths: ListWidths::default(),
             list_columns: preferences.list_columns.clone(),
+            grid_zoom: preferences.grid_zoom,
+            list_zoom: preferences.list_zoom,
+            wheel_travel: WheelTravel::default(),
             pane_geometry: PerPane::default(),
             sidebar_open: !preferences.sidebar_collapsed,
             sidebar_overlay_open: false,
@@ -1156,6 +1179,8 @@ impl Explorer {
                 sidebar_width: self.sidebar_width.round() as u32,
                 details_width: self.details_width.round() as u32,
                 list_columns: self.list_columns.clone(),
+                grid_zoom: self.grid_zoom,
+                list_zoom: self.list_zoom,
                 sidebar_collapsed: !self.sidebar_open,
                 details_open: self.inspector_open,
                 window_width: f32::from(size.width).round() as u32,
@@ -1836,16 +1861,17 @@ impl Explorer {
 
     /// Looks up the cached thumbnails of tab `id`'s images on the background
     /// executor, then generates the missing ones (freedesktop `large`), a batch at a time so the first tiles do not wait for a long
-    /// folder. The answers that still apply stay on screen meanwhile; a newer
+    /// folder. `bucket` is the smallest cache size the grid's zoom needs. The answers that still apply stay on screen meanwhile; a newer
     /// commit replaces the task (dropping it).
     fn start_thumbnails(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let bucket = self.grid_zoom.thumbnail_bucket();
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
         let trust_known = !tab.state.current().lists_files_from_elsewhere();
         let displayed = tab.state.visible_shared();
         let (keep, todo) =
-            entries::plan_thumbnails(&tab.snapshot, &displayed, &tab.thumbs, trust_known);
+            entries::plan_thumbnails(&tab.snapshot, &displayed, &tab.thumbs, trust_known, bucket);
         tab.thumbs = Arc::new(keep);
         tab.thumbs_task = None;
         if todo.is_empty() {
@@ -1863,7 +1889,7 @@ impl Explorer {
                         batch
                             .into_iter()
                             .map(|(path, modified)| {
-                                let found = fileflux::core::thumbnails::lookup(&path);
+                                let found = fileflux::core::thumbnails::lookup_at(&path, bucket);
                                 (path, modified, found)
                             })
                             .collect::<Vec<_>>()
@@ -1898,7 +1924,8 @@ impl Explorer {
                     .map(|(path, modified)| {
                         let (path, modified) = (path.clone(), *modified);
                         cx.background_executor().spawn(async move {
-                            let found = match fileflux::core::thumbnails::generate(&path) {
+                            let found = match fileflux::core::thumbnails::generate_at(&path, bucket)
+                            {
                                 Outcome::Ready(thumbnail) => Some(thumbnail),
                                 // A file of the cache is a thumbnail already.
                                 Outcome::Skipped(Skip::InsideCache) => Some(path.clone()),
@@ -1930,6 +1957,66 @@ impl Explorer {
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.thumbs_task = Some(task);
         }
+    }
+
+    /// Applies a zoom command to the view the focused pane shows (the
+    /// keys, the menu rows): the grid's or the list's own level. The level is
+    /// saved with the other preferences. A grid level that needs a bigger
+    /// thumbnail size looks the thumbnails up again for every tab; one that
+    /// the cache already satisfies does not queue anything.
+    pub(crate) fn zoom(&mut self, command: ZoomCommand, cx: &mut Context<Self>) {
+        match self.tab().state.view() {
+            View::Grid => {
+                let before = self.grid_zoom;
+                self.grid_zoom = command.apply(before);
+                if self.grid_zoom == before {
+                    return;
+                }
+                if self.grid_zoom.thumbnail_bucket() != before.thumbnail_bucket() {
+                    let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
+                    for id in ids {
+                        self.start_thumbnails(id, cx);
+                    }
+                }
+            }
+            View::List => {
+                let before = self.list_zoom;
+                self.list_zoom = command.apply(before);
+                if self.list_zoom == before {
+                    return;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// A wheel turn over pane `side`'s entries area. With Ctrl held it zooms
+    /// the view that pane shows (up zooms in) instead of scrolling; `true`
+    /// when the event was taken. Not while a menu or a dialog is open.
+    pub(crate) fn wheel_zoom(
+        &mut self,
+        side: Side,
+        event: &gpui::ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let over = self
+            .pane_geometry
+            .get(side)
+            .bounds
+            .is_some_and(|bounds| bounds.contains(&event.position));
+        if !over || self.menu.is_some() || self.dialogs.is_open() {
+            return false;
+        }
+        let control = event.modifiers.control;
+        let delta = f32::from(event.delta.pixel_delta(px(zoom::WHEEL_NOTCH)).y);
+        let command = self.wheel_travel.feed(control, delta);
+        if let Some(command) = command {
+            let focused = self.tabs.focus();
+            self.tabs.focus_side(side);
+            self.zoom(command, cx);
+            self.tabs.focus_side(focused);
+        }
+        control
     }
 
     /// Shows `answers` on tab `id`. `false` when the explorer is gone and the
@@ -3284,6 +3371,15 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &ToggleHidden, _window, cx| {
                 this.arrange(ArrangeCommand::ToggleHidden, cx);
             }))
+            .on_action(cx.listener(|this, _: &ZoomEntriesIn, _window, cx| {
+                this.zoom(ZoomCommand::In, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomEntriesOut, _window, cx| {
+                this.zoom(ZoomCommand::Out, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomEntriesReset, _window, cx| {
+                this.zoom(ZoomCommand::Reset, cx);
+            }))
             .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
                 let columns = this.grid_step();
                 this.move_selection(-columns, cx);
@@ -3546,7 +3642,7 @@ impl Explorer {
     fn set_columns(&mut self, side: Side, window: &Window) {
         let estimate = self.content_width(window);
         let geometry = self.pane_geometry.get_mut(side);
-        geometry.columns = entries::grid_columns(geometry.width.unwrap_or(estimate));
+        geometry.columns = zoom::grid_columns(geometry.width.unwrap_or(estimate), self.grid_zoom);
     }
 
     /// One pane: its document island under a 3 px edge that is tinted while

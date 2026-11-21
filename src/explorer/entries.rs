@@ -22,6 +22,8 @@ use bolt::composites::ListRow;
 use bolt::primitives::{Icon, WhenFocusVisible};
 use bolt::tokens::{Borders, ChromeColors, Spacing};
 use fileflux::core::places::format_bytes;
+use fileflux::core::thumbnails::Bucket;
+use fileflux::core::zoom::GridZoom;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
@@ -36,43 +38,12 @@ use super::dnd::{self, DropTarget};
 use super::panes::Side;
 use super::state::View;
 use super::view::{ENTRIES_CONTEXT, Explorer};
+use super::zoom::{
+    GridMetrics, GridZoomExt as _, NAME_GAP, NAME_LINE, SUB_GAP, SUB_LINE, TILE_BOTTOM_PADDING,
+    TILE_GAP, TILE_TOP_PADDING,
+};
 use super::{icon, util};
 
-/// Tile width of the reference grid (the artboard's 112 px minimum); every
-/// tile draws at exactly this width, so a partial last row matches a full
-/// one.
-pub(crate) const TILE_WIDTH: f32 = 112.0;
-/// Tile top padding above the thumbnail slot.
-pub(crate) const TILE_TOP_PADDING: f32 = 12.0;
-/// Width of the thumbnail slot every glyph, folder and photo draws in.
-pub(crate) const THUMB_WIDTH: f32 = 64.0;
-/// Height of the thumbnail slot, so the folder silhouette, the file glyphs
-/// and the photo thumbnails share a baseline row.
-pub(crate) const THUMB_HEIGHT: f32 = 52.0;
-/// Size of a file glyph inside the thumbnail slot (thinner and larger than
-/// the earlier 32 px glyph, as in the artboard).
-const GLYPH_SIZE: f32 = 40.0;
-/// Gap between the thumbnail slot and the filename.
-pub(crate) const NAME_GAP: f32 = 8.0;
-/// One filename line's height; long names clip at two lines.
-pub(crate) const NAME_LINE: f32 = 17.0;
-/// Gap between the filename and the size subline.
-const SUB_GAP: f32 = 2.0;
-/// The mono 11 px subline's height.
-const SUB_LINE: f32 = 14.0;
-/// Tile bottom padding under the subline.
-const TILE_BOTTOM_PADDING: f32 = 4.0;
-/// Tile height: top padding, the thumbnail slot, the name gap, two clamped
-/// filename lines, the subline gap and subline, and bottom padding.
-pub(crate) const TILE_HEIGHT: f32 = TILE_TOP_PADDING
-    + THUMB_HEIGHT
-    + NAME_GAP
-    + 2.0 * NAME_LINE
-    + SUB_GAP
-    + SUB_LINE
-    + TILE_BOTTOM_PADDING;
-/// Gap between tiles.
-pub(crate) const TILE_GAP: f32 = 6.0;
 /// Opacity of an entry that was cut and waits for Paste.
 pub(crate) const CUT_OPACITY: f32 = 0.45;
 /// Alpha of the tint border around a selected tile (artboard `.35`).
@@ -99,14 +70,8 @@ const ENTRIES_PADDING: f32 = 16.0;
 /// Grid top padding under the folder subbar (artboard 4 px).
 const GRID_TOP_PADDING: f32 = 4.0;
 
-/// The photo thumbnail box (artboard `.photo`): 62×46 with a 1 px border.
-const PHOTO_WIDTH: f32 = 62.0;
-const PHOTO_HEIGHT: f32 = 46.0;
-/// Size of the icon inside the photo box when no thumbnail shows.
-const PHOTO_GLYPH: f32 = 28.0;
-
 /// The folder silhouette is composed from the artboard's 59×50 `folderArt`
-/// viewBox, scaled so its height fills [`THUMB_HEIGHT`]; the bundled Lucide
+/// viewBox, scaled so its height fills the level's thumbnail slot; the bundled Lucide
 /// folder glyph is stroke-only, so the two tones are composed natively.
 const FOLDER_VIEW_WIDTH: f32 = 59.0;
 const FOLDER_VIEW_HEIGHT: f32 = 50.0;
@@ -168,7 +133,8 @@ fn folder_part(scale: f32, x: f32, y: f32, width: f32, height: f32, color: Hsla)
 /// The two-tone folder of the artboard's `folderArt`, `height` pixels tall:
 /// the back layer (tab plus back panel) in info at reduced opacity, the
 /// front body in full info, and a faint lighter top edge in strong. The
-/// grid draws it [`THUMB_HEIGHT`] tall, the details panel larger.
+/// grid draws it as tall as the zoom level's thumbnail slot, the details
+/// panel larger.
 pub(crate) fn folder_silhouette(info: Hsla, strong: Hsla, height: f32) -> impl IntoElement {
     let back = info.opacity(0.55);
     let scale = height / FOLDER_VIEW_HEIGHT;
@@ -287,6 +253,13 @@ pub(crate) fn misses_after(previous: Option<&Thumb>, modified: Option<SystemTime
 /// shows its glyph: rendering never touches the disk to find one.
 pub(crate) type Thumbs = HashMap<PathBuf, Thumb>;
 
+/// Whether the cached thumbnail `found` fills a box that needs `wanted`.
+/// A file outside the cache's size directories (an image that is itself in
+/// the cache) is its own thumbnail and always does.
+fn large_enough(found: &Path, wanted: Bucket) -> bool {
+    Bucket::of_thumbnail(found).is_none_or(|bucket| bucket >= wanted)
+}
+
 /// An image whose thumbnail is looked up: a regular file (a symlink shows
 /// the symlink glyph) of a format GPUI decodes.
 fn wants_thumbnail(entry: &Entry) -> bool {
@@ -301,12 +274,16 @@ fn wants_thumbnail(entry: &Entry) -> bool {
 /// listing order, and an index outside the snapshot is skipped. With `trust_known`
 /// an image whose entry time did not change keeps its answer; the Recent
 /// list shows when a file was *used*, which says nothing about the file
-/// changing, so it trusts none.
+/// changing, so it trusts none. A found thumbnail from a size directory
+/// smaller than `wanted` (the zoom grew past what it can fill) stays on
+/// screen and is looked up again in the bigger size; one that is big enough
+/// is never looked up again for a zoom change alone.
 pub(crate) fn plan_thumbnails(
     snapshot: &[Entry],
     displayed: &[usize],
     known: &Thumbs,
     trust_known: bool,
+    wanted: Bucket,
 ) -> (Thumbs, Vec<(PathBuf, Option<SystemTime>)>) {
     let mut keep = Thumbs::new();
     let mut todo = Vec::new();
@@ -336,7 +313,10 @@ pub(crate) fn plan_thumbnails(
             Some(thumb)
                 if trust_known
                     && thumb.modified == entry.modified
-                    && (thumb.found.is_some() || thumb.misses >= MAX_MISSES) =>
+                    && match &thumb.found {
+                        Some(found) => large_enough(found, wanted),
+                        None => thumb.misses >= MAX_MISSES,
+                    } =>
             {
                 keep.insert(entry.path.clone(), thumb.clone());
             }
@@ -357,30 +337,37 @@ pub(crate) fn plan_thumbnails(
 /// when it has one, else the extension glyph. The full image is never
 /// decoded for a tile: with no thumbnail (not yet made, too large, on a
 /// remote mount, undecodable) that icon shows alone. Object-fit cover
-/// inside the 62×46 bordered box.
+/// inside the level's bordered photo box (62×46 at Medium).
 fn photo_thumbnail(
     thumb: Option<&Thumb>,
     name: &OsStr,
     colors: &bolt::colors::Colors,
+    metrics: &GridMetrics,
 ) -> gpui::AnyElement {
     let glyph = file_glyph(name);
     let theme = fileflux::core::icons::for_file(name);
     let Some(path) = thumb.and_then(|thumb| thumb.found.clone()) else {
         return div()
-            .w(px(PHOTO_WIDTH))
-            .h(px(PHOTO_HEIGHT))
+            .w(px(metrics.photo_width))
+            .h(px(metrics.photo_height))
             .border_1()
             .border_color(colors.line_2)
             .bg(colors.raised)
             .overflow_hidden()
-            .child(centered_art(theme, glyph, colors.muted))
+            .child(centered_art(
+                theme,
+                glyph,
+                colors.muted,
+                metrics.photo_glyph,
+            ))
             .into_any_element();
     };
     let muted = colors.muted;
+    let photo_glyph = metrics.photo_glyph;
     let loading_theme = theme.clone();
     div()
-        .w(px(PHOTO_WIDTH))
-        .h(px(PHOTO_HEIGHT))
+        .w(px(metrics.photo_width))
+        .h(px(metrics.photo_height))
         .border_1()
         .border_color(colors.line_2)
         .bg(colors.raised)
@@ -389,8 +376,10 @@ fn photo_thumbnail(
             gpui::img(path)
                 .size_full()
                 .object_fit(gpui::ObjectFit::Cover)
-                .with_loading(move || centered_art(loading_theme.clone(), glyph, muted))
-                .with_fallback(move || centered_art(theme.clone(), glyph, muted)),
+                .with_loading(move || {
+                    centered_art(loading_theme.clone(), glyph, muted, photo_glyph)
+                })
+                .with_fallback(move || centered_art(theme.clone(), glyph, muted, photo_glyph)),
         )
         .into_any_element()
 }
@@ -402,8 +391,9 @@ fn centered_art(
     theme: Option<PathBuf>,
     glyph: gpui_kit_assets::IconName,
     color: Hsla,
+    size: f32,
 ) -> gpui::AnyElement {
-    match theme_icon(theme, PHOTO_GLYPH) {
+    match theme_icon(theme, size) {
         Some(art) => div()
             .size_full()
             .flex()
@@ -411,27 +401,19 @@ fn centered_art(
             .justify_center()
             .child(art)
             .into_any_element(),
-        None => centered_glyph(glyph, color),
+        None => centered_glyph(glyph, color, size),
     }
 }
 
 /// A glyph centered in the photo box, for the loading and error states.
-fn centered_glyph(name: gpui_kit_assets::IconName, color: Hsla) -> gpui::AnyElement {
+fn centered_glyph(name: gpui_kit_assets::IconName, color: Hsla, size: f32) -> gpui::AnyElement {
     div()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
-        .child(Icon::new(icon(name)).size(px(PHOTO_GLYPH)).color(color))
+        .child(Icon::new(icon(name)).size(px(size)).color(color))
         .into_any_element()
-}
-
-/// Derives the grid column count from the entries area's **inner** width —
-/// the content box the tiles lay out in; the padding is already excluded by
-/// the measurement — with a minimum of one so nothing is ever unreachable.
-pub(crate) fn grid_columns(inner_width: f32) -> usize {
-    let usable = inner_width.max(TILE_WIDTH);
-    (((usable + TILE_GAP) / (TILE_WIDTH + TILE_GAP)).floor() as usize).max(1)
 }
 
 /// The tile indices of grid row `row`: a full row holds exactly `columns`
@@ -597,6 +579,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let list_view = this.tab().state.view() == View::List;
     let in_recent = this.tab().state.current().lists_files_from_elsewhere();
     let columns = this.rendered_columns().max(1);
+    let zoom = this.grid_zoom;
     let item_count = if list_view {
         count
     } else {
@@ -653,6 +636,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                             drag: drag_for_rows.as_ref(),
                             outlined,
                             in_recent,
+                            zoom,
                         };
                         render_grid_row(&data, row, columns, &weak_for_rows, cx)
                     })
@@ -728,6 +712,8 @@ struct GridData<'a> {
     /// The Recent view and search results: a tile's second line names the
     /// folder the file is in.
     in_recent: bool,
+    /// The grid's icon size level.
+    zoom: GridZoom,
 }
 
 /// The message of a search with nothing to list: still looking, nothing
@@ -794,14 +780,16 @@ fn render_grid_row(
         drag,
         outlined,
         in_recent,
+        zoom,
     } = *data;
+    let metrics = zoom.metrics();
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
     let mut row_element = div()
         .id(ElementId::Name(format!("explorer-grid-row-{row}").into()))
         .flex()
         .gap(px(TILE_GAP))
-        .h(px(TILE_HEIGHT))
+        .h(px(metrics.tile_height()))
         .min_w_0();
     for index in grid_tile_range(row, visible.len(), columns) {
         let Some(tile) = visible.get(index).and_then(|&i| snapshot.get(i)) else {
@@ -824,20 +812,20 @@ fn render_grid_row(
             file_glyph_element(
                 gpui_kit_assets::IconName::Link2Off,
                 colors.warning,
-                GLYPH_SIZE,
+                metrics.glyph,
             )
         } else if tile.is_symlink {
             file_glyph_element(
                 gpui_kit_assets::IconName::FileSymlink,
                 colors.muted,
-                GLYPH_SIZE,
+                metrics.glyph,
             )
         } else if is_folder {
-            folder_silhouette(colors.info, colors.strong, THUMB_HEIGHT).into_any_element()
+            folder_silhouette(colors.info, colors.strong, metrics.thumb_height).into_any_element()
         } else if has_thumbnail(&tile.name) {
-            photo_thumbnail(thumbs.get(&path), &tile.name, &colors)
+            photo_thumbnail(thumbs.get(&path), &tile.name, &colors, &metrics)
         } else {
-            file_icon(&tile.name, colors.muted, GLYPH_SIZE)
+            file_icon(&tile.name, colors.muted, metrics.glyph)
         };
         // Folders show their item count once the background count arrived;
         // files their size.
@@ -867,7 +855,7 @@ fn render_grid_row(
         .interactive(false)
         .build(cx)
         .cursor_pointer()
-        .w(px(TILE_WIDTH))
+        .w(px(metrics.tile_width))
         .flex_none()
         .h_full()
         .flex()
@@ -929,8 +917,8 @@ fn render_grid_row(
         let mut tile_element = tile_element
             .child(
                 div()
-                    .w(px(THUMB_WIDTH))
-                    .h(px(THUMB_HEIGHT))
+                    .w(px(metrics.thumb_width))
+                    .h(px(metrics.thumb_height))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1078,25 +1066,6 @@ fn entry_click(
 mod tests {
     use super::*;
 
-    /// `grid_columns` answers with the column count of the entries area's
-    /// **inner** (already padded) width: exact-width boundaries fit exactly
-    /// that many tiles, one pixel less drops a column, and nothing ever
-    /// collapses to zero columns, so the last row is always reachable.
-    #[test]
-    fn grid_columns_fits_exact_tile_boundaries_and_narrow_panes() {
-        assert_eq!(grid_columns(TILE_WIDTH), 1);
-        assert_eq!(grid_columns(0.0), 1, "never zero columns");
-        assert_eq!(
-            grid_columns(2.0 * TILE_WIDTH + TILE_GAP),
-            2,
-            "exactly two tiles fit"
-        );
-        assert_eq!(grid_columns(2.0 * TILE_WIDTH + TILE_GAP - 1.0), 1);
-        assert_eq!(grid_columns(3.0 * TILE_WIDTH + 2.0 * TILE_GAP), 3);
-        assert_eq!(grid_columns(3.0 * TILE_WIDTH + 2.0 * TILE_GAP - 1.0), 2);
-        assert_eq!(grid_columns(4.0 * TILE_WIDTH + 3.0 * TILE_GAP), 4);
-    }
-
     /// Every grid row, the last partial one included, addresses the same
     /// fixed tile geometry: a full row holds exactly `columns` tiles, the
     /// last partial row holds exactly the remaining tiles (never stretched
@@ -1150,36 +1119,6 @@ mod tests {
         assert_eq!(glyph("readme.txt.bak"), IconName::File);
     }
 
-    /// The tile height is exactly its composition, the folder silhouette
-    /// fits the thumbnail slot, and the photo box fits it too.
-    #[test]
-    fn tile_height_matches_its_composition_and_slot() {
-        let composed = TILE_TOP_PADDING
-            + THUMB_HEIGHT
-            + NAME_GAP
-            + 2.0 * NAME_LINE
-            + SUB_GAP
-            + SUB_LINE
-            + TILE_BOTTOM_PADDING;
-        assert_eq!(
-            TILE_HEIGHT, composed,
-            "the row height is the tile's own sum"
-        );
-        assert_eq!(TILE_WIDTH, 112.0);
-        assert_eq!(THUMB_HEIGHT, 52.0);
-        let folder_width = FOLDER_VIEW_WIDTH * THUMB_HEIGHT / FOLDER_VIEW_HEIGHT;
-        let thumb_width = THUMB_WIDTH;
-        assert!(
-            folder_width <= thumb_width,
-            "silhouette fits the slot width"
-        );
-        let tile_width = TILE_WIDTH;
-        assert!(thumb_width <= tile_width, "slot fits the tile width");
-        assert!((PHOTO_WIDTH, PHOTO_HEIGHT) <= (THUMB_WIDTH, THUMB_HEIGHT));
-        let (glyph, thumb_height) = (GLYPH_SIZE, THUMB_HEIGHT);
-        assert!(glyph <= thumb_height);
-    }
-
     /// Thumbnails are chosen from the extension alone, case-insensitively,
     /// for decodable raster formats only.
     #[test]
@@ -1226,7 +1165,7 @@ mod tests {
             folder,
             image("a.png", 2),
         ];
-        let (keep, todo) = plan_thumbnails(&snapshot, &[], &Thumbs::new(), true);
+        let (keep, todo) = plan_thumbnails(&snapshot, &[], &Thumbs::new(), true, Bucket::Normal);
         assert!(keep.is_empty());
         let paths: Vec<_> = todo.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
@@ -1255,7 +1194,7 @@ mod tests {
         }
         let snapshot = [image("a.png", 9), same.clone(), image("new.png", 1)];
 
-        let (keep, todo) = plan_thumbnails(&snapshot, &[], &known, true);
+        let (keep, todo) = plan_thumbnails(&snapshot, &[], &known, true, Bucket::Normal);
 
         assert!(
             keep.contains_key(Path::new("/p/a.png")),
@@ -1286,7 +1225,8 @@ mod tests {
             image("c.png", 1),
         ];
         let displayed = [3, 1, 0, 9, 1];
-        let (_, todo) = plan_thumbnails(&snapshot, &displayed, &Thumbs::new(), true);
+        let (_, todo) =
+            plan_thumbnails(&snapshot, &displayed, &Thumbs::new(), true, Bucket::Normal);
         let paths: Vec<_> = todo.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
             paths,
@@ -1297,6 +1237,59 @@ mod tests {
                 PathBuf::from("/p/hidden.png"),
             ]
         );
+    }
+
+    /// A thumbnail found in the cache's `normal` directory stays on screen
+    /// when the zoom outgrows it and is looked up again for `large`; one that
+    /// is big enough is never queued for a zoom change alone, in either
+    /// direction.
+    #[test]
+    fn a_zoom_change_requeues_only_thumbnails_too_small_for_the_new_size() {
+        let entry = image("a.png", 1);
+        let known_in = |directory: &str| {
+            let mut known = Thumbs::new();
+            known.insert(
+                entry.path.clone(),
+                Thumb {
+                    modified: entry.modified,
+                    found: Some(PathBuf::from(format!("/c/thumbnails/{directory}/a.png"))),
+                    misses: 0,
+                },
+            );
+            known
+        };
+        let plan = |directory: &str, wanted| {
+            let (keep, todo) = plan_thumbnails(
+                std::slice::from_ref(&entry),
+                &[0],
+                &known_in(directory),
+                true,
+                wanted,
+            );
+            (keep.len(), todo.len())
+        };
+        assert_eq!(plan("normal", Bucket::Normal), (1, 0), "same size");
+        assert_eq!(plan("normal", Bucket::Large), (1, 1), "kept, asked again");
+        assert_eq!(plan("large", Bucket::Large), (1, 0), "already large");
+        assert_eq!(plan("large", Bucket::Normal), (1, 0), "bigger is fine");
+        assert_eq!(plan("x-large", Bucket::Large), (1, 0));
+        assert_eq!(
+            plan("elsewhere", Bucket::Large),
+            (1, 0),
+            "its own thumbnail"
+        );
+    }
+
+    /// A settled miss stays settled across a zoom change: the bucket only
+    /// matters for thumbnails that were found.
+    #[test]
+    fn a_zoom_change_does_not_wake_a_settled_miss() {
+        let snapshot = [image("a.png", 1)];
+        let mut known = Thumbs::new();
+        pass_with_misses(&snapshot, &mut known);
+        pass_with_misses(&snapshot, &mut known);
+        let (_, todo) = plan_thumbnails(&snapshot, &[], &known, true, Bucket::Large);
+        assert!(todo.is_empty());
     }
 
     /// The Recent list shows when a file was used, not when it changed, so
@@ -1313,7 +1306,13 @@ mod tests {
                 misses: MAX_MISSES,
             },
         );
-        let (keep, todo) = plan_thumbnails(std::slice::from_ref(&entry), &[0], &known, false);
+        let (keep, todo) = plan_thumbnails(
+            std::slice::from_ref(&entry),
+            &[0],
+            &known,
+            false,
+            Bucket::Normal,
+        );
         assert_eq!(keep.len(), 1);
         assert_eq!(todo.len(), 1);
     }
@@ -1321,7 +1320,7 @@ mod tests {
     /// Runs one planning pass the way the explorer does and records `outcome`
     /// (a miss) for every image it queued, returning how many it queued.
     fn pass_with_misses(snapshot: &[Entry], known: &mut Thumbs) -> usize {
-        let (mut keep, todo) = plan_thumbnails(snapshot, &[], known, true);
+        let (mut keep, todo) = plan_thumbnails(snapshot, &[], known, true, Bucket::Normal);
         for (path, modified) in &todo {
             let misses = misses_after(keep.get(path), *modified);
             keep.insert(

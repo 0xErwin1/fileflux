@@ -42,7 +42,7 @@ use gpui::{
 };
 use gpui_component::h_flex;
 use gpui_component::{
-    ActiveTheme as _, Sizable as _, Size,
+    ActiveTheme as _, Sizable as _,
     table::{Column, DataTable, TableDelegate, TableState},
 };
 
@@ -53,6 +53,8 @@ use super::entries;
 use super::state::SortSpec;
 use super::util;
 use super::view::Explorer;
+use super::zoom::ListZoomExt as _;
+use fileflux::core::zoom::ListZoom;
 
 /// One column of the details list. Name is always the first; the others
 /// are the user's choice (see [`columns_for`]).
@@ -166,9 +168,6 @@ pub(crate) fn columns_for(prefs: &[ColumnPref]) -> Vec<ListColumn> {
 /// How far a recorded drag width may drift from the delegate's applied
 /// widths before it counts as a deliberate user change.
 pub(crate) const DRAG_EPSILON: f32 = 0.5;
-
-/// Size of a list row's leading glyph.
-const LIST_ROW_GLYPH: f32 = 14.0;
 
 /// A cell's presentation, decided by pure functions so the mapping tests
 /// read the same truth the cells render.
@@ -347,6 +346,8 @@ pub(crate) struct EntryTableDelegate {
     /// Each name is followed by the folder its entry lives in (search
     /// results).
     with_folder: bool,
+    /// Size of a row's leading glyph, from the list's zoom level.
+    glyph: f32,
     weak: WeakEntity<Explorer>,
 }
 
@@ -369,8 +370,17 @@ impl EntryTableDelegate {
             dragged: None,
             outlined: false,
             with_folder: false,
+            glyph: ListZoom::Medium.icon(),
             weak,
         }
+    }
+
+    /// Sets the leading glyph's size. `true` when it changed, so the caller
+    /// refreshes the table.
+    pub(crate) fn set_glyph(&mut self, glyph: f32) -> bool {
+        let changed = self.glyph != glyph;
+        self.glyph = glyph;
+        changed
     }
 
     /// Shows the folder of each entry after its name. `true` when it changed.
@@ -679,9 +689,9 @@ impl TableDelegate for EntryTableDelegate {
             // A plain file prefers the installed theme's icon for its type;
             // folders, symlinks and broken links keep their Lucide glyphs.
             let icon = match glyph {
-                Glyph::File => entries::file_icon(&entry.name, color, LIST_ROW_GLYPH),
+                Glyph::File => entries::file_icon(&entry.name, color, self.glyph),
                 glyph => Icon::new(super::icon(glyph.icon_name()))
-                    .size(px(LIST_ROW_GLYPH))
+                    .size(px(self.glyph))
                     .color(color)
                     .into_any_element(),
             };
@@ -867,6 +877,7 @@ pub(crate) fn render_list(
                 .as_ref()
                 .map(super::actions::Renaming::view),
         );
+        let glyph_changed = delegate.set_glyph(explorer.list_zoom.icon());
         let columns_changed = delegate.set_columns(columns);
         let widths_changed = delegate.widths() != desired.as_slice();
         if widths_changed {
@@ -877,6 +888,7 @@ pub(crate) fn render_list(
             || counts_changed
             || widths_changed
             || columns_changed
+            || glyph_changed
             || renaming_changed
             || cut_changed
             || folder_changed
@@ -895,7 +907,7 @@ pub(crate) fn render_list(
         .child(
             DataTable::new(&explorer.tab().table)
                 .bordered(false)
-                .with_size(Size::Small)
+                .with_size(explorer.list_zoom.table_size())
                 .header_row_height(header_height),
         )
 }

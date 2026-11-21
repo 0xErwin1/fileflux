@@ -32,6 +32,7 @@ pub mod thumbnailers;
 pub mod thumbnails;
 pub mod trash;
 pub mod watch;
+pub mod zoom;
 
 /// A navigable directory, the virtual read-only home Trash, the virtual
 /// read-only list of recently used files or the virtual read-only results of

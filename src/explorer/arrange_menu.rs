@@ -6,6 +6,7 @@
 
 use fileflux::core::kinds::FileCategory;
 use fileflux::core::settings::ColumnPref;
+use fileflux::core::zoom::ZoomCommand;
 
 use super::arrange::{ArrangeCommand, Arrangement, DateRange, SizeRange, SortDir, SortKey};
 use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow, SubmenuSpec};
@@ -146,6 +147,24 @@ pub(crate) fn column_rows(columns: &[ColumnPref]) -> Vec<MenuRow> {
     .collect()
 }
 
+/// The rows of the Zoom menu: the icon size of the view that is shown. The
+/// shortcut hints name the first chord of each (Ctrl++ also zooms in).
+pub(crate) fn zoom_rows() -> Vec<MenuRow> {
+    [
+        (ZoomCommand::In, "Zoom in", "Ctrl+="),
+        (ZoomCommand::Out, "Zoom out", "Ctrl+-"),
+        (ZoomCommand::Reset, "Reset zoom", "Ctrl+0"),
+    ]
+    .into_iter()
+    .map(|(command, label, shortcut)| {
+        MenuRow::Item(MenuItemSpec {
+            shortcut: Some(shortcut),
+            ..MenuItemSpec::new(MenuCommand::Zoom(command), label)
+        })
+    })
+    .collect()
+}
+
 /// `columns` after a click on `column`'s row: shown when it was hidden,
 /// hidden when it was shown, in the canonical order.
 pub(crate) fn toggled_columns(columns: &[ColumnPref], column: ColumnPref) -> Vec<ColumnPref> {
@@ -169,6 +188,7 @@ pub(crate) fn rows(
         ArrangeMenu::Filter => filter_rows(arrangement),
         ArrangeMenu::Select => select_rows(),
         ArrangeMenu::Columns => column_rows(columns),
+        ArrangeMenu::Zoom => zoom_rows(),
     }
 }
 
@@ -184,6 +204,26 @@ pub(crate) fn with_columns(
         .position(|row| matches!(row, MenuRow::Submenu(spec) if spec.menu == ArrangeMenu::Filter));
     if let Some(at) = after_filter {
         rows.insert(at + 1, submenu(ArrangeMenu::Columns, arrangement, columns));
+    }
+    rows
+}
+
+/// `rows` of an empty-space menu with the Zoom submenu after the last of
+/// Filter and Columns, so it is the view-related group's tail in both views.
+pub(crate) fn with_zoom(mut rows: Vec<MenuRow>) -> Vec<MenuRow> {
+    let after = rows.iter().rposition(|row| {
+        matches!(row, MenuRow::Submenu(spec)
+            if matches!(spec.menu, ArrangeMenu::Filter | ArrangeMenu::Columns))
+    });
+    if let Some(at) = after {
+        rows.insert(
+            at + 1,
+            MenuRow::Submenu(SubmenuSpec {
+                menu: ArrangeMenu::Zoom,
+                label: ArrangeMenu::Zoom.label(),
+                rows: zoom_rows(),
+            }),
+        );
     }
     rows
 }
@@ -543,6 +583,79 @@ mod tests {
         ));
         assert!(row(&rows, "Sort by").is_none() && row(&rows, "Filter").is_none());
         assert!(row(&rows, "New folder").is_some() && row(&rows, "Paste").is_some());
+    }
+
+    #[test]
+    fn the_zoom_menu_offers_in_out_and_reset_with_their_keys() {
+        use fileflux::core::zoom::ZoomCommand;
+        let rows = zoom_rows();
+        assert_eq!(labels(&rows), ["Zoom in", "Zoom out", "Reset zoom"]);
+        let specs = items(&rows);
+        let commands: Vec<_> = specs.iter().map(|spec| spec.command).collect();
+        assert_eq!(
+            commands,
+            [
+                MenuCommand::Zoom(ZoomCommand::In),
+                MenuCommand::Zoom(ZoomCommand::Out),
+                MenuCommand::Zoom(ZoomCommand::Reset),
+            ]
+        );
+        let keys: Vec<_> = specs.iter().map(|spec| spec.shortcut).collect();
+        assert_eq!(keys, [Some("Ctrl+="), Some("Ctrl+-"), Some("Ctrl+0")]);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.enabled && spec.checked.is_none())
+        );
+        assert_eq!(ArrangeMenu::Zoom.label(), "Zoom");
+    }
+
+    /// The folder's own menu gets Zoom after Filter in the grid and after
+    /// Columns in the list; the other menus have none.
+    #[test]
+    fn zoom_follows_filter_in_the_grid_and_columns_in_the_list() {
+        let arrangement = Arrangement::default();
+        let base = menu_rows(&target(0, false), &arrangement);
+        let order = |rows: &[MenuRow]| -> Vec<ArrangeMenu> {
+            rows.iter()
+                .filter_map(|row| match row {
+                    MenuRow::Submenu(spec) => Some(spec.menu),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            order(&base),
+            [ArrangeMenu::Select, ArrangeMenu::Sort, ArrangeMenu::Filter],
+            "the base menu is untouched"
+        );
+        let grid = with_zoom(base.clone());
+        assert_eq!(
+            order(&grid),
+            [
+                ArrangeMenu::Select,
+                ArrangeMenu::Sort,
+                ArrangeMenu::Filter,
+                ArrangeMenu::Zoom
+            ]
+        );
+        let list = with_zoom(with_columns(base, &arrangement, &ColumnPref::defaults()));
+        assert_eq!(
+            order(&list),
+            [
+                ArrangeMenu::Select,
+                ArrangeMenu::Sort,
+                ArrangeMenu::Filter,
+                ArrangeMenu::Columns,
+                ArrangeMenu::Zoom
+            ]
+        );
+        let flyout = submenu_of(&list, ArrangeMenu::Zoom).map(|spec| spec.rows.clone());
+        assert_eq!(flyout, Some(zoom_rows()));
+        // Refreshing the checks keeps the rows as they are.
+        let mut refreshed = list.clone();
+        refresh(&mut refreshed, &arrangement, &ColumnPref::defaults());
+        assert_eq!(refreshed, list);
     }
 
     #[test]

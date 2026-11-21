@@ -16,6 +16,7 @@ use bolt::composites::{
 use super::actions::MenuState;
 use super::icon;
 use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow};
+use fileflux::core::zoom::ZoomCommand;
 
 /// The rows the target title takes at the top of the root level: the header
 /// and the separator under it.
@@ -26,6 +27,9 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
     Some(match command {
         // Sort and filter choices show their check mark instead.
         MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => return None,
+        MenuCommand::Zoom(ZoomCommand::In) => IconName::ZoomIn,
+        MenuCommand::Zoom(ZoomCommand::Out) => IconName::ZoomOut,
+        MenuCommand::Zoom(ZoomCommand::Reset) => IconName::RotateCcw,
         MenuCommand::AddFavorite => IconName::Star,
         MenuCommand::RemoveFavorite => IconName::StarFill,
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
@@ -62,6 +66,7 @@ fn submenu_icon(menu: ArrangeMenu) -> gpui_kit_assets::IconName {
         ArrangeMenu::Filter => gpui_kit_assets::IconName::ListFilter,
         ArrangeMenu::Select => gpui_kit_assets::IconName::SquareCheck,
         ArrangeMenu::Columns => gpui_kit_assets::IconName::Table,
+        ArrangeMenu::Zoom => gpui_kit_assets::IconName::ZoomIn,
     }
 }
 

@@ -99,6 +99,20 @@ A segmented toggle in the toolbar switches between two presentations. The toggle
 
 **List columns.** Name is always shown; Size and Modified are on by default. Right-click a column header, or open the empty-space menu's **Columns** submenu, to tick or untick Size, Modified, **Type** (the same label as the details panel: "Image · JPG", "Folder"), **Permissions** (`rw-r--r--`, as the details panel shows it), **Owner** (user name, the number when the id has no name) and **Group** (likewise). The menu stays open while you tick several. The choice is saved and applies to every tab and the next launch; a dragged width is remembered per column for the session. Clicking the Type, Permissions, Owner or Group header sorts by it (Permissions by the octal mode, Owner and Group by name without case; ties fall back to the name, folders stay first); the same keys are in the **Sort by** menu. Owner, Group and Permissions are read during the scan; entries that do not come from a folder scan (search results, Trash, Recent) show "—" in those three columns.
 
+### Icon size
+
+Each view has its own icon size, in the GNOME Files fashion. The grid has four levels, **small**, **medium**, **large** and **larger**: the tile, its icon and its thumbnail grow together, and the number of columns follows the width of the pane at every level. The list has three, **small**, **medium** and **large**, which change the row height and the icon in the Name column. Medium is the size Fileflux drew before the zoom existed.
+
+| How | What it does |
+|---|---|
+| Ctrl+= or Ctrl++ (Ctrl+Shift+= where `+` needs Shift) | One level larger |
+| Ctrl+- | One level smaller |
+| Ctrl+0 | Back to medium |
+| Ctrl+wheel over the entries | Wheel up zooms in, wheel down zooms out; one level per notch (a touchpad's small movements add up to a notch) |
+| Empty-space menu, **Zoom** | **Zoom in**, **Zoom out**, **Reset zoom**; in the list it comes after **Columns**, in the grid after **Filter** |
+
+The keys and the wheel act on the view that is shown, and stop at the smallest and the largest level. The grid's and the list's levels are saved separately (`grid_zoom` and `list_zoom` in `settings.toml`) and apply to every tab and the next launch. In a split view both panes share the two levels.
+
 Sizes use one SI formatter everywhere. Modified dates are shown in the system's local time zone (`TZ`, else `/etc/localtime`).
 
 File icons come from the freedesktop icon theme the desktop is configured to use, so a Blender file, a shell script, a PDF or a spreadsheet shows the icon of the application that handles it. The lookup follows `gtk-icon-theme-name` in `~/.config/gtk-3.0/settings.ini`, that theme's `Inherits=` chain, and then `Adwaita`, `breeze`, `Papirus` and `hicolor`, in `$XDG_DATA_HOME/icons` and every `$XDG_DATA_DIRS/*/icons`; each type is resolved once per session. Themed icons keep their colours because Fileflux rasterizes them at the size it draws, and a type the theme does not name keeps the built-in glyph.
@@ -345,7 +359,7 @@ Images, videos, PDFs, office documents and vector images are previewed; the rest
 
 ## Thumbnails
 
-Thumbnails follow the freedesktop Thumbnail Managing Standard. Fileflux reuses thumbnails other applications already made in `$XDG_CACHE_HOME/thumbnails` (default `~/.cache/thumbnails`) when their `Thumb::URI` and `Thumb::MTime` match the file. When there is none it generates a 256 px `large` PNG there, upright per the photo's EXIF orientation, off the UI thread and at most two at a time. Images that fail to decode are recorded under `fail/fileflux-<version>/` and not retried until they change. Fileflux never generates thumbnails for files inside the cache, on gvfs/FUSE/network mounts, or for images over 50 megapixels or 100 MB; those show the file-type icon.
+Thumbnails follow the freedesktop Thumbnail Managing Standard. Fileflux reuses thumbnails other applications already made in `$XDG_CACHE_HOME/thumbnails` (default `~/.cache/thumbnails`) when their `Thumb::URI` and `Thumb::MTime` match the file. When there is none it generates a 256 px `large` PNG there, upright per the photo's EXIF orientation, off the UI thread and at most two at a time. Images that fail to decode are recorded under `fail/fileflux-<version>/` and not retried until they change. The icon size asks for the thumbnail size that fits: the `normal` (128 px) directory is enough while a tile's picture is at most 128 px wide or tall (the grid's small, medium and large levels), and the **larger** level needs `large` (256 px) or above. Zooming up to it looks the pictures up again in `large` and generates the missing ones; zooming back keeps the larger thumbnails it already has, and a picture whose cached thumbnail is big enough is not looked up again just because the zoom changed. Fileflux never generates thumbnails for files inside the cache, on gvfs/FUSE/network mounts, or for images over 50 megapixels or 100 MB; those show the file-type icon.
 
 Formats Fileflux does not decode — videos, PDFs, office documents, vector images — are thumbnailed by the freedesktop thumbnailers installed on the system, the same `.thumbnailer` commands pcmanfm, Nautilus and Thunar run: `~/.local/share/thumbnailers` first, then every `$XDG_DATA_DIRS/*/thumbnailers` (usually `/usr/share/thumbnailers`). Install one for the types you care about, for example `ffmpegthumbnailer` (`video/mp4`, `video/x-matroska`, …) or a PDF one (`application/pdf`). Each command runs without a shell, is killed after 10 seconds, and its output is decoded and rewritten into the cache with the standard's tags so the other file managers reuse it. With no thumbnailer for a type, the tile shows the file's icon.
 

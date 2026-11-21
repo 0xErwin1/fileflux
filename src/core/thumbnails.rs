@@ -28,6 +28,51 @@ use super::trash::decode_percent;
 /// thumbnail that exists.
 pub const SIZE_DIRECTORIES: [&str; 3] = ["normal", "large", "x-large"];
 
+/// The longest edge, in pixels, of a `normal` thumbnail.
+pub const NORMAL_EDGE: f32 = 128.0;
+
+/// The smallest freedesktop size directory a tile accepts: the thumbnail
+/// must be at least as large as the box it fills, or it draws blurred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Bucket {
+    /// `normal`, 128 px: enough for a box up to that size.
+    Normal,
+    /// `large` (256 px) or above: for a bigger box.
+    Large,
+}
+
+impl Bucket {
+    /// The bucket for a thumbnail box whose longest edge is `edge` logical
+    /// pixels: `normal` up to its own 128 px, `large` above.
+    #[must_use]
+    pub fn for_display(edge: f32) -> Self {
+        if edge <= NORMAL_EDGE {
+            Self::Normal
+        } else {
+            Self::Large
+        }
+    }
+
+    /// The size directories that satisfy this bucket, smallest first.
+    fn directories(self) -> &'static [&'static str] {
+        match self {
+            Self::Normal => &SIZE_DIRECTORIES,
+            Self::Large => &["large", "x-large"],
+        }
+    }
+
+    /// The bucket a cached thumbnail belongs to, from its size directory;
+    /// `None` for a path outside the cache's size directories.
+    #[must_use]
+    pub fn of_thumbnail(thumbnail: &Path) -> Option<Self> {
+        match thumbnail.parent()?.file_name()?.to_str()? {
+            "normal" => Some(Self::Normal),
+            "large" | "x-large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+
 /// `$XDG_CACHE_HOME/thumbnails` (fallback `$HOME/.cache/thumbnails`). A
 /// relative `$XDG_CACHE_HOME` is ignored, as the XDG specification says.
 #[must_use]
@@ -134,12 +179,19 @@ impl Source {
 /// This stats, canonicalizes and reads files: call it off the UI thread.
 #[must_use]
 pub fn find(cache_root: &Path, image: &Path) -> Option<PathBuf> {
-    find_for(cache_root, image, &Source::of(image)?)
+    find_at(cache_root, image, Bucket::Normal)
 }
 
-fn find_for(cache_root: &Path, image: &Path, source: &Source) -> Option<PathBuf> {
+/// [`find`] for a tile that needs at least the `bucket` size: a smaller
+/// cached thumbnail is not an answer.
+#[must_use]
+pub fn find_at(cache_root: &Path, image: &Path, bucket: Bucket) -> Option<PathBuf> {
+    find_for(cache_root, image, &Source::of(image)?, bucket)
+}
+
+fn find_for(cache_root: &Path, image: &Path, source: &Source, bucket: Bucket) -> Option<PathBuf> {
     let name = thumbnail_file_name(&source.uri);
-    SIZE_DIRECTORIES.iter().find_map(|size| {
+    bucket.directories().iter().find_map(|size| {
         let candidate = cache_root.join(size).join(&name);
         let (tagged_uri, tagged_mtime) = thumbnail_tags(&candidate)?;
         let fresh = same_uri(&tagged_uri, &source.uri)
@@ -192,15 +244,22 @@ impl Hit {
 /// remembered, so a thumbnail another program makes later is found.
 #[derive(Debug, Default)]
 pub struct Memo {
-    hits: Mutex<HashMap<(PathBuf, u64), Hit>>,
+    hits: Mutex<HashMap<(PathBuf, u64, Bucket), Hit>>,
 }
 
 impl Memo {
     /// [`find`] through the memory. Blocking, like [`find`].
     #[must_use]
     pub fn lookup(&self, cache_root: &Path, image: &Path) -> Option<PathBuf> {
+        self.lookup_at(cache_root, image, Bucket::Normal)
+    }
+
+    /// [`Self::lookup`] for at least the `bucket` size; each bucket has its
+    /// own remembered answer.
+    #[must_use]
+    pub fn lookup_at(&self, cache_root: &Path, image: &Path, bucket: Bucket) -> Option<PathBuf> {
         let source = Source::of(image)?;
-        let key = (source.canonical.clone(), source.modified);
+        let key = (source.canonical.clone(), source.modified, bucket);
         let remembered = self
             .hits
             .lock()
@@ -219,7 +278,7 @@ impl Memo {
             }
             None => {}
         }
-        let found = find_for(cache_root, image, &source)?;
+        let found = find_for(cache_root, image, &source, bucket)?;
         let hit = Hit::of(found.clone())?;
         let mut hits = self.hits.lock().unwrap_or_else(PoisonError::into_inner);
         if hits.len() >= MEMO_LIMIT {
@@ -235,6 +294,12 @@ impl Memo {
 /// while rendering.
 #[must_use]
 pub fn lookup(image: &Path) -> Option<PathBuf> {
+    lookup_at(image, Bucket::Normal)
+}
+
+/// [`lookup`] for a tile that needs at least the `bucket` size.
+#[must_use]
+pub fn lookup_at(image: &Path, bucket: Bucket) -> Option<PathBuf> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     static MEMO: LazyLock<Memo> = LazyLock::new(Memo::default);
     let root = ROOT
@@ -245,7 +310,7 @@ pub fn lookup(image: &Path) -> Option<PathBuf> {
             )
         })
         .as_deref()?;
-    let found = MEMO.lookup(root, image);
+    let found = MEMO.lookup_at(root, image, bucket);
     match &found {
         Some(thumbnail) => log::debug!(
             "using cached thumbnail {} for {}",
@@ -345,13 +410,21 @@ impl Generator {
     /// the size caps.
     #[must_use]
     pub fn ensure(&self, image: &Path) -> Outcome {
+        self.ensure_at(image, Bucket::Normal)
+    }
+
+    /// [`Self::ensure`] for a tile that needs at least the `bucket` size: a
+    /// cached `normal` thumbnail does not satisfy `Large`, so a `large` one
+    /// is made beside it.
+    #[must_use]
+    pub fn ensure_at(&self, image: &Path, bucket: Bucket) -> Outcome {
         let Some(source) = Source::of(image) else {
             return Outcome::Skipped(Skip::Unreachable);
         };
         if let Some(skip) = self.skip_reason(&source.canonical) {
             return Outcome::Skipped(skip);
         }
-        if let Some(found) = find_for(&self.cache_root, image, &source) {
+        if let Some(found) = find_for(&self.cache_root, image, &source, bucket) {
             return Outcome::Ready(found);
         }
         if self.failure_is_recorded(&source) {
@@ -593,6 +666,12 @@ fn write_png(
 /// directory. Blocking: the explorer calls it on the background executor.
 #[must_use]
 pub fn generate(image: &Path) -> Outcome {
+    generate_at(image, Bucket::Normal)
+}
+
+/// [`generate`] for a tile that needs at least the `bucket` size.
+#[must_use]
+pub fn generate_at(image: &Path, bucket: Bucket) -> Outcome {
     static GENERATOR: LazyLock<Option<Generator>> = LazyLock::new(|| {
         let root = cache_root(
             std::env::var_os("HOME").as_deref(),
@@ -603,6 +682,129 @@ pub fn generate(image: &Path) -> Outcome {
     GENERATOR
         .as_ref()
         .map_or(Outcome::Skipped(Skip::CacheUnwritable), |generator| {
-            generator.ensure(image)
+            generator.ensure_at(image, bucket)
         })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fileflux-bucket-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).expect("scratch directory is created");
+        dir
+    }
+
+    /// A tiny real PNG image the generator can decode.
+    fn picture(dir: &Path) -> PathBuf {
+        let path = dir.join("picture.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]))
+            .save(&path)
+            .expect("fixture image writes");
+        fs::canonicalize(&path).expect("fixture image resolves")
+    }
+
+    /// Caches a thumbnail of `image` in the `size` directory, tagged as the
+    /// standard requires.
+    fn cache_entry(cache: &Path, size: &str, image: &Path) -> PathBuf {
+        let source = Source::of(image).expect("fixture image is reachable");
+        let dir = cache.join(size);
+        let name = thumbnail_file_name(&source.uri);
+        write_png(
+            &dir,
+            OsStr::new(&name),
+            (1, 1),
+            png::ColorType::Grayscale,
+            &[0],
+            &Generator::tags(&source),
+        )
+        .expect("fixture thumbnail writes");
+        dir.join(name)
+    }
+
+    #[test]
+    fn the_bucket_follows_the_displayed_edge_at_the_normal_size() {
+        for edge in [1.0, 46.0, 62.0, 110.0, 128.0] {
+            assert_eq!(Bucket::for_display(edge), Bucket::Normal, "{edge}");
+        }
+        for edge in [128.5, 174.0, 256.0, 512.0] {
+            assert_eq!(Bucket::for_display(edge), Bucket::Large, "{edge}");
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_path_names_its_bucket_by_its_size_directory() {
+        let at = |path: &str| Bucket::of_thumbnail(Path::new(path));
+        assert_eq!(at("/c/thumbnails/normal/a.png"), Some(Bucket::Normal));
+        assert_eq!(at("/c/thumbnails/large/a.png"), Some(Bucket::Large));
+        assert_eq!(at("/c/thumbnails/x-large/a.png"), Some(Bucket::Large));
+        assert_eq!(at("/pictures/a.png"), None);
+        assert!(Bucket::Normal < Bucket::Large);
+    }
+
+    #[test]
+    fn a_large_request_skips_the_normal_thumbnail_and_a_normal_one_prefers_it() {
+        let dir = scratch("find");
+        let cache = dir.join("thumbnails");
+        let image = picture(&dir);
+        let normal = cache_entry(&cache, "normal", &image);
+        assert_eq!(
+            find_at(&cache, &image, Bucket::Normal),
+            Some(normal.clone())
+        );
+        assert_eq!(find_at(&cache, &image, Bucket::Large), None);
+        assert_eq!(find(&cache, &image), Some(normal.clone()), "find is Normal");
+
+        let large = cache_entry(&cache, "large", &image);
+        assert_eq!(find_at(&cache, &image, Bucket::Normal), Some(normal));
+        assert_eq!(find_at(&cache, &image, Bucket::Large), Some(large));
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn the_memo_keeps_one_answer_per_bucket() {
+        let dir = scratch("memo");
+        let cache = dir.join("thumbnails");
+        let image = picture(&dir);
+        let normal = cache_entry(&cache, "normal", &image);
+        let memo = Memo::default();
+        assert_eq!(memo.lookup(&cache, &image), Some(normal.clone()));
+        assert_eq!(
+            memo.lookup_at(&cache, &image, Bucket::Large),
+            None,
+            "the remembered normal hit does not answer a large request"
+        );
+        let large = cache_entry(&cache, "large", &image);
+        assert_eq!(memo.lookup_at(&cache, &image, Bucket::Large), Some(large));
+        assert_eq!(memo.lookup(&cache, &image), Some(normal));
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn ensuring_a_large_thumbnail_generates_one_beside_a_cached_normal() {
+        let dir = scratch("ensure");
+        let cache = dir.join("thumbnails");
+        let image = picture(&dir);
+        let normal = cache_entry(&cache, "normal", &image);
+        let generator = Generator::new(cache.clone(), None);
+        assert_eq!(generator.ensure(&image), Outcome::Ready(normal));
+        let made = generator.ensure_at(&image, Bucket::Large);
+        let Outcome::Ready(large) = made else {
+            unreachable!("a large thumbnail is generated, got {made:?}");
+        };
+        assert_eq!(Bucket::of_thumbnail(&large), Some(Bucket::Large));
+        assert_eq!(
+            generator.ensure_at(&image, Bucket::Large),
+            Outcome::Ready(large),
+            "the second request reuses it"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
 }

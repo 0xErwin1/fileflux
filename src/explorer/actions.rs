@@ -1126,6 +1126,10 @@ impl Explorer {
                 &self.list_columns,
             );
         }
+        // Both views have an icon size; the folder's own menu offers it.
+        if selected.is_empty() && !target.in_trash {
+            rows = arrange_menu::with_zoom(rows);
+        }
         if self.tab().state.current().lists_files_from_elsewhere() {
             rows = recent_menu_rows(rows, target.selected);
         }
@@ -1480,6 +1484,7 @@ impl Explorer {
             }
             MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
             MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
+            MenuCommand::Zoom(zoom) => self.zoom(zoom, cx),
             MenuCommand::SelectAll => self.select_all(cx),
             MenuCommand::InvertSelection => self.invert_selection(cx),
             MenuCommand::SelectMatching => self.select_matching(window, cx),

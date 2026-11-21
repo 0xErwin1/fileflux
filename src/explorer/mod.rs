@@ -31,6 +31,7 @@ pub(crate) mod toolbar;
 pub(crate) mod typeahead;
 pub(crate) mod util;
 pub(crate) mod view;
+pub(crate) mod zoom;
 
 pub(crate) use view::{Explorer, bind_keys};
 

@@ -16,14 +16,15 @@ use gpui::{
     AnyElement, App, Context, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Styled, Task, Window, div, px,
 };
-use gpui_component::{ActiveTheme, Size};
+use gpui_component::ActiveTheme;
 
 use super::dnd;
-use super::entries::{TILE_GAP, TILE_HEIGHT, TILE_WIDTH};
 use super::panes::Side;
 use super::state::SelectionSnapshot;
 use super::state::View;
 use super::view::Explorer;
+use super::zoom::{GridZoomExt as _, ListZoomExt as _, TILE_GAP};
+use fileflux::core::zoom::GridZoom;
 
 /// How far, in logical pixels, the pointer must move from the press before a
 /// press becomes a drag (a rectangle or a file drag): the desktop default
@@ -39,8 +40,8 @@ pub(crate) const SCROLLBAR_STRIP: f32 = 14.0;
 /// How entries are laid out in the content, enough to map points to entries.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Layout {
-    /// Fixed tiles, `columns` per row, left-aligned.
-    Grid { columns: usize },
+    /// Fixed tiles of the `zoom` level, `columns` per row, left-aligned.
+    Grid { columns: usize, zoom: GridZoom },
     /// Full-width rows of one height.
     List { row_height: f32 },
 }
@@ -110,20 +111,27 @@ impl Mode {
     }
 }
 
+/// The width and height of one tile at `zoom`.
+fn tile_size(zoom: GridZoom) -> (f32, f32) {
+    let metrics = zoom.metrics();
+    (metrics.tile_width, metrics.tile_height())
+}
+
 /// The index of the entry under a content point, when there is one.
 pub(crate) fn entry_at(layout: Layout, count: usize, x: f32, y: f32) -> Option<usize> {
     if x < 0.0 || y < 0.0 {
         return None;
     }
     let index = match layout {
-        Layout::Grid { columns } => {
-            let pitch = TILE_WIDTH + TILE_GAP;
+        Layout::Grid { columns, zoom } => {
+            let (tile_width, tile_height) = tile_size(zoom);
+            let pitch = tile_width + TILE_GAP;
             let column = (x / pitch).floor() as usize;
             // The gap right of a tile is empty space.
-            if column >= columns || x - column as f32 * pitch >= TILE_WIDTH {
+            if column >= columns || x - column as f32 * pitch >= tile_width {
                 return None;
             }
-            (y / TILE_HEIGHT).floor() as usize * columns + column
+            (y / tile_height).floor() as usize * columns + column
         }
         Layout::List { row_height } => (y / row_height).floor() as usize,
     };
@@ -142,13 +150,14 @@ pub(crate) fn hits(layout: Layout, count: usize, rect: Rect) -> Vec<usize> {
             let last = last_row(row_height).min(count - 1);
             (first_row(row_height)..=last).collect()
         }
-        Layout::Grid { columns } => {
+        Layout::Grid { columns, zoom } => {
             let columns = columns.max(1);
-            let pitch = TILE_WIDTH + TILE_GAP;
-            // A tile at column `c` spans `c * pitch .. c * pitch + TILE_WIDTH`.
-            let first_column = (((rect.left - TILE_WIDTH) / pitch).floor() + 1.0).max(0.0) as usize;
+            let (tile_width, tile_height) = tile_size(zoom);
+            let pitch = tile_width + TILE_GAP;
+            // A tile at column `c` spans `c * pitch .. c * pitch + tile_width`.
+            let first_column = (((rect.left - tile_width) / pitch).floor() + 1.0).max(0.0) as usize;
             let last_column = ((rect.right / pitch).floor() as usize).min(columns - 1);
-            let rows = first_row(TILE_HEIGHT)..=last_row(TILE_HEIGHT);
+            let rows = first_row(tile_height)..=last_row(tile_height);
             let mut covered = Vec::new();
             for row in rows {
                 let start = row * columns;
@@ -289,13 +298,14 @@ impl Explorer {
                 self.tab().grid_scroll.clone(),
                 Layout::Grid {
                     columns: self.rendered_columns().max(1),
+                    zoom: self.grid_zoom,
                 },
             ),
             View::List => (
                 f32::from(bolt::fonts::grid_header_height(cx)),
                 self.tab().table.read(cx).vertical_scroll_handle.clone(),
                 Layout::List {
-                    row_height: f32::from(Size::Small.table_row_height()),
+                    row_height: self.list_zoom.row_height(),
                 },
             ),
         };
@@ -570,6 +580,19 @@ pub(crate) fn listen(weak: &gpui::WeakEntity<Explorer>, side: Side, window: &mut
             log::debug!("the entries area outlived its explorer: {error}");
         }
     });
+    let wheel = weak.clone();
+    window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, _window, cx| {
+        // Captured before the list under the pointer scrolls: Ctrl+wheel
+        // zooms and must not also scroll.
+        if phase != gpui::DispatchPhase::Capture {
+            return;
+        }
+        match wheel.update(cx, |this, cx| this.wheel_zoom(side, event, cx)) {
+            Ok(true) => cx.stop_propagation(),
+            Ok(false) => {}
+            Err(error) => log::debug!("the entries area outlived its explorer: {error}"),
+        }
+    });
     let ups = weak.clone();
     window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
         if phase != gpui::DispatchPhase::Capture || event.button != MouseButton::Left {
@@ -602,9 +625,15 @@ pub(crate) fn listen(weak: &gpui::WeakEntity<Explorer>, side: Side, window: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::explorer::entries::TILE_TOP_PADDING;
+    use crate::explorer::zoom::TILE_TOP_PADDING;
 
-    const GRID: Layout = Layout::Grid { columns: 4 };
+    /// Today's tile, the Medium level.
+    const TILE_WIDTH: f32 = 112.0;
+    const TILE_HEIGHT: f32 = 126.0;
+    const GRID: Layout = Layout::Grid {
+        columns: 4,
+        zoom: GridZoom::Medium,
+    };
     const LIST: Layout = Layout::List { row_height: 30.0 };
     const PITCH: f32 = TILE_WIDTH + TILE_GAP;
 
@@ -666,7 +695,10 @@ mod tests {
         let wide = rect(0.0, 0.0, 100.0 * PITCH, 5.0);
         assert_eq!(hits(GRID, 10, wide), vec![0, 1, 2, 3]);
         // One column: tiles stack.
-        let one = Layout::Grid { columns: 1 };
+        let one = Layout::Grid {
+            columns: 1,
+            zoom: GridZoom::Medium,
+        };
         assert_eq!(
             hits(one, 3, rect(0.0, 0.0, 500.0, 2.0 * TILE_HEIGHT - 1.0)),
             vec![0, 1]
@@ -686,12 +718,35 @@ mod tests {
     fn a_million_entries_are_hit_by_arithmetic() {
         let near_end = rect(0.0, 29_999_970.0, 5.0, 29_999_999.0);
         assert_eq!(hits(LIST, 1_000_000, near_end), vec![999_999]);
-        let tiles = Layout::Grid { columns: 10 };
+        let tiles = Layout::Grid {
+            columns: 10,
+            zoom: GridZoom::Medium,
+        };
         let row = 99_999.0 * TILE_HEIGHT;
         assert_eq!(
             hits(tiles, 1_000_000, rect(0.0, row + 1.0, 3.0, row + 2.0)),
             vec![999_990]
         );
+    }
+
+    /// The hit test follows the level's tile, not a fixed one.
+    #[test]
+    fn hit_testing_uses_the_tile_of_the_zoom_level() {
+        for zoom in GridZoom::ALL {
+            let metrics = zoom.metrics();
+            let (width, height) = (metrics.tile_width, metrics.tile_height());
+            let layout = Layout::Grid { columns: 3, zoom };
+            let pitch = width + TILE_GAP;
+            assert_eq!(entry_at(layout, 9, 1.0, 1.0), Some(0), "{zoom:?}");
+            assert_eq!(
+                entry_at(layout, 9, pitch + 1.0, height + 1.0),
+                Some(4),
+                "{zoom:?}"
+            );
+            assert_eq!(entry_at(layout, 9, width + 1.0, 1.0), None, "{zoom:?} gap");
+            let two_by_two = rect(pitch + 1.0, 1.0, 2.0 * pitch + 1.0, height + 1.0);
+            assert_eq!(hits(layout, 9, two_by_two), vec![1, 2, 4, 5], "{zoom:?}");
+        }
     }
 
     #[test]

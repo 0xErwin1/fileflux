@@ -42,6 +42,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Location;
+use super::zoom::{GridZoom, ListZoom};
 
 /// The `version` of the settings file this build reads and writes.
 pub const SETTINGS_VERSION: u32 = 2;
@@ -316,6 +317,12 @@ pub struct Preferences {
     /// before the key existed loads the default (Size and Modified), so no
     /// settings migration is needed.
     pub list_columns: Vec<ColumnPref>,
+    /// The icon size of the grid view. A file written before the key existed
+    /// loads Medium, today's size, so no settings migration is needed.
+    pub grid_zoom: GridZoom,
+    /// The row and icon size of the list view; Medium when absent, like
+    /// [`Self::grid_zoom`].
+    pub list_zoom: ListZoom,
     pub sidebar_collapsed: bool,
     /// The details panel (Ctrl+I) is open.
     pub details_open: bool,
@@ -331,6 +338,8 @@ impl Default for Preferences {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             details_width: DEFAULT_DETAILS_WIDTH,
             list_columns: ColumnPref::defaults(),
+            grid_zoom: GridZoom::Medium,
+            list_zoom: ListZoom::Medium,
             sidebar_collapsed: false,
             details_open: true,
             window_width: DEFAULT_WINDOW.0,
@@ -1215,6 +1224,65 @@ mod tests {
             "Name alone is a choice"
         );
         assert_eq!(loaded.value.version, SETTINGS_VERSION, "no version bump");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The zoom levels are new keys: a file from before them (version 1 or
+    /// 2) draws Medium, today's sizes, with no notice and no version bump.
+    #[test]
+    fn files_without_zoom_levels_load_as_medium() {
+        assert_eq!(Settings::default().preferences.grid_zoom, GridZoom::Medium);
+        assert_eq!(Settings::default().preferences.list_zoom, ListZoom::Medium);
+        let dir = scratch("zoom-old");
+        for (name, text) in [
+            (
+                "v1",
+                "version = 1\n[preferences]\ndefault_view = \"grid\"\n",
+            ),
+            ("v2", "version = 2\n[preferences]\nsidebar_width = 300\n"),
+            ("empty", ""),
+        ] {
+            let path = dir.join(format!("{name}.toml"));
+            std::fs::write(&path, text).expect("fixture writes");
+            let loaded = load_settings(&path, SystemTime::now());
+            assert_eq!(loaded.notice, None, "{name}");
+            assert_eq!(
+                loaded.value.preferences.grid_zoom,
+                GridZoom::Medium,
+                "{name}"
+            );
+            assert_eq!(
+                loaded.value.preferences.list_zoom,
+                ListZoom::Medium,
+                "{name}"
+            );
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn zoom_levels_round_trip_under_preferences_and_unknown_names_are_corrupt() {
+        let dir = scratch("zoom-roundtrip");
+        let path = dir.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.preferences.grid_zoom = GridZoom::Larger;
+        settings.preferences.list_zoom = ListZoom::Small;
+        save_settings(&path, &settings).expect("settings save");
+        let text = std::fs::read_to_string(&path).expect("file reads");
+        assert!(text.contains("grid_zoom = \"larger\""), "{text}");
+        assert!(text.contains("list_zoom = \"small\""), "{text}");
+        let loaded = load_settings(&path, SystemTime::now());
+        assert_eq!(loaded.value, settings);
+        assert_eq!(loaded.value.version, SETTINGS_VERSION, "no version bump");
+
+        std::fs::write(
+            &path,
+            "version = 2\n[preferences]\nlist_zoom = \"larger\"\n",
+        )
+        .expect("fixture writes");
+        let loaded = load_settings(&path, SystemTime::now());
+        assert!(loaded.notice.is_some(), "the list has no larger level");
+        assert_eq!(loaded.value, Settings::default());
         drop(std::fs::remove_dir_all(&dir));
     }
 
