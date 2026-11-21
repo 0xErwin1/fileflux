@@ -540,6 +540,7 @@ fn a_sidebar_row_menu_offers_open_tab_favorite_copy_and_properties() {
         [
             "Open",
             "Open in new tab",
+            "Analyze Disk Usage",
             "-",
             "Add to favorites",
             "Copy path",
@@ -569,6 +570,7 @@ fn a_favorite_row_offers_remove_instead_of_add() {
         [
             "Open",
             "Open in new tab",
+            "Analyze Disk Usage",
             "-",
             "Remove from favorites",
             "Copy path",
@@ -594,6 +596,7 @@ fn a_sidebar_row_offers_open_in_terminal_only_when_a_terminal_exists() {
             "Open",
             "Open in new tab",
             "Open in terminal",
+            "Analyze Disk Usage",
             "-",
             "Add to favorites",
             "Copy path",

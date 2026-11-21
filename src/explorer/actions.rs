@@ -1863,6 +1863,11 @@ impl Explorer {
             MenuCommand::OpenInNewTab => {
                 self.open_tab(location, Placement::Background, window, cx);
             }
+            MenuCommand::AnalyzeDiskUsage => {
+                if let Location::Directory(folder) = location {
+                    self.analyze_usage_of(folder, window, cx);
+                }
+            }
             MenuCommand::AddFavorite => self.set_favorite(&location, true, cx),
             MenuCommand::RemoveFavorite => self.set_favorite(&location, false, cx),
             MenuCommand::CopyPath => {

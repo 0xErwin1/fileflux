@@ -1832,6 +1832,13 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
     if target.terminal {
         rows.push(item(MenuCommand::OpenTerminal, "Open in terminal", false));
     }
+    // A place or a mounted partition is a folder to measure, reachable here
+    // without opening it first.
+    rows.push(item(
+        MenuCommand::AnalyzeDiskUsage,
+        super::usage::ANALYZE_LABEL,
+        false,
+    ));
     rows.push(MenuRow::Separator);
     rows.push(if target.favorite {
         item(MenuCommand::RemoveFavorite, "Remove from favorites", false)
