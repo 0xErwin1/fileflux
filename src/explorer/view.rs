@@ -72,7 +72,7 @@ use crate::explorer::state::{
     ExplorerState, Favorites, PathArgument, Scan, SearchRun, Transition, View,
 };
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
-use crate::explorer::tabs::{Affected, Placement};
+use crate::explorer::tabs::{Affected, DraggedTab, Placement};
 use crate::explorer::toasts;
 use crate::explorer::typeahead::{self, TypeAhead};
 use crate::explorer::zoom::{self, GridZoomExt as _, WheelTravel};
@@ -173,6 +173,10 @@ actions!(
         /// Activates the previous tab, wrapping around (Ctrl+Shift+Tab,
         /// Ctrl+PageUp).
         PreviousTab,
+        /// Moves the active tab one place left (Ctrl+Shift+PageUp).
+        MoveTabLeft,
+        /// Moves the active tab one place right (Ctrl+Shift+PageDown).
+        MoveTabRight,
         /// Activates the first tab (Alt+1).
         JumpToTab1,
         /// Activates the second tab (Alt+2).
@@ -315,6 +319,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-pagedown", NextTab, tabs),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, tabs),
         KeyBinding::new("ctrl-pageup", PreviousTab, tabs),
+        KeyBinding::new("ctrl-shift-pageup", MoveTabLeft, tabs),
+        KeyBinding::new("ctrl-shift-pagedown", MoveTabRight, tabs),
         KeyBinding::new("alt-1", JumpToTab1, tabs),
         KeyBinding::new("alt-2", JumpToTab2, tabs),
         KeyBinding::new("alt-3", JumpToTab3, tabs),
@@ -821,6 +827,11 @@ pub(crate) struct Explorer {
     /// Restored tabs whose saved folder has not been read yet, by tab: if the
     /// first scan finds it gone, the tab falls back to an existing ancestor.
     restore_pending: HashMap<TabId, PathBuf>,
+    /// The tab being dragged in the tab strips, while its drag lasts: a
+    /// split view then shows a strip on a one-tab pane too, so the tab can
+    /// be dropped there. Cleared by the drop and, for a drag that ended
+    /// elsewhere, by the next pump tick.
+    pub(crate) tab_drag: Option<TabId>,
     /// How many restored tabs fell back so far, for the status notice.
     restore_fallbacks: usize,
     /// A settings problem for the status bar (an invalid file at startup, a
@@ -1094,6 +1105,7 @@ impl Explorer {
             folders,
             default_presentation,
             restore_pending,
+            tab_drag: None,
             restore_fallbacks: 0,
             settings_notice: None,
             inspector_open: preferences.details_open,
@@ -1242,6 +1254,10 @@ impl Explorer {
     /// still for the debounce. The write runs on the background executor; a
     /// failure shows one status notice and never blocks.
     fn persist_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.tab_drag.is_some() && !cx.has_active_drag() {
+            self.tab_drag = None;
+            cx.notify();
+        }
         self.remember_changed_views();
         self.save_folders_in_background(cx);
         let (settings, session) = self.persist_snapshot(window);
@@ -3202,6 +3218,55 @@ impl Explorer {
         }
     }
 
+    /// Ctrl+Shift+PageUp / PageDown: moves the active tab one place; it
+    /// stays active and stops at the ends. Every per-tab structure is keyed
+    /// by tab id, so only the order changes (and the saved session with it).
+    pub(crate) fn move_active_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.tabs.move_active(step) {
+            cx.notify();
+        }
+    }
+
+    /// A tab dropped in the gap `gap` of the strip of `to`: reorders it
+    /// there, or moves it to the other pane (see [`Panes::drop_tab`]). The
+    /// tab keeps everything it owns — its watch holds, scan, scroll handles
+    /// — because the whole [`Tab`] changes lists.
+    pub(crate) fn drop_tab(
+        &mut self,
+        dragged: DraggedTab,
+        to: Side,
+        gap: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_drag = None;
+        let Some((from_side, from)) = self.tabs.locate(|tab| tab.id == dragged.id) else {
+            cx.notify();
+            return;
+        };
+        if !self.tabs.drop_tab(from_side, from, to, gap) {
+            cx.notify();
+            return;
+        }
+        if from_side != to {
+            // The pane that lost the tab shows another one now; an unwatched
+            // tab (the Trash) is read again, like on a switch.
+            let refresh = self.tabs.active_of_mut(from_side).and_then(|tab| {
+                tab.watch
+                    .committed
+                    .is_none()
+                    .then(|| (tab.id, tab.state.begin_op_refresh()))
+            });
+            if let Some((id, scan)) = refresh {
+                self.start_scan_in(id, scan, window, cx);
+                self.restart_search_in(id, cx);
+            }
+            self.tabs.focus_side(to);
+            self.after_tab_switch(true, window, cx);
+        }
+        cx.notify();
+    }
+
     /// Alt+1..9: the tab with that number.
     pub(crate) fn jump_to_tab(
         &mut self,
@@ -3697,6 +3762,12 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
                 this.cycle_tab(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabLeft, _window, cx| {
+                this.move_active_tab(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabRight, _window, cx| {
+                this.move_active_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &JumpToTab1, window, cx| {
                 this.jump_to_tab(1, window, cx);

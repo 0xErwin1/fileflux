@@ -1024,4 +1024,19 @@ mod tests {
         assert!(!same_device(&[], &dir), "nothing to move: not a move");
         Ok(())
     }
+
+    #[test]
+    fn entry_drop_targets_ignore_tab_drags() {
+        use crate::explorer::panes::Side;
+        use crate::explorer::tabs::DraggedTab;
+        let tab = DraggedTab {
+            id: 1,
+            side: Side::Left,
+        };
+        assert!(dragged_paths(&tab).is_none());
+        let entries = DraggedEntries {
+            paths: Arc::new(vec![PathBuf::from("/a")]),
+        };
+        assert!(dragged_paths(&entries).is_some());
+    }
 }

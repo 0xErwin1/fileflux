@@ -28,7 +28,7 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Tabs | Reorder tabs; drag a tab to another window | Fixed order |
+| Tabs | Drag a tab to another window (the file explorer has one window; this needs more than one) | Tabs reorder within the window and move between the two panes |
 | Open with | Several files at once | One selected file |
 | Optical media | List and mount discs | Excluded from Devices |
 | Translations | A translated interface | English only |

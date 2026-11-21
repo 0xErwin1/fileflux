@@ -19,7 +19,7 @@ use fileflux::core::Location;
 use fileflux::core::settings::{SESSION_VERSION, Session, SessionSplit, SessionTab};
 
 use super::ops::paste::ClipMode;
-use super::tabs::{Placement, TabList};
+use super::tabs::{Placement, TabList, gap_target, keyboard_move};
 
 /// The narrowest window (in logical pixels) that draws two panes side by
 /// side. Each pane needs its toolbar and about 380 px of entries; with the
@@ -327,6 +327,79 @@ impl<T> Panes<T> {
     /// The tab at the window-wide `index` (see [`Self::focused_offset`]).
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
         self.iter().nth(index)
+    }
+
+    /// The pane and the position inside it of the first tab `matches`
+    /// accepts (a parked pane included).
+    pub(crate) fn locate(&self, matches: impl Fn(&T) -> bool) -> Option<(Side, usize)> {
+        if let Some(local) = self.left.iter().position(&matches) {
+            return Some((Side::Left, local));
+        }
+        let local = self.right.as_ref()?.iter().position(&matches)?;
+        Some((Side::Right, local))
+    }
+
+    /// The active tab of `side`'s pane, mutably (`None` for a pane that
+    /// does not exist).
+    pub(crate) fn active_of_mut(&mut self, side: Side) -> Option<&mut T> {
+        match side {
+            Side::Left => Some(self.left.active_mut()),
+            Side::Right => self.right.as_mut().map(TabList::active_mut),
+        }
+    }
+
+    /// Whether `side` has tabs on screen: the left pane always, the right
+    /// one while split.
+    fn is_shown(&self, side: Side) -> bool {
+        side == Side::Left || self.split
+    }
+
+    /// A tab dropped in the gap `gap` of the tab strip of `to_side`: the tab
+    /// at `from` of `from_side` is reordered there (same pane) or moves
+    /// there and becomes that pane's active tab (other pane). `false` —
+    /// nothing changes — when it would leave the order as it is, when the
+    /// target pane is not shown, or when the tab is the last one of its
+    /// pane.
+    pub(crate) fn drop_tab(
+        &mut self,
+        from_side: Side,
+        from: usize,
+        to_side: Side,
+        gap: usize,
+    ) -> bool {
+        if !self.is_shown(from_side) || !self.is_shown(to_side) {
+            return false;
+        }
+        if from_side == to_side {
+            let list = match (to_side, self.right.as_mut()) {
+                (Side::Right, Some(right)) => right,
+                (Side::Right, None) => return false,
+                (Side::Left, _) => &mut self.left,
+            };
+            return list.move_tab(from, gap_target(from, gap));
+        }
+        let (source, target) = match (from_side, self.right.as_mut()) {
+            (Side::Left, Some(right)) => (&mut self.left, right),
+            (Side::Right, Some(right)) => (right, &mut self.left),
+            (_, None) => return false,
+        };
+        // `close` refuses the last tab of the pane and a missing position,
+        // and the target exists, so nothing is lost.
+        let Some(tab) = source.close(from) else {
+            return false;
+        };
+        target.insert_active(gap, tab);
+        true
+    }
+
+    /// Ctrl+Shift+PageUp / PageDown: moves the focused pane's active tab by
+    /// `step`. `false` at the ends.
+    pub(crate) fn move_active(&mut self, step: isize) -> bool {
+        let list = self.focused_mut();
+        match keyboard_move(list.active_index(), list.len(), step) {
+            Some(to) => list.move_tab(list.active_index(), to),
+            None => false,
+        }
     }
 
     /// The window-wide position of the first tab `matches` accepts.
@@ -869,5 +942,148 @@ mod tests {
         let panes = Panes::new(dir("/a"));
         assert!(saved(&panes).split.is_none());
         assert!(restore_session(&saved(&panes), None).split.is_none());
+    }
+
+    // --- moving tabs ---------------------------------------------------------
+
+    /// Left: l1 l2 l3 (l2 active); right: r1 r2 (r1 active); split.
+    fn two_full_panes() -> Panes<&'static str> {
+        let mut panes = Panes::new("l1");
+        panes.open("l2", Placement::Foreground);
+        panes.open("l3", Placement::Foreground);
+        panes.activate(1);
+        assert!(panes.split(Some("r1")));
+        panes.focus_side(Side::Right);
+        panes.open("r2", Placement::Background);
+        panes.focus_side(Side::Left);
+        panes
+    }
+
+    fn pane_order(panes: &Panes<&'static str>) -> (Vec<&'static str>, Vec<&'static str>) {
+        let left = panes.left.iter().copied().collect();
+        let right = panes
+            .right
+            .as_ref()
+            .map(|list| list.iter().copied().collect())
+            .unwrap_or_default();
+        (left, right)
+    }
+
+    #[test]
+    fn locating_a_tab_gives_its_pane_and_local_position() {
+        let panes = two_full_panes();
+        assert_eq!(panes.locate(|tab| *tab == "l3"), Some((Side::Left, 2)));
+        assert_eq!(panes.locate(|tab| *tab == "r2"), Some((Side::Right, 1)));
+        assert_eq!(panes.locate(|tab| *tab == "zz"), None);
+    }
+
+    #[test]
+    fn a_drop_in_the_same_pane_reorders_and_keeps_the_active_tab() {
+        let mut panes = two_full_panes();
+        assert!(panes.drop_tab(Side::Left, 0, Side::Left, 3));
+        let (left, right) = pane_order(&panes);
+        assert_eq!(left, ["l2", "l3", "l1"]);
+        assert_eq!(right, ["r1", "r2"]);
+        assert_eq!(*panes.active(), "l2");
+        assert!(!panes.drop_tab(Side::Left, 1, Side::Left, 1), "own gap");
+        assert!(!panes.drop_tab(Side::Left, 1, Side::Left, 2), "own gap");
+        assert_eq!(pane_order(&panes).0, ["l2", "l3", "l1"]);
+    }
+
+    #[test]
+    fn a_drop_on_the_other_pane_moves_the_tab_there_and_activates_it() {
+        let mut panes = two_full_panes();
+        // l1 (not active) to the gap between r1 and r2.
+        assert!(panes.drop_tab(Side::Left, 0, Side::Right, 1));
+        let (left, right) = pane_order(&panes);
+        assert_eq!(left, ["l2", "l3"]);
+        assert_eq!(right, ["r1", "l1", "r2"]);
+        assert_eq!(*panes.left.active(), "l2", "source keeps its active tab");
+        assert_eq!(panes.left.active_index(), 0);
+        let right = panes
+            .right
+            .as_ref()
+            .map(|list| (*list.active(), list.active_index()));
+        assert_eq!(right, Some(("l1", 1)), "the moved tab is active there");
+    }
+
+    #[test]
+    fn moving_the_active_tab_away_activates_its_neighbour_in_the_source() {
+        let mut panes = two_full_panes();
+        // l2 is active, between l1 and l3: the right neighbour takes over.
+        assert!(panes.drop_tab(Side::Left, 1, Side::Right, 2));
+        let (left, right) = pane_order(&panes);
+        assert_eq!(left, ["l1", "l3"]);
+        assert_eq!(right, ["r1", "r2", "l2"]);
+        assert_eq!(*panes.left.active(), "l3");
+    }
+
+    #[test]
+    fn the_last_tab_of_a_pane_stays_where_it_is() {
+        let mut panes = split_panes();
+        // Right holds only r1.
+        assert!(!panes.drop_tab(Side::Right, 0, Side::Left, 0));
+        assert_eq!(all(&panes), ["l1", "l2", "r1"]);
+        assert_eq!(*panes.left.active(), "l2");
+    }
+
+    #[test]
+    fn a_tab_cannot_go_to_a_pane_that_is_not_shown() {
+        let mut panes = two_full_panes();
+        panes.unsplit();
+        let before = pane_order(&panes);
+        assert!(!panes.drop_tab(Side::Left, 0, Side::Right, 0));
+        assert_eq!(pane_order(&panes), before);
+        let mut single = Panes::new("a");
+        single.open("b", Placement::Foreground);
+        assert!(!single.drop_tab(Side::Left, 0, Side::Right, 0));
+        assert_eq!(single.len(), 2);
+    }
+
+    #[test]
+    fn a_drop_naming_a_missing_tab_changes_nothing() {
+        let mut panes = two_full_panes();
+        let before = pane_order(&panes);
+        assert!(!panes.drop_tab(Side::Left, 9, Side::Right, 0));
+        assert!(!panes.drop_tab(Side::Right, 9, Side::Left, 0));
+        assert_eq!(pane_order(&panes), before);
+    }
+
+    #[test]
+    fn the_keyboard_moves_the_focused_panes_active_tab() {
+        let mut panes = two_full_panes();
+        assert!(panes.move_active(1));
+        assert_eq!(pane_order(&panes).0, ["l1", "l3", "l2"]);
+        assert_eq!(*panes.active(), "l2");
+        assert!(!panes.move_active(1), "stops at the right end");
+        assert!(panes.move_active(-1));
+        assert!(panes.move_active(-1));
+        assert!(!panes.move_active(-1), "stops at the left end");
+        assert_eq!(pane_order(&panes).0, ["l2", "l1", "l3"]);
+        assert_eq!(
+            pane_order(&panes).1,
+            ["r1", "r2"],
+            "the other pane is untouched"
+        );
+    }
+
+    #[test]
+    fn the_saved_session_follows_a_reorder_and_a_cross_pane_move() -> Result<(), String> {
+        let home = Some(Path::new("/home/x"));
+        let mut panes = Panes::new(dir("/a"));
+        panes.open(dir("/b"), Placement::Foreground);
+        panes.open(dir("/c"), Placement::Foreground);
+        assert!(panes.split(Some(dir("/r"))));
+        // Reorder: /c to the front (active stays /c).
+        assert!(panes.drop_tab(Side::Left, 2, Side::Left, 0));
+        // Cross-pane: /a to the right pane's end.
+        assert!(panes.drop_tab(Side::Left, 1, Side::Right, 1));
+        let session = saved(&panes);
+        let restored = restore_session(&session, home);
+        let rebuilt = rebuild(&restored).ok_or("no panes")?;
+        let (_, _, tabs, active) = layout_of(&rebuilt);
+        assert_eq!(tabs, [dir("/c"), dir("/b"), dir("/r"), dir("/a")]);
+        assert_eq!(active, [0, 1], "left /c, right /a");
+        Ok(())
     }
 }

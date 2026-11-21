@@ -8,16 +8,26 @@
 //! full path is its tooltip) and a close button while it is active or
 //! hovered; a middle click closes it. Tabs share the row and shrink down to
 //! a floor before they clip.
+//!
+//! A tab can be dragged (payload [`DraggedTab`], which the entry drop
+//! targets ignore). While one is dragged, every tab shows two drop zones —
+//! its left and right half, each a gap between tabs — and a tint bar marks
+//! the gap the pointer is in; the empty end of the strip is the gap after
+//! the last tab. In a split view a one-tab pane shows its strip meanwhile,
+//! so a tab can be dropped onto the other pane.
 
 use bolt::primitives::Icon;
 use bolt::tokens::ChromeColors;
 use fileflux::core::Location;
-use gpui::{Context, Div, MouseButton, SharedString, Stateful, Styled, div, prelude::*, px};
+use gpui::{
+    Context, Div, MouseButton, Render, SharedString, Stateful, Styled, Window, div, prelude::*, px,
+};
 use gpui_component::ActiveTheme;
 use gpui_component::tooltip::Tooltip;
 
 use super::icon;
-use super::tabs::{tab_label, tab_tooltip};
+use super::panes::Side;
+use super::tabs::{DraggedTab, dragged_tab, gap_is_noop, tab_label, tab_tooltip};
 use super::view::Explorer;
 
 /// Height of the strip and of every tab.
@@ -31,9 +41,18 @@ const CLOSE_SIZE: f32 = 18.0;
 
 /// The strip, or nothing while there is a single tab.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
-    if this.tabs.len() < 2 {
+    let dragging = this.tab_drag.is_some() && cx.has_active_drag();
+    if this.tabs.len() < 2 && !(dragging && this.tabs.is_split()) {
         return None;
     }
+    // The dragged tab's pane and position, so the gaps that would leave the
+    // order as it is show no zone.
+    let grabbed = this
+        .tab_drag
+        .filter(|_| dragging)
+        .and_then(|id| this.tabs.locate(|tab| tab.id == id));
+    // During a frame of a split view the focus is on the pane being drawn.
+    let side = this.tabs.focus();
     let colors = bolt::colors(cx);
     let home = this
         .places
@@ -58,6 +77,13 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
         let location = tab.state.current();
         strip = strip.child(render_tab(
             index,
+            Zones {
+                id: tab.id,
+                side,
+                local,
+                grabbed: dragging.then_some(grabbed).flatten(),
+                dragging,
+            },
             index == active,
             location,
             tab_label(location, home),
@@ -65,12 +91,87 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
             cx,
         ));
     }
+    if dragging {
+        // The empty end of the strip: the gap after the last tab. It only
+        // takes what the tabs leave over.
+        let end = this.tabs.focused().len();
+        let mut filler = div().h_full();
+        filler.style().flex_grow = Some(0.001);
+        let skip =
+            grabbed.is_some_and(|(from_side, from)| from_side == side && gap_is_noop(from, end));
+        if !skip {
+            strip = strip.child(gap_zone(filler, side, end, Edge::Left, cx));
+        }
+    }
     Some(strip)
+}
+
+/// What a tab needs to draw its drop zones.
+#[derive(Clone, Copy)]
+struct Zones {
+    /// The tab's identity.
+    id: u64,
+    side: Side,
+    /// The tab's position in its own pane.
+    local: usize,
+    /// The dragged tab's pane and position, while a tab drag lasts.
+    grabbed: Option<(Side, usize)>,
+    dragging: bool,
+}
+
+/// Which edge of a zone the drop indicator is drawn on.
+#[derive(Clone, Copy)]
+enum Edge {
+    Left,
+    Right,
+}
+
+/// Makes `zone` accept a dragged tab for the gap `gap` of `side`'s strip: a
+/// tint bar on `edge` while the pointer is over it, and a drop that moves
+/// the tab there.
+fn gap_zone<E>(zone: E, side: Side, gap: usize, edge: Edge, cx: &mut Context<Explorer>) -> E
+where
+    E: InteractiveElement + Styled,
+{
+    let tint = ChromeColors::tint(cx.theme());
+    zone.can_drop(|value, _, _| dragged_tab(value).is_some())
+        .drag_over::<DraggedTab>(move |style, _, _, _| match edge {
+            Edge::Left => style.border_l_2().border_color(tint),
+            Edge::Right => style.border_r_2().border_color(tint),
+        })
+        .on_drop::<DraggedTab>(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+            this.drop_tab(*dragged, side, gap, window, cx);
+        }))
+}
+
+/// The card that follows the pointer while a tab is dragged.
+struct TabDragPreview {
+    label: String,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = bolt::colors(cx);
+        let tint = ChromeColors::tint(cx.theme());
+        div()
+            .flex()
+            .items_center()
+            .h(px(TAB_HEIGHT))
+            .w(px(TAB_MIN_WIDTH + 40.0))
+            .px(px(12.0))
+            .bg(colors.raised)
+            .border_1()
+            .border_color(tint)
+            .text_size(px(13.0))
+            .text_color(colors.strong)
+            .child(div().min_w_0().truncate().child(self.label.clone()))
+    }
 }
 
 /// One tab.
 fn render_tab(
     index: usize,
+    zones: Zones,
     active: bool,
     location: &Location,
     label: String,
@@ -87,6 +188,12 @@ fn render_tab(
         Location::Search { .. } => gpui_kit_assets::IconName::FolderSearch,
     };
     let close_group = group.clone();
+    let weak = cx.weak_entity();
+    let drag_label = label.clone();
+    let payload = DraggedTab {
+        id: zones.id,
+        side: zones.side,
+    };
     div()
         .id(("explorer-tab", index))
         .group(group.clone())
@@ -112,6 +219,17 @@ fn render_tab(
                 .hover(|tab| tab.bg(colors.raised).text_color(colors.foreground))
         })
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .on_drag(payload, move |dragged, _grab, _window, cx| {
+            let id = dragged.id;
+            if let Err(error) = weak.update(cx, |this, cx| {
+                this.tab_drag = Some(id);
+                cx.notify();
+            }) {
+                log::debug!("a tab drag began in a closed explorer: {error}");
+            }
+            let label = drag_label.clone();
+            cx.new(|_| TabDragPreview { label })
+        })
         .on_click(cx.listener(move |this, _event, window, cx| {
             this.activate_tab(index, window, cx);
         }))
@@ -151,6 +269,21 @@ fn render_tab(
                 }))
                 .child(Icon::new(icon(gpui_kit_assets::IconName::X)).size(px(12.0))),
         )
+        .when(zones.dragging, |tab| {
+            let zone = |gap: usize, edge: Edge, cx: &mut Context<Explorer>| {
+                let noop = zones
+                    .grabbed
+                    .is_some_and(|(side, from)| side == zones.side && gap_is_noop(from, gap));
+                let base = div().absolute().top_0().bottom_0().w_1_2();
+                let base = match edge {
+                    Edge::Left => base.left_0(),
+                    Edge::Right => base.right_0(),
+                };
+                (!noop).then(|| gap_zone(base, zones.side, gap, edge, cx))
+            };
+            tab.children(zone(zones.local, Edge::Left, cx))
+                .children(zone(zones.local + 1, Edge::Right, cx))
+        })
         .when(active, |tab| {
             // The 2 px tint marker along the bottom edge.
             tab.child(

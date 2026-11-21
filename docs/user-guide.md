@@ -160,13 +160,16 @@ The tab strip appears above the toolbar once two or more tabs are open. A tab sh
 | New tab | Ctrl+T. It starts with the view, sort and filters of the tab it came from, and a fresh history |
 | Close tab | Ctrl+W, the close button, or a middle click. The last tab is never closed. Closing the active tab activates its right neighbour (the left one when it was the rightmost) |
 | Switch | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp, Alt+1 … Alt+9, or click |
+| Reorder | Drag a tab along the strip; a tint bar shows the gap it will land in. Or Ctrl+Shift+PageUp / Ctrl+Shift+PageDown to move the active tab one place left or right (it stops at the ends). The moved tab keeps its history, selection, view and everything else, and the order is saved with the session |
+| Move to the other pane | In a [split view](#dual-pane), drag a tab onto the other pane's tab strip (a pane with one tab shows its strip while you drag). The tab lands in the gap you drop it in and becomes that pane's active tab; the pane it left activates its right neighbour (else the left one) if it was the active one. A pane's last tab cannot be dragged out, like it cannot be closed. The tab keeps its watch on the folder and any scan in progress |
 | Open in a new tab | Middle-click a folder (grid, list), a sidebar row or a breadcrumb segment, or **Open in new tab** in the context menu. It opens in the background, to the right of the active tab. Files do nothing |
 
 Each tab keeps its own location, history, selection, view, sort, filter text, scroll position and path-edit state. Shared across the window: the sidebar and favorites, the clipboard (copy in one tab, paste in another), the undo history, progress cards, dialogs and toasts.
 
 - Switching tabs cancels an inline rename and closes an open context menu.
 - A file operation keeps running when you switch tabs. When it finishes, every tab showing a folder it changed is re-read.
-- Tabs are restored at the next launch (see [Settings](settings.md)).
+- Tabs are restored at the next launch, in their saved order and pane (see [Settings](settings.md)).
+- Fileflux's file explorer has a single window, so a tab cannot be dragged to another window yet (see the [roadmap](roadmap.md)).
 
 ## Dual pane
 

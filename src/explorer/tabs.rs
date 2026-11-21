@@ -167,6 +167,57 @@ impl<T> TabList<T> {
         self.activate(next as usize);
     }
 
+    /// Moves the tab at `from` so it sits at position `to` (both counted
+    /// before the move). The active tab stays the active tab, wherever it
+    /// ends up. `false` — nothing changes — for a position past the end and
+    /// for `from == to`.
+    pub(crate) fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        let len = self.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        self.background_run = 0;
+        let active_at = self.before.len();
+        // `from` and `to` each sit left of, on, or right of the active tab;
+        // the active tab itself is never taken out of its field, only the
+        // tabs around it change sides.
+        if from == active_at {
+            if to < active_at {
+                // The tabs from `to` up to the active one shift right.
+                let mut shifted = self.before.split_off(to);
+                shifted.append(&mut self.after);
+                self.after = shifted;
+            } else {
+                // The tabs from the active one up to `to` shift left.
+                let shifted: Vec<T> = self.after.drain(..to - active_at).collect();
+                self.before.extend(shifted);
+            }
+        } else if from < active_at {
+            let tab = self.before.remove(from);
+            if to < active_at {
+                self.before.insert(to, tab);
+            } else {
+                self.after.insert(to - active_at, tab);
+            }
+        } else {
+            let tab = self.after.remove(from - active_at - 1);
+            if to <= active_at {
+                self.before.insert(to, tab);
+            } else {
+                self.after.insert(to - active_at - 1, tab);
+            }
+        }
+        true
+    }
+
+    /// Inserts `item` at the gap `gap` (0 is before the first tab, `len`
+    /// after the last; larger values mean the end) and makes it active.
+    pub(crate) fn insert_active(&mut self, gap: usize, item: T) {
+        let gap = gap.min(self.len());
+        let at = self.open(item, Placement::Foreground);
+        self.move_tab(at, gap);
+    }
+
     /// Alt+1..9: activates tab number `number` (counting from one); `false`
     /// when there is no such tab.
     pub(crate) fn jump(&mut self, number: usize) -> bool {
@@ -174,6 +225,41 @@ impl<T> TabList<T> {
             .checked_sub(1)
             .is_some_and(|index| self.activate(index))
     }
+}
+
+/// Where the tab at `from` lands when dropped in the gap `gap` of its own
+/// list: the gap counts before the tab leaves.
+pub(crate) fn gap_target(from: usize, gap: usize) -> usize {
+    if gap > from { gap - 1 } else { gap }
+}
+
+/// Whether dropping the tab at `from` in the gap `gap` of its own list
+/// leaves the order as it is (the gaps on either side of the tab).
+pub(crate) fn gap_is_noop(from: usize, gap: usize) -> bool {
+    gap == from || gap == from + 1
+}
+
+/// Ctrl+Shift+PageUp / PageDown: where the active tab at `active` of `len`
+/// goes when moved by `step` (-1 left, 1 right). `None` at the ends: the
+/// tab does not wrap around.
+pub(crate) fn keyboard_move(active: usize, len: usize, step: isize) -> Option<usize> {
+    let target = active.checked_add_signed(step)?;
+    (target < len).then_some(target)
+}
+
+/// The payload of a drag that started on a tab: which tab, by identity, and
+/// the pane it was dragged from. A type of its own, so the entry drop
+/// targets (which only know `DraggedEntries` and external paths) ignore it
+/// and the tab drop targets ignore entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DraggedTab {
+    pub(crate) id: u64,
+    pub(crate) side: super::panes::Side,
+}
+
+/// The tab a drag payload carries, if it is a tab drag.
+pub(crate) fn dragged_tab(value: &dyn std::any::Any) -> Option<&DraggedTab> {
+    value.downcast_ref::<DraggedTab>()
 }
 
 /// The text a tab shows: `Home` for the home directory, `Trash` for the
@@ -665,6 +751,145 @@ mod tests {
             [1],
             "the origin tab waits for its result even when it moved elsewhere"
         );
+    }
+
+    // --- reordering ---------------------------------------------------------
+
+    /// The Vec model of `move_tab`: remove, then insert at `to`.
+    fn model_move(order: &[&'static str], from: usize, to: usize) -> Vec<&'static str> {
+        let mut moved = order.to_vec();
+        let item = moved.remove(from);
+        moved.insert(to, item);
+        moved
+    }
+
+    #[test]
+    fn moving_a_tab_forward_and_backward_reorders_it() {
+        let mut tabs = list(&["a", "b", "c", "d"]);
+        assert!(tabs.move_tab(0, 2));
+        assert_eq!(order(&tabs), ["b", "c", "a", "d"]);
+        assert!(tabs.move_tab(3, 1));
+        assert_eq!(order(&tabs), ["b", "d", "c", "a"]);
+    }
+
+    #[test]
+    fn moving_a_tab_onto_its_own_position_changes_nothing() {
+        let mut tabs = list(&["a", "b", "c"]);
+        tabs.activate(1);
+        assert!(!tabs.move_tab(1, 1));
+        assert_eq!(order(&tabs), ["a", "b", "c"]);
+        assert_eq!(tabs.active_index(), 1);
+    }
+
+    #[test]
+    fn moving_past_the_end_changes_nothing() {
+        let mut tabs = list(&["a", "b", "c"]);
+        assert!(!tabs.move_tab(3, 0));
+        assert!(!tabs.move_tab(0, 3));
+        assert!(!tabs.move_tab(7, 9));
+        assert_eq!(order(&tabs), ["a", "b", "c"]);
+        assert_eq!(tabs.active_index(), 0);
+    }
+
+    #[test]
+    fn every_move_matches_the_model_and_keeps_the_active_tab() {
+        let names = ["a", "b", "c", "d", "e"];
+        for len in 1..=names.len() {
+            let Some(base) = names.get(..len) else {
+                continue;
+            };
+            for active in 0..len {
+                for from in 0..len {
+                    for to in 0..len {
+                        let mut tabs = list(base);
+                        tabs.activate(active);
+                        let identity = *tabs.active();
+                        assert_eq!(tabs.move_tab(from, to), from != to);
+                        let expected = model_move(base, from, to);
+                        assert_eq!(order(&tabs), expected, "len {len} {from}->{to}");
+                        assert_eq!(*tabs.active(), identity, "active follows");
+                        assert_eq!(
+                            tabs.active_index(),
+                            expected
+                                .iter()
+                                .position(|name| *name == identity)
+                                .unwrap_or(99),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_ends_the_background_run() {
+        let mut tabs = list(&["a", "b"]);
+        tabs.open("x", Placement::Background);
+        tabs.move_tab(0, 2);
+        tabs.open("y", Placement::Background);
+        assert_eq!(order(&tabs), ["x", "b", "a", "y"]);
+    }
+
+    #[test]
+    fn inserting_in_a_gap_activates_the_new_tab_there() {
+        for gap in 0..=3 {
+            let mut tabs = list(&["a", "b", "c"]);
+            tabs.activate(1);
+            tabs.insert_active(gap, "n");
+            let mut expected = vec!["a", "b", "c"];
+            expected.insert(gap, "n");
+            assert_eq!(order(&tabs), expected, "gap {gap}");
+            assert_eq!(*tabs.active(), "n");
+            assert_eq!(tabs.active_index(), gap);
+        }
+        let mut tabs = list(&["a"]);
+        tabs.insert_active(99, "n");
+        assert_eq!(order(&tabs), ["a", "n"], "a gap past the end means the end");
+    }
+
+    #[test]
+    fn a_gap_drop_lands_where_the_indicator_showed() {
+        // Tab 1 of four dragged to each gap 0..=4.
+        let results: Vec<_> = (0..=4).map(|gap| gap_target(1, gap)).collect();
+        assert_eq!(results, [0, 1, 1, 2, 3]);
+        assert!(gap_is_noop(1, 1) && gap_is_noop(1, 2));
+        assert!(!gap_is_noop(1, 0) && !gap_is_noop(1, 3) && !gap_is_noop(1, 4));
+        for len in 1..=5usize {
+            for from in 0..len {
+                for gap in 0..=len {
+                    let names = ["a", "b", "c", "d", "e"];
+                    let mut tabs = list(names.get(..len).unwrap_or_default());
+                    let changed = tabs.move_tab(from, gap_target(from, gap));
+                    assert_eq!(changed, !gap_is_noop(from, gap), "{from} gap {gap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_keyboard_moves_the_active_tab_one_step_and_stops_at_the_ends() {
+        assert_eq!(keyboard_move(1, 3, -1), Some(0));
+        assert_eq!(keyboard_move(1, 3, 1), Some(2));
+        assert_eq!(keyboard_move(0, 3, -1), None, "no wrap to the right end");
+        assert_eq!(keyboard_move(2, 3, 1), None, "no wrap to the left end");
+        assert_eq!(keyboard_move(0, 1, 1), None);
+        assert_eq!(keyboard_move(0, 1, -1), None);
+    }
+
+    #[test]
+    fn only_tab_payloads_are_tab_drags() {
+        use crate::explorer::dnd::DraggedEntries;
+        use crate::explorer::panes::Side;
+        let tab = DraggedTab {
+            id: 7,
+            side: Side::Right,
+        };
+        assert_eq!(dragged_tab(&tab), Some(&tab));
+        let entries = DraggedEntries {
+            paths: std::sync::Arc::new(vec![PathBuf::from("/a")]),
+        };
+        assert_eq!(dragged_tab(&entries), None);
+        assert_eq!(dragged_tab(&"text"), None);
     }
 }
 

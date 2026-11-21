@@ -10,6 +10,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Ctrl+W | Close tab | The last tab is never closed |
 | Ctrl+Tab / Ctrl+PageDown | Next tab | Wraps around |
 | Ctrl+Shift+Tab / Ctrl+PageUp | Previous tab | Wraps around |
+| Ctrl+Shift+PageUp / Ctrl+Shift+PageDown | Move the active tab left / right | The tab stays active; it stops at the ends (no wrap) |
 | Alt+1 … Alt+9 | Jump to tab 1–9 | Nothing happens when there is no such tab |
 | F3 | Split into two panes / back to one | Also the toolbar's Split view button; see [Dual pane](user-guide.md#dual-pane) |
 | F6 | Switch to the other pane | Only while split |
@@ -77,6 +78,8 @@ Mouse: the wheel and the back/forward buttons navigate, Ctrl+wheel zooms around 
 | Click / Ctrl+click / Shift+click | Select / toggle / select a range |
 | Middle-click a folder, sidebar row or breadcrumb | Open in a background tab |
 | Middle-click a tab | Close it |
+| Drag a tab along the strip | Reorder it (a tint bar marks the gap) |
+| Drag a tab onto the other pane's strip | Move it there (split view) |
 | Ctrl+wheel over the entries | Zoom | Wheel up zooms in, wheel down zooms out, one level per wheel notch; the list does not scroll while Ctrl is held |
 | Drop with Ctrl | Copy |
 | Drop with Shift | Move |
