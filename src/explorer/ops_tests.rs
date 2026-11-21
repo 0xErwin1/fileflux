@@ -2862,3 +2862,32 @@ fn a_new_file_that_reuses_a_deleted_inode_is_not_the_same_item() {
         }
     );
 }
+
+/// A folder in the Trash is not entered: inside it the explorer would offer
+/// the menus and shortcuts of a normal folder (paste, rename, new folder,
+/// favorites), which change trashed content behind the trash's own records.
+#[test]
+fn a_folder_inside_the_trash_is_never_entered() {
+    let root = std::path::Path::new("/home/me/.local/share/Trash");
+    assert!(inside_trash(&root.join("files/photos"), root));
+    assert!(inside_trash(&root.join("files/photos/2024"), root));
+    assert!(inside_trash(root, root));
+    assert!(!inside_trash(
+        std::path::Path::new("/home/me/Pictures"),
+        root
+    ));
+    assert!(
+        !inside_trash(
+            std::path::Path::new("/home/me/.local/share/Trash-old"),
+            root
+        ),
+        "a sibling whose name only starts like the trash is a normal folder"
+    );
+
+    let notice = trashed_folder_notice();
+    assert_eq!(notice.severity, Severity::Info);
+    assert_eq!(
+        notice.text,
+        "Folders in the Trash cannot be opened. Restore the folder to open it."
+    );
+}

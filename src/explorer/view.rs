@@ -1238,6 +1238,29 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Scan> {
+        // A folder in the Trash is not entered, whichever way it is reached
+        // (opening it from the Trash view, the path bar, history): inside it
+        // the normal folder menus and shortcuts would change trashed content
+        // behind the trash's own records.
+        let into_trash = match (
+            self.trash_root.as_deref(),
+            self.tab().state.target_of(&transition),
+        ) {
+            (Some(root), Some(Location::Directory(path))) => {
+                crate::explorer::ops::inside_trash(&path, root)
+            }
+            _ => false,
+        };
+        if into_trash {
+            self.push_toast(
+                crate::explorer::ops::trashed_folder_notice(),
+                &[],
+                None,
+                window,
+                cx,
+            );
+            return None;
+        }
         // A device that is being ejected is not entered, whichever way the
         // folder is reached (a visit, a history step, Up): a history entry
         // may be a symlink into it, which is resolved off the UI thread, so

@@ -261,6 +261,21 @@ pub(crate) struct Notice {
     pub(crate) text: String,
 }
 
+/// Whether `path` is the Trash or lies inside it (`root` is the trash
+/// root, holding `files/` and `info/`). The check is by path components, so
+/// a sibling such as `Trash-old` is not inside.
+pub(crate) fn inside_trash(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+/// What the user is told when opening a folder that is in the Trash.
+pub(crate) fn trashed_folder_notice() -> Notice {
+    Notice {
+        severity: Severity::Info,
+        text: "Folders in the Trash cannot be opened. Restore the folder to open it.".to_owned(),
+    }
+}
+
 /// The outcome of one [`Job`].
 #[derive(Debug, Default)]
 pub(crate) struct Report {
