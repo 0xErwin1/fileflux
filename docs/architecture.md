@@ -45,7 +45,7 @@ One package, one library and one binary.
 |---|---|
 | State and arrangement | `state`, `entries`, `arrange`, `arrange_menu` |
 | Operations | `actions`, `ops`, `paste`, `clipboard`, `dnd`, `progress` |
-| Chrome | `view`, `toolbar`, `tabstrip`, `tabs`, `panes` (the two tab lists, focus, split layout and F5/Shift+F5 planning), `sidebar`, `table`, `inspector`, `overlay` |
+| Chrome | `view`, `toolbar`, `tabstrip`, `tabs`, `panes` (the two tab lists, focus, split layout and F5/Shift+F5 planning), `sidebar`, `table`, `inspector`, `permissions` (the details panel's permission and group editor), `overlay` |
 | Devices and persistence | `devices`, `persist`, `favorites` (the bookmarks watch), `toasts` (timeouts, stack limit, placement) |
 
 ## Threading model

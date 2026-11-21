@@ -118,6 +118,7 @@ fn undo_paths(action: &UndoAction) -> Vec<PathBuf> {
             .flat_map(|entry| [entry.item.original.clone(), entry.item.files_path()])
             .collect(),
         UndoAction::Create { path, .. } => vec![path.clone()],
+        UndoAction::Permissions { items } => items.iter().map(|item| item.path.clone()).collect(),
         UndoAction::Copy { items } | UndoAction::Move { items } => items
             .iter()
             .flat_map(|item| [item.from.clone(), item.to.clone()])
@@ -136,6 +137,7 @@ pub(crate) fn job_paths(job: &Job, trash_root: &Path) -> Vec<PathBuf> {
             vec![trash_root.to_path_buf()]
         }
         Job::Undo(action) => undo_paths(action),
+        Job::Permissions(job) => job.paths.clone(),
         Job::Paste(paste) => {
             let mut paths = paste.sources.clone();
             paths.push(paste.dest.clone());

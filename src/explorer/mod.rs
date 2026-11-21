@@ -13,6 +13,7 @@ pub(crate) mod menu_tree;
 pub(crate) mod ops;
 pub(crate) mod overlay;
 pub(crate) mod panes;
+pub(crate) mod permissions;
 pub(crate) mod persist;
 pub(crate) mod progress;
 pub(crate) mod rubber;

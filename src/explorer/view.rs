@@ -458,6 +458,12 @@ pub(crate) struct Tab {
     pub(crate) permission_in_flight: Option<PathBuf>,
     /// The retained permission probe task.
     pub(crate) permission_task: Option<Task<()>>,
+    /// The permission editor of the selection (see [`super::permissions`]).
+    pub(crate) perms: Option<super::permissions::Editor>,
+    /// The selection whose entries the editor is reading.
+    pub(crate) perms_in_flight: Option<Vec<PathBuf>>,
+    /// The retained editor read task.
+    pub(crate) perms_task: Option<Task<()>>,
     /// The measured (or being measured) folder size of the details panel.
     pub(crate) du: Option<inspector::DuView>,
     /// The folder-size walk in flight (see [`inspector::du_plan`]).
@@ -593,6 +599,9 @@ impl Tab {
             permissions: None,
             permission_in_flight: None,
             permission_task: None,
+            perms: None,
+            perms_in_flight: None,
+            perms_task: None,
             du: None,
             du_run: None,
             du_task: None,
@@ -3570,6 +3579,7 @@ impl Explorer {
     fn render_document_island(&mut self, window: &Window, cx: &mut Context<Self>) -> Island {
         self.inspector_shown = self.inspector_wanted(window);
         self.sync_permissions(cx);
+        self.sync_permission_editor(cx);
         self.sync_du(cx);
         let panel = self.inspector_shown.then(|| inspector::render(self, cx));
         // The details handle covers the panel's left edge.

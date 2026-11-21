@@ -140,6 +140,11 @@ pub(crate) enum UndoAction {
     /// from, each only if it is still the item that was moved, never
     /// replacing anything.
     Move { items: Vec<PlacedEntry> },
+    /// Undo of a permission or group change: put back the exact previous
+    /// modes and groups, each only if it is still the same inode.
+    Permissions {
+        items: Vec<fileflux::core::perms::Previous>,
+    },
 }
 
 /// An undo action with the id a toast's Undo button names it by.
@@ -317,6 +322,9 @@ pub(crate) struct Report {
     /// Sources a paste moved away from their original place (a cut that
     /// is only partly done keeps the rest on the clipboard).
     pub(crate) moved: Vec<PathBuf>,
+    /// A permission or group change ran: the details panel reads the
+    /// entries again.
+    pub(crate) permissions_changed: bool,
 }
 
 impl Report {
@@ -360,6 +368,8 @@ pub(crate) enum Job {
     Undo(UndoAction),
     /// Copy or move from the clipboard; asks the UI about conflicts.
     Paste(PasteJob),
+    /// The details panel's permission and group editor.
+    Permissions(super::permissions::PermsJob),
 }
 
 /// Chooses the Trash a path goes to.
@@ -481,6 +491,7 @@ pub(crate) fn run_job(job: Job, ctx: &JobCtx, sink: &Sink) -> Report {
         Job::DeleteFromTrash(names) => delete_from_trash(&names, ctx, sink),
         Job::EmptyTrash(names) => empty_trash(ctx, names, sink),
         Job::Paste(job) => paste::run_paste(job, sink),
+        Job::Permissions(job) => super::permissions::run(job, sink),
         Job::Undo(action) => match undo(&action, ctx, sink) {
             Ok(report) => report,
             Err(reason) => Report::error(format!("Can't undo: {reason}")),
@@ -940,6 +951,7 @@ fn undo(action: &UndoAction, ctx: &JobCtx, sink: &Sink) -> Result<Report, String
         } => undo_create(path, *kind, *identity, ctx),
         UndoAction::Copy { items } => Ok(paste::undo_copy(items, ctx, sink)),
         UndoAction::Move { items } => Ok(paste::undo_move(items, sink)),
+        UndoAction::Permissions { items } => Ok(super::permissions::undo(items, sink)),
     }
 }
 

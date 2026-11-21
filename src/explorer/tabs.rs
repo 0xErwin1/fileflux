@@ -250,7 +250,8 @@ impl Affected {
             | Job::DeleteFromTrash(_)
             | Job::EmptyTrash(_)
             | Job::Undo(_)
-            | Job::Paste(_) => Self::Everything,
+            | Job::Paste(_)
+            | Job::Permissions(_) => Self::Everything,
         }
     }
 

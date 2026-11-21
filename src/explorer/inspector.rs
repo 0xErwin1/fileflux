@@ -639,11 +639,13 @@ fn wrappable(text: &str) -> String {
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let selected = this.tab().state.selected_entries();
-    let body = match selected.as_slice() {
+    let mut body = match selected.as_slice() {
         [] => none_selected(this, cx),
         [entry] => one_selected(this, entry, cx),
         many => many_selected(many, cx),
     };
+    // The editor of the selected entries (a real folder only).
+    body.extend(super::permissions::render(this, cx));
     div()
         .id("explorer-inspector")
         .flex_none()

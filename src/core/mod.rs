@@ -17,6 +17,7 @@ pub mod kinds;
 pub mod mimes;
 pub mod navigation;
 pub mod ops;
+pub mod perms;
 pub mod places;
 pub mod recent;
 pub mod search;

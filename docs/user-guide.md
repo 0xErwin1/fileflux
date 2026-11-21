@@ -281,15 +281,25 @@ Toasts stack in the **bottom-right corner** of the window, above the status bar,
 
 ## Details panel
 
-A read-only panel on the right (300 px by default, resizable), toggled by the toolbar button or Ctrl+I. It is open by default and hides itself when the window is too narrow to leave the entries 520 px.
+A panel on the right (300 px by default, resizable) that describes the selection and edits its permissions and group, toggled by the toolbar button or Ctrl+I. It is open by default and hides itself when the window is too narrow to leave the entries 520 px.
 
 | Selection | Shows |
 |---|---|
 | Nothing | Folder glyph, name, item total ("N of M" while a filter is active), size on disk of the folder (see below) and full location |
 | One entry | A preview (image files draw the image, videos and documents their thumbnail; others the folder or file icon), name, kind ("Image · JPG"), size, modified time, permissions (`rw-r--r--`, or `unavailable`), item count for folders, size on disk of a folder (see below), and path (Trash entries show their original location) |
-| Several | The count and the total size of the selected files |
+| Several | The count and the total size of the selected files, and the permissions editor for all of them together |
 
 Images, videos, PDFs, office documents and vector images are previewed; the rest show their file icon.
+
+**Permissions** appear under the facts for one or several selected entries, in a real folder only (the Trash, Recent and search results stay read-only). The editor follows GNOME Files:
+
+- Per class (**Owner**, **Group**, **Others**) pick **None**, **Read only** or **Read and write**. A folder's access maps to `r-x` for Read only and `rwx` for Read and write, so a readable folder stays listable and None means `---`. For files, **Allow executing** turns the execute bit on for every class that can read, or off for all.
+- The setuid, setgid and sticky bits are never changed.
+- **Group** lists the groups you belong to (your primary group first); the entries are given that group. The **owner** is shown but cannot be changed: that needs root, and Fileflux does not elevate.
+- With several entries, a value they do not share reads "(mixed)" and nothing is highlighted. **Apply** changes only the classes you picked a different value for (and the group if you picked another), so the other bits of each entry stay exactly as they were. **Reset** drops your choices.
+- **Apply to enclosed files…** (when a folder is selected) asks for a second press, then gives the folder rule (`r-x`/`rwx`) to the folder and every subfolder and the file rule to every file inside, using the access the editor shows (plus the group, if you picked one). It never follows symbolic links and does not enter another filesystem. It runs in the background with a progress card and Cancel.
+- Symbolic links are skipped and the notice says how many: their own mode cannot be changed on Linux, and changing the target through a link is never done.
+- The result is one notice: "Changed permissions of 12 items", with the failures (a file you do not own, a folder you cannot read) listed under **Details**. **Undo** (the toast's button or Ctrl+Z) restores the exact previous modes and groups of everything that changed, skipping any entry that was replaced since. A change of more than 100,000 entries cannot be undone, and the notice says so.
 
 **Size on disk** appears for one selected folder, or for the current folder when nothing is selected. It is measured in the background after a short pause, so arrowing through folders does not walk each one: a growing "12.4 GB so far…" turns into the final value, with "N files · M folders" beside it. Selecting something else cancels the walk. The number follows the rules of `du`: allocated blocks rather than the apparent size (a sparse file counts what it occupies), each hard-linked file once, symbolic links never followed, and only the folder's own filesystem (a mount below it is skipped). Subfolders that cannot be read are skipped and the value reads "(incomplete)". Folders on gvfs mounts (phones, network shares) are not walked on their own: the panel shows **Calculate size** instead. The list and grid Size column keeps showing "N items" for folders, as GNOME Files does.
 

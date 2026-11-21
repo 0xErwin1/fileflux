@@ -278,6 +278,9 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         self.progress.finish(id);
+        if report.permissions_changed {
+            self.forget_permission_editors();
+        }
         self.finish_paste(id, &report, window, cx);
         let undo_id = report.undo.take().map(|action| self.undo.push(action));
         if let Some(notice) = report.notice.take() {
