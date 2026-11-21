@@ -481,6 +481,7 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "-",
             "Paste",
             "-",
+            "Select",
             "Sort by",
             "Filter",
             "-",
@@ -501,6 +502,7 @@ fn the_menu_of_empty_space_offers_create_and_terminal_only_when_it_works() {
             "-",
             "Paste",
             "-",
+            "Select",
             "Sort by",
             "Filter",
             "-",
@@ -778,7 +780,7 @@ fn the_recent_menu_of_several_entries_has_no_open_containing_folder() {
 #[test]
 fn the_recent_empty_space_menu_only_sorts_and_filters() {
     let rows = recent_menu_rows(menu_rows(&target(false, 0, false, true)), 0);
-    assert_eq!(flat(&rows), ["Sort by", "Filter"]);
+    assert_eq!(flat(&rows), ["Select", "Sort by", "Filter"]);
 }
 
 fn assert_no_stray_separators(rows: &[MenuRow]) {
@@ -803,7 +805,7 @@ fn the_trash_menu_restores_and_deletes_and_never_creates() {
     assert!(item(&rows, MenuCommand::NewFolder).is_none());
 
     let empty_space = menu_rows(&target(true, 0, false, true));
-    assert_eq!(flat(&empty_space), ["Empty Trash"]);
+    assert_eq!(flat(&empty_space), ["Empty Trash", "-", "Select"]);
     assert!(item(&empty_space, MenuCommand::EmptyTrash).is_some_and(|item| item.danger));
     assert!(
         menu_rows(&target(true, 0, true, true)).is_empty(),
@@ -2995,4 +2997,42 @@ fn archive_dialogs_say_what_they_do() {
     );
     assert_eq!(extract.title, "Extract \u{201c}a.zip\u{201d} to\u{2026}");
     assert_eq!(extract.confirm, "Extract");
+}
+
+fn select_submenu(rows: &[MenuRow]) -> Option<&SubmenuSpec> {
+    rows.iter().find_map(|row| match row {
+        MenuRow::Submenu(spec) if spec.label == "Select" => Some(spec),
+        _ => None,
+    })
+}
+
+#[test]
+fn the_select_submenu_offers_all_invert_and_matching() {
+    let rows = menu_rows(&target(false, 0, false, true));
+    let select = select_submenu(&rows).map(|spec| spec.rows.clone());
+    let select = select.unwrap_or_default();
+    assert_eq!(
+        flat(&select),
+        [
+            "Select all",
+            "Invert selection",
+            "Select items matching\u{2026}"
+        ]
+    );
+    let hint = |command| item(&select, command).and_then(|item| item.shortcut);
+    assert_eq!(hint(MenuCommand::SelectAll), Some("Ctrl+A"));
+    assert_eq!(hint(MenuCommand::InvertSelection), Some("Ctrl+Shift+I"));
+    assert_eq!(hint(MenuCommand::SelectMatching), Some("Ctrl+S"));
+}
+
+#[test]
+fn the_select_submenu_is_in_the_trash_recent_and_empty_space_but_not_on_a_selection() {
+    assert!(select_submenu(&menu_rows(&target(true, 0, false, true))).is_some());
+    let recent = recent_menu_rows(menu_rows(&target(false, 0, false, true)), 0);
+    assert!(select_submenu(&recent).is_some());
+    assert!(select_submenu(&menu_rows(&target(false, 2, false, true))).is_none());
+    assert!(
+        menu_rows(&target(true, 0, true, true)).is_empty(),
+        "an empty Trash still has no menu"
+    );
 }

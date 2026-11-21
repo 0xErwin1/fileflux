@@ -1336,6 +1336,12 @@ pub(crate) enum MenuCommand {
     Paste,
     /// Paste into the single selected folder ("Paste into folder").
     PasteIntoFolder,
+    /// Selection: every visible entry.
+    SelectAll,
+    /// Selection: swap selected and unselected over the visible entries.
+    InvertSelection,
+    /// Selection: ask for a name pattern and select the matches.
+    SelectMatching,
     /// A sort or filter change; the menu stays open and redraws its checks.
     Arrange(ArrangeCommand),
     /// Sidebar rows: pin the row's folder to the Favorites.
@@ -1367,6 +1373,8 @@ pub(crate) enum MenuCommand {
 pub(crate) enum ArrangeMenu {
     Sort,
     Filter,
+    /// Select all, Invert selection, Select items matching…
+    Select,
 }
 
 impl ArrangeMenu {
@@ -1375,6 +1383,7 @@ impl ArrangeMenu {
         match self {
             Self::Sort => "Sort by",
             Self::Filter => "Filter",
+            Self::Select => "Select",
         }
     }
 }
@@ -1568,7 +1577,11 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
                 delete(),
             ]
         } else if !target.folder_is_empty {
-            vec![item(MenuCommand::EmptyTrash, "Empty Trash", None, true)]
+            vec![
+                item(MenuCommand::EmptyTrash, "Empty Trash", None, true),
+                MenuRow::Separator,
+                arrange_menu::submenu(ArrangeMenu::Select, arrangement),
+            ]
         } else {
             Vec::new()
         };
@@ -1648,6 +1661,7 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
         MenuRow::Separator,
         paste(MenuCommand::Paste, "Paste"),
         MenuRow::Separator,
+        arrange_menu::submenu(ArrangeMenu::Select, arrangement),
         arrange_menu::submenu(ArrangeMenu::Sort, arrangement),
         arrange_menu::submenu(ArrangeMenu::Filter, arrangement),
         MenuRow::Separator,
@@ -1799,6 +1813,8 @@ pub(crate) enum DialogKind {
     },
     /// "Compress…" (a name and a format) or "Extract to…" (a folder).
     Archive { extract: bool },
+    /// "Select items matching…": a glob pattern.
+    SelectPattern,
     /// Running operations use the device that is about to be unmounted or
     /// ejected; `count` of them, the device is called `label`.
     DeviceBusy {
@@ -1828,6 +1844,8 @@ pub(crate) enum DialogAction {
     DeviceWhenIdle(DevicePlan),
     /// The archive dialog: its field and what confirming starts.
     Archive(super::archive::ArchiveDialog),
+    /// The "Select items matching…" dialog: its field.
+    SelectPattern(super::selection::SelectDialog),
 }
 
 /// The "Open with…" chooser. Its rows are the applications for `mime` and
@@ -2058,7 +2076,9 @@ impl DialogState {
     /// destroys nothing, so Enter there launches the selected application.
     pub(crate) fn initial_focus(&self) -> DialogChoice {
         match self.kind {
-            DialogKind::OpenWith { .. } | DialogKind::Archive { .. } => DialogChoice::Confirm,
+            DialogKind::OpenWith { .. }
+            | DialogKind::Archive { .. }
+            | DialogKind::SelectPattern => DialogChoice::Confirm,
             DialogKind::Conflict { .. } => CONFLICT_DEFAULT,
             _ => DIALOG_DEFAULT,
         }
@@ -2339,6 +2359,13 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
                 .to_owned(),
             "Extract",
         ),
+        DialogKind::SelectPattern => (
+            "Select items matching\u{2026}".to_owned(),
+            "Type a name pattern: * is any run of characters, ? one character, [abc] \
+             one of them, [!abc] none of them. Case is ignored."
+                .to_owned(),
+            "Select",
+        ),
         DialogKind::DeviceBusy {
             label,
             count,
@@ -2383,7 +2410,7 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         // Every application is a row of its own: none is folded away.
         DialogKind::OpenWith { .. } => names.to_vec(),
         // The field says what the dialog is about.
-        DialogKind::Archive { .. } => Vec::new(),
+        DialogKind::Archive { .. } | DialogKind::SelectPattern => Vec::new(),
         _ => listed(names),
     };
     DialogText {

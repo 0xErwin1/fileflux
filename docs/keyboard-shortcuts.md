@@ -28,6 +28,8 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Shift+↑ ↓ ← → | Extend the selection | From the anchor |
 | Shift+Home / Shift+End | Extend to the first / last entry | |
 | Ctrl+A | Select all visible entries | Respects the filter |
+| Ctrl+Shift+I | Invert the selection | Over the visible entries only: selected become unselected and the reverse; entries the filter hides keep their state. The cursor goes to the first selected entry |
+| Ctrl+S | Select items matching… | Opens a dialog for a name pattern; see [Selection](user-guide.md#selection) |
 | Type a name | Jump to the first visible entry starting with it | Case-insensitive, in the displayed order; the file view must have the keyboard (not a text field). The typed prefix resets after about a second, on Escape, on navigation, or when the selection changes by mouse or arrow keys. Repeating one letter (`a`, `a`, …) cycles through the entries starting with it |
 | Enter | Open | Folders navigate; images open the viewer; other files open with the default application |
 | F2 | Rename | One entry, in place |

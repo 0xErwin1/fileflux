@@ -100,11 +100,35 @@ pub(crate) fn filter_rows(arrangement: &Arrangement) -> Vec<MenuRow> {
     rows
 }
 
+/// The rows of the Select menu.
+pub(crate) fn select_rows() -> Vec<MenuRow> {
+    let row = |command, label, shortcut| {
+        MenuRow::Item(MenuItemSpec {
+            shortcut: Some(shortcut),
+            ..MenuItemSpec::new(command, label)
+        })
+    };
+    vec![
+        row(MenuCommand::SelectAll, "Select all", "Ctrl+A"),
+        row(
+            MenuCommand::InvertSelection,
+            "Invert selection",
+            "Ctrl+Shift+I",
+        ),
+        row(
+            MenuCommand::SelectMatching,
+            "Select items matching\u{2026}",
+            "Ctrl+S",
+        ),
+    ]
+}
+
 /// The rows of `menu` for `arrangement`.
 pub(crate) fn rows(menu: ArrangeMenu, arrangement: &Arrangement) -> Vec<MenuRow> {
     match menu {
         ArrangeMenu::Sort => sort_rows(arrangement),
         ArrangeMenu::Filter => filter_rows(arrangement),
+        ArrangeMenu::Select => select_rows(),
     }
 }
 
@@ -345,8 +369,13 @@ mod tests {
             at(ArrangeMenu::Filter),
             at(ArrangeMenu::Sort).map(|sort| sort + 1)
         );
+        // Select opens the group, right before Sort by.
+        assert_eq!(
+            at(ArrangeMenu::Select).map(|select| select + 1),
+            at(ArrangeMenu::Sort)
+        );
         assert!(matches!(
-            at(ArrangeMenu::Sort).and_then(|sort| rows.get(sort - 1)),
+            at(ArrangeMenu::Select).and_then(|select| rows.get(select - 1)),
             Some(MenuRow::Separator)
         ));
         assert!(row(&rows, "Sort by").is_none() && row(&rows, "Filter").is_none());
@@ -385,12 +414,14 @@ mod tests {
                 "{selected} selected"
             );
         }
-        for selected in [0, 2] {
-            let rows = menu_rows(&target(selected, true), &arrangement);
-            assert!(
-                rows.iter().all(|row| !matches!(row, MenuRow::Submenu(_))),
-                "trash, {selected} selected"
-            );
-        }
+        let rows = menu_rows(&target(2, true), &arrangement);
+        assert!(rows.iter().all(|row| !matches!(row, MenuRow::Submenu(_))));
+        // The Trash's empty space only gains Select, never Sort or Filter.
+        let rows = menu_rows(&target(0, true), &arrangement);
+        assert!(
+            rows.iter().all(
+                |row| !matches!(row, MenuRow::Submenu(spec) if spec.menu != ArrangeMenu::Select)
+            )
+        );
     }
 }

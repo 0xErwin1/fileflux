@@ -169,6 +169,8 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | ↑ ↓ ← →, Home, End | Move through the visible entries and scroll them into view |
 | Shift + those keys | Extend the selection from the anchor |
 | Ctrl+A | Select every entry visible under the filter |
+| Ctrl+Shift+I | Invert the selection over the visible entries: what was selected is deselected and the reverse. Entries the filter or the hidden-file setting hides keep their state. The cursor moves to the first selected entry |
+| Ctrl+S | Select items matching… (see below) |
 | Type a name | Type-ahead find: the selection jumps to the first visible entry whose name starts with the letters you type (case-insensitive, following the sort, filter and hidden-file rules). Pause for about a second, press Escape, change folder or move the selection with the mouse or arrow keys to start over; repeating one letter cycles through the entries that start with it. Ctrl+F still filters |
 | Escape | Clear the selection |
 | Click on empty space | Clear the selection (Ctrl or Shift held: leave it) |
@@ -177,6 +179,10 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | Shift+drag on empty space | Add the entries the rectangle touches to the selection from before the drag |
 
 **Rubber-band selection** works in the grid and the list, in both panes. Press on empty space (the gaps between tiles, the blank part of a tile around its icon and name, the space right of the last tile or below the last row, the pane's margins; never on a tile's icon or name, a list row, a column header or the scrollbar), then drag. Without a modifier the rectangle replaces the selection; with Ctrl it toggles, and with Shift it adds, always relative to the selection you had when you pressed, so shrinking the rectangle gives entries back. Holding the pointer near, or beyond, the top or bottom edge scrolls the pane, faster the further out it is. Escape during the drag cancels it and restores the selection from before the press. Dragging from an entry still drags files, not a rectangle.
+
+**Select items matching…** (Ctrl+S) asks for a name pattern. Enter selects every visible entry whose name matches, replacing the selection; Escape cancels. `*` stands for any run of characters (also none), `?` for exactly one character, `[abc]` or `[a-c]` for one of the listed characters and `[!abc]` for any other. Every other character, such as `.`, `+` or `(`, stands for itself. The whole name must match and case is ignored, so `*.jpg` finds `Photo.JPG`. With no match, a toast says `No items match <pattern>` and the selection stays. The dialog remembers the last pattern until you quit.
+
+Right-click on empty space (in a folder, the Trash, Recent or search results) and open **Select** for Select all, Invert selection and Select items matching… without the keyboard.
 
 A selected entry that the filter hides stays selected, but operations act only on the entries that are visible.
 

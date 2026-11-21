@@ -23,7 +23,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Selection | Invert selection; select by pattern | Ctrl+A and the rubber band |
 | Views | A compact view, an icon size control, and Type, Permissions and Owner columns | Grid and a list with Name, Size and Modified |
 | Search | File content, regular expressions, case sensitivity | Case-insensitive name substring, capped at 10,000 matches |
 | Network | A "Connect to server" dialog; network bookmarks in the sidebar | Only mounts gvfs already made are browsed; `sftp://` and `smb://` bookmarks are hidden |

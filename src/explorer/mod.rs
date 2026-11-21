@@ -19,6 +19,7 @@ pub(crate) mod permissions;
 pub(crate) mod persist;
 pub(crate) mod progress;
 pub(crate) mod rubber;
+pub(crate) mod selection;
 pub(crate) mod sidebar;
 pub(crate) mod state;
 pub(crate) mod table;

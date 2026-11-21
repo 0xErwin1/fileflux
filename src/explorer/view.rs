@@ -113,6 +113,11 @@ actions!(
         RenameSelected,
         /// Selects every visible entry (Ctrl+A).
         SelectAll,
+        /// Swaps selected and unselected over the visible entries
+        /// (Ctrl+Shift+I).
+        InvertSelection,
+        /// Asks for a name pattern and selects the matches (Ctrl+S).
+        SelectMatching,
         /// Moves the selected entries to the Trash (Del).
         TrashSelected,
         /// Asks to delete the selected entries for good (Shift+Del).
@@ -256,6 +261,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
     let operations = Some("FilefluxExplorer && !Input && !Modal && !FilefluxMenu");
     cx.bind_keys([
         KeyBinding::new("ctrl-a", SelectAll, operations),
+        KeyBinding::new("ctrl-shift-i", InvertSelection, operations),
+        KeyBinding::new("ctrl-s", SelectMatching, operations),
         KeyBinding::new("f2", RenameSelected, operations),
         KeyBinding::new("delete", TrashSelected, operations),
         KeyBinding::new("shift-delete", DeleteSelected, operations),
@@ -794,6 +801,8 @@ pub(crate) struct Explorer {
     pub(crate) renaming: Option<Renaming>,
     /// The type-ahead prefix of the entries area (see [`typeahead`]).
     pub(crate) typeahead: TypeAhead,
+    /// The last pattern of "Select items matching…", for the session.
+    pub(crate) select_pattern: String,
     /// The open context menu, if any.
     pub(crate) menu: Option<MenuState>,
     /// The focus of the open context menu.
@@ -1035,6 +1044,7 @@ impl Explorer {
             undo: UndoStack::default(),
             renaming: None,
             typeahead: TypeAhead::default(),
+            select_pattern: String::new(),
             menu: None,
             menu_focus: cx.focus_handle(),
             dialogs: DialogQueue::default(),
@@ -3320,8 +3330,13 @@ impl Render for Explorer {
                 this.extend_selection_to_extreme(count.saturating_sub(1), cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
-                this.tab_mut().state.select_all_visible();
-                cx.notify();
+                this.select_all(cx);
+            }))
+            .on_action(cx.listener(|this, _: &InvertSelection, _window, cx| {
+                this.invert_selection(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectMatching, window, cx| {
+                this.select_matching(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
                 this.open_selected(window, cx);

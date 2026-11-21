@@ -12,6 +12,7 @@ pub mod clipboard;
 pub mod devices;
 pub mod du;
 pub mod fs;
+pub mod glob;
 pub mod icons;
 pub mod images;
 pub mod kinds;

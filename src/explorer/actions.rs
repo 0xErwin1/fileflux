@@ -934,6 +934,14 @@ impl Explorer {
             self.confirm_archive(window, cx);
             return;
         }
+        if self
+            .dialogs
+            .current()
+            .is_some_and(|dialog| matches!(dialog.action, DialogAction::SelectPattern(_)))
+        {
+            self.confirm_select_pattern(window, cx);
+            return;
+        }
         let Some(dialog) = self.dialogs.close() else {
             return;
         };
@@ -953,7 +961,9 @@ impl Explorer {
             DialogAction::EmptyTrash(names) => {
                 ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
             }
-            DialogAction::OpenWith(_) | DialogAction::Archive(_) => return,
+            DialogAction::OpenWith(_)
+            | DialogAction::Archive(_)
+            | DialogAction::SelectPattern(_) => return,
             DialogAction::DeviceWhenIdle(plan) => {
                 self.queue_device_plan(plan, window, cx);
                 return;
@@ -1438,6 +1448,9 @@ impl Explorer {
             }
             MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
             MenuCommand::Arrange(_) => {}
+            MenuCommand::SelectAll => self.select_all(cx),
+            MenuCommand::InvertSelection => self.invert_selection(cx),
+            MenuCommand::SelectMatching => self.select_matching(window, cx),
             MenuCommand::Open => self.open_selected(window, cx),
             MenuCommand::OpenInViewer => self.open_in_viewer(window, cx),
             MenuCommand::OpenContainingFolder => self.open_containing_folder(window, cx),

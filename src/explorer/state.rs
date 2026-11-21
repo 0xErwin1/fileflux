@@ -1200,6 +1200,51 @@ impl ExplorerState {
         self.cursor = Some(last);
     }
 
+    /// Ctrl+Shift+I: over the visible entries, selects what was not selected
+    /// and deselects what was. Entries the filter hides keep their state.
+    /// The cursor and anchor move to the first selected visible entry, or
+    /// stay where they are when none is selected afterwards.
+    pub(crate) fn invert_selection_visible(&mut self) {
+        let visible: Vec<PathBuf> = self
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        for path in &visible {
+            if !self.selected.remove(path) {
+                self.selected.insert(path.clone());
+            }
+        }
+        if let Some(first) = visible
+            .into_iter()
+            .find(|path| self.selected.contains(path))
+        {
+            self.anchor = Some(first.clone());
+            self.cursor = Some(first);
+        }
+    }
+
+    /// "Select items matching…": replaces the selection with the visible
+    /// entries whose display name matches the glob `pattern` (see
+    /// [`fileflux::core::glob`]), the cursor on the first of them. Returns
+    /// how many matched; with none the selection is left as it was.
+    pub(crate) fn select_matching(&mut self, pattern: &str) -> usize {
+        let matched: Vec<PathBuf> = self
+            .visible_entries()
+            .iter()
+            .filter(|entry| fileflux::core::glob::matches(pattern, &entry.display_name()))
+            .map(|entry| entry.path.clone())
+            .collect();
+        let Some(first) = matched.first().cloned() else {
+            return 0;
+        };
+        let count = matched.len();
+        self.selected = matched.into_iter().collect();
+        self.anchor = Some(first.clone());
+        self.cursor = Some(first);
+        count
+    }
+
     /// The selection with its anchor and cursor, to put back later (a
     /// cancelled rubber band).
     pub(crate) fn selection_snapshot(&self) -> SelectionSnapshot {
@@ -1446,6 +1491,131 @@ mod tests {
         state.clear_selection();
         state.select_all_visible();
         assert!(state.selection().is_empty());
+        Ok(())
+    }
+
+    fn paths(state: &ExplorerState) -> Vec<String> {
+        state
+            .selection()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn invert_swaps_selected_and_unselected_over_the_visible_entries() -> TestResult {
+        let mut state = sized_state()?;
+        state.select_only(Path::new("/fixture/b"));
+        state.invert_selection_visible();
+        assert_eq!(paths(&state), ["/fixture/a", "/fixture/c", "/fixture/d"]);
+        // Name order a, b, c, d: the first selected entry is "a".
+        assert_eq!(state.cursor_position(), Some(0));
+        state.invert_selection_visible();
+        assert_eq!(paths(&state), ["/fixture/b"]);
+        assert_eq!(state.cursor_position(), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn invert_follows_the_displayed_order_for_the_cursor() -> TestResult {
+        let mut state = sized_state()?;
+        state.click_sort(SortKey::Size);
+        state.click_sort(SortKey::Size);
+        state.select_only(Path::new("/fixture/d"));
+        state.invert_selection_visible();
+        let first = state.cursor_position().ok_or("cursor")?;
+        let order: Vec<PathBuf> = state
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        let expected = order
+            .iter()
+            .position(|path| state.selection().contains(path));
+        assert_eq!(
+            expected,
+            Some(first),
+            "the first selected in displayed order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invert_of_everything_or_nothing() -> TestResult {
+        let mut state = sized_state()?;
+        state.invert_selection_visible();
+        assert_eq!(state.selection().len(), 4, "nothing selected: all");
+        state.invert_selection_visible();
+        assert!(state.selection().is_empty(), "all selected: none");
+        Ok(())
+    }
+
+    #[test]
+    fn invert_leaves_filtered_out_entries_alone() -> TestResult {
+        let mut state = sized_state()?;
+        state.select_only(Path::new("/fixture/a"));
+        state.set_query("b".into());
+        // Only "b" is visible; "a" is hidden by the filter but selected.
+        state.invert_selection_visible();
+        assert_eq!(paths(&state), ["/fixture/a", "/fixture/b"]);
+        state.invert_selection_visible();
+        assert_eq!(paths(&state), ["/fixture/a"], "hidden stays selected");
+        Ok(())
+    }
+
+    #[test]
+    fn invert_keeps_the_cursor_when_nothing_ends_up_selected() -> TestResult {
+        let mut state = sized_state()?;
+        state.select_all_visible();
+        let before = state.cursor_position();
+        state.invert_selection_visible();
+        assert!(state.selection().is_empty());
+        assert_eq!(state.cursor_position(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn invert_on_an_empty_view_does_nothing() -> TestResult {
+        let mut state = sized_state()?;
+        state.set_query("zzz".into());
+        state.invert_selection_visible();
+        assert!(state.selection().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn select_matching_replaces_the_selection_with_the_visible_matches() -> TestResult {
+        let mut state = sized_state()?;
+        state.select_only(Path::new("/fixture/a"));
+        assert_eq!(state.select_matching("[B-C]"), 2);
+        assert_eq!(paths(&state), ["/fixture/b", "/fixture/c"]);
+        assert_eq!(state.cursor_position(), Some(1), "the first match");
+        Ok(())
+    }
+
+    #[test]
+    fn select_matching_only_reaches_visible_entries() -> TestResult {
+        let mut state = sized_state()?;
+        state.set_query("c".into());
+        assert_eq!(state.select_matching("*"), 1);
+        assert_eq!(paths(&state), ["/fixture/c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn select_matching_without_a_match_keeps_the_selection() -> TestResult {
+        let mut state = sized_state()?;
+        state.select_only(Path::new("/fixture/d"));
+        let cursor = state.cursor_position();
+        assert_eq!(state.select_matching("zzz*"), 0);
+        assert_eq!(paths(&state), ["/fixture/d"]);
+        assert_eq!(state.cursor_position(), cursor);
+        assert_eq!(
+            state.select_matching(""),
+            0,
+            "an empty pattern selects nothing"
+        );
+        assert_eq!(paths(&state), ["/fixture/d"]);
         Ok(())
     }
 

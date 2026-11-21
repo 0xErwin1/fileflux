@@ -38,6 +38,9 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::MoveToTrash | MenuCommand::DeletePermanently | MenuCommand::EmptyTrash => {
             IconName::Trash
         }
+        MenuCommand::SelectAll | MenuCommand::InvertSelection | MenuCommand::SelectMatching => {
+            return None;
+        }
         MenuCommand::NewFolder => IconName::FolderPlus,
         MenuCommand::NewFile => IconName::FilePlus,
         MenuCommand::OpenTerminal => IconName::Terminal,
@@ -57,6 +60,7 @@ fn submenu_icon(menu: ArrangeMenu) -> gpui_kit_assets::IconName {
     match menu {
         ArrangeMenu::Sort => gpui_kit_assets::IconName::ArrowUpDown,
         ArrangeMenu::Filter => gpui_kit_assets::IconName::ListFilter,
+        ArrangeMenu::Select => gpui_kit_assets::IconName::SquareCheck,
     }
 }
 
@@ -381,9 +385,13 @@ mod tests {
         assert!(filter.is_some_and(MenuNode::opens_flyout));
         assert!(sort.is_some_and(|node| node.item.has_submenu));
         assert_eq!(sort.map(|node| node.children.len()), Some(11));
-        // No other row nests, and no "Back" row exists anywhere.
+        // Select nests too, and no other row does; no "Back" row exists.
         let nesting = root.iter().filter(|node| node.opens_flyout()).count();
-        assert_eq!(nesting, 2);
+        assert_eq!(nesting, 3);
+        assert!(
+            labelled(&root, "Select")
+                .is_some_and(|at| root.get(at).is_some_and(MenuNode::opens_flyout))
+        );
         assert!(labelled(&root, "Back").is_none());
         assert!(
             sort.is_some_and(|node| labelled(&node.children, "Back").is_none()),

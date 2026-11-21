@@ -186,9 +186,14 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         DialogAction::Archive(state) => Some(state),
         _ => None,
     };
+    let pattern = match &dialog.action {
+        DialogAction::SelectPattern(state) => Some(state),
+        _ => None,
+    };
     // Waiting for a device to be free destroys nothing: not a danger button.
     let calm = open_with.is_some()
         || archive.is_some()
+        || pattern.is_some()
         || matches!(dialog.kind, DialogKind::DeviceBusy { .. });
     let body = div()
         .flex()
@@ -210,6 +215,13 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         )
         // "Compress…" and "Extract to…": one text field, and for Compress
         // the format choice.
+        .children(pattern.map(|state| {
+            Input::new(&state.input)
+                .id("explorer-select-pattern-input")
+                .aria_label("Name pattern")
+                .w_full()
+                .small()
+        }))
         .children(archive.map(|state| {
             Input::new(&state.input)
                 .id("explorer-archive-input")
@@ -388,7 +400,9 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         );
 
     let modal = Modal::new(text.title.clone()).id("explorer-dialog");
-    let modal = if archive.is_some() {
+    let modal = if pattern.is_some() {
+        modal.icon(icon(gpui_kit_assets::IconName::SquareCheck))
+    } else if archive.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::Archive))
     } else if open_with.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::FolderOpen))
