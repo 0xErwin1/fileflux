@@ -938,6 +938,13 @@ fn row_shell(
                     this.open_tab(middle.clone(), Placement::Background, window, cx);
                 }),
             );
+            // A row that stands for a folder is dragged as that folder.
+            let row = match draggable_folder(location) {
+                Some(path) => {
+                    dnd::place_drag_source(row, path.to_path_buf(), &cx.entity().downgrade())
+                }
+                None => row,
+            };
             // Dropping on a row is dropping on its place: a folder, or the
             // Trash.
             let target = match location {
@@ -959,6 +966,18 @@ fn row_shell(
         return row;
     }
     row.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+}
+
+/// The folder a sidebar row can be dragged as: the rows that stand for a
+/// real folder (places, favorites, mounted devices). The Trash, Recent and
+/// the analysis rows are not folders to move, copy or open elsewhere.
+fn draggable_folder(location: &Location) -> Option<&Path> {
+    match location {
+        Location::Directory(path) => Some(path.as_path()),
+        Location::Trash | Location::Recent | Location::Search { .. } | Location::Usage { .. } => {
+            None
+        }
+    }
 }
 
 /// One sidebar navigation row: icon and name, with the exact path as the
@@ -1301,6 +1320,22 @@ mod tests {
             "the drag clamps are the settings clamps"
         );
     }
+
+    #[test]
+    fn only_the_rows_that_stand_for_a_folder_can_be_dragged() {
+        let home = Location::Directory(PathBuf::from("/h"));
+        assert_eq!(draggable_folder(&home), Some(Path::new("/h")));
+        for location in [
+            Location::Trash,
+            Location::Recent,
+            Location::Usage {
+                root: PathBuf::from("/h"),
+            },
+        ] {
+            assert_eq!(draggable_folder(&location), None, "{location:?}");
+        }
+    }
+
     fn volume(kind: VolumeKind, removable: bool) -> Volume {
         Volume {
             label: "x".to_owned(),

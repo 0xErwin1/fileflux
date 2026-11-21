@@ -39,10 +39,10 @@ use gpui::{AppContext as _, Context, Entity, Pixels, Point, Window};
 
 use super::actions::MenuOn;
 use super::devices::MISSING_GIO_UNLOCK;
+use super::menu_tree::Shown;
 use super::ops::{
     DialogAction, DialogKind, DialogState, MenuCommand, MenuItemSpec, MenuRow, Severity,
 };
-use super::state::Transition;
 use super::view::Explorer;
 
 /// What a disabled entry says when `gio` is not installed.
@@ -88,6 +88,9 @@ enum Goal {
 struct Attempt {
     goal: Goal,
     label: String,
+    /// Where the mounted folder opens once the attempt succeeds: a new
+    /// background tab when the command came from a Shift+right-click menu.
+    shown: Shown,
     session: MountSession,
 }
 
@@ -331,6 +334,19 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.connect_to_in(uri, title, Shown::Here, window, cx);
+    }
+
+    /// [`Self::connect_to`] that opens the server's folder where `shown`
+    /// says (a new background tab under Shift+right-click).
+    pub(crate) fn connect_to_in(
+        &mut self,
+        uri: &ServerUri,
+        title: Option<&str>,
+        shown: Shown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(gio) = self.gio() else {
             return self.say(Severity::Info, MISSING_GIO, window, cx);
         };
@@ -344,7 +360,7 @@ impl Explorer {
             .as_ref()
             .and_then(|places| mounted_path(&places.volumes, gvfs_root_from_env().as_deref(), uri))
         {
-            self.navigate(Transition::Visit(Location::Directory(path)), window, cx);
+            self.show_location(Location::Directory(path), shown, window, cx);
             return;
         }
         let label = uri.label(title);
@@ -353,6 +369,7 @@ impl Explorer {
                 self.network.attempt = Some(Attempt {
                     goal: Goal::Connect(uri.clone()),
                     label: label.clone(),
+                    shown,
                     session,
                 });
                 self.say(
@@ -546,7 +563,10 @@ impl Explorer {
         }
         self.devices.working.remove(attempt.working_key());
         cx.notify();
-        let Attempt { goal, label, .. } = &attempt;
+        let Attempt {
+            goal, label, shown, ..
+        } = &attempt;
+        let shown = *shown;
         match (outcome, goal) {
             (MountOutcome::Cancelled, _) => {}
             (MountOutcome::Failed(message), Goal::Connect(_)) => self.say(
@@ -559,10 +579,10 @@ impl Explorer {
                 self.unlock_failed(target, label, message, window, cx);
             }
             (MountOutcome::Mounted, Goal::Connect(uri)) => {
-                self.open_mounted(uri, label, window, cx);
+                self.open_mounted(uri, label, shown, window, cx);
             }
             (MountOutcome::Mounted, Goal::Unlock(target)) => {
-                self.open_unlocked(target, label, window, cx);
+                self.open_unlocked(target, label, shown, window, cx);
             }
         }
     }
@@ -573,6 +593,18 @@ impl Explorer {
     pub(crate) fn unlock_device(
         &mut self,
         path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.unlock_device_in(path, Shown::Here, window, cx);
+    }
+
+    /// [`Self::unlock_device`] that opens the unlocked volume where `shown`
+    /// says (a new background tab under Shift+right-click).
+    pub(crate) fn unlock_device_in(
+        &mut self,
+        path: PathBuf,
+        shown: Shown,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -603,6 +635,7 @@ impl Explorer {
                 self.network.attempt = Some(Attempt {
                     goal: Goal::Unlock(target),
                     label: label.clone(),
+                    shown,
                     session,
                 });
                 self.say(
@@ -669,6 +702,7 @@ impl Explorer {
         &mut self,
         target: &UnlockTarget,
         label: &str,
+        shown: Shown,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -695,7 +729,7 @@ impl Explorer {
                     this.devices.list = devices(&nodes);
                     this.devices.nodes = nodes;
                     this.devices.last_poll = None;
-                    this.navigate(Transition::Visit(Location::Directory(mount)), window, cx);
+                    this.show_location(Location::Directory(mount), shown, window, cx);
                     cx.notify();
                 }
                 None => this.say(
@@ -717,6 +751,7 @@ impl Explorer {
         &mut self,
         uri: &ServerUri,
         label: &str,
+        shown: Shown,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -734,7 +769,7 @@ impl Explorer {
             let found = lookup.await;
             if let Err(closed) = this.update_in(cx, |this, window, cx| match found {
                 Some(path) => {
-                    this.navigate(Transition::Visit(Location::Directory(path)), window, cx);
+                    this.show_location(Location::Directory(path), shown, window, cx);
                 }
                 None => this.say(
                     Severity::Warning,

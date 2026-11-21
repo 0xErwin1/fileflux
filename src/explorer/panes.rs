@@ -136,6 +136,16 @@ pub(crate) struct SplitDrag {
     pub(crate) start_x: f32,
 }
 
+/// What [`Panes::focus_other_pane`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OtherPane {
+    /// There is no other pane to show something in, and none could come
+    /// back: the view stays as it was.
+    Missing,
+    /// The focus moved to the other pane; `real` is the pane that had it.
+    Focused { real: Side },
+}
+
 /// One of the two panes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -273,16 +283,20 @@ impl<T> Panes<T> {
 
     /// The first step of showing something in the pane that does not have
     /// the focus: a parked right pane comes back (see [`Self::split`]) and the
-    /// focus moves to the other pane. Returns the pane that had the focus,
-    /// which the caller gives it back to once it has opened the tab. `None` —
-    /// nothing changes — when there is no other pane to show (the caller
-    /// splits with a new tab instead).
-    pub(crate) fn focus_other_pane(&mut self) -> Option<Side> {
+    /// focus moves to the other pane. [`OtherPane::Focused`] names the pane
+    /// that had the focus, which the caller gives it back to once it has
+    /// opened the tab. [`OtherPane::Missing`] — nothing changes — when there
+    /// is no other pane to show (the caller splits with a new tab instead).
+    pub(crate) fn focus_other_pane(&mut self) -> OtherPane {
         if !self.split && !self.split(None) {
-            return None;
+            return OtherPane::Missing;
         }
         let real = self.focus;
-        self.focus_side(real.other()).then_some(real)
+        if self.focus_side(real.other()) {
+            OtherPane::Focused { real }
+        } else {
+            OtherPane::Missing
+        }
     }
 
     /// F6: moves the focus to the other pane. `false` while not split.
@@ -644,7 +658,7 @@ mod tests {
     #[test]
     fn showing_in_the_other_pane_of_a_single_pane_view_needs_a_new_pane() {
         let mut panes = Panes::new("a");
-        assert_eq!(panes.focus_other_pane(), None);
+        assert_eq!(panes.focus_other_pane(), OtherPane::Missing);
         assert!(!panes.is_split() && !panes.has_right(), "nothing changed");
         assert_eq!(panes.focus(), Side::Left);
     }
@@ -655,7 +669,7 @@ mod tests {
         panes.unsplit(); // focus is left: the right pane (r1) is parked
         assert!(panes.has_right() && !panes.is_split());
         let real = panes.focus_other_pane();
-        assert_eq!(real, Some(Side::Left));
+        assert_eq!(real, OtherPane::Focused { real: Side::Left });
         assert!(panes.is_split(), "the parked pane came back");
         assert_eq!(
             panes.focus(),
@@ -674,7 +688,10 @@ mod tests {
             let mut panes = split_panes(); // l1 l2 | r1
             panes.focus_side(focused);
             let before = all(&panes);
-            assert_eq!(panes.focus_other_pane(), Some(focused));
+            assert_eq!(
+                panes.focus_other_pane(),
+                OtherPane::Focused { real: focused }
+            );
             assert_eq!(panes.focus(), focused.other());
             panes.open("folder", Placement::Foreground);
             panes.focus_side(focused);

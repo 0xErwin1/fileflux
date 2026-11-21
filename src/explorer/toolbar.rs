@@ -7,10 +7,13 @@
 //! one `⋯` menu holding Split view, Favorite this folder, Refresh and
 //! Properties, and — in a split view — the pane's close control.
 //!
-//! The controls keep their sizes from `bolt`'s tokens. The row never wraps
-//! and never overflows its pane: the breadcrumbs and the search field give
-//! way first (down to [`CRUMBS_MIN_WIDTH`] and [`SEARCH_MIN_WIDTH`]), and
-//! whatever still does not fit is clipped at the pane edge.
+//! The controls keep their sizes from `bolt`'s tokens and none is ever cut:
+//! [`plan`] decides from the pane's width whether the six groups fit one row
+//! (the breadcrumbs and the search field give way first, down to
+//! [`CRUMBS_MIN_WIDTH`] and [`SEARCH_MIN_WIDTH`]) or the search field and the
+//! view switch move to a second row under the path. The breadcrumb bar
+//! collapses its leading segments into a "…" before it would clip an icon
+//! (see [`collapse_crumbs`]).
 
 use bolt::controls::{Button, InputEscape, SearchCount, SearchField};
 use bolt::primitives::Icon;
@@ -29,10 +32,140 @@ use super::tabs::Placement;
 use super::util::{self, CrumbKind};
 use super::view::Explorer;
 
-/// The narrowest the breadcrumb bar and the search field get before the row
-/// clips: both shrink from their natural width down to these.
-pub(crate) const CRUMBS_MIN_WIDTH: f32 = 72.0;
-pub(crate) const SEARCH_MIN_WIDTH: f32 = 56.0;
+/// The narrowest the breadcrumb bar and the search field get before the
+/// search field and the view switch move to a second row. The bar holds a
+/// Home icon, a "…", a chevron and the start of the current folder; the field
+/// its icon, some text and the filter button.
+pub(crate) const CRUMBS_MIN_WIDTH: f32 = 120.0;
+pub(crate) const SEARCH_MIN_WIDTH: f32 = 150.0;
+/// The search field's natural width (13.75 rem) while the row has room.
+const SEARCH_NATURAL_WIDTH: f32 = 220.0;
+/// The toolbar row's left and right padding (14 + 10) and the gap between
+/// its controls (`Spacing::XXS`).
+const ROW_PADDING: f32 = 24.0;
+const ROW_GAP: f32 = 6.0;
+/// An icon-only button (`ButtonMetrics::ICON_ONLY_WIDTH`).
+const BUTTON_WIDTH: f32 = 32.0;
+/// Back, forward and up: three buttons 4 px apart.
+const NAV_WIDTH: f32 = 3.0 * BUTTON_WIDTH + 2.0 * 4.0;
+/// The view switch: three 28 px segments 2 px apart in a 2 px padded, 1 px
+/// bordered frame.
+const VIEW_TOGGLE_WIDTH: f32 = 3.0 * 28.0 + 2.0 * 2.0 + 2.0 * 2.0 + 2.0;
+/// The breadcrumb bar's own border and horizontal padding.
+const CRUMB_BAR_INSET: f32 = 2.0 + 2.0 * 4.0;
+
+/// Where the toolbar's controls go at a pane width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Plan {
+    /// The search field and the view switch sit on a second row under the
+    /// path: the pane is too narrow for one.
+    pub(crate) two_rows: bool,
+    /// The width the breadcrumb bar gets.
+    pub(crate) crumbs_width: f32,
+}
+
+/// How many controls sit on a row, and the width they take together with
+/// the row's padding and gaps.
+fn row_width(controls: usize, widths: f32) -> f32 {
+    ROW_PADDING + widths + ROW_GAP * controls.saturating_sub(1) as f32
+}
+
+/// The width of what `chrome` puts on the path's row besides the path (the
+/// hamburger, the history buttons, the `⋯` button and the close control),
+/// and how many controls that is, the path included.
+fn path_row_extras(chrome: Chrome) -> (usize, f32) {
+    let hamburger = usize::from(chrome.sidebar_toggle);
+    let close = usize::from(chrome.close.is_some());
+    // The path, the history buttons, the `⋯` button.
+    let controls = 3 + hamburger + close;
+    let widths = NAV_WIDTH + BUTTON_WIDTH * (1 + hamburger + close) as f32;
+    (controls, widths)
+}
+
+/// Lays the toolbar out in a pane `width` pixels wide: one row when the path,
+/// the search field and the view switch each get their minimum, else the
+/// search field and the view switch on a second row. Nothing is ever wider
+/// than the row it is on, from [`two_row_floor`] up.
+pub(crate) fn plan(width: f32, chrome: Chrome) -> Plan {
+    let (path_controls, path_widths) = path_row_extras(chrome);
+    let one_row = row_width(
+        path_controls + 2,
+        path_widths + CRUMBS_MIN_WIDTH + SEARCH_MIN_WIDTH + VIEW_TOGGLE_WIDTH,
+    );
+    if width >= one_row {
+        // The search field keeps its natural width while the bar keeps its
+        // minimum; below that it shrinks.
+        let without_path = row_width(path_controls + 2, path_widths + VIEW_TOGGLE_WIDTH);
+        let crumbs = (width - without_path - SEARCH_NATURAL_WIDTH).max(CRUMBS_MIN_WIDTH);
+        return Plan {
+            two_rows: false,
+            crumbs_width: crumbs,
+        };
+    }
+    let without_path = row_width(path_controls, path_widths);
+    Plan {
+        two_rows: true,
+        crumbs_width: (width - without_path).max(CRUMBS_MIN_WIDTH),
+    }
+}
+
+/// The narrowest pane the toolbar fits without clipping anything: the
+/// wider of its two rows when it is on two.
+#[cfg(test)]
+pub(crate) fn two_row_floor(chrome: Chrome) -> f32 {
+    let (path_controls, path_widths) = path_row_extras(chrome);
+    let path_row = row_width(path_controls, path_widths + CRUMBS_MIN_WIDTH);
+    let search_row = row_width(2, SEARCH_MIN_WIDTH + VIEW_TOGGLE_WIDTH);
+    path_row.max(search_row)
+}
+
+// --- breadcrumb collapse ---------------------------------------------------------------------
+
+/// What a breadcrumb segment's text takes per character at 13 px: an
+/// estimate that errs wide, so a bar that fits by it fits for real.
+const CRUMB_CHAR_WIDTH: f32 = 7.0;
+/// A segment's padding (7 + 7) and border (1 + 1).
+const CRUMB_PADDING: f32 = 16.0;
+/// A chevron separator: segments sit directly against it.
+const CRUMB_CHEVRON: f32 = 12.0;
+/// The Home icon (14) and its gap to the label (6).
+const CRUMB_HOME_ICON: f32 = 20.0;
+/// The "…" segment that stands for the hidden leading ones.
+const CRUMB_ELLIPSIS: f32 = CRUMB_PADDING + 1.0 * CRUMB_CHAR_WIDTH + 2.0;
+
+/// The width a breadcrumb segment takes: its label, its Home icon when it
+/// has one, and its padding.
+pub(crate) fn crumb_width(label: &str, home_icon: bool) -> f32 {
+    let icon = if home_icon { CRUMB_HOME_ICON } else { 0.0 };
+    CRUMB_PADDING + icon + label.chars().count() as f32 * CRUMB_CHAR_WIDTH
+}
+
+/// How many leading segments of a path (`widths`, in order) go behind a "…"
+/// so the rest fits `budget`. The current folder (the last one) is never
+/// hidden: when it alone is wider than the bar its label truncates, but no
+/// icon is ever cut. Nothing is hidden when everything fits.
+pub(crate) fn collapse_crumbs(widths: &[f32], budget: f32) -> usize {
+    let separators = |count: usize| CRUMB_CHEVRON * count.saturating_sub(1) as f32;
+    let total: f32 = widths.iter().sum::<f32>() + separators(widths.len());
+    if total <= budget {
+        return 0;
+    }
+    // Otherwise the "…" and its chevron take their place, and segments are
+    // kept from the end while they fit.
+    let Some((last, earlier)) = widths.split_last() else {
+        return 0;
+    };
+    let mut used = CRUMB_ELLIPSIS + CRUMB_CHEVRON + last;
+    let mut kept = 1;
+    for width in earlier.iter().rev() {
+        if used + CRUMB_CHEVRON + width > budget {
+            break;
+        }
+        used += CRUMB_CHEVRON + width;
+        kept += 1;
+    }
+    widths.len() - kept
+}
 
 /// What a pane's toolbar carries besides its own controls.
 #[derive(Clone, Copy, Debug)]
@@ -41,9 +174,12 @@ pub(crate) struct Chrome {
     pub(crate) sidebar_toggle: bool,
     /// The pane this toolbar closes with its × control, in a split view.
     pub(crate) close: Option<Side>,
+    /// The width of the pane the toolbar is in.
+    pub(crate) pane_width: f32,
 }
 
-/// The toolbar row: one line, never wider than its pane.
+/// The toolbar: one row, or two in a pane too narrow for one (see [`plan`]),
+/// never wider than its pane.
 pub(crate) fn render(this: &Explorer, chrome: Chrome, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let search_options_open = matches!(
@@ -54,188 +190,250 @@ pub(crate) fn render(this: &Explorer, chrome: Chrome, cx: &mut Context<Explorer>
         this.menu.as_ref().map(|menu| &menu.on),
         Some(MenuOn::Toolbar)
     );
+    let plan = plan(chrome.pane_width, chrome);
 
-    div()
+    // The hamburger that brings the hidden sidebar back: the first
+    // control of the leftmost pane only (the sidebar has its own).
+    let hamburger = chrome.sidebar_toggle.then(|| {
+        Button::new("explorer-sidebar-show", "Show sidebar")
+            .ghost()
+            .icon_only()
+            .icon(icon(gpui_kit_assets::IconName::Menu))
+            .tooltip("Show sidebar")
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.toggle_sidebar(window, cx);
+            }))
+            .into_any_element()
+    });
+    let nav = nav_buttons(this, cx);
+    // The current path: breadcrumbs, or — after a click on the bar's
+    // empty space or Ctrl+L — the editable field. The frame captures
+    // the input's own Escape (`bolt_input::Escape`), which the input
+    // consumes before it would ever bubble: here Escape restores the
+    // committed path, returns to the breadcrumbs and gives the focus
+    // back to the entries area (reqflux sidebar filter pattern).
+    let path = if this.tab().path_editing {
+        path_editor(this, cx).into_any_element()
+    } else {
+        crumb_bar(this, plan.crumbs_width, cx).into_any_element()
+    };
+    let search = search_frame(this, plan, search_options_open, cx);
+    // An invalid regular expression: why nothing ran. It gives way (and
+    // ends in an ellipsis) before it pushes a control out of the row.
+    let search_error = this.tab().search_error.clone().map(|error| {
+        div()
+            .id("explorer-search-error")
+            .flex_shrink(1.0)
+            .min_w_0()
+            .max_w(px(260.0))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_color(colors.danger)
+            .child(error)
+            .into_any_element()
+    });
+    let view_toggle = view_toggle(this, cx);
+    // The one overflow control: Split view, Favorite this folder,
+    // Refresh and Properties, each with its shortcut. It stays raised
+    // while its menu is open.
+    let more = Button::new("explorer-more", "More actions")
+        .ghost()
+        .icon_only()
+        .icon(icon(gpui_kit_assets::IconName::Ellipsis))
+        .tooltip("Split view, favorite this folder, refresh and properties")
+        .selected(toolbar_menu_open)
+        .toggled(toolbar_menu_open)
+        .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+            let position = super::overlay::below(event.position());
+            this.open_toolbar_menu(position, window, cx);
+        }))
+        .into_any_element();
+    // In a split view each pane closes itself; the other one stays.
+    let close = chrome.close.map(|side| {
+        Button::new("explorer-close-pane", "Close pane")
+            .ghost()
+            .icon_only()
+            .icon(icon(gpui_kit_assets::IconName::X))
+            .tooltip("Close this pane")
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.close_pane(side, window, cx);
+            }))
+            .into_any_element()
+    });
+
+    let row = || {
+        div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .gap(Spacing::XXS)
+            .pl(px(14.0))
+            .pr(px(10.0))
+            .min_h(px(50.0))
+    };
+    let toolbar = div()
         .id("explorer-toolbar")
         .flex_none()
         .w_full()
         .min_w_0()
         .overflow_hidden()
         .flex()
-        .items_center()
-        .gap(Spacing::XXS)
-        .pl(px(14.0))
-        .pr(px(10.0))
-        .min_h(px(50.0))
+        .flex_col()
         .border_b_1()
-        .border_color(colors.line)
-        // The hamburger that brings the hidden sidebar back: the first
-        // control of the leftmost pane only (the sidebar has its own).
-        .children(chrome.sidebar_toggle.then(|| {
-            Button::new("explorer-sidebar-show", "Show sidebar")
+        .border_color(colors.line);
+    if plan.two_rows {
+        toolbar
+            .child(
+                row()
+                    .children(hamburger)
+                    .child(nav)
+                    .child(path)
+                    .child(more)
+                    .children(close),
+            )
+            .child(
+                row()
+                    .min_h(px(44.0))
+                    .child(search)
+                    .children(search_error)
+                    .child(view_toggle),
+            )
+    } else {
+        toolbar.child(
+            row()
+                .children(hamburger)
+                .child(nav)
+                .child(path)
+                .child(search)
+                .children(search_error)
+                .child(view_toggle)
+                .child(more)
+                .children(close),
+        )
+    }
+}
+
+/// History: back, forward, up — with honest disabled states.
+fn nav_buttons(this: &Explorer, cx: &mut Context<Explorer>) -> gpui::AnyElement {
+    div()
+        .id("explorer-nav-buttons")
+        .flex_none()
+        .flex()
+        .gap(Spacing::XS)
+        .child(
+            Button::new("explorer-back", "Back")
                 .ghost()
                 .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::Menu))
-                .tooltip("Show sidebar")
+                .icon(icon(gpui_kit_assets::IconName::ChevronLeft))
+                .tooltip("Go back (Alt+Left)")
+                .disabled(!this.tab().state.navigation().can_back())
                 .on_click(cx.listener(|this, _event, window, cx| {
-                    this.toggle_sidebar(window, cx);
-                }))
-        }))
-        // History: back, forward, up — with honest disabled states.
-        .child(
-            div()
-                .id("explorer-nav-buttons")
-                .flex_none()
-                .flex()
-                .gap(Spacing::XS)
-                .child(
-                    Button::new("explorer-back", "Back")
-                        .ghost()
-                        .icon_only()
-                        .icon(icon(gpui_kit_assets::IconName::ChevronLeft))
-                        .tooltip("Go back (Alt+Left)")
-                        .disabled(!this.tab().state.navigation().can_back())
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.navigate(Transition::Back, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("explorer-forward", "Forward")
-                        .ghost()
-                        .icon_only()
-                        .icon(icon(gpui_kit_assets::IconName::ChevronRight))
-                        .tooltip("Go forward (Alt+Right)")
-                        .disabled(!this.tab().state.navigation().can_forward())
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.navigate(Transition::Forward, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("explorer-up", "Up")
-                        .ghost()
-                        .icon_only()
-                        .icon(icon(gpui_kit_assets::IconName::ChevronUp))
-                        .tooltip("Parent folder (Alt+Up)")
-                        .disabled(!this.tab().state.navigation().can_up())
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.navigate(Transition::Up, window, cx);
-                        })),
-                ),
-        )
-        // The current path: breadcrumbs, or — after a click on the bar's
-        // empty space or Ctrl+L — the editable field. The frame captures
-        // the input's own Escape (`bolt_input::Escape`), which the input
-        // consumes before it would ever bubble: here Escape restores the
-        // committed path, returns to the breadcrumbs and gives the focus
-        // back to the entries area (reqflux sidebar filter pattern).
-        .child(if this.tab().path_editing {
-            path_editor(this, cx).into_any_element()
-        } else {
-            crumb_bar(this, cx).into_any_element()
-        })
-        // Current-folder filename search with its live count, and its
-        // options behind the filter button at the field's trailing edge.
-        // The frame wrapping the field captures the input's own Escape here
-        // too: it clears the query, restores the full listing and returns
-        // the entries focus.
-        .child(
-            div()
-                .id("explorer-search-frame")
-                // Natural width 13.75 rem, shrinking to its minimum.
-                .flex()
-                .w(gpui::rems(13.75))
-                .min_w(px(SEARCH_MIN_WIDTH))
-                .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                    this.clear_search_on_escape(window, cx);
-                    cx.stop_propagation();
-                }))
-                .child(
-                    SearchField::new("explorer-search", &this.tab().search_input)
-                        .aria_label(if this.tab().deep_search {
-                            "Search names in the current folder and its subfolders"
-                        } else {
-                            "Search names in current folder"
-                        })
-                        .count(search_count(this, cx))
-                        .trailing(search_filter_button(this, cx, search_options_open)),
-                ),
-        )
-        // An invalid regular expression: why nothing ran.
-        .children(this.tab().search_error.clone().map(|error| {
-            div()
-                .id("explorer-search-error")
-                .flex_none()
-                .max_w(px(260.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_color(colors.danger)
-                .child(error)
-        }))
-        // Grid/list/compact view: one segmented control, the pressed segment raised
-        // and tinted.
-        .child(
-            div()
-                .id("explorer-view-toggle")
-                .flex_none()
-                .flex()
-                .p(px(2.0))
-                .gap(px(2.0))
-                .bg(colors.background)
-                .border_1()
-                .border_color(colors.line)
-                .child(view_segment(
-                    this,
-                    cx,
-                    "explorer-view-grid",
-                    gpui_kit_assets::IconName::LayoutGrid,
-                    "Icon view",
-                    View::Grid,
-                ))
-                .child(view_segment(
-                    this,
-                    cx,
-                    "explorer-view-list",
-                    gpui_kit_assets::IconName::List,
-                    "List view",
-                    View::List,
-                ))
-                .child(view_segment(
-                    this,
-                    cx,
-                    "explorer-view-compact",
-                    gpui_kit_assets::IconName::LayoutList,
-                    "Compact view",
-                    View::Compact,
-                )),
-        )
-        // The one overflow control: Split view, Favorite this folder,
-        // Refresh and Properties, each with its shortcut. It stays raised
-        // while its menu is open.
-        .child(
-            Button::new("explorer-more", "More actions")
-                .ghost()
-                .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::Ellipsis))
-                .tooltip("Split view, favorite this folder, refresh and properties")
-                .selected(toolbar_menu_open)
-                .toggled(toolbar_menu_open)
-                .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
-                    let position = super::overlay::below(event.position());
-                    this.open_toolbar_menu(position, window, cx);
+                    this.navigate(Transition::Back, window, cx);
                 })),
         )
-        // In a split view each pane closes itself; the other one stays.
-        .children(chrome.close.map(|side| {
-            Button::new("explorer-close-pane", "Close pane")
+        .child(
+            Button::new("explorer-forward", "Forward")
                 .ghost()
                 .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::X))
-                .tooltip("Close this pane")
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.close_pane(side, window, cx);
-                }))
+                .icon(icon(gpui_kit_assets::IconName::ChevronRight))
+                .tooltip("Go forward (Alt+Right)")
+                .disabled(!this.tab().state.navigation().can_forward())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.navigate(Transition::Forward, window, cx);
+                })),
+        )
+        .child(
+            Button::new("explorer-up", "Up")
+                .ghost()
+                .icon_only()
+                .icon(icon(gpui_kit_assets::IconName::ChevronUp))
+                .tooltip("Parent folder (Alt+Up)")
+                .disabled(!this.tab().state.navigation().can_up())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.navigate(Transition::Up, window, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+/// Current-folder filename search with its live count, and its options
+/// behind the filter button at the field's trailing edge. The frame wrapping
+/// the field captures the input's own Escape here too: it clears the query,
+/// restores the full listing and returns the entries focus. On one row it
+/// keeps its natural width (13.75 rem) and shrinks to its minimum; on the
+/// second row it fills what the view switch leaves.
+fn search_frame(
+    this: &Explorer,
+    plan: Plan,
+    options_open: bool,
+    cx: &mut Context<Explorer>,
+) -> gpui::AnyElement {
+    let frame = div().id("explorer-search-frame").flex();
+    let frame = if plan.two_rows {
+        frame.flex_1()
+    } else {
+        frame.w(gpui::rems(13.75))
+    };
+    frame
+        .min_w(px(SEARCH_MIN_WIDTH))
+        .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
+            this.clear_search_on_escape(window, cx);
+            cx.stop_propagation();
         }))
+        .child(
+            SearchField::new("explorer-search", &this.tab().search_input)
+                .aria_label(if this.tab().deep_search {
+                    "Search names in the current folder and its subfolders"
+                } else {
+                    "Search names in current folder"
+                })
+                .count(search_count(this, cx))
+                .trailing(search_filter_button(this, cx, options_open)),
+        )
+        .into_any_element()
+}
+
+/// Grid/list/compact view: one segmented control, the pressed segment raised
+/// and tinted.
+fn view_toggle(this: &Explorer, cx: &mut Context<Explorer>) -> gpui::AnyElement {
+    let colors = bolt::colors(cx);
+    div()
+        .id("explorer-view-toggle")
+        .flex_none()
+        .flex()
+        .p(px(2.0))
+        .gap(px(2.0))
+        .bg(colors.background)
+        .border_1()
+        .border_color(colors.line)
+        .child(view_segment(
+            this,
+            cx,
+            "explorer-view-grid",
+            gpui_kit_assets::IconName::LayoutGrid,
+            "Icon view",
+            View::Grid,
+        ))
+        .child(view_segment(
+            this,
+            cx,
+            "explorer-view-list",
+            gpui_kit_assets::IconName::List,
+            "List view",
+            View::List,
+        ))
+        .child(view_segment(
+            this,
+            cx,
+            "explorer-view-compact",
+            gpui_kit_assets::IconName::LayoutList,
+            "Compact view",
+            View::Compact,
+        ))
+        .into_any_element()
 }
 
 /// The search field's filter button: opens the search options popover —
@@ -303,13 +501,20 @@ fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
 
 /// The breadcrumb bar: a 30 px control with Home (or `/`) first, chevron
 /// separators and one clickable segment per folder, the last one strong.
-/// Leading segments shrink and clip before the current folder does; a click
-/// on the bar's empty space opens the path editor.
-fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
+/// When the path does not fit `width` its leading segments collapse into a
+/// "…" (which goes to the nearest hidden folder) instead of being clipped,
+/// and an icon is never cut; a click on the bar's empty space opens the path
+/// editor.
+fn crumb_bar(this: &Explorer, width: f32, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let home = this.places.as_ref().map(|places| places.home.as_path());
     let crumbs = util::breadcrumbs(this.tab().state.current(), home);
     let last = crumbs.len().saturating_sub(1);
+    let widths: Vec<f32> = crumbs
+        .iter()
+        .map(|crumb| crumb_width(&crumb.label, crumb.kind == CrumbKind::Home))
+        .collect();
+    let hidden = collapse_crumbs(&widths, width - CRUMB_BAR_INSET);
 
     let mut bar = div()
         .id("explorer-crumbs")
@@ -332,13 +537,48 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
             this.focus_path(window, cx);
         }));
 
-    for (index, crumb) in crumbs.into_iter().enumerate() {
+    let chevron = || {
+        div().flex_none().child(
+            Icon::new(icon(gpui_kit_assets::IconName::ChevronRight))
+                .size(px(12.0))
+                .color(colors.line_2),
+        )
+    };
+    // The path's own "…" (see `util::breadcrumbs`) already stands for the
+    // folders it hides: when it is the first one shown, it is the one.
+    let own_ellipsis = crumbs
+        .get(hidden)
+        .is_some_and(|crumb| crumb.kind == CrumbKind::Ellipsis);
+    if hidden > 0
+        && !own_ellipsis
+        && let Some(nearest) = crumbs.get(hidden - 1).map(|crumb| crumb.target.clone())
+    {
+        // The hidden leading segments: one click goes to the closest.
+        bar = bar.child(
+            div()
+                .id("explorer-crumb-more")
+                .flex_none()
+                .h(px(22.0))
+                .px(px(7.0))
+                .flex()
+                .items_center()
+                .text_size(px(13.0))
+                .text_color(colors.muted)
+                .cursor_pointer()
+                .hover(|segment| segment.text_color(colors.foreground))
+                .tooltip(|window, cx| {
+                    Tooltip::new("Show the folders on the way to here").build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.navigate(Transition::Visit(nearest.clone()), window, cx);
+                }))
+                .child("\u{2026}"),
+        );
+    }
+    for (index, crumb) in crumbs.into_iter().enumerate().skip(hidden) {
         if index > 0 {
-            bar = bar.child(
-                Icon::new(icon(gpui_kit_assets::IconName::ChevronRight))
-                    .size(px(12.0))
-                    .color(colors.line_2),
-            );
+            bar = bar.child(chevron());
         }
         let is_last = index == last;
         let target = crumb.target.clone();
@@ -380,26 +620,37 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
                 }),
             );
         segment = if is_last {
-            // The current folder keeps its room and clips last.
-            segment.flex_shrink_0().max_w_full().truncate()
+            // The current folder is the only segment whose text gives way: it
+            // ends in an ellipsis, its icon and the separators stay whole.
+            segment.flex_shrink(1.0).min_w_0().max_w_full()
         } else {
             segment
-                .min_w(px(18.0))
-                .truncate()
+                .flex_none()
                 .cursor_pointer()
                 .hover(|segment| segment.text_color(colors.foreground))
         };
         if crumb.kind == CrumbKind::Home {
             segment = segment.child(
-                Icon::new(icon(gpui_kit_assets::IconName::House))
-                    .size(px(14.0))
-                    .color(if is_last { colors.strong } else { colors.muted }),
+                div().flex_none().child(
+                    Icon::new(icon(gpui_kit_assets::IconName::House))
+                        .size(px(14.0))
+                        .color(if is_last { colors.strong } else { colors.muted }),
+                ),
             );
         }
         if let Some(drop) = drop {
             segment = dnd::drop_target(segment, drop, &cx.entity().downgrade(), cx);
         }
-        bar = bar.child(segment.child(crumb.label));
+        bar = bar.child(
+            segment.child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(crumb.label),
+            ),
+        );
     }
     bar
 }
@@ -473,6 +724,7 @@ fn search_count(this: &Explorer, _cx: &mut Context<Explorer>) -> Option<SearchCo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::explorer::ops::{
         MenuCommand, MenuItemSpec, MenuRow, SearchOption, search_option_rows, toolbar_menu_rows,
     };
@@ -609,5 +861,146 @@ mod tests {
     fn the_favorite_row_is_disabled_where_favoriting_is_refused() {
         let rows = toolbar_menu_rows(false);
         assert!(spec_of(&rows, "Favorite this folder").is_some_and(|spec| !spec.enabled));
+    }
+
+    fn chromes() -> Vec<Chrome> {
+        let mut all = Vec::new();
+        for sidebar_toggle in [false, true] {
+            for close in [None, Some(Side::Left)] {
+                all.push(Chrome {
+                    sidebar_toggle,
+                    close,
+                    pane_width: 0.0,
+                });
+            }
+        }
+        all
+    }
+
+    /// The width the plan's rows need at the width the plan gives the path.
+    fn needed_widths(plan: Plan, chrome: Chrome) -> Vec<f32> {
+        let (path_controls, path_widths) = path_row_extras(chrome);
+        if plan.two_rows {
+            vec![
+                row_width(path_controls, path_widths + plan.crumbs_width),
+                row_width(2, SEARCH_MIN_WIDTH + VIEW_TOGGLE_WIDTH),
+            ]
+        } else {
+            vec![row_width(
+                path_controls + 2,
+                path_widths + plan.crumbs_width + SEARCH_MIN_WIDTH + VIEW_TOGGLE_WIDTH,
+            )]
+        }
+    }
+
+    #[test]
+    fn no_control_is_wider_than_its_row_at_any_pane_width_from_the_floor_up() {
+        for chrome in chromes() {
+            let floor = two_row_floor(chrome);
+            for width in (floor as u32)..=3000 {
+                let width = width as f32;
+                let plan = plan(
+                    width,
+                    Chrome {
+                        pane_width: width,
+                        ..chrome
+                    },
+                );
+                assert!(
+                    plan.crumbs_width >= CRUMBS_MIN_WIDTH,
+                    "{chrome:?} at {width}"
+                );
+                for needed in needed_widths(plan, chrome) {
+                    assert!(
+                        needed <= width,
+                        "{chrome:?} at {width}: a row needs {needed} ({plan:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_panes_the_split_accepts_fit_their_toolbar() {
+        use bolt::tokens::IslandMetrics;
+        use fileflux::core::settings::DEFAULT_SIDEBAR_WIDTH;
+        let gap = IslandMetrics::GAP.as_f32();
+        // The window widths the split accepts, with the sidebar docked at its
+        // default width: each pane is half of what the shell leaves.
+        for window in [1100.0_f32, 1130.0, 1260.0, 1500.0] {
+            let shell = 2.0 * gap + DEFAULT_SIDEBAR_WIDTH as f32 + gap;
+            let (left, right) = crate::explorer::panes::pane_widths(window - shell - gap, 0.5);
+            for chrome in chromes() {
+                for pane in [left, right] {
+                    assert!(
+                        two_row_floor(chrome) <= pane,
+                        "{window} px window: a {pane} px pane is below the toolbar's floor {}",
+                        two_row_floor(chrome)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_pane_keeps_one_row_and_a_narrow_one_moves_search_and_view_down() {
+        let chrome = Chrome {
+            sidebar_toggle: false,
+            close: None,
+            pane_width: 0.0,
+        };
+        assert!(!plan(1200.0, chrome).two_rows, "a single wide pane");
+        assert!(plan(469.0, chrome).two_rows, "half of a 1260 px window");
+        let wide = plan(1200.0, chrome);
+        assert!(
+            wide.crumbs_width > CRUMBS_MIN_WIDTH,
+            "the bar takes what the search field's natural width leaves"
+        );
+    }
+
+    #[test]
+    fn a_path_that_fits_is_not_collapsed() {
+        let widths = [60.0, 50.0, 70.0];
+        assert_eq!(collapse_crumbs(&widths, 500.0), 0);
+        assert_eq!(collapse_crumbs(&[], 10.0), 0);
+        assert_eq!(collapse_crumbs(&[80.0], 10.0), 0, "a lone segment stays");
+    }
+
+    #[test]
+    fn a_long_path_hides_leading_segments_behind_an_ellipsis_and_keeps_the_current_folder() {
+        let widths = [60.0, 80.0, 70.0, 90.0, 100.0];
+        let total: f32 = widths.iter().sum::<f32>() + CRUMB_CHEVRON * 4.0;
+        assert_eq!(collapse_crumbs(&widths, total), 0, "exactly fits");
+        for budget in 150..total as u32 {
+            let budget = budget as f32;
+            let hidden = collapse_crumbs(&widths, budget);
+            assert!((1..widths.len()).contains(&hidden), "budget {budget}");
+            let shown = widths.get(hidden..).unwrap_or_default();
+            let used = CRUMB_ELLIPSIS + shown.iter().map(|w| CRUMB_CHEVRON + w).sum::<f32>();
+            assert!(
+                used <= budget,
+                "budget {budget}: {hidden} hidden uses {used}"
+            );
+            // Nothing more could have been kept.
+            if hidden > 1 {
+                assert!(
+                    used + CRUMB_CHEVRON + widths.get(hidden - 1).copied().unwrap_or_default()
+                        > budget,
+                    "budget {budget}: {hidden} hidden is too many"
+                );
+            }
+        }
+        // Narrower than the current folder alone: it stays, its label gives way.
+        assert_eq!(collapse_crumbs(&widths, 20.0), 4);
+    }
+
+    #[test]
+    fn a_crumb_is_as_wide_as_its_label_icon_and_padding() {
+        assert!(crumb_width("Home", true) > crumb_width("Home", false));
+        assert!(crumb_width("Documents", false) > crumb_width("Doc", false));
+        assert!(
+            crumb_width("", true) >= CRUMB_PADDING + CRUMB_HOME_ICON,
+            "the Home icon always has its room"
+        );
     }
 }

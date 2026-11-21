@@ -40,7 +40,10 @@ fn command_navigates(on: &MenuOn, command: MenuCommand) -> bool {
         MenuCommand::Open
         | MenuCommand::OpenContainingFolder
         | MenuCommand::AnalyzeDiskUsage
-        | MenuCommand::Mount => true,
+        | MenuCommand::Mount
+        // Both open the folder they reach once they finish.
+        | MenuCommand::Unlock
+        | MenuCommand::ConnectBookmark => true,
         // The sidebar and device menus show the place, then the panel.
         MenuCommand::Properties => {
             matches!(on, MenuOn::Sidebar { .. } | MenuOn::DeviceMenu { .. })
@@ -219,6 +222,36 @@ pub(crate) const fn opens_in_new_tab(right_press: bool, shift: bool) -> bool {
     right_press && shift
 }
 
+/// Whether a right mouse press is being dispatched. The window sets it in a
+/// capture handler ahead of every handler of the press ([`Self::press`]) and
+/// clears it as soon as the press is done ([`Self::settle`]), so a menu the
+/// press opens knows the mouse opened it, and a menu a later key opens does
+/// not inherit that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RightPress {
+    dispatching: bool,
+}
+
+impl RightPress {
+    /// A mouse press of `button` reached the window. Returns whether the
+    /// caller must [`Self::settle`] once the press's handlers have run.
+    pub(crate) fn press(&mut self, button: gpui::MouseButton) -> bool {
+        self.dispatching = button == gpui::MouseButton::Right;
+        self.dispatching
+    }
+
+    /// The press's handlers have run.
+    pub(crate) fn settle(&mut self) {
+        self.dispatching = false;
+    }
+
+    /// Whether a menu opened now is in new tab mode (see
+    /// [`opens_in_new_tab`]).
+    pub(crate) const fn opens_in_new_tab(self, shift: bool) -> bool {
+        opens_in_new_tab(self.dispatching, shift)
+    }
+}
+
 impl MenuState {
     /// A menu open on its first selectable row.
     pub(crate) fn new(
@@ -242,11 +275,12 @@ impl MenuState {
         menu
     }
 
-    /// Puts the menu in new tab mode when `shift` (see [`opens_in_new_tab`]):
-    /// its navigating commands open background tabs, and the title says so.
-    pub(crate) fn in_new_tab(mut self, shift: bool) -> Self {
-        self.new_tab = shift;
-        if shift && let Some(title) = self.title.as_mut() {
+    /// Puts the menu in new tab mode when `new_tab` (what
+    /// [`opens_in_new_tab`] decided): its navigating commands open background
+    /// tabs, and the title says so.
+    pub(crate) fn in_new_tab(mut self, new_tab: bool) -> Self {
+        self.new_tab = new_tab;
+        if new_tab && let Some(title) = self.title.as_mut() {
             title.push_str(NEW_TAB_SUFFIX);
         }
         let root = self.nodes();
@@ -480,6 +514,40 @@ mod tests {
     }
 
     #[test]
+    fn a_right_press_sets_the_flag_before_its_handlers_and_clears_it_after() {
+        use gpui::MouseButton;
+        let mut flag = RightPress::default();
+        assert!(
+            !flag.opens_in_new_tab(true),
+            "no press: a keyboard menu with Shift"
+        );
+        // The capture handler runs first: the menu the press opens, from any
+        // handler of it, sees the flag.
+        assert!(flag.press(MouseButton::Right), "a right press must settle");
+        assert!(flag.opens_in_new_tab(true));
+        assert!(!flag.opens_in_new_tab(false), "Shift is still needed");
+        // Cleared right after the press: a keyboard menu does not inherit it.
+        flag.settle();
+        assert!(!flag.opens_in_new_tab(true), "a later keyboard menu");
+        assert_eq!(flag, RightPress::default());
+    }
+
+    #[test]
+    fn only_a_right_press_raises_the_flag() {
+        use gpui::MouseButton;
+        for button in [MouseButton::Left, MouseButton::Middle] {
+            let mut flag = RightPress::default();
+            assert!(!flag.press(button), "{button:?} has nothing to settle");
+            assert!(!flag.opens_in_new_tab(true), "{button:?}");
+        }
+        // A left press after a right one drops a flag nobody settled.
+        let mut flag = RightPress::default();
+        flag.press(MouseButton::Right);
+        flag.press(MouseButton::Left);
+        assert!(!flag.opens_in_new_tab(true));
+    }
+
+    #[test]
     fn shift_puts_a_menu_in_new_tab_mode_and_the_title_says_so() {
         let titled = |new_tab| {
             MenuState::new(
@@ -509,6 +577,19 @@ mod tests {
             location: Location::Trash,
             device: None,
         };
+        #[allow(clippy::expect_used)]
+        let bookmark = MenuOn::Network {
+            row: "network-bookmark-0".to_owned(),
+            bookmark: fileflux::core::bookmarks::NetworkBookmark {
+                uri: fileflux::core::network::ServerUri::parse("smb://server/share")
+                    .expect("a valid address"),
+                title: None,
+            },
+        };
+        let locked = MenuOn::Device {
+            row: "device-0".to_owned(),
+            device: "/dev/sdb1".into(),
+        };
         let navigating = [
             (&MenuOn::Entries, MenuCommand::Open),
             (&MenuOn::Entries, MenuCommand::OpenContainingFolder),
@@ -517,6 +598,11 @@ mod tests {
             (&sidebar, MenuCommand::AnalyzeDiskUsage),
             // The sidebar shows the place with the details panel.
             (&sidebar, MenuCommand::Properties),
+            // Connecting to a bookmark and unlocking a volume open the
+            // server's or the volume's folder once they finish.
+            (&bookmark, MenuCommand::ConnectBookmark),
+            (&locked, MenuCommand::Unlock),
+            (&locked, MenuCommand::Mount),
         ];
         for (on, command) in navigating {
             assert_eq!(shown_for(true, on, command), Shown::NewTab, "{command:?}");
@@ -537,6 +623,9 @@ mod tests {
             (&MenuOn::Entries, MenuCommand::OpenInSplit),
             (&sidebar, MenuCommand::OpenInSplit),
             (&sidebar, MenuCommand::CopyPath),
+            // Removing a bookmark and ejecting a device go nowhere.
+            (&bookmark, MenuCommand::RemoveBookmark),
+            (&locked, MenuCommand::Eject),
         ];
         for (on, command) in staying {
             assert_eq!(shown_for(true, on, command), Shown::Here, "{command:?}");

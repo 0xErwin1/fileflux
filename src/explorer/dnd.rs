@@ -346,6 +346,16 @@ pub(crate) struct DraggedEntries {
 }
 
 impl DraggedEntries {
+    /// The payload of one folder dragged from a sidebar row: the same
+    /// payload an entry's drag carries, so every drop target and zone takes
+    /// it the same way.
+    pub(crate) fn one_folder(path: PathBuf) -> Self {
+        Self {
+            paths: Arc::new(vec![path]),
+            folder: true,
+        }
+    }
+
     /// The folder, when exactly one folder is being dragged: the only drag
     /// the "Open in split" strip and the tab strip take.
     pub(crate) fn sole_folder(&self) -> Option<&Path> {
@@ -471,36 +481,64 @@ pub(crate) fn drag_source<E: StatefulInteractiveElement>(
     } else {
         Arc::new(vec![path.clone()])
     };
+    attach_drag(element, DraggedEntries { paths, folder }, path, glyph, weak)
+}
+
+/// Makes a sidebar row the drag source of the one folder it stands for. The
+/// payload is an entry drag's, so drops on folders, the split rail and the
+/// tab strip treat it the same; a click that does not move still navigates.
+pub(crate) fn place_drag_source<E: StatefulInteractiveElement>(
+    element: E,
+    path: PathBuf,
+    weak: &WeakEntity<Explorer>,
+) -> E {
+    let dragged = DraggedEntries::one_folder(path.clone());
+    attach_drag(
+        element,
+        dragged,
+        path,
+        gpui_kit_assets::IconName::Folder,
+        weak,
+    )
+}
+
+/// Starts `dragged` from `element`: the preview card, the folder-drag mark
+/// the strips wait for, and the file list handed to other applications.
+fn attach_drag<E: StatefulInteractiveElement>(
+    element: E,
+    dragged: DraggedEntries,
+    path: PathBuf,
+    glyph: gpui_kit_assets::IconName,
+    weak: &WeakEntity<Explorer>,
+) -> E {
+    let folder = dragged.folder;
     let payload_explorer = weak.clone();
     let drag_explorer = weak.clone();
-    let dragged_path = path.clone();
+    let dragged_path = path;
     element
-        .on_drag(
-            DraggedEntries { paths, folder },
-            move |dragged, grab, _window, cx| {
-                if dragged.sole_folder().is_some()
-                    && let Err(error) = drag_explorer.update(cx, |this, cx| {
-                        // The press focused the pane the folder lives in.
-                        this.folder_drag = Some(this.tabs.focus());
-                        cx.notify();
-                    })
-                {
-                    log::debug!("a folder drag began in a closed explorer: {error}");
-                }
-                let one = dragged.paths.len() == 1;
-                let preview = DragPreview {
-                    text: preview_text(&dragged.paths),
-                    glyph: if one {
-                        glyph
-                    } else {
-                        gpui_kit_assets::IconName::Files
-                    },
-                    folder: one && folder,
-                    grab,
-                };
-                cx.new(|_| preview)
-            },
-        )
+        .on_drag(dragged, move |dragged, grab, _window, cx| {
+            if dragged.sole_folder().is_some()
+                && let Err(error) = drag_explorer.update(cx, |this, cx| {
+                    // The press focused the pane the folder lives in.
+                    this.folder_drag = Some(this.tabs.focus());
+                    cx.notify();
+                })
+            {
+                log::debug!("a folder drag began in a closed explorer: {error}");
+            }
+            let one = dragged.paths.len() == 1;
+            let preview = DragPreview {
+                text: preview_text(&dragged.paths),
+                glyph: if one {
+                    glyph
+                } else {
+                    gpui_kit_assets::IconName::Files
+                },
+                folder: one && folder,
+                grab,
+            };
+            cx.new(|_| preview)
+        })
         // Leaving the window hands the drag to the desktop as a file list, so
         // the entries can be dropped on other applications.
         .external_drag_payload(move |dragged: &DraggedEntries, _window, cx| {
@@ -736,13 +774,12 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // `resolve_drop` reads "the dragged path is a folder" only for the
-        // open zones; a target drop plans from the paths alone.
-        let folder_is_irrelevant_for_a_target = false;
         self.drop_in_zone(
             origin,
             sources,
-            folder_is_irrelevant_for_a_target,
+            // Only the open zones read "the dragged path is a folder"; a
+            // target drop plans from the paths alone.
+            false,
             &DropZone::Target(target.clone()),
             window,
             cx,
@@ -1347,32 +1384,97 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_dragged_from_the_sidebar_drops_like_one_dragged_from_the_entries() {
+        let dragged = DraggedEntries::one_folder(p("/h/music"));
+        assert_eq!(dragged.sole_folder(), Some(Path::new("/h/music")));
+        assert_eq!(dragged_folder(&dragged), Some(Path::new("/h/music")));
+        let entries = DraggedEntries {
+            paths: Arc::new(vec![p("/h/music")]),
+            folder: true,
+        };
+        let tabs = DropZone::TabStrip {
+            side: Side::Right,
+            gap: 1,
+        };
+        for zone in [
+            DropZone::Target(folder("/h/docs")),
+            DropZone::Target(DropTarget::Trash),
+            DropZone::SplitStrip,
+            tabs,
+        ] {
+            let resolved = |payload: &DraggedEntries, ctrl, shift| {
+                resolve_drop(
+                    DragOrigin::Internal,
+                    &payload.paths,
+                    payload.folder,
+                    &zone,
+                    ctrl,
+                    shift,
+                    |_| true,
+                )
+            };
+            for (ctrl, shift) in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    resolved(&dragged, ctrl, shift),
+                    resolved(&entries, ctrl, shift),
+                    "{zone:?} ctrl={ctrl} shift={shift}"
+                );
+            }
+        }
+        assert_eq!(
+            resolve_drop(
+                DragOrigin::Internal,
+                &dragged.paths,
+                dragged.folder,
+                &DropZone::SplitStrip,
+                false,
+                false,
+                |_| true
+            ),
+            DropAction::OpenInSplit(p("/h/music"))
+        );
+    }
+
+    #[test]
     fn the_split_rail_never_covers_a_tile_of_the_rightmost_column() {
-        use crate::explorer::zoom::{GridZoomExt as _, TILE_GAP, grid_columns};
+        use crate::explorer::entries::grid_row_width;
+        use crate::explorer::panes::MIN_PANE_WIDTH;
         use fileflux::core::zoom::GridZoom;
-        // The grid lays its tiles out inside the area's padding, so the
-        // rail (the width of that padding) at the area's right edge never
-        // overlaps the rightmost column, whatever the width and zoom: a
-        // point over that tile is not in the split zone and resolves to the
+        // The grid lays its tiles out inside the area's padding (the width
+        // `grid_row_width` is the production layout's), so the rail (the
+        // width of that padding) at the area's right edge never overlaps the
+        // rightmost column, at every area width a pane gets and every zoom:
+        // a point over that tile is not in the split zone and resolves to the
         // folder target.
         for zoom in GridZoom::ALL {
-            let tile = zoom.metrics().tile_width;
-            for width in 200..=2400 {
+            for width in (MIN_PANE_WIDTH as u32)..=2400 {
                 let area = width as f32;
                 let inner = area - 2.0 * ENTRIES_PADDING;
-                let columns = grid_columns(inner, zoom);
-                let last_right =
-                    ENTRIES_PADDING + columns as f32 * tile + (columns - 1) as f32 * TILE_GAP;
-                if inner < tile {
-                    continue; // one column forced into a too narrow area
-                }
+                let last_right = ENTRIES_PADDING + grid_row_width(inner, zoom);
                 assert!(
                     last_right <= area - SPLIT_RAIL_WIDTH,
                     "{zoom:?} at {area}: the rightmost tile ends at {last_right}"
                 );
             }
         }
-        // And what a drop on that tile means is the folder target's plan.
+    }
+
+    #[test]
+    fn a_grid_row_too_narrow_for_one_tile_is_one_tile_wide() {
+        use crate::explorer::entries::grid_row_width;
+        use crate::explorer::zoom::GridZoomExt as _;
+        use fileflux::core::zoom::GridZoom;
+        // The forced single column used to underflow `columns - 1`.
+        for zoom in GridZoom::ALL {
+            let tile = zoom.metrics().tile_width;
+            for inner in [0.0, 1.0, tile - 1.0, tile] {
+                assert_eq!(grid_row_width(inner, zoom), tile, "{zoom:?} at {inner}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_drop_on_the_rightmost_tile_is_the_folder_targets_plan() {
         let tile = DropZone::Target(folder("/h/docs"));
         assert!(matches!(
             resolve(DragOrigin::Internal, &["/h/a"], true, &tile, false, false),

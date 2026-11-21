@@ -58,10 +58,11 @@ use crate::explorer::devices::{CheckedStep, DeviceHub};
 use crate::explorer::favorites::{BookmarkSync, favorites_of};
 use crate::explorer::folder_memory::{self, FolderMemory};
 use crate::explorer::inspector::{self, PermissionProbe};
+use crate::explorer::menu_tree::RightPress;
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{ArrangeMenu, DialogQueue};
 use crate::explorer::ops::{OpenAction, OpenSplit, Severity, UndoStack, open_action, split_open};
-use crate::explorer::panes::{self, PaneLayout, Panes, PerPane, Side, SplitDrag};
+use crate::explorer::panes::{self, OtherPane, PaneLayout, Panes, PerPane, Side, SplitDrag};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
     session_tab, view_from_pref, view_to_pref,
@@ -882,10 +883,10 @@ pub(crate) struct Explorer {
     pub(crate) menu: Option<MenuState>,
     /// The focus of the open context menu.
     pub(crate) menu_focus: FocusHandle,
-    /// A right mouse press is being dispatched: a menu opened now was opened
-    /// by it (see [`super::menu_tree::opens_in_new_tab`]). Set ahead of the
-    /// press's handlers and cleared right after them.
-    pub(crate) right_press: bool,
+    /// Whether a right mouse press is being dispatched: a menu opened now
+    /// was opened by it (see [`RightPress`]). Set ahead of the press's
+    /// handlers and cleared right after them.
+    pub(crate) right_press: RightPress,
     /// The open confirmation dialog and those waiting behind it: modal over
     /// the whole window, whichever tab is active.
     pub(crate) dialogs: DialogQueue,
@@ -1149,7 +1150,7 @@ impl Explorer {
             select_pattern: String::new(),
             menu: None,
             menu_focus: cx.focus_handle(),
-            right_press: false,
+            right_press: RightPress::default(),
             dialogs: DialogQueue::default(),
             dialog_focus: cx.focus_handle(),
             dialog_cancel_focus: cx.focus_handle(),
@@ -3555,7 +3556,7 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(real) = self.tabs.focus_other_pane() else {
+        let OtherPane::Focused { real } = self.tabs.focus_other_pane() else {
             let state = self.tab().state.for_new_tab(location.clone());
             let id = self.next_tab_id;
             self.next_tab_id += 1;
@@ -3589,6 +3590,19 @@ impl Explorer {
                 this.open_tab_checked(location, Placement::At(gap), window, cx);
             }
         });
+    }
+
+    /// The width of `side`'s document island: its share of the room between
+    /// the sidebar and the window edge when both panes draw, else all of it.
+    fn pane_width(&self, side: Side, layout: PaneLayout, window: &Window) -> f32 {
+        if layout != PaneLayout::SideBySide {
+            return (f32::from(window.viewport_size().width) - self.shell_width(window)).max(0.0);
+        }
+        let (left, right) = panes::pane_widths(self.split_available(window), self.split_ratio);
+        match side {
+            Side::Left => left,
+            Side::Right => right,
+        }
     }
 
     /// The width the two panes share: the window without the shell and the
@@ -3930,9 +3944,8 @@ impl Render for Explorer {
             // Ahead of every handler of a right press, so the menu it opens
             // knows it was opened by the mouse (Shift: new tab mode).
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                if event.button == MouseButton::Right {
-                    this.right_press = true;
-                    cx.defer_in(window, |this, _window, _cx| this.right_press = false);
+                if this.right_press.press(event.button) {
+                    cx.defer_in(window, |this, _window, _cx| this.right_press.settle());
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusPath, window, cx| {
@@ -4339,6 +4352,7 @@ impl Explorer {
         let chrome = toolbar::Chrome {
             sidebar_toggle: panes::shows_sidebar_toggle(self.sidebar_visible(window), side, layout),
             close: panes::shows_pane_close(layout).then_some(side),
+            pane_width: self.pane_width(side, layout, window),
         };
         self.inspector_shown = self.inspector_wanted(window);
         self.sync_permissions(cx);

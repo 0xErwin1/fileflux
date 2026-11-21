@@ -795,7 +795,7 @@ impl Explorer {
     ) {
         match command {
             MenuCommand::Mount => self.mount_device_in(path, shown, window, cx),
-            MenuCommand::Unlock => self.unlock_device(path, window, cx),
+            MenuCommand::Unlock => self.unlock_device_in(path, shown, window, cx),
             MenuCommand::Unmount => self.unmount_device(&path, window, cx),
             MenuCommand::Eject => self.eject_device(&path, window, cx),
             MenuCommand::CopyPath => {

@@ -67,6 +67,23 @@ pub(crate) fn hover_wash(colors: &bolt::colors::Colors) -> Hsla {
 }
 /// Horizontal padding of the entries area.
 pub(crate) const ENTRIES_PADDING: f32 = 16.0;
+
+/// The width of a grid row of `columns` fixed-width tiles [`TILE_GAP`] apart.
+/// Never underflows: no columns, or one, is at most one tile wide.
+pub(crate) fn grid_row_extent(columns: usize, zoom: GridZoom) -> f32 {
+    let tile = zoom.metrics().tile_width;
+    columns as f32 * tile + columns.saturating_sub(1) as f32 * TILE_GAP
+}
+
+/// The width the tiles of a full grid row take in an entries area whose
+/// content box is `inner` wide: as many columns as
+/// [`grid_columns`](super::zoom::grid_columns) says. A forced single column
+/// is one tile wide.
+#[cfg(test)]
+pub(crate) fn grid_row_width(inner: f32, zoom: GridZoom) -> f32 {
+    grid_row_extent(super::zoom::grid_columns(inner, zoom), zoom)
+}
+
 /// Grid top padding under the folder subbar (artboard 4 px).
 const GRID_TOP_PADDING: f32 = 4.0;
 
@@ -810,7 +827,9 @@ fn render_grid_row(
         .flex()
         .gap(px(TILE_GAP))
         .h(px(metrics.tile_height()))
-        .min_w_0();
+        // A row is never narrower than its tiles: the width the "Open in
+        // split" rail's clearance is measured from (see `grid_row_width`).
+        .min_w(px(grid_row_extent(columns, zoom)));
     for index in grid_tile_range(row, visible.len(), columns) {
         let Some(tile) = visible.get(index).and_then(|&i| snapshot.get(i)) else {
             continue;

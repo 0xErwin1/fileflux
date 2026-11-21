@@ -55,14 +55,35 @@ const CLOSE_SIZE: f32 = 18.0;
 /// zones of a drag show it, so it lays over the toolbar instead of pushing
 /// the entries down mid-drag.
 fn is_overlay(this: &Explorer, cx: &App) -> bool {
-    this.tabs.len() < 2 && is_drag_target(this, cx)
+    this.tabs.len() < 2 && Drags::of(this, cx).target_the_strip(this)
 }
 
-/// A drag the strip takes: a folder, or a tab of a split view (to the other
-/// pane).
-fn is_drag_target(this: &Explorer, cx: &App) -> bool {
-    let tab_dragging = this.tab_drag.is_some() && cx.has_active_drag();
-    (tab_dragging && this.tabs.is_split()) || dnd::folder_drag_live(this, cx)
+/// What is being dragged right now, read once per frame of the strip.
+#[derive(Clone, Copy)]
+struct Drags {
+    /// A tab of this window.
+    tab: bool,
+    /// One folder (from the entries or the sidebar).
+    folder: bool,
+}
+
+impl Drags {
+    fn of(this: &Explorer, cx: &App) -> Self {
+        Self {
+            tab: this.tab_drag.is_some() && cx.has_active_drag(),
+            folder: dnd::folder_drag_live(this, cx),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.tab || self.folder
+    }
+
+    /// Whether the strip takes the drag: a folder always, a tab only in a
+    /// split view (to the other pane).
+    fn target_the_strip(self, this: &Explorer) -> bool {
+        (self.tab && this.tabs.is_split()) || self.folder
+    }
 }
 
 /// The strip in the layout: nothing while there is a single tab.
@@ -91,10 +112,9 @@ pub(crate) fn overlay(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Sta
 }
 
 fn build(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
-    let tab_dragging = this.tab_drag.is_some() && cx.has_active_drag();
-    let folder_dragging = dnd::folder_drag_live(this, cx);
-    let dragging = tab_dragging || folder_dragging;
-    if this.tabs.len() < 2 && !is_drag_target(this, cx) {
+    let drags = Drags::of(this, cx);
+    let (tab_dragging, folder_dragging, dragging) = (drags.tab, drags.folder, drags.any());
+    if this.tabs.len() < 2 && !drags.target_the_strip(this) {
         return None;
     }
     // The dragged tab's pane and position, so the gaps that would leave the
