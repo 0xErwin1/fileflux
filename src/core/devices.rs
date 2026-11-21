@@ -689,6 +689,13 @@ fn find_node<'a>(nodes: &'a [BlockNode], path: &Path) -> Option<&'a BlockNode> {
     })
 }
 
+/// Whether `container` shows a mapped (`crypt`) child in `nodes`: it is
+/// unlocked, mounted or not.
+pub fn is_unlocked(nodes: &[BlockNode], container: &Path) -> bool {
+    find_node(nodes, container)
+        .is_some_and(|node| node.children.iter().any(|child| child.kind == "crypt"))
+}
+
 /// Where the unlocked volume of the container `container` is mounted in
 /// `nodes`: the first mount point of the container's children.
 pub fn unlocked_mount(nodes: &[BlockNode], container: &Path) -> Option<PathBuf> {
@@ -2345,5 +2352,14 @@ mod tests {
             assert!(run_unmount(&tool, &step).is_err(), "{message}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_container_is_unlocked_when_the_listing_shows_a_mapper_child() {
+        let nodes = luks();
+        assert!(is_unlocked(&nodes, Path::new("/dev/sdf1")));
+        assert!(is_unlocked(&nodes, Path::new("/dev/sdg1")));
+        assert!(!is_unlocked(&nodes, Path::new("/dev/sde1")));
+        assert!(!is_unlocked(&nodes, Path::new("/dev/nope")));
     }
 }

@@ -325,13 +325,29 @@ pub(crate) fn failed_notice(label: &str, reason: &str) -> String {
 }
 
 /// The toast a finished plan ends with. "Can be removed safely" only when
-/// every step ran, the power-off included.
+/// every step ran, the power-off included. `lock_failed`: the volumes were
+/// unmounted and only the lock of a container failed.
 pub(crate) fn plan_notice(
     plan: &DevicePlan,
     result: &Result<(), DeviceError>,
+    lock_failed: bool,
 ) -> (Severity, String) {
     let eject = plan.power_off.is_some();
     match result {
+        Err(error) if lock_failed => {
+            let tail = if eject {
+                ", so it was not powered off"
+            } else {
+                ""
+            };
+            (
+                Severity::Error,
+                format!(
+                    "Unmounted {}, but could not lock it{tail}: {error}",
+                    plan.label
+                ),
+            )
+        }
         Ok(()) if eject => (
             Severity::Success,
             format!("{} can be removed safely", plan.label),
@@ -1131,6 +1147,7 @@ impl Explorer {
             let mounts = plan.mounts();
             let mut moved: Vec<(TabId, PathBuf)> = Vec::new();
             let mut unmounted = false;
+            let mut lock_failed = false;
             let outcome: Option<Result<(), DeviceError>> = async {
                 // The tabs on the device leave it.
                 let tabs = this.update_in(cx, |this, _, _| this.tab_snapshot()).ok()?;
@@ -1187,7 +1204,7 @@ impl Explorer {
                     .await;
                 this.update_in(cx, |this, _, _| this.release_watches(&doomed))
                     .ok()?;
-                for step in &plan.unmount {
+                for (at, step) in plan.unmount.iter().enumerate() {
                     // Anything that started since the plan was asked for.
                     let running = this
                         .update_in(cx, |this, _, _| this.running_touches())
@@ -1202,6 +1219,7 @@ impl Explorer {
                     if let Err(reason) = checked {
                         return Some(Err(DeviceError::Failed { reason }));
                     }
+                    let locking = step.via == UnmountVia::UdisksLock;
                     let step = step.clone();
                     let program = match unmount_program(&step, udisksctl.as_deref(), gio.as_deref())
                     {
@@ -1213,6 +1231,14 @@ impl Explorer {
                         .spawn(async move { run_unmount(&program, &step) })
                         .await;
                     if let Err(error) = done {
+                        // Only locks are left: the volumes are unmounted.
+                        lock_failed = locking
+                            && plan
+                                .unmount
+                                .iter()
+                                .skip(at)
+                                .all(|rest| rest.via == UnmountVia::UdisksLock);
+                        unmounted = lock_failed;
                         return Some(Err(error));
                     }
                 }
@@ -1240,7 +1266,7 @@ impl Explorer {
                     &plan,
                     key.as_deref(),
                     result,
-                    (&moved, unmounted),
+                    (&moved, unmounted, lock_failed),
                     window,
                     cx,
                 );
@@ -1256,7 +1282,7 @@ impl Explorer {
         plan: &DevicePlan,
         key: Option<&Path>,
         result: Result<(), DeviceError>,
-        (moved, unmounted): (&[(TabId, PathBuf)], bool),
+        (moved, unmounted, lock_failed): (&[(TabId, PathBuf)], bool, bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1281,7 +1307,7 @@ impl Explorer {
                 tab.state.set_notice(text);
             }
         }
-        let (severity, text) = plan_notice(plan, &result);
+        let (severity, text) = plan_notice(plan, &result, lock_failed);
         self.say(severity, text, window, cx);
         cx.notify();
     }
@@ -1595,7 +1621,7 @@ mod tests {
             via: UnmountVia::UdisksLock,
         });
         assert_eq!(
-            plan_notice(&locked_too, &Ok(())),
+            plan_notice(&locked_too, &Ok(()), false),
             (Severity::Success, "Unmounted and locked K".to_owned())
         );
     }
@@ -1871,7 +1897,7 @@ mod tests {
     fn removed_safely_only_after_every_step_including_the_power_off() {
         let eject = plan("KINGSTON", "/run/media/u/USB");
         assert_eq!(
-            plan_notice(&eject, &Ok(())),
+            plan_notice(&eject, &Ok(()), false),
             (
                 Severity::Success,
                 "KINGSTON can be removed safely".to_owned()
@@ -1880,7 +1906,7 @@ mod tests {
         let failed = DeviceError::Failed {
             reason: "target is busy".to_owned(),
         };
-        let (severity, text) = plan_notice(&eject, &Err(failed.clone()));
+        let (severity, text) = plan_notice(&eject, &Err(failed.clone()), false);
         assert_eq!(severity, Severity::Error);
         assert_eq!(text, "Could not eject KINGSTON: target is busy");
         assert!(!text.contains("safely"));
@@ -1889,11 +1915,11 @@ mod tests {
             ..eject
         };
         assert_eq!(
-            plan_notice(&unmount, &Ok(())),
+            plan_notice(&unmount, &Ok(()), false),
             (Severity::Success, "Unmounted KINGSTON".to_owned())
         );
         assert_eq!(
-            plan_notice(&unmount, &Err(failed)).1,
+            plan_notice(&unmount, &Err(failed), false).1,
             "Could not unmount KINGSTON: target is busy"
         );
     }
@@ -2434,5 +2460,36 @@ mod tests {
             ..eject
         };
         assert_eq!(hub.busy_before(&other), None);
+    }
+
+    #[test]
+    fn a_lock_failure_after_the_unmount_is_not_called_an_unmount_failure() {
+        let failed = Err(DeviceError::Failed {
+            reason: "busy".to_owned(),
+        });
+        let eject = plan("KINGSTON", "/run/media/u/USB");
+        let unmount = DevicePlan {
+            power_off: None,
+            ..eject.clone()
+        };
+        assert_eq!(
+            plan_notice(&unmount, &failed, true),
+            (
+                Severity::Error,
+                "Unmounted KINGSTON, but could not lock it: busy".to_owned()
+            )
+        );
+        assert_eq!(
+            plan_notice(&eject, &failed, true),
+            (
+                Severity::Error,
+                "Unmounted KINGSTON, but could not lock it, so it was not powered off: busy"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            plan_notice(&unmount, &failed, false).1,
+            "Could not unmount KINGSTON: busy"
+        );
     }
 }

@@ -28,7 +28,7 @@ use bolt::controls::{InputEvent, InputState};
 use fileflux::core::Location;
 use fileflux::core::bookmarks::{self, NetworkBookmark};
 use fileflux::core::devices::{
-    UnlockTarget, devices, list_blocks, unlock_target, wait_for_unlocked_mount,
+    UnlockTarget, devices, is_unlocked, list_blocks, unlock_target, wait_for_unlocked_mount,
 };
 use fileflux::core::network::{
     Answer, MountEvent, MountOutcome, MountSession, Prompt, Secret, ServerUri, mount_target,
@@ -555,15 +555,8 @@ impl Explorer {
                 window,
                 cx,
             ),
-            (MountOutcome::Failed(message), Goal::Unlock(_)) => {
-                // Still locked: the row stays, and a new try asks again.
-                self.devices.last_poll = None;
-                self.say(
-                    Severity::Error,
-                    format!("Could not unlock {label}: {message}"),
-                    window,
-                    cx,
-                );
+            (MountOutcome::Failed(message), Goal::Unlock(target)) => {
+                self.unlock_failed(target, label, message, window, cx);
             }
             (MountOutcome::Mounted, Goal::Connect(uri)) => {
                 self.open_mounted(uri, label, window, cx);
@@ -627,6 +620,47 @@ impl Explorer {
                 cx,
             ),
         }
+    }
+
+    /// gio failed on an unlock. It unlocks and then mounts, so the container
+    /// may be open already: a fresh listing, read off the UI thread, tells.
+    /// An open container shows its mapper as an unmounted device to mount.
+    fn unlock_failed(
+        &mut self,
+        target: &UnlockTarget,
+        label: &str,
+        message: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.devices.last_poll = None;
+        let (container, label) = (target.path().to_path_buf(), label.to_owned());
+        let Some(lsblk) = self.devices.lsblk.clone() else {
+            let text = unlock_failure_notice(&label, &message, false);
+            return self.say(Severity::Error, text, window, cx);
+        };
+        let listing = cx
+            .background_executor()
+            .spawn(async move { list_blocks(&lsblk) });
+        cx.spawn_in(window, async move |this, cx| {
+            let nodes = listing.await.ok();
+            let open = nodes
+                .as_deref()
+                .is_some_and(|nodes| is_unlocked(nodes, &container));
+            if let Err(closed) = this.update_in(cx, |this, window, cx| {
+                if let Some(nodes) = nodes {
+                    this.devices.list = devices(&nodes);
+                    this.devices.nodes = nodes;
+                }
+                this.devices.last_poll = None;
+                let text = unlock_failure_notice(&label, &message, open);
+                this.say(Severity::Error, text, window, cx);
+                cx.notify();
+            }) {
+                log::debug!("the explorer closed before an unlock failure was shown: {closed}");
+            }
+        })
+        .detach();
     }
 
     /// Reads fresh listings off the UI thread until the unlocked volume's
@@ -771,6 +805,16 @@ impl Explorer {
             }
         })
         .detach();
+    }
+}
+
+/// The toast for a failed `gio mount -d`: when the container was unlocked
+/// anyway (`open`), only the mount failed.
+fn unlock_failure_notice(label: &str, message: &str, open: bool) -> String {
+    if open {
+        format!("Unlocked {label}, but could not mount it: {message}")
+    } else {
+        format!("Could not unlock {label}: {message}")
     }
 }
 
@@ -959,5 +1003,17 @@ mod tests {
         let mut alone = Vec::new();
         add_connect_row(&mut alone, true);
         assert_eq!(alone.len(), 1, "no separator on an empty menu");
+    }
+
+    #[test]
+    fn a_failed_unlock_says_what_state_the_container_is_in() {
+        assert_eq!(
+            unlock_failure_notice("Vault", "Wrong passphrase", false),
+            "Could not unlock Vault: Wrong passphrase"
+        );
+        assert_eq!(
+            unlock_failure_notice("Vault", "mount failed", true),
+            "Unlocked Vault, but could not mount it: mount failed"
+        );
     }
 }
