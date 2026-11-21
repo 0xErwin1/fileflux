@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, TimeZone};
+use fileflux::core::clipboard::{ClipboardFiles, format_plain_paths, parse_clipboard_files};
 use fileflux::core::ops::{
     self as core_ops, Conflict, ItemOutcome, Mode, TransferError, TransferReport, rename_noreplace,
 };
@@ -216,14 +217,11 @@ pub(crate) fn paste_title(mode: ClipMode, sources: &[PathBuf], dest: &Path) -> S
 }
 
 /// The text the system clipboard gets: the paths, one per line. The gpui
-/// clipboard carries plain text only, so this is `text/plain`, not a
-/// `text/uri-list` of `file://` URIs: pasting into a terminal gives paths.
+/// clipboard carries plain text only (see [`system_clipboard_action`]), so
+/// this is `text/plain`, not a `text/uri-list` of `file://` URIs: pasting
+/// into a terminal gives paths.
 pub(crate) fn clipboard_text(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("\n")
+    format_plain_paths(paths)
 }
 
 /// Whether the system clipboard no longer holds what Copy/Cut wrote. An
@@ -234,6 +232,41 @@ pub(crate) fn clipboard_is_stale(expected: &str, system: Option<&str>) -> bool {
         text.replace("\r\n", "\n").trim_end_matches('\n').to_owned()
     }
     system.is_some_and(|system| normal(system) != normal(expected))
+}
+
+/// What Paste does about the system clipboard.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SystemClipboard {
+    /// The internal clipboard stands: the system one is unreadable or still
+    /// holds what Copy/Cut wrote, or it changed to something that is not files
+    /// and there was no internal clipboard to drop.
+    Keep,
+    /// Something else was copied since: the internal clipboard goes.
+    Forget,
+    /// Another application copied or cut files: they replace the internal
+    /// clipboard.
+    Adopt(ClipboardFiles),
+}
+
+/// Decides what the system clipboard `system` means given the text `written`
+/// that Copy/Cut last put there (`None` when the internal clipboard is
+/// empty). The system clipboard wins when it changed since Fileflux wrote it.
+pub(crate) fn system_clipboard_action(
+    written: Option<&str>,
+    system: Option<&str>,
+    exists: impl Fn(&Path) -> bool,
+) -> SystemClipboard {
+    let Some(system) = system else {
+        return SystemClipboard::Keep;
+    };
+    if written.is_some_and(|written| !clipboard_is_stale(written, Some(system))) {
+        return SystemClipboard::Keep;
+    }
+    match parse_clipboard_files(system, exists) {
+        Some(files) => SystemClipboard::Adopt(files),
+        None if written.is_some() => SystemClipboard::Forget,
+        None => SystemClipboard::Keep,
+    }
 }
 
 /// The status line after Copy/Cut.

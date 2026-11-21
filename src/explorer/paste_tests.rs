@@ -7,6 +7,7 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::{TimeZone, Utc};
+use fileflux::core::clipboard::ClipboardAction;
 use fileflux::core::ops::{ItemOutcome, ItemReport, TransferError};
 
 use super::super::{DialogState, Job, MenuCommand, MenuItemSpec, MenuRow, MenuTarget, run_job};
@@ -147,6 +148,63 @@ fn the_system_clipboard_gets_the_paths_one_per_line() {
         "/x/a b.txt\n/x/c"
     );
     assert_eq!(clipboard_text(&[]), "");
+}
+
+#[test]
+fn files_another_application_copied_replace_our_clipboard() {
+    let exists = |_: &Path| true;
+    let adopted = |written, system| system_clipboard_action(written, system, exists);
+    let files = |action, list: &[&str]| {
+        SystemClipboard::Adopt(ClipboardFiles {
+            action,
+            paths: paths(list),
+        })
+    };
+    // Nothing of ours: a file list on the system clipboard is pasted.
+    assert_eq!(
+        adopted(None, Some("copy\nfile:///x/a%20b")),
+        files(ClipboardAction::Copy, &["/x/a b"])
+    );
+    assert_eq!(
+        adopted(None, Some("cut\r\nfile:///x/a\r\n")),
+        files(ClipboardAction::Cut, &["/x/a"])
+    );
+    // It changed since we wrote ours: the system clipboard wins.
+    assert_eq!(
+        adopted(Some("/x/old"), Some("file:///x/new")),
+        files(ClipboardAction::Copy, &["/x/new"])
+    );
+}
+
+#[test]
+fn our_clipboard_stands_while_the_system_one_is_what_we_wrote() {
+    let exists = |_: &Path| true;
+    assert_eq!(
+        system_clipboard_action(Some("/x/a\n/x/b"), Some("/x/a\n/x/b\n"), exists),
+        SystemClipboard::Keep
+    );
+    assert_eq!(
+        system_clipboard_action(Some("/x/a"), None, exists),
+        SystemClipboard::Keep
+    );
+}
+
+#[test]
+fn a_system_clipboard_that_is_not_files_drops_ours_and_is_otherwise_ignored() {
+    let exists = |_: &Path| true;
+    assert_eq!(
+        system_clipboard_action(Some("/x/a"), Some("hello world"), exists),
+        SystemClipboard::Forget
+    );
+    assert_eq!(
+        system_clipboard_action(None, Some("hello world"), exists),
+        SystemClipboard::Keep
+    );
+    // Files that are gone are not a clipboard.
+    assert_eq!(
+        system_clipboard_action(None, Some("file:///x/gone"), |_: &Path| false),
+        SystemClipboard::Keep
+    );
 }
 
 #[test]

@@ -2,7 +2,12 @@
 //!
 //! Copy and Cut keep the paths in the app (see [`ClipboardState`]) and also
 //! write them, one per line, to the system clipboard, so pasting into a
-//! terminal gives paths. Paste runs `core::ops::transfer` off the UI thread
+//! terminal gives paths. Paste first looks at the system clipboard: files
+//! another application copied or cut there (`file://` URIs or absolute
+//! paths, one per line, optionally after a `copy`/`cut` line) replace the
+//! internal clipboard. The gpui clipboard carries text only, so the
+//! `x-special/gnome-copied-files` and `text/uri-list` targets cannot be
+//! offered or read. Paste runs `core::ops::transfer` off the UI thread
 //! as a byte-based operation behind the progress card. When the worker meets
 //! an existing target it blocks and sends a question over a channel; the
 //! pump below turns it into a modal that waits its turn in the dialog queue
@@ -12,13 +17,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use fileflux::core::Location;
+use fileflux::core::clipboard::ClipboardAction;
 use fileflux::core::ops::Conflict;
 use gpui::{ClipboardItem, Context, Task, Window};
 
 use super::devices::job_paths;
 use super::ops::paste::{
     ClipMode, ConflictAnswer, ConflictLink, ConflictRequest, PasteInto, PasteJob, PastePlan,
-    clip_notice, clipboard_is_stale, clipboard_text, paste_target, paste_title, plan_paste,
+    SystemClipboard, clip_notice, clipboard_text, paste_target, paste_title, plan_paste,
+    system_clipboard_action,
 };
 use super::ops::{DialogState, Job, Report, Severity};
 use super::progress::Unit;
@@ -75,17 +82,32 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Forgets the internal clipboard when something else was put on the
-    /// system clipboard since: "the clipboard changed".
+    /// Brings the internal clipboard in line with the system one: it is
+    /// forgotten when something else was put on the system clipboard since,
+    /// and replaced when what was put there is files another application
+    /// copied or cut (see [`system_clipboard_action`]).
     fn reconcile_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some(expected) = self.clipboard_text.as_deref() else {
-            return;
-        };
         let system = cx.read_from_clipboard().and_then(|item| item.text());
-        if clipboard_is_stale(expected, system.as_deref()) {
-            self.clipboard.clear();
-            self.clipboard_text = None;
-            cx.notify();
+        let action =
+            system_clipboard_action(self.clipboard_text.as_deref(), system.as_deref(), |path| {
+                path.symlink_metadata().is_ok()
+            });
+        match action {
+            SystemClipboard::Keep => {}
+            SystemClipboard::Forget => {
+                self.clipboard.clear();
+                self.clipboard_text = None;
+                cx.notify();
+            }
+            SystemClipboard::Adopt(files) => {
+                let mode = match files.action {
+                    ClipboardAction::Copy => ClipMode::Copy,
+                    ClipboardAction::Cut => ClipMode::Cut,
+                };
+                self.clipboard.set(mode, files.paths);
+                self.clipboard_text = system;
+                cx.notify();
+            }
         }
     }
 

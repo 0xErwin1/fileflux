@@ -241,9 +241,10 @@ Each history entry remembers which file it acted on (device and inode). If the i
 
 | Action | Behavior |
 |---|---|
-| Copy / Cut | Ctrl+C / Ctrl+X remember the selected entries and also write their paths, one per line, to the system clipboard as plain text, so pasting into a terminal gives paths. The clipboard is internal: other programs do not see files |
+| Copy / Cut | Ctrl+C / Ctrl+X remember the selected entries and also write their paths, one per line, to the system clipboard as plain text, so pasting into a terminal gives paths. Other applications do not receive files: Fileflux can offer only plain text on the system clipboard, not the `x-special/gnome-copied-files` or `text/uri-list` formats that file managers paste from |
 | Cut look | Cut entries are drawn dimmed until pasted or until the clipboard changes |
 | Paste | Ctrl+V or **Paste** pastes into the shown folder. With exactly one folder selected, the menu offers **Paste into folder** instead. Nothing is offered in the Trash view |
+| Files from other applications | If another application put files on the system clipboard as text, Ctrl+V pastes them: every line a `file://` URI (percent-encoded) or an absolute path, optionally after a first line `copy` or `cut`. Without that line it is a copy; `cut` moves. Missing files are skipped, and any other text is not a file list. The system clipboard wins when it changed since Fileflux last wrote it; otherwise the internal clipboard is used. The conflict dialog, progress card and Undo are the same as for any paste. Files that a file manager copied only as `x-special/gnome-copied-files` or `text/uri-list` (without text) are not seen yet |
 | After paste | A cut-and-paste empties the clipboard (a cancelled one keeps what did not move). A copy stays |
 
 Pasting is a byte-based operation with a progress card: "Copying 12 items to Pictures", bytes done, current file, speed and an estimate after two seconds, and **Cancel**. Folders are copied recursively, symlinks as links (never followed), and permissions and modification times are kept. A copy is built under a hidden temporary name and renamed into place, so a cancelled or failed copy never leaves a half file under the real name. A move renames when it can; across devices it copies, verifies and only then removes the source.
