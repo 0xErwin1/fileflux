@@ -66,7 +66,7 @@ pub(crate) fn hover_wash(colors: &bolt::colors::Colors) -> Hsla {
     colors.strong.opacity(HOVER_WASH_ALPHA)
 }
 /// Horizontal padding of the entries area.
-const ENTRIES_PADDING: f32 = 16.0;
+pub(crate) const ENTRIES_PADDING: f32 = 16.0;
 /// Grid top padding under the folder subbar (artboard 4 px).
 const GRID_TOP_PADDING: f32 = 4.0;
 

@@ -26,7 +26,8 @@ use bolt::primitives::Icon;
 use bolt::tokens::ChromeColors;
 use fileflux::core::Location;
 use gpui::{
-    Context, Div, MouseButton, Render, SharedString, Stateful, Styled, Window, div, prelude::*, px,
+    App, Context, Div, MouseButton, Render, SharedString, Stateful, Styled, Window, div,
+    prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::tooltip::Tooltip;
@@ -48,12 +49,50 @@ const FOLDER_EDGE: f32 = 12.0;
 /// Edge of the square close button.
 const CLOSE_SIZE: f32 = 18.0;
 
-/// The strip, or nothing while there is a single tab.
+/// Whether the strip of a one-tab pane is drawn as an overlay: only the drop
+/// zones of a drag show it, so it lays over the toolbar instead of pushing
+/// the entries down mid-drag.
+fn is_overlay(this: &Explorer, cx: &App) -> bool {
+    this.tabs.len() < 2 && is_drag_target(this, cx)
+}
+
+/// A drag the strip takes: a folder, or a tab of a split view (to the other
+/// pane).
+fn is_drag_target(this: &Explorer, cx: &App) -> bool {
+    let tab_dragging = this.tab_drag.is_some() && cx.has_active_drag();
+    (tab_dragging && this.tabs.is_split()) || dnd::folder_drag_live(this, cx)
+}
+
+/// The strip in the layout: nothing while there is a single tab.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
+    if is_overlay(this, cx) {
+        return None;
+    }
+    build(this, cx)
+}
+
+/// The strip of a one-tab pane during a drag, over the top of the pane. The
+/// caller adds it after the toolbar, so it paints above it.
+pub(crate) fn overlay(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
+    if !is_overlay(this, cx) {
+        return None;
+    }
+    let colors = bolt::colors(cx);
+    build(this, cx).map(|strip| {
+        strip
+            .absolute()
+            .inset_0()
+            .h_full()
+            .bg(colors.desk)
+            .occlude()
+    })
+}
+
+fn build(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
     let tab_dragging = this.tab_drag.is_some() && cx.has_active_drag();
     let folder_dragging = dnd::folder_drag_live(this, cx);
     let dragging = tab_dragging || folder_dragging;
-    if this.tabs.len() < 2 && !((tab_dragging && this.tabs.is_split()) || folder_dragging) {
+    if this.tabs.len() < 2 && !is_drag_target(this, cx) {
         return None;
     }
     // The dragged tab's pane and position, so the gaps that would leave the
@@ -79,6 +118,17 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
         .overflow_hidden()
         .border_b_1()
         .border_color(colors.line);
+    // The tabs sit in a box of their own that is as wide as they would be
+    // at their maximum, and shrinks when the strip is narrower: they get the
+    // widths they have with no drag, and the end zone below takes only what
+    // is left of the strip.
+    let mut tabs = div()
+        .h_full()
+        .min_w_0()
+        .flex()
+        .items_stretch()
+        .overflow_hidden()
+        .w(px(TAB_MAX_WIDTH * this.tabs.len() as f32));
     let active = this.tabs.active_index();
     // Indices count window-wide (see `Panes::focused_offset`), so a click
     // can only reach a tab of the pane the strip belongs to.
@@ -86,7 +136,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
     for (local, tab) in this.tabs.focused().iter().enumerate() {
         let index = offset + local;
         let location = tab.state.current();
-        strip = strip.child(render_tab(
+        tabs = tabs.child(render_tab(
             index,
             Zones {
                 id: tab.id,
@@ -103,13 +153,15 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stat
             cx,
         ));
     }
+    strip = strip.child(tabs);
     if dragging {
-        // The empty end of the strip: the gap after the last tab. It grows
-        // like a tab, so once the tabs reach their maximum width it takes
-        // the rest of the strip. A grow factor below one would leave it only
-        // that fraction of the free space: a sliver no pointer can hit.
+        // The empty end of the strip: the gap after the last tab. It takes
+        // the whole of what the tabs leave free (a grow factor below one
+        // would leave it a sliver no pointer can hit); when the tabs fill the
+        // strip there is none, and the right half of the last tab is the end
+        // gap.
         let end = this.tabs.focused().len();
-        let filler = div().h_full().flex_1().min_w(px(TAB_MIN_WIDTH / 2.0));
+        let filler = div().h_full().flex_1().min_w_0();
         let skip =
             grabbed.is_some_and(|(from_side, from)| from_side == side && gap_is_noop(from, end));
         if !skip {

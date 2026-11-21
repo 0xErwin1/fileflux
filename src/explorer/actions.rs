@@ -31,7 +31,7 @@ use super::arrange::ArrangeCommand;
 use super::arrange_menu;
 use super::devices::{device_menu_rows, job_paths, with_device_rows};
 use super::folder_memory;
-use super::menu_tree::{Shown, shown_for};
+use super::menu_tree::{Shown, opens_in_new_tab, shown_for};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, AppLaunch, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job,
@@ -1336,7 +1336,7 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_tab = window.modifiers().shift;
+        let new_tab = opens_in_new_tab(self.right_press, window.modifiers().shift);
         self.menu = Some(MenuState::new(on, title, position, rows).in_new_tab(new_tab));
         cx.defer_in(window, |this, window, cx| {
             if this.menu.is_some() {

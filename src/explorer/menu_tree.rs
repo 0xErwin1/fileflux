@@ -211,6 +211,14 @@ fn row_in<'a>(rows: &'a [MenuRow], titled: bool, path: &[usize]) -> Option<&'a M
     level.get(skip(*last, parents.len())?)
 }
 
+/// Whether a menu that opens now is in new tab mode: only a menu opened by
+/// a right mouse press with Shift held. A menu opened from the keyboard (a
+/// Shift chord) or by a left click on a button (the toolbar, a device) never
+/// is, whatever Shift says.
+pub(crate) const fn opens_in_new_tab(right_press: bool, shift: bool) -> bool {
+    right_press && shift
+}
+
 impl MenuState {
     /// A menu open on its first selectable row.
     pub(crate) fn new(
@@ -234,12 +242,11 @@ impl MenuState {
         menu
     }
 
-    /// Puts the menu in new tab mode when `on` (Shift was held as it
-    /// opened): its navigating commands open background tabs, and the title
-    /// says so.
-    pub(crate) fn in_new_tab(mut self, on: bool) -> Self {
-        self.new_tab = on;
-        if on && let Some(title) = self.title.as_mut() {
+    /// Puts the menu in new tab mode when `shift` (see [`opens_in_new_tab`]):
+    /// its navigating commands open background tabs, and the title says so.
+    pub(crate) fn in_new_tab(mut self, shift: bool) -> Self {
+        self.new_tab = shift;
+        if shift && let Some(title) = self.title.as_mut() {
             title.push_str(NEW_TAB_SUFFIX);
         }
         let root = self.nodes();
@@ -459,6 +466,17 @@ mod tests {
             .filter(|node| node.item.checked == Some(true))
             .map(|node| node.item.label.to_string())
             .collect()
+    }
+
+    #[test]
+    fn only_a_right_press_with_shift_opens_a_menu_in_new_tab_mode() {
+        assert!(opens_in_new_tab(true, true));
+        assert!(!opens_in_new_tab(true, false), "a plain right click");
+        assert!(
+            !opens_in_new_tab(false, true),
+            "a Shift chord or a left click on a button"
+        );
+        assert!(!opens_in_new_tab(false, false));
     }
 
     #[test]

@@ -19,6 +19,11 @@ pub(crate) enum Placement {
     /// Opens to the right of the active tab, which stays active
     /// (middle-click, "Open in new tab").
     Background,
+    /// Opens in the gap `gap` (0 is before the first tab, larger than the
+    /// tab count means the end) and becomes the active tab (a folder dropped
+    /// on the tab strip). No tab that was already there moves relative to
+    /// the others.
+    At(usize),
 }
 
 /// An ordered list of tabs with one active tab. It is never empty — the
@@ -99,6 +104,12 @@ impl<T> TabList<T> {
                 self.after.insert(at, item);
                 self.background_run += 1;
                 self.before.len() + 1 + at
+            }
+            Placement::At(gap) => {
+                let gap = gap.min(self.len());
+                let at = self.open(item, Placement::Foreground);
+                self.move_tab(at, gap);
+                gap
             }
         }
     }
@@ -213,9 +224,7 @@ impl<T> TabList<T> {
     /// Inserts `item` at the gap `gap` (0 is before the first tab, `len`
     /// after the last; larger values mean the end) and makes it active.
     pub(crate) fn insert_active(&mut self, gap: usize, item: T) {
-        let gap = gap.min(self.len());
-        let at = self.open(item, Placement::Foreground);
-        self.move_tab(at, gap);
+        self.open(item, Placement::At(gap));
     }
 
     /// Alt+1..9: activates tab number `number` (counting from one); `false`

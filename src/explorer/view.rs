@@ -877,6 +877,10 @@ pub(crate) struct Explorer {
     pub(crate) menu: Option<MenuState>,
     /// The focus of the open context menu.
     pub(crate) menu_focus: FocusHandle,
+    /// A right mouse press is being dispatched: a menu opened now was opened
+    /// by it (see [`super::menu_tree::opens_in_new_tab`]). Set ahead of the
+    /// press's handlers and cleared right after them.
+    pub(crate) right_press: bool,
     /// The open confirmation dialog and those waiting behind it: modal over
     /// the whole window, whichever tab is active.
     pub(crate) dialogs: DialogQueue,
@@ -1140,6 +1144,7 @@ impl Explorer {
             select_pattern: String::new(),
             menu: None,
             menu_focus: cx.focus_handle(),
+            right_press: false,
             dialogs: DialogQueue::default(),
             dialog_focus: cx.focus_handle(),
             dialog_cancel_focus: cx.focus_handle(),
@@ -3244,7 +3249,7 @@ impl Explorer {
         let scan = tab.state.begin(Transition::Visit(location));
         self.tabs.open(tab, placement);
         self.start_scan_in(id, scan, window, cx);
-        if placement == Placement::Foreground {
+        if placement != Placement::Background {
             self.after_tab_switch(false, window, cx);
         }
         cx.notify();
@@ -3475,6 +3480,22 @@ impl Explorer {
             self.say(Severity::Info, panes::split_refusal(width), window, cx);
             return;
         }
+        self.when_folder_enterable(folder, window, cx, |this, location, window, cx| {
+            this.open_in_split_checked(location, window, cx);
+        });
+    }
+
+    /// Runs `then` with `folder` as a location once it may be shown: a
+    /// folder of the Trash is refused with its toast and one on a device that
+    /// is being ejected with that notice (see [`Self::when_not_ejecting`]).
+    /// The one guard of every command that shows a folder in a new place.
+    fn when_folder_enterable(
+        &mut self,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Location, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         let location = Location::Directory(folder.clone());
         if self.refuses_entering(&location) {
             self.push_toast(
@@ -3487,7 +3508,7 @@ impl Explorer {
             return;
         }
         self.when_not_ejecting(vec![folder], window, cx, move |this, window, cx| {
-            this.open_in_split_checked(location, window, cx);
+            then(this, location, window, cx);
         });
     }
 
@@ -3497,24 +3518,19 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.tabs.is_split() {
-            if self.tabs.has_right() {
-                // The parked pane comes back; the folder opens in it below.
-                self.tabs.split(None);
-            } else {
-                let state = self.tab().state.for_new_tab(location.clone());
-                let id = self.next_tab_id;
-                self.next_tab_id += 1;
-                let mut tab = Tab::new(id, state, window, cx);
-                let scan = tab.state.begin(Transition::Visit(location));
-                self.tabs.split(Some(tab));
-                self.start_scan_in(id, scan, window, cx);
-                cx.notify();
-                return;
-            }
-        }
-        let real = self.tabs.focus();
-        self.tabs.focus_side(real.other());
+        let Some(real) = self.tabs.focus_other_pane() else {
+            let state = self.tab().state.for_new_tab(location.clone());
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            let mut tab = Tab::new(id, state, window, cx);
+            let scan = tab.state.begin(Transition::Visit(location));
+            self.tabs.split(Some(tab));
+            self.start_scan_in(id, scan, window, cx);
+            cx.notify();
+            return;
+        };
+        // The other pane has the focus while the tab opens in it; a parked
+        // pane came back with it (see `Panes::focus_other_pane`).
         self.open_tab_checked(location, Placement::Foreground, window, cx);
         self.tabs.focus_side(real);
         self.after_tab_switch(false, window, cx);
@@ -3531,27 +3547,10 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let location = Location::Directory(folder.clone());
-        if self.refuses_entering(&location) {
-            self.push_toast(
-                crate::explorer::ops::trashed_folder_notice(),
-                &[],
-                None,
-                window,
-                cx,
-            );
-            return;
-        }
-        self.when_not_ejecting(vec![folder], window, cx, move |this, window, cx| {
-            if !this.tabs.focus_side(side) {
-                return;
+        self.when_folder_enterable(folder, window, cx, move |this, location, window, cx| {
+            if this.tabs.focus_side(side) {
+                this.open_tab_checked(location, Placement::At(gap), window, cx);
             }
-            let before = this.tabs.focused().len();
-            this.open_tab_checked(location, Placement::Foreground, window, cx);
-            let list = this.tabs.focused_mut();
-            let at = list.active_index();
-            list.move_tab(at, gap.min(before));
-            cx.notify();
         });
     }
 
@@ -3891,6 +3890,14 @@ impl Render for Explorer {
             .bg(colors.desk)
             .text_color(colors.foreground)
             .child(self.render_header())
+            // Ahead of every handler of a right press, so the menu it opens
+            // knows it was opened by the mouse (Shift: new tab mode).
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Right {
+                    this.right_press = true;
+                    cx.defer_in(window, |this, _window, _cx| this.right_press = false);
+                }
+            }))
             .on_action(cx.listener(|this, _: &FocusPath, window, cx| {
                 this.focus_path(window, cx);
             }))
@@ -4307,7 +4314,15 @@ impl Explorer {
             .min_w_0()
             .h_full()
             .children(tabstrip::render(self, cx))
-            .child(toolbar::render(self, cx))
+            // A one-tab pane draws its drag-time tab strip over the toolbar,
+            // covering it exactly, so nothing below moves during a drag.
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(toolbar::render(self, cx))
+                    .children(tabstrip::overlay(self, cx)),
+            )
             .child(
                 if matches!(self.tab().state.current(), Location::Usage { .. }) {
                     // The usage view carries its own header (title, trail, Stop);

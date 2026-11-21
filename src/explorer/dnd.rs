@@ -25,6 +25,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 
+use super::entries::ENTRIES_PADDING;
 use super::icon;
 use super::ops::paste::ClipMode;
 use super::panes::Side;
@@ -551,28 +552,38 @@ fn external_payload(
     Some(ExternalDragPayload::Files(FileDragPaths::new(files)))
 }
 
-/// The width of the "Open in split" strip.
-const SPLIT_STRIP_WIDTH: f32 = 132.0;
+/// The width of the "Open in split" rail while nothing hovers it: the
+/// padding the grid keeps free at the right of the files area, so the rail
+/// never covers a tile (the list's rows reach the edge; the rail hides only
+/// their last pixels).
+pub(crate) const SPLIT_RAIL_WIDTH: f32 = ENTRIES_PADDING;
+/// The width the rail widens to, with its label, while the drag hovers it.
+const SPLIT_RAIL_OPEN_WIDTH: f32 = 132.0;
 
-/// The "Open in split" strip: a column along the right edge of the files
-/// area that takes a dragged folder (see [`DropZone::SplitStrip`]). It sits
-/// over whatever is there and hides it from the pointer, so a folder dropped
-/// on it is never also dropped on an entry underneath. The caller draws it
-/// only while [`folder_drag_live`].
+/// The "Open in split" rail: a narrow column at the very right edge of the
+/// files area that takes a dragged folder (see [`DropZone::SplitStrip`]). At
+/// rest it sits in the padding beside the tiles, so every entry stays a
+/// target for the move and copy drops; it widens and shows its label only
+/// while the drag hovers it. It hides what is under it from the pointer, so a
+/// folder dropped on it is never also dropped on an entry. The caller draws
+/// it only while [`folder_drag_live`].
 pub(crate) fn split_strip(cx: &mut Context<Explorer>) -> gpui::Stateful<gpui::Div> {
     let colors = bolt::colors(cx);
     let tint = ChromeColors::tint(cx.theme());
     let wash = cx.theme().list_active;
+    const GROUP: &str = "explorer-split-rail-group";
     div()
         .id("explorer-split-strip")
+        .group(GROUP)
         .role(gpui::accesskit::Role::Group)
         .aria_label("Open in split")
         .absolute()
         .top_0()
         .bottom_0()
         .right_0()
-        .w(px(SPLIT_STRIP_WIDTH))
-        .occlude()
+        .w(px(SPLIT_RAIL_WIDTH))
+        .overflow_hidden()
+        .block_mouse_except_scroll()
         .flex()
         .items_center()
         .justify_center()
@@ -584,12 +595,24 @@ pub(crate) fn split_strip(cx: &mut Context<Explorer>) -> gpui::Stateful<gpui::Di
         .text_color(colors.strong)
         .child(
             Icon::new(icon(gpui_kit_assets::IconName::PanelRight))
-                .size(px(16.0))
+                .size(px(12.0))
                 .color(tint),
         )
-        .child("Open in split")
+        .child(
+            div()
+                .id("explorer-split-label")
+                .hidden()
+                .whitespace_nowrap()
+                .group_drag_over::<DraggedEntries>(GROUP, |style| style.flex())
+                .child("Open in split"),
+        )
         .can_drop(|value, _, _| dragged_folder(value).is_some())
-        .drag_over::<DraggedEntries>(move |style, _, _, _| style.bg(wash).border_color(tint))
+        .drag_over::<DraggedEntries>(move |style, _, _, _| {
+            style
+                .w(px(SPLIT_RAIL_OPEN_WIDTH))
+                .bg(wash)
+                .border_color(tint)
+        })
         .on_drop::<DraggedEntries>(cx.listener(|this, dragged: &DraggedEntries, window, cx| {
             this.drop_dragged(dragged, &DropZone::SplitStrip, window, cx);
         }))
@@ -713,10 +736,13 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `resolve_drop` reads "the dragged path is a folder" only for the
+        // open zones; a target drop plans from the paths alone.
+        let folder_is_irrelevant_for_a_target = false;
         self.drop_in_zone(
             origin,
             sources,
-            false,
+            folder_is_irrelevant_for_a_target,
             &DropZone::Target(target.clone()),
             window,
             cx,
@@ -1318,6 +1344,40 @@ mod tests {
             ),
             DropAction::Plan(DropPlan::Trash)
         );
+    }
+
+    #[test]
+    fn the_split_rail_never_covers_a_tile_of_the_rightmost_column() {
+        use crate::explorer::zoom::{GridZoomExt as _, TILE_GAP, grid_columns};
+        use fileflux::core::zoom::GridZoom;
+        // The grid lays its tiles out inside the area's padding, so the
+        // rail (the width of that padding) at the area's right edge never
+        // overlaps the rightmost column, whatever the width and zoom: a
+        // point over that tile is not in the split zone and resolves to the
+        // folder target.
+        for zoom in GridZoom::ALL {
+            let tile = zoom.metrics().tile_width;
+            for width in 200..=2400 {
+                let area = width as f32;
+                let inner = area - 2.0 * ENTRIES_PADDING;
+                let columns = grid_columns(inner, zoom);
+                let last_right =
+                    ENTRIES_PADDING + columns as f32 * tile + (columns - 1) as f32 * TILE_GAP;
+                if inner < tile {
+                    continue; // one column forced into a too narrow area
+                }
+                assert!(
+                    last_right <= area - SPLIT_RAIL_WIDTH,
+                    "{zoom:?} at {area}: the rightmost tile ends at {last_right}"
+                );
+            }
+        }
+        // And what a drop on that tile means is the folder target's plan.
+        let tile = DropZone::Target(folder("/h/docs"));
+        assert!(matches!(
+            resolve(DragOrigin::Internal, &["/h/a"], true, &tile, false, false),
+            DropAction::Plan(DropPlan::Paste { .. })
+        ));
     }
 
     #[test]

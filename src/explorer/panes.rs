@@ -244,6 +244,20 @@ impl<T> Panes<T> {
         shown
     }
 
+    /// The first step of showing something in the pane that does not have
+    /// the focus: a parked right pane comes back (see [`Self::split`]) and the
+    /// focus moves to the other pane. Returns the pane that had the focus,
+    /// which the caller gives it back to once it has opened the tab. `None` —
+    /// nothing changes — when there is no other pane to show (the caller
+    /// splits with a new tab instead).
+    pub(crate) fn focus_other_pane(&mut self) -> Option<Side> {
+        if !self.split && !self.split(None) {
+            return None;
+        }
+        let real = self.focus;
+        self.focus_side(real.other()).then_some(real)
+    }
+
     /// F6: moves the focus to the other pane. `false` while not split.
     pub(crate) fn switch_focus(&mut self) -> bool {
         self.split && self.focus_side(self.focus.other())
@@ -585,6 +599,86 @@ mod tests {
 
     fn all(panes: &Panes<&'static str>) -> Vec<&'static str> {
         panes.iter().copied().collect()
+    }
+
+    #[test]
+    fn showing_in_the_other_pane_of_a_single_pane_view_needs_a_new_pane() {
+        let mut panes = Panes::new("a");
+        assert_eq!(panes.focus_other_pane(), None);
+        assert!(!panes.is_split() && !panes.has_right(), "nothing changed");
+        assert_eq!(panes.focus(), Side::Left);
+    }
+
+    #[test]
+    fn showing_in_the_other_pane_restores_a_parked_pane_and_lands_there() {
+        let mut panes = split_panes(); // l1 l2 | r1
+        panes.unsplit(); // focus is left: the right pane (r1) is parked
+        assert!(panes.has_right() && !panes.is_split());
+        let real = panes.focus_other_pane();
+        assert_eq!(real, Some(Side::Left));
+        assert!(panes.is_split(), "the parked pane came back");
+        assert_eq!(
+            panes.focus(),
+            Side::Right,
+            "the folder opens in the other pane"
+        );
+        panes.open("folder", Placement::Foreground);
+        panes.focus_side(Side::Left);
+        assert_eq!(panes.focused().len(), 2, "the focused pane got nothing");
+        assert_eq!(all(&panes), ["l1", "l2", "r1", "folder"]);
+    }
+
+    #[test]
+    fn showing_in_the_other_pane_of_a_split_view_opens_a_tab_there() {
+        for focused in [Side::Left, Side::Right] {
+            let mut panes = split_panes(); // l1 l2 | r1
+            panes.focus_side(focused);
+            let before = all(&panes);
+            assert_eq!(panes.focus_other_pane(), Some(focused));
+            assert_eq!(panes.focus(), focused.other());
+            panes.open("folder", Placement::Foreground);
+            panes.focus_side(focused);
+            assert_eq!(panes.focus(), focused, "the focus is restored");
+            let after = all(&panes);
+            let expected = match focused {
+                Side::Left => ["l1", "l2", "r1", "folder"],
+                Side::Right => ["l1", "l2", "folder", "r1"],
+            };
+            assert_eq!(after.len(), before.len() + 1);
+            assert_eq!(after, expected, "focus {focused:?}");
+        }
+    }
+
+    #[test]
+    fn a_folder_dropped_in_a_gap_becomes_the_tab_at_that_position() {
+        for side in [Side::Left, Side::Right] {
+            for gap in 0..=3 {
+                let mut panes = split_panes();
+                panes.focus_side(Side::Left);
+                panes.open("l3", Placement::Background);
+                panes.focus_side(Side::Right);
+                panes.open("r2", Placement::Background);
+                panes.focus_side(side);
+                let original: Vec<_> = panes.focused().iter().copied().collect();
+                let other_pane: Vec<_> = panes
+                    .other()
+                    .map(|l| l.iter().copied().collect())
+                    .unwrap_or_default();
+                panes.open("folder", Placement::At(gap));
+                let now: Vec<_> = panes.focused().iter().copied().collect();
+                let mut expected = original.clone();
+                expected.insert(gap.min(original.len()), "folder");
+                assert_eq!(now, expected, "{side:?} gap {gap}");
+                assert_eq!(*panes.active(), "folder");
+                let others: Vec<_> = now.iter().copied().filter(|t| *t != "folder").collect();
+                assert_eq!(others, original, "no pre-existing tab moved");
+                let untouched: Vec<_> = panes
+                    .other()
+                    .map(|l| l.iter().copied().collect())
+                    .unwrap_or_default();
+                assert_eq!(untouched, other_pane, "the other pane is untouched");
+            }
+        }
     }
 
     #[test]
