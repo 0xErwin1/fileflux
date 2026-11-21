@@ -318,12 +318,13 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         self.progress.finish(id);
-        if report.permissions_changed {
+        let effects = job_effects(&report);
+        if effects.re_read_permissions {
             self.forget_permission_editors();
         }
         self.finish_paste(id, &report, window, cx);
         let undo_id = report.undo.take().map(|action| self.undo.push(action));
-        if let Some(notice) = report.notice.take() {
+        if let Some(notice) = report.notice.take().filter(|_| effects.toast) {
             let toast = self.push_toast(notice, &report.details, undo_id, window, cx);
             if let (Some(undo_id), Some(toast)) = (undo_id, toast) {
                 self.undo.attach_toast(undo_id, toast);
@@ -331,7 +332,7 @@ impl Explorer {
         }
         // A cancelled job already said what it did not delete; otherwise
         // the follow-up dialog queues behind any dialog that is open now.
-        if !report.needs_permanent.is_empty() && !report.cancelled {
+        if effects.offer_permanent_delete {
             let dialog = no_trash_dialog(std::mem::take(&mut report.needs_permanent));
             self.offer_dialog(dialog, window, cx);
         }
@@ -2455,5 +2456,81 @@ impl Explorer {
             }
         })
         .detach();
+    }
+}
+
+/// What finishing a job shows and refreshes, decided from its report
+/// alone so it is testable without a window: a cancelled job still toasts
+/// what it did (a dismissed authorization says so), and a permission or
+/// owner change, cancelled or not, re-reads the details panel.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct JobEffects {
+    /// Read the details panel's permissions again.
+    pub(crate) re_read_permissions: bool,
+    /// Show the report's notice as a toast.
+    pub(crate) toast: bool,
+    /// Ask before deleting for good what could not go to the Trash.
+    pub(crate) offer_permanent_delete: bool,
+}
+
+pub(crate) fn job_effects(report: &Report) -> JobEffects {
+    JobEffects {
+        re_read_permissions: report.permissions_changed,
+        toast: report.notice.is_some(),
+        offer_permanent_delete: !report.needs_permanent.is_empty() && !report.cancelled,
+    }
+}
+
+#[cfg(test)]
+mod job_effects_tests {
+    use super::{JobEffects, job_effects};
+    use crate::explorer::ops::{Notice, Report, Severity};
+    use std::path::PathBuf;
+
+    fn cancelled_owner_change() -> Report {
+        // What permissions::owner_report gives for a dismissed polkit
+        // dialog (pinned by its own test): a warning with the reason, a
+        // re-read of the panel, cancelled, no undo.
+        Report {
+            notice: Some(Notice {
+                severity: Severity::Warning,
+                text: "Authentication was cancelled; the owner was not changed".to_owned(),
+            }),
+            cancelled: true,
+            permissions_changed: true,
+            ..Report::default()
+        }
+    }
+
+    #[test]
+    fn a_cancelled_owner_change_is_toasted_and_reads_the_panel_again() {
+        assert_eq!(
+            job_effects(&cancelled_owner_change()),
+            JobEffects {
+                re_read_permissions: true,
+                toast: true,
+                offer_permanent_delete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cancelled_trash_says_what_it_did_and_asks_nothing_more() {
+        let report = Report {
+            needs_permanent: vec![PathBuf::from("/x")],
+            ..cancelled_owner_change()
+        };
+        assert!(!job_effects(&report).offer_permanent_delete);
+        let finished = Report {
+            cancelled: false,
+            ..report
+        };
+        assert!(job_effects(&finished).offer_permanent_delete);
+    }
+
+    #[test]
+    fn a_quiet_job_shows_no_toast() {
+        let effects = job_effects(&Report::default());
+        assert!(!effects.toast && !effects.re_read_permissions);
     }
 }
