@@ -5,7 +5,7 @@ Mount, unmount and eject drives from the sidebar, and browse phones and network 
 ## Quick path
 
 1. Plug in a USB drive; it appears under **Devices** (a few seconds at most).
-2. Click it to mount and open it, or right-click for **Mount**, **Unmount** or **Eject**.
+2. Click it to mount and open it, or right-click for **Mount**, **Unlock and mount** (encrypted), **Unmount** or **Eject**.
 3. Wait for the toast "<name> can be removed safely" before unplugging.
 
 ## What is listed
@@ -15,7 +15,7 @@ The **Devices** section shows mounted volumes (one entry per device, with a usag
 Left out: swap, RAID/LVM members, loop, zram and optical devices, empty card readers, and partitions that hold a system mount (`/`, `/boot`, `/efi`, `/usr`, `/var`, `/nix`, `/etc`, `/home`, `/opt`, `/swap`, `/root`) or active swap, together with the encrypted container above them.
 
 - **Dual boot:** the other partitions of the system disk (a Windows or data partition) are listed and can be mounted and unmounted, but the system disk is never ejected.
-- An encrypted (LUKS) container nobody unlocked shows as **Locked**; unlocking is not supported yet.
+- An encrypted (LUKS) container nobody unlocked shows as **Locked**; click it, or right-click → **Unlock and mount** (see [Encrypted drives](#encrypted-drives)). Once unlocked, the volume inside it is listed like any other, and the container itself is hidden.
 - A device without a label is called "<size> Volume".
 
 ## Actions
@@ -31,10 +31,22 @@ Everything goes through `udisksctl`: no root, no shell, always with `--no-user-i
 | Action | Allowed for |
 |---|---|
 | Mount | An unmounted, unlocked filesystem |
+| Unlock and mount | A locked LUKS container (needs `gio`) |
 | Unmount | A mount under `/run/media` or `/media`, or any mount on a removable or hot-plug disk; never a system or `fstab` mount elsewhere |
 | Eject | Removable or hot-plug disks only |
 
+Unmount and Eject on an unlocked volume lock its container afterwards.
+
 A busy or unauthorized device shows a toast with the reason `udisksctl` gave ("Could not unmount KINGSTON: target is busy").
+
+## Encrypted drives
+
+**Unlock and mount** runs `gio mount -d <device>` (the device node from the current `lsblk` listing, always an absolute `/dev/` path of a locked `crypto_LUKS` container, never a typed string) and shows gio's questions in the same dialog as [Connect to Server](user-guide.md#network). The passphrase field is masked; the passphrase goes once to gio's standard input and is zeroed afterwards. It is never kept (no keyring, no cache), never put in a command line, environment, log or notice, and it is removed from gio's error message. **Cancel**, or the **Unlocking…** row of the Network section, kills gio.
+
+- On success the devices are listed again and the unlocked volume's mount point opens.
+- A wrong passphrase shows gio's message in a notice (the passphrase redacted); the volume stays **Locked** and you can try again.
+- **Unmount** and **Eject** also lock the container: after the unmount (or after the last unmount of an ejected disk) `udisksctl lock --block-device=<container> --no-user-interaction` runs. A container that is already locked counts as done. If the lock fails the toast says so, although the unmount already happened.
+- Unlocking needs `gio` (glib, with gvfs's udisks2 monitor); without it the action is disabled and the Devices section says so. TCRYPT (VeraCrypt) volumes are not detected by `lsblk`, so they are not offered. An unlocked volume that is not mounted can be mounted but has no separate **Lock** action: eject the disk instead.
 
 ## Safety rules
 
@@ -51,6 +63,7 @@ A busy or unauthorized device shows a toast with the reason `udisksctl` gave ("C
 
 - Without `udisksctl`, the mount and eject actions and the unmounted rows are hidden, with a one-line notice under the section label.
 - Without `lsblk`, only mounted volumes show, with a notice.
+- Without `gio`, **Unlock and mount** is disabled ("Install gio (glib) to unlock encrypted drives").
 
 ## Phones and gvfs mounts
 

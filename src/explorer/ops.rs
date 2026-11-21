@@ -1357,6 +1357,9 @@ pub(crate) enum MenuCommand {
     RemoveFavorite,
     /// Devices: mount the unmounted filesystem.
     Mount,
+    /// Devices: unlock the encrypted volume (asks for its passphrase) and
+    /// mount it.
+    Unlock,
     /// Archives: write a new archive of the selection.
     Compress,
     /// Archives: extract the selected archive into a new folder beside it.
@@ -1836,11 +1839,13 @@ pub(crate) enum DialogKind {
     SelectPattern,
     /// "Connect to Server…": a server address.
     Connect,
-    /// A prompt of `gio mount` for the server called `host`: the question
-    /// `label` asks, whether the answer is a masked secret, and whether it
-    /// is a question with choices (answered by its own buttons).
+    /// A prompt of `gio mount` for the server (or, with `unlock`, the
+    /// encrypted volume) called `host`: the question `label` asks, whether
+    /// the answer is a masked secret, and whether it is a question with
+    /// choices (answered by its own buttons).
     MountPrompt {
         host: String,
+        unlock: bool,
         label: String,
         secret: bool,
         question: bool,
@@ -2425,18 +2430,27 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         ),
         DialogKind::MountPrompt {
             host,
+            unlock,
             label,
             question,
             ..
-        } => (
-            format!("Connect to {host}"),
-            if *question {
-                "Choose how to continue. Cancel stops connecting.".to_owned()
+        } => {
+            let (title, verb) = if *unlock {
+                (format!("Unlock {host}"), "unlock it")
             } else {
-                format!("{label} is needed to connect. Cancel stops connecting.")
-            },
-            "Continue",
-        ),
+                (format!("Connect to {host}"), "connect")
+            };
+            let stop = if *unlock { "unlocking" } else { "connecting" };
+            (
+                title,
+                if *question {
+                    format!("Choose how to continue. Cancel stops {stop}.")
+                } else {
+                    format!("{label} is needed to {verb}. Cancel stops {stop}.")
+                },
+                "Continue",
+            )
+        }
         DialogKind::DeviceBusy {
             label,
             count,

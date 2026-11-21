@@ -425,7 +425,7 @@ The sidebar's Places section has a **Recent** row. It lists up to 200 files that
 
 ## Sidebar
 
-Right-click a row of Places, Favorites or Devices (a Network bookmark's menu is described in [Network](#network)): **Open**, **Open in new tab**, **Open in terminal**, **Add to favorites** / **Remove from favorites**, **Copy path** and **Properties** (opens the folder with the details panel shown). The **Home Trash** row offers Open, Open in new tab and **Empty Trash…**, which asks first. Devices have extra actions: see [Devices](devices.md).
+Right-click a row of Places, Favorites or Devices (a Network bookmark's menu is described in [Network](#network)): **Open**, **Open in new tab**, **Open in terminal**, **Add to favorites** / **Remove from favorites**, **Copy path** and **Properties** (opens the folder with the details panel shown). The **Home Trash** row offers Open, Open in new tab and **Empty Trash…**, which asks first. Devices have extra actions: see [Devices](devices.md). A **Locked** (encrypted LUKS) device is unlocked by a click on its row or by **Unlock and mount** in its menu: `gio` asks for the passphrase in a masked dialog (never saved or logged, no keyring), then the unlocked volume opens. Unmounting or ejecting it locks it again.
 
 ## Current scope
 

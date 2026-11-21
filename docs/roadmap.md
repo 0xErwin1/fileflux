@@ -23,7 +23,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Encrypted drives | Unlock a LUKS container | Shown as Locked |
 | Desktop integration | The `org.freedesktop.FileManager1` D-Bus interface ("Show in folder" from other applications) and a single instance | Nothing |
 
 ## Priority 3: refinements

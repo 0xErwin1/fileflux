@@ -274,14 +274,11 @@ fn network_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
             this.close_sidebar_overlay(OverlayEvent::RowChosen);
         })),
     );
-    if let Some(label) = this.network.connecting() {
+    if let Some(status) = this.network.status() {
         section = section.child(
             network_row(
                 "network-connecting".to_owned(),
-                (
-                    &format!("Connecting to {label}\u{2026}"),
-                    "Click to cancel".to_owned(),
-                ),
+                (&status, "Click to cancel".to_owned()),
                 gpui_kit_assets::IconName::X,
                 true,
                 this,
@@ -508,7 +505,13 @@ fn volume_row(
         volume.label.clone()
     };
     let name_for_menu = name.clone();
-    let actions = device.map(|device| actions_for(device, this.devices.udisksctl.is_some()));
+    let actions = device.map(|device| {
+        actions_for(
+            device,
+            this.devices.udisksctl.is_some(),
+            this.devices.gio.is_some(),
+        )
+    });
     let mut top = div()
         .flex()
         .items_center()

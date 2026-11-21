@@ -76,7 +76,7 @@ pub struct BlockNode {
 pub enum DeviceState {
     Unmounted,
     Mounted(PathBuf),
-    /// An encrypted container nobody unlocked: shown, never acted on.
+    /// An encrypted container nobody unlocked: [`Device::can_unlock`].
     Locked,
 }
 
@@ -97,6 +97,9 @@ pub struct Device {
     /// The disk is removable or hot-pluggable, and holds nothing of the
     /// running system: it can be powered off.
     pub ejectable: bool,
+    /// The LUKS container this device was unlocked from (`/dev/sdb1` for
+    /// `/dev/mapper/luks-…`): locked again after the device is unmounted.
+    pub container: Option<PathBuf>,
 }
 
 impl Device {
@@ -111,6 +114,11 @@ impl Device {
     /// Unmounted and unlocked: a click mounts it.
     pub fn can_mount(&self) -> bool {
         self.state == DeviceState::Unmounted
+    }
+
+    /// A locked LUKS container: `gio mount -d` unlocks and mounts it.
+    pub fn can_unlock(&self) -> bool {
+        self.state == DeviceState::Locked && self.fstype.as_deref() == Some(LUKS)
     }
 
     /// Mounted by the user's session (removable media), never a system mount.
@@ -141,6 +149,9 @@ pub struct UnmountStep {
 pub enum UnmountVia {
     /// `udisksctl unmount --block-device=<device>`.
     Udisks,
+    /// `udisksctl lock --block-device=<container>`: locks the LUKS container
+    /// again once nothing of it is mounted. The step has no mounts.
+    UdisksLock,
     /// `gio mount -u <path>`: a gvfs mount (phone, share), whose `device`
     /// is the mount path itself.
     Gio,
@@ -177,6 +188,10 @@ impl DevicePlan {
             .collect()
     }
 }
+
+/// What `lsblk` reports as the filesystem type of a LUKS container. (`TCRYPT`
+/// volumes carry no signature `lsblk` can name, so they never show as locked.)
+const LUKS: &str = "crypto_LUKS";
 
 fn under_media_root(path: &Path) -> bool {
     path.starts_with("/run/media") || path.starts_with("/media")
@@ -327,7 +342,12 @@ fn size_label(size: u64) -> String {
     }
 }
 
-fn collect_devices(node: &BlockNode, disk: &BlockNode, out: &mut Vec<Device>) {
+fn collect_devices(
+    node: &BlockNode,
+    disk: &BlockNode,
+    container: Option<&Path>,
+    out: &mut Vec<Device>,
+) {
     // A partition that holds the running system, and the container (LUKS)
     // above it, are not offered; its siblings still are. The disk itself is
     // only a parent here: it is skipped when it is a system filesystem.
@@ -338,8 +358,9 @@ fn collect_devices(node: &BlockNode, disk: &BlockNode, out: &mut Vec<Device>) {
     if !node.children.is_empty() {
         // A container with something below it (partitions, an unlocked
         // volume) is not itself a filesystem.
+        let below = (node.fstype.as_deref() == Some(LUKS)).then_some(node.path.as_path());
         for child in &node.children {
-            collect_devices(child, disk, out);
+            collect_devices(child, disk, below, out);
         }
         return;
     }
@@ -352,7 +373,7 @@ fn collect_devices(node: &BlockNode, disk: &BlockNode, out: &mut Vec<Device>) {
     if is_not_a_filesystem(fstype) {
         return;
     }
-    let state = if fstype == "crypto_LUKS" {
+    let state = if fstype == LUKS {
         DeviceState::Locked
     } else {
         node.mountpoints
@@ -375,6 +396,7 @@ fn collect_devices(node: &BlockNode, disk: &BlockNode, out: &mut Vec<Device>) {
         mounts: node.mountpoints.clone(),
         ejectable: !holds_system(disk)
             && (is_ejectable_disk(disk) || node.removable || node.hotplug),
+        container: container.map(Path::to_path_buf),
     });
 }
 
@@ -389,7 +411,7 @@ pub fn devices(nodes: &[BlockNode]) -> Vec<Device> {
         if is_virtual(disk) {
             continue;
         }
-        collect_devices(disk, disk, &mut out);
+        collect_devices(disk, disk, None, &mut out);
     }
     out
 }
@@ -404,19 +426,46 @@ pub fn device_for_mount<'a>(devices: &'a [Device], mount: &Path) -> Option<&'a D
 /// Unmounting just `device`; `None` when that is not the session's to do.
 pub fn unmount_plan(device: &Device) -> Option<DevicePlan> {
     let mount = device.mount_point().filter(|_| device.can_unmount())?;
+    let mut unmount = vec![UnmountStep {
+        device: device.path.clone(),
+        mounts: if device.mounts.is_empty() {
+            vec![mount.to_path_buf()]
+        } else {
+            device.mounts.clone()
+        },
+        via: UnmountVia::Udisks,
+    }];
+    // An unlocked volume goes back to locked: unmounting alone would leave
+    // the container open.
+    if let Some(container) = &device.container {
+        unmount.push(lock_step(container));
+    }
     Some(DevicePlan {
         label: device.label.clone(),
-        unmount: vec![UnmountStep {
-            device: device.path.clone(),
-            mounts: if device.mounts.is_empty() {
-                vec![mount.to_path_buf()]
-            } else {
-                device.mounts.clone()
-            },
-            via: UnmountVia::Udisks,
-        }],
+        unmount,
         power_off: None,
     })
+}
+
+fn lock_step(container: &Path) -> UnmountStep {
+    UnmountStep {
+        device: container.to_path_buf(),
+        mounts: Vec::new(),
+        via: UnmountVia::UdisksLock,
+    }
+}
+
+/// The unlocked LUKS containers at or below `node`: they have a mapped
+/// child.
+fn unlocked_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
+    if node.fstype.as_deref() == Some(LUKS)
+        && node.children.iter().any(|child| child.kind == "crypt")
+    {
+        out.push(lock_step(&node.path));
+    }
+    for child in &node.children {
+        unlocked_below(child, out);
+    }
 }
 
 fn mounted_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
@@ -442,7 +491,7 @@ pub fn eject_plan(nodes: &[BlockNode], disk: &Path, label: &str) -> Option<Devic
         return None;
     }
     let mut filesystems = Vec::new();
-    collect_devices(node, node, &mut filesystems);
+    collect_devices(node, node, None, &mut filesystems);
     if filesystems.is_empty() {
         return None;
     }
@@ -450,6 +499,9 @@ pub fn eject_plan(nodes: &[BlockNode], disk: &Path, label: &str) -> Option<Devic
     mounted_below(node, &mut unmount);
     // Stable: equally deep mounts keep their tree order.
     unmount.sort_by_key(|step| std::cmp::Reverse(step.depth()));
+    // Everything is unmounted by then: the containers lock, then the disk
+    // powers off.
+    unlocked_below(node, &mut unmount);
     Some(DevicePlan {
         label: label.to_owned(),
         unmount,
@@ -528,6 +580,145 @@ pub fn fallback_target(
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+// --- unlocking ----------------------------------------------------------------
+
+/// Why a device is not offered to `gio mount -d`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlockError {
+    /// Not an absolute path below `/dev` without `..`.
+    NotADevicePath,
+    /// The name starts with `-`: `gio` could read it as an option.
+    LeadingDash,
+    /// Not a locked LUKS container of the current listing.
+    NotLocked,
+}
+
+impl fmt::Display for UnlockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UnlockError::NotADevicePath => "that is not a device under /dev",
+            UnlockError::LeadingDash => "that device name starts with a dash",
+            UnlockError::NotLocked => "that is not a locked encrypted volume",
+        })
+    }
+}
+
+impl Error for UnlockError {}
+
+/// A locked LUKS container that passed [`unlock_target`]: the only thing
+/// `gio mount -d` is ever started with. Its fields are private, so no typed
+/// string reaches `gio`'s argv.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnlockTarget {
+    path: PathBuf,
+    label: String,
+}
+
+impl UnlockTarget {
+    /// The device node, e.g. `/dev/sdb1`, as the listing reported it.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The name the user knows the volume by.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// `requested` as an unlock target: an absolute `/dev/…` path (no `..`, no
+/// name starting with `-`) that is a locked LUKS container of `nodes`, the
+/// current listing. The path kept is the listing's, never the argument.
+///
+/// # Errors
+///
+/// [`UnlockError`] with the reason the device is refused.
+pub fn unlock_target(nodes: &[BlockNode], requested: &Path) -> Result<UnlockTarget, UnlockError> {
+    use std::path::Component;
+    let mut parts = requested.components();
+    let shaped = parts.next() == Some(Component::RootDir)
+        && parts.next() == Some(Component::Normal(OsStr::new("dev")))
+        && parts.clone().next().is_some()
+        && parts.all(|part| matches!(part, Component::Normal(_)));
+    // `/dev/sde1/` normalizes to a listed path: only the exact text is
+    // accepted.
+    if !shaped || requested.as_os_str().as_encoded_bytes().ends_with(b"/") {
+        return Err(UnlockError::NotADevicePath);
+    }
+    if requested
+        .components()
+        .any(|part| part.as_os_str().as_encoded_bytes().starts_with(b"-"))
+    {
+        return Err(UnlockError::LeadingDash);
+    }
+    let found = devices(nodes)
+        .into_iter()
+        .find(|device| device.path == requested && device.can_unlock())
+        .ok_or(UnlockError::NotLocked)?;
+    Ok(UnlockTarget {
+        path: found.path,
+        label: found.label,
+    })
+}
+
+/// `gio mount -d <device>`: `-d` takes the device as its value, so it is
+/// never read as an option of its own.
+pub fn unlock_args(target: &UnlockTarget) -> Vec<OsString> {
+    vec![
+        OsString::from("mount"),
+        OsString::from("-d"),
+        target.path.as_os_str().to_owned(),
+    ]
+}
+
+fn first_mount(node: &BlockNode) -> Option<PathBuf> {
+    node.mountpoints
+        .first()
+        .cloned()
+        .or_else(|| node.children.iter().find_map(first_mount))
+}
+
+fn find_node<'a>(nodes: &'a [BlockNode], path: &Path) -> Option<&'a BlockNode> {
+    nodes.iter().find_map(|node| {
+        if node.path == path {
+            Some(node)
+        } else {
+            find_node(&node.children, path)
+        }
+    })
+}
+
+/// Where the unlocked volume of the container `container` is mounted in
+/// `nodes`: the first mount point of the container's children.
+pub fn unlocked_mount(nodes: &[BlockNode], container: &Path) -> Option<PathBuf> {
+    find_node(nodes, container)?
+        .children
+        .iter()
+        .find_map(first_mount)
+}
+
+/// Lists the devices up to `attempts` times, `delay` apart, until the
+/// unlocked volume of `container` is mounted: the mapper can trail gio's
+/// exit by a moment. Answers that listing and the mount point.
+pub fn wait_for_unlocked_mount(
+    mut list: impl FnMut() -> Result<Vec<BlockNode>, DeviceError>,
+    container: &Path,
+    attempts: u32,
+    delay: Duration,
+) -> Option<(Vec<BlockNode>, PathBuf)> {
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            thread::sleep(delay);
+        }
+        if let Ok(nodes) = list()
+            && let Some(mount) = unlocked_mount(&nodes, container)
+        {
+            return Some((nodes, mount));
+        }
+    }
+    None
+}
+
 // --- udisksctl ----------------------------------------------------------------
 
 /// `<verb> --block-device=<path> --no-user-interaction`: the path is glued
@@ -550,6 +741,11 @@ pub fn mount_args(device: &Path) -> Vec<OsString> {
 /// `udisksctl unmount --block-device=<device> --no-user-interaction`.
 pub fn unmount_args(device: &Path) -> Vec<OsString> {
     udisks_args("unmount", device)
+}
+
+/// `udisksctl lock --block-device=<container> --no-user-interaction`.
+pub fn lock_args(container: &Path) -> Vec<OsString> {
+    udisks_args("lock", container)
 }
 
 /// `udisksctl power-off --block-device=<disk> --no-user-interaction`.
@@ -795,7 +991,7 @@ pub fn unmount_program<'a>(
     gio: Option<&'a Path>,
 ) -> Result<&'a Path, DeviceError> {
     let (program, name) = match step.via {
-        UnmountVia::Udisks => (udisksctl, "udisksctl"),
+        UnmountVia::Udisks | UnmountVia::UdisksLock => (udisksctl, "udisksctl"),
         UnmountVia::Gio => (gio, "gio"),
     };
     program.ok_or_else(|| DeviceError::Failed {
@@ -808,6 +1004,7 @@ pub fn unmount_program<'a>(
 pub fn run_unmount(program: &Path, step: &UnmountStep) -> Result<(), DeviceError> {
     let args = match step.via {
         UnmountVia::Udisks => unmount_args(&step.device),
+        UnmountVia::UdisksLock => lock_args(&step.device),
         UnmountVia::Gio => gio_unmount_args(&step.device),
     };
     let output = run_tool(program, &args, UDISKS_TIMEOUT)?;
@@ -815,13 +1012,15 @@ pub fn run_unmount(program: &Path, step: &UnmountStep) -> Result<(), DeviceError
         || output.stderr.contains("is not mounted")
         || output
             .stderr
-            .contains("Containing mount for file not found");
+            .contains("Containing mount for file not found")
+        || (step.via == UnmountVia::UdisksLock
+            && output.stderr.to_lowercase().contains("not unlocked"));
     if output.success || already {
         Ok(())
     } else {
         Err(DeviceError::Failed {
             reason: match step.via {
-                UnmountVia::Udisks => failure_reason(&output.stderr),
+                UnmountVia::Udisks | UnmountVia::UdisksLock => failure_reason(&output.stderr),
                 UnmountVia::Gio => output
                     .stderr
                     .lines()
@@ -1835,6 +2034,255 @@ mod tests {
             "echo 'gio: Containing mount for file not found' >&2; exit 1",
         )?;
         run_unmount(&gone, &step)?;
+        Ok(())
+    }
+
+    // --- encrypted drives -----------------------------------------------------
+
+    /// A LUKS stick, locked (`sde`), unlocked and mounted (`sdf`), and
+    /// unlocked but not mounted (`sdg`).
+    const LUKS: &str = r#"{"blockdevices":[
+      {"name":"sde","path":"/dev/sde","fstype":null,"size":8000000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"disk","pkname":null,"uuid":null,
+         "children":[{"name":"sde1","path":"/dev/sde1","label":"Vault","fstype":"crypto_LUKS","size":7999000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"part","pkname":"sde","uuid":"u1"}]},
+      {"name":"sdf","path":"/dev/sdf","fstype":null,"size":8000000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"disk","pkname":null,"uuid":null,
+         "children":[{"name":"sdf1","path":"/dev/sdf1","fstype":"crypto_LUKS","size":7999000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"part","pkname":"sdf","uuid":"u2",
+            "children":[{"name":"luks-u2","path":"/dev/mapper/luks-u2","label":"Secrets","fstype":"ext4","size":7900000000,"mountpoints":["/run/media/iperez/Secrets"],"rm":true,"hotplug":true,"type":"crypt","pkname":"sdf1","uuid":"m2"}]}]},
+      {"name":"sdg","path":"/dev/sdg","fstype":null,"size":8000000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"disk","pkname":null,"uuid":null,
+         "children":[{"name":"sdg1","path":"/dev/sdg1","fstype":"crypto_LUKS","size":7999000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"part","pkname":"sdg","uuid":"u3",
+            "children":[{"name":"luks-u3","path":"/dev/mapper/luks-u3","fstype":"ext4","size":7900000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"crypt","pkname":"sdg1","uuid":"m3"}]}]}
+    ]}"#;
+
+    fn luks() -> Vec<BlockNode> {
+        parse_lsblk(LUKS).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_luks_container_without_children_is_locked_and_can_be_unlocked() {
+        let found = devices(&luks());
+        let locked = find(&found, "/dev/sde1");
+        assert_eq!(locked.map(|d| d.state.clone()), Some(DeviceState::Locked));
+        assert!(locked.is_some_and(Device::can_unlock));
+        assert_eq!(locked.and_then(|d| d.container.clone()), None);
+    }
+
+    #[test]
+    fn a_luks_container_with_a_mapper_child_is_unlocked_and_shows_the_child() {
+        let found = devices(&luks());
+        assert_eq!(find(&found, "/dev/sdf1"), None, "the container is hidden");
+        let mapper = find(&found, "/dev/mapper/luks-u2");
+        assert_eq!(
+            mapper.map(|d| d.state.clone()),
+            Some(DeviceState::Mounted(PathBuf::from(
+                "/run/media/iperez/Secrets"
+            )))
+        );
+        assert!(mapper.is_some_and(|d| !d.can_unlock()));
+        assert_eq!(
+            mapper.and_then(|d| d.container.clone()),
+            Some(PathBuf::from("/dev/sdf1"))
+        );
+        let idle = find(&found, "/dev/mapper/luks-u3");
+        assert_eq!(idle.map(|d| d.state.clone()), Some(DeviceState::Unmounted));
+        assert!(idle.is_some_and(|d| !d.can_unlock()));
+    }
+
+    #[test]
+    fn only_a_locked_container_from_the_listing_is_an_unlock_target() {
+        let nodes = luks();
+        let target = unlock_target(&nodes, Path::new("/dev/sde1"));
+        assert_eq!(
+            target.as_ref().map(|t| (t.path(), t.label())),
+            Ok((Path::new("/dev/sde1"), "Vault"))
+        );
+        for (request, why) in [
+            ("sde1", "relative"),
+            ("-d", "an option"),
+            ("/dev/-sde1", "leading dash name"),
+            ("/dev/../tmp/sde1", "parent component"),
+            ("/tmp/sde1", "outside /dev"),
+            ("/dev/sde1/", "another spelling"),
+            ("/dev/sdz1", "not in the listing"),
+            ("/dev/sdf1", "an unlocked container is not listed"),
+            ("/dev/mapper/luks-u2", "already unlocked"),
+            ("/dev/sde", "a disk"),
+            ("", "empty"),
+        ] {
+            assert!(
+                unlock_target(&nodes, Path::new(request)).is_err(),
+                "{request:?} ({why}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_name_starting_with_a_dash_is_refused_too() {
+        let json = r#"{"blockdevices":[{"name":"-x","path":"/dev/-x","fstype":"crypto_LUKS","size":1,"mountpoints":[null],"rm":true,"hotplug":true,"type":"part","pkname":null,"uuid":null}]}"#;
+        let nodes = parse_lsblk(json).unwrap_or_default();
+        assert!(devices(&nodes).iter().any(Device::can_unlock));
+        assert_eq!(
+            unlock_target(&nodes, Path::new("/dev/-x")),
+            Err(UnlockError::LeadingDash)
+        );
+    }
+
+    #[test]
+    fn unlocking_runs_gio_mount_d_with_the_device_alone() {
+        let nodes = luks();
+        let target = unlock_target(&nodes, Path::new("/dev/sde1"));
+        assert_eq!(
+            target.map(|t| unlock_args(&t)),
+            Ok(vec![
+                OsString::from("mount"),
+                OsString::from("-d"),
+                OsString::from("/dev/sde1")
+            ])
+        );
+    }
+
+    #[test]
+    fn the_unlocked_mount_comes_from_the_children_of_the_container() {
+        let nodes = luks();
+        assert_eq!(
+            unlocked_mount(&nodes, Path::new("/dev/sdf1")),
+            Some(PathBuf::from("/run/media/iperez/Secrets"))
+        );
+        assert_eq!(unlocked_mount(&nodes, Path::new("/dev/sdg1")), None);
+        assert_eq!(unlocked_mount(&nodes, Path::new("/dev/sde1")), None);
+        assert_eq!(unlocked_mount(&nodes, Path::new("/dev/nope")), None);
+    }
+
+    #[test]
+    fn the_unlocked_mount_is_waited_for_with_fresh_listings() {
+        let mut calls = 0;
+        let found = wait_for_unlocked_mount(
+            || {
+                calls += 1;
+                let mut nodes = luks();
+                if calls >= 3
+                    && let Some(node) = nodes
+                        .get_mut(2)
+                        .and_then(|disk| disk.children.first_mut())
+                        .and_then(|part| part.children.first_mut())
+                {
+                    node.mountpoints = vec![PathBuf::from("/run/media/iperez/late")];
+                }
+                Ok(nodes)
+            },
+            Path::new("/dev/sdg1"),
+            5,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            found.map(|(_, mount)| mount),
+            Some(PathBuf::from("/run/media/iperez/late"))
+        );
+        assert_eq!(calls, 3, "stops at the first listing that has it");
+        assert_eq!(
+            wait_for_unlocked_mount(|| Ok(luks()), Path::new("/dev/sdg1"), 3, Duration::ZERO),
+            None,
+            "gives up after the attempts"
+        );
+        let broken = || {
+            Err(DeviceError::Failed {
+                reason: "x".to_owned(),
+            })
+        };
+        assert_eq!(
+            wait_for_unlocked_mount(broken, Path::new("/dev/sdg1"), 2, Duration::ZERO),
+            None
+        );
+    }
+
+    #[test]
+    fn unmounting_an_unlocked_volume_locks_its_container_after_the_unmount() {
+        let found = devices(&luks());
+        let plan = find(&found, "/dev/mapper/luks-u2").and_then(unmount_plan);
+        assert_eq!(
+            plan.map(|p| p.unmount),
+            Some(vec![
+                UnmountStep {
+                    device: PathBuf::from("/dev/mapper/luks-u2"),
+                    mounts: vec![PathBuf::from("/run/media/iperez/Secrets")],
+                    via: UnmountVia::Udisks,
+                },
+                UnmountStep {
+                    device: PathBuf::from("/dev/sdf1"),
+                    mounts: Vec::new(),
+                    via: UnmountVia::UdisksLock,
+                },
+            ])
+        );
+        // A plain volume still unmounts alone.
+        let plain = devices(&parsed());
+        assert_eq!(
+            find(&plain, "/dev/sdb1")
+                .and_then(unmount_plan)
+                .map(|p| p.unmount.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ejecting_a_disk_locks_its_unlocked_containers_before_power_off() {
+        let plan = eject_plan(&luks(), Path::new("/dev/sdf"), "Secrets");
+        assert_eq!(
+            plan,
+            Some(DevicePlan {
+                label: "Secrets".to_owned(),
+                unmount: vec![
+                    UnmountStep {
+                        device: PathBuf::from("/dev/mapper/luks-u2"),
+                        mounts: vec![PathBuf::from("/run/media/iperez/Secrets")],
+                        via: UnmountVia::Udisks,
+                    },
+                    UnmountStep {
+                        device: PathBuf::from("/dev/sdf1"),
+                        mounts: Vec::new(),
+                        via: UnmountVia::UdisksLock,
+                    },
+                ],
+                power_off: Some(PathBuf::from("/dev/sdf")),
+            })
+        );
+        // Unlocked but not mounted: only the lock.
+        let idle = eject_plan(&luks(), Path::new("/dev/sdg"), "x").map(|p| p.unmount);
+        assert_eq!(
+            idle,
+            Some(vec![UnmountStep {
+                device: PathBuf::from("/dev/sdg1"),
+                mounts: Vec::new(),
+                via: UnmountVia::UdisksLock,
+            }])
+        );
+        // A locked one has nothing to lock.
+        let locked = eject_plan(&luks(), Path::new("/dev/sde"), "x").map(|p| p.unmount);
+        assert_eq!(locked, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_lock_step_runs_udisksctl_lock_and_tolerates_an_already_locked_device() -> TestResult {
+        let fixture = Fixture::new()?;
+        let log = fixture.0.join("argv.log");
+        let ok = fixture.script("udisksctl", &format!("echo \"$@\" >> '{}'", log.display()))?;
+        let step = UnmountStep {
+            device: PathBuf::from("/dev/sdf1"),
+            mounts: Vec::new(),
+            via: UnmountVia::UdisksLock,
+        };
+        run_unmount(&ok, &step)?;
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            "lock --block-device=/dev/sdf1 --no-user-interaction\n"
+        );
+        let gone = fixture.script(
+            "udisksctl-gone",
+            "echo 'Error locking /dev/sdf1: Device /dev/sdf1 is not unlocked' >&2; exit 1",
+        )?;
+        run_unmount(&gone, &step)?;
+        let busy = fixture.script("udisksctl-busy", "echo 'Error locking: busy' >&2; exit 1")?;
+        assert!(run_unmount(&busy, &step).is_err());
+        let program = unmount_program(&step, Some(Path::new("/bin/udisksctl")), None);
+        assert_eq!(program, Ok(Path::new("/bin/udisksctl")));
         Ok(())
     }
 }

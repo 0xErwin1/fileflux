@@ -12,9 +12,11 @@ use std::time::Duration;
 
 use super::{
     Answer, MountEvent, MountOutcome, MountSession, Prompt, PromptKind, PromptScanner, Scheme,
-    Secret, ServerUri, UriError, mount_target, mounted_name, spawn_mount, wait_for_mount,
+    Secret, ServerUri, UriError, mount_target, mounted_name, spawn_mount, spawn_unlock,
+    wait_for_mount,
 };
 use crate::core::bookmarks::{self, NetworkBookmark};
+use crate::core::devices::{self, UnlockTarget, unlock_target};
 
 /// The scripts are written and run right away: while another test forks, a
 /// just-written script can be exec'd with ETXTBSY, so the tests take turns
@@ -778,6 +780,121 @@ fn an_answer_with_a_line_break_is_refused_and_gio_is_stopped() {
 fn a_missing_gio_does_not_start() {
     let scratch = Scratch::new("missing");
     assert!(spawn_mount(&scratch.path("no-such-gio"), &uri("sftp://h/")).is_err());
+}
+
+// --- unlocking an encrypted volume (`gio mount -d`) ---------------------------
+
+fn locked_stick() -> UnlockTarget {
+    let json = r#"{"blockdevices":[{"name":"sde","path":"/dev/sde","fstype":null,"size":8000000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"disk","pkname":null,"uuid":null,
+        "children":[{"name":"sde1","path":"/dev/sde1","label":"Vault","fstype":"crypto_LUKS","size":7999000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"part","pkname":"sde","uuid":"u1"}]}]}"#;
+    let nodes = devices::parse_lsblk(json).expect("the listing parses");
+    unlock_target(&nodes, Path::new("/dev/sde1")).expect("a locked volume")
+}
+
+fn start_unlock(gio: &Path, target: &UnlockTarget) -> MountSession {
+    for _ in 0..100 {
+        match spawn_unlock(gio, target) {
+            Ok(session) => return session,
+            Err(error) if error.to_string().to_lowercase().contains("busy") => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("gio did not start: {error}"),
+        }
+    }
+    panic!("gio stayed busy");
+}
+
+/// A fake gio that asks for the passphrase like gvfs does for a LUKS volume
+/// and fails, echoing it back, unless it is the right one.
+fn unlocking_gio(scratch: &Scratch, right: &str) -> PathBuf {
+    let dir = scratch.0.display();
+    scratch.gio(&format!(
+        r#"printf '%s\n' "$@" > '{dir}/argv'
+env > '{dir}/env'
+printf 'Enter a passphrase to unlock the volume\n'
+printf 'Password: '
+read pass
+printf '%s\n' "$pass" >> '{dir}/stdin'
+if [ "$pass" = '{right}' ]; then exit 0; fi
+printf 'gio: Error mounting /dev/sde1: Failed to unlock %s: Error unlocking /dev/sde1\n' "$pass" >&2
+exit 1"#
+    ))
+}
+
+#[test]
+fn the_passphrase_goes_to_gio_stdin_once_and_argv_is_exactly_mount_d_device() {
+    let scratch = Scratch::new("unlock-round-trip");
+    let gio = unlocking_gio(&scratch, "p4ss-phrase");
+    let session = start_unlock(&gio, &locked_stick());
+
+    let Prompt::Text { kind, message, .. } = prompt(&session) else {
+        panic!("a text prompt");
+    };
+    assert_eq!(kind, PromptKind::Password);
+    assert!(message.join(" ").contains("passphrase"), "{message:?}");
+    session
+        .control
+        .answer(Answer::Line(Secret::new("p4ss-phrase")));
+    assert_eq!(done(&session), MountOutcome::Mounted);
+
+    assert_eq!(scratch.read("argv"), "mount\n-d\n/dev/sde1\n");
+    assert_eq!(scratch.read("stdin"), "p4ss-phrase\n", "delivered once");
+    assert!(
+        !scratch.read("env").contains("p4ss-phrase"),
+        "not in the environment"
+    );
+    assert!(!scratch.read("argv").contains("p4ss-phrase"), "not in argv");
+}
+
+#[test]
+fn a_wrong_passphrase_fails_with_gios_message_redacted() {
+    let scratch = Scratch::new("unlock-wrong");
+    let gio = unlocking_gio(&scratch, "right");
+    let session = start_unlock(&gio, &locked_stick());
+    let seen = format!("{:?}", prompt(&session));
+    session
+        .control
+        .answer(Answer::Line(Secret::new("wr0ng-phrase")));
+    let outcome = done(&session);
+    let shown = format!("{outcome:?}{seen}");
+    let MountOutcome::Failed(message) = outcome else {
+        panic!("a wrong passphrase fails");
+    };
+    assert!(message.contains("Error unlocking"), "{message}");
+    assert!(message.contains("***"), "{message}");
+    assert!(!shown.contains("wr0ng-phrase"), "{shown}");
+    // The volume stays locked and the user can try again with a new run.
+    let again = start_unlock(&gio, &locked_stick());
+    prompt(&again);
+    again.control.answer(Answer::Line(Secret::new("right")));
+    assert_eq!(done(&again), MountOutcome::Mounted);
+}
+
+#[test]
+fn cancelling_an_unlock_kills_gio() {
+    let scratch = Scratch::new("unlock-cancel");
+    let dir = scratch.0.display();
+    let gio = scratch.gio(&format!(
+        r#"echo $$ > '{dir}/pid'
+printf 'Password: '
+exec sleep 60"#
+    ));
+    let session = start_unlock(&gio, &locked_stick());
+    assert_eq!(prompt(&session).kind(), Some(PromptKind::Password));
+    let pid: u32 = scratch
+        .read("pid")
+        .trim()
+        .parse()
+        .expect("gio wrote its pid");
+    session.control.cancel();
+    assert_eq!(done(&session), MountOutcome::Cancelled);
+    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "gio is gone");
+}
+
+#[test]
+fn a_missing_gio_does_not_start_an_unlock() {
+    let scratch = Scratch::new("unlock-missing");
+    assert!(spawn_unlock(&scratch.path("no-such-gio"), &locked_stick()).is_err());
 }
 
 // --- the gvfs mount a URI made ------------------------------------------------

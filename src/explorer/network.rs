@@ -11,6 +11,14 @@
 //! Continue, moves from there to gio (a [`Secret`], zeroed when dropped) and
 //! the field is emptied at once. It is never logged, saved, shown in a
 //! notice or put in argv or the environment. Only one attempt runs at a time.
+//!
+//! Unlocking an encrypted volume ("Unlock and mount" on a Locked device) is
+//! the same attempt with another goal: `gio mount -d <device>` asks for the
+//! passphrase through the same masked dialog (the same [`Secret`], redaction
+//! and cancel). The passphrase is never kept: no keyring, no cache. On
+//! success a fresh `lsblk` listing names the unlocked volume's mount point
+//! and the tab opens it; on a wrong passphrase the volume stays Locked and
+//! the person can try again.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
@@ -19,14 +27,18 @@ use std::time::{Duration, Instant};
 use bolt::controls::{InputEvent, InputState};
 use fileflux::core::Location;
 use fileflux::core::bookmarks::{self, NetworkBookmark};
+use fileflux::core::devices::{
+    UnlockTarget, devices, list_blocks, unlock_target, wait_for_unlocked_mount,
+};
 use fileflux::core::network::{
     Answer, MountEvent, MountOutcome, MountSession, Prompt, Secret, ServerUri, mount_target,
-    mounted_name, spawn_mount, wait_for_mount,
+    mounted_name, spawn_mount, spawn_unlock, wait_for_mount,
 };
 use fileflux::core::places::{Volume, gvfs_root_from_env};
 use gpui::{AppContext as _, Context, Entity, Pixels, Point, Window};
 
 use super::actions::MenuOn;
+use super::devices::MISSING_GIO_UNLOCK;
 use super::ops::{
     DialogAction, DialogKind, DialogState, MenuCommand, MenuItemSpec, MenuRow, Severity,
 };
@@ -62,12 +74,31 @@ pub(crate) struct PromptDialog {
     pub(crate) input: Option<Entity<InputState>>,
 }
 
-/// The attempt in progress: the address, its label and the running gio.
+/// What an attempt is for.
+#[derive(Debug)]
+enum Goal {
+    /// Mount a server address.
+    Connect(ServerUri),
+    /// Unlock an encrypted volume of the device listing.
+    Unlock(UnlockTarget),
+}
+
+/// The attempt in progress: its goal, its label and the running gio.
 #[derive(Debug)]
 struct Attempt {
-    uri: ServerUri,
+    goal: Goal,
     label: String,
     session: MountSession,
+}
+
+impl Attempt {
+    /// The device row the attempt shows "Unlocking…" on, if it unlocks.
+    fn working_key(&self) -> &Path {
+        match &self.goal {
+            Goal::Unlock(target) => target.path(),
+            Goal::Connect(_) => Path::new(""),
+        }
+    }
 }
 
 impl Drop for Attempt {
@@ -93,6 +124,23 @@ impl NetworkHub {
     /// The label of the server being connected to.
     pub(crate) fn connecting(&self) -> Option<&str> {
         self.attempt.as_ref().map(|attempt| attempt.label.as_str())
+    }
+
+    /// Whether the attempt in progress unlocks an encrypted volume.
+    pub(crate) fn unlocking(&self) -> bool {
+        self.attempt
+            .as_ref()
+            .is_some_and(|attempt| matches!(attempt.goal, Goal::Unlock(_)))
+    }
+
+    /// What the sidebar's cancel row says: "Connecting to X…" or
+    /// "Unlocking X…".
+    pub(crate) fn status(&self) -> Option<String> {
+        let attempt = self.attempt.as_ref()?;
+        Some(match attempt.goal {
+            Goal::Connect(_) => format!("Connecting to {}\u{2026}", attempt.label),
+            Goal::Unlock(_) => format!("Unlocking {}\u{2026}", attempt.label),
+        })
     }
 }
 
@@ -303,7 +351,7 @@ impl Explorer {
         match spawn_mount(&gio, uri) {
             Ok(session) => {
                 self.network.attempt = Some(Attempt {
-                    uri: uri.clone(),
+                    goal: Goal::Connect(uri.clone()),
                     label: label.clone(),
                     session,
                 });
@@ -387,8 +435,10 @@ impl Explorer {
             )
         });
         let field = input.clone();
+        let unlock = self.network.unlocking();
         let kind = DialogKind::MountPrompt {
             host,
+            unlock,
             label,
             secret,
             question,
@@ -469,12 +519,17 @@ impl Explorer {
             return;
         };
         attempt.session.control.cancel();
+        self.devices.working.remove(attempt.working_key());
         if self.dialogs.discard_mount_prompts(Instant::now()) {
             self.dialog_closed(window, cx);
         }
+        let verb = match attempt.goal {
+            Goal::Connect(_) => "connecting to",
+            Goal::Unlock(_) => "unlocking",
+        };
         self.say(
             Severity::Info,
-            format!("Cancelled connecting to {}", attempt.label),
+            format!("Cancelled {verb} {}", attempt.label),
             window,
             cx,
         );
@@ -489,17 +544,130 @@ impl Explorer {
         if self.dialogs.discard_mount_prompts(Instant::now()) {
             self.dialog_closed(window, cx);
         }
+        self.devices.working.remove(attempt.working_key());
         cx.notify();
-        match outcome {
-            MountOutcome::Cancelled => {}
-            MountOutcome::Failed(message) => self.say(
+        let Attempt { goal, label, .. } = &attempt;
+        match (outcome, goal) {
+            (MountOutcome::Cancelled, _) => {}
+            (MountOutcome::Failed(message), Goal::Connect(_)) => self.say(
                 Severity::Error,
-                format!("Could not connect to {}: {message}", attempt.label),
+                format!("Could not connect to {label}: {message}"),
                 window,
                 cx,
             ),
-            MountOutcome::Mounted => self.open_mounted(&attempt.uri, &attempt.label, window, cx),
+            (MountOutcome::Failed(message), Goal::Unlock(_)) => {
+                // Still locked: the row stays, and a new try asks again.
+                self.devices.last_poll = None;
+                self.say(
+                    Severity::Error,
+                    format!("Could not unlock {label}: {message}"),
+                    window,
+                    cx,
+                );
+            }
+            (MountOutcome::Mounted, Goal::Connect(uri)) => {
+                self.open_mounted(uri, label, window, cx);
+            }
+            (MountOutcome::Mounted, Goal::Unlock(target)) => {
+                self.open_unlocked(target, label, window, cx);
+            }
         }
+    }
+
+    /// "Unlock and mount": validates `path` against the device listing,
+    /// starts `gio mount -d` and answers its passphrase prompt in the masked
+    /// dialog.
+    pub(crate) fn unlock_device(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(gio) = self.gio() else {
+            return self.say(Severity::Info, MISSING_GIO_UNLOCK, window, cx);
+        };
+        if let Some(label) = self.network.connecting() {
+            let text = format!("Already working on {label}");
+            return self.say(Severity::Info, text, window, cx);
+        }
+        let target = match unlock_target(&self.devices.nodes, &path) {
+            Ok(target) => target,
+            Err(error) => return self.say(Severity::Info, error.to_string(), window, cx),
+        };
+        let label = target.label().to_owned();
+        match spawn_unlock(&gio, &target) {
+            Ok(session) => {
+                self.devices
+                    .working
+                    .insert(target.path().to_path_buf(), "Unlocking\u{2026}");
+                self.network.attempt = Some(Attempt {
+                    goal: Goal::Unlock(target),
+                    label: label.clone(),
+                    session,
+                });
+                self.say(
+                    Severity::Info,
+                    format!("Unlocking {label}\u{2026}"),
+                    window,
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => self.say(
+                Severity::Error,
+                format!("Could not start gio to unlock {label}: {error}"),
+                window,
+                cx,
+            ),
+        }
+    }
+
+    /// Reads fresh listings off the UI thread until the unlocked volume's
+    /// mount point shows, then opens it.
+    fn open_unlocked(
+        &mut self,
+        target: &UnlockTarget,
+        label: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.devices.last_poll = None;
+        let Some(lsblk) = self.devices.lsblk.clone() else {
+            self.tab_mut()
+                .state
+                .set_notice(format!("Unlocked {label}, but lsblk is missing"));
+            return;
+        };
+        let (container, label) = (target.path().to_path_buf(), label.to_owned());
+        let lookup = cx.background_executor().spawn(async move {
+            wait_for_unlocked_mount(
+                || list_blocks(&lsblk),
+                &container,
+                LOOKUP_ATTEMPTS,
+                LOOKUP_DELAY,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let found = lookup.await;
+            if let Err(closed) = this.update_in(cx, |this, window, cx| match found {
+                Some((nodes, mount)) => {
+                    this.devices.list = devices(&nodes);
+                    this.devices.nodes = nodes;
+                    this.devices.last_poll = None;
+                    this.navigate(Transition::Visit(Location::Directory(mount)), window, cx);
+                    cx.notify();
+                }
+                None => this.say(
+                    Severity::Warning,
+                    format!("Unlocked {label}, but its folder did not appear"),
+                    window,
+                    cx,
+                ),
+            }) {
+                log::debug!("the explorer closed before the volume was opened: {closed}");
+            }
+        })
+        .detach();
     }
 
     /// Looks for the gvfs folder of a mounted address off the UI thread and
@@ -706,6 +874,7 @@ mod tests {
         assert!(connect.body.contains("password"));
         let kind = DialogKind::MountPrompt {
             host: "nas/media".to_owned(),
+            unlock: false,
             label: "Password".to_owned(),
             secret: true,
             question: false,
@@ -715,6 +884,27 @@ mod tests {
         assert_eq!(prompt.title, "Connect to nas/media");
         assert!(prompt.body.starts_with("Password is needed"));
         assert_eq!(prompt.names, lines, "gio's own lines are shown as they are");
+    }
+
+    #[test]
+    fn the_unlock_dialog_names_the_volume_and_never_a_passphrase() {
+        use super::super::ops::dialog_text;
+        let kind = DialogKind::MountPrompt {
+            host: "Vault".to_owned(),
+            unlock: true,
+            label: "Password".to_owned(),
+            secret: true,
+            question: false,
+        };
+        let lines = ["Enter a passphrase to unlock the volume".to_owned()];
+        let prompt = dialog_text(&kind, &lines);
+        assert_eq!(prompt.title, "Unlock Vault");
+        assert_eq!(
+            prompt.body,
+            "Password is needed to unlock it. Cancel stops unlocking."
+        );
+        assert_eq!(prompt.confirm, "Continue");
+        assert_eq!(prompt.names, lines);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use fileflux::core::Location;
+use fileflux::core::devices::UnmountVia;
 use fileflux::core::devices::{
     BlockNode, Device, DeviceError, DevicePlan, DeviceState, devices, eject_plan, fallback_target,
     find_tool, gio_unmount_plan, list_blocks, mount, path_is_on_mounts, path_uses_mounts,
@@ -32,6 +33,10 @@ use super::ops::{
 use super::state::Transition;
 use super::view::{Explorer, TabId};
 
+/// What a disabled Unlock says (and the Devices notice) when `gio` is not
+/// installed.
+pub(crate) const MISSING_GIO_UNLOCK: &str = "Install gio (glib) to unlock encrypted drives";
+
 /// How long an unmount waits for the tabs on the device to move away: the
 /// number of steps and the time of each.
 const TAB_WAIT_STEPS: usize = 60;
@@ -43,17 +48,26 @@ pub(crate) struct DeviceActions {
     pub(crate) mount: bool,
     pub(crate) unmount: bool,
     pub(crate) eject: bool,
+    /// "Unlock and mount": `None` when the device is not a locked volume,
+    /// else whether it can run (it needs `gio`, not `udisksctl`).
+    pub(crate) unlock: Option<bool>,
 }
 
-/// The actions of `device`, none of them when `udisksctl` is missing.
-pub(crate) fn actions_for(device: &Device, udisks: bool) -> DeviceActions {
+/// The actions of `device`: none of them when `udisksctl` is missing, but
+/// for Unlock, which runs through `gio` and is disabled without it.
+pub(crate) fn actions_for(device: &Device, udisks: bool, gio: bool) -> DeviceActions {
+    let unlock = device.can_unlock().then_some(gio);
     if !udisks {
-        return DeviceActions::default();
+        return DeviceActions {
+            unlock,
+            ..DeviceActions::default()
+        };
     }
     DeviceActions {
         mount: device.can_mount(),
         unmount: device.can_unmount(),
         eject: device.can_eject(),
+        unlock,
     }
 }
 
@@ -65,6 +79,19 @@ fn device_command_rows(actions: DeviceActions) -> Vec<MenuRow> {
     let mut rows = Vec::new();
     if actions.mount {
         rows.push(command_row(MenuCommand::Mount, "Mount"));
+    }
+    if let Some(enabled) = actions.unlock {
+        rows.push(MenuRow::Item(MenuItemSpec {
+            enabled,
+            ..MenuItemSpec::new(
+                MenuCommand::Unlock,
+                if enabled {
+                    "Unlock and mount"
+                } else {
+                    "Unlock and mount (needs gio)"
+                },
+            )
+        }));
     }
     if actions.unmount {
         rows.push(command_row(MenuCommand::Unmount, "Unmount"));
@@ -91,7 +118,8 @@ pub(crate) fn with_device_rows(mut rows: Vec<MenuRow>, actions: DeviceActions) -
     rows
 }
 
-/// An unmounted or locked row's menu: Mount, Eject, Copy path.
+/// An unmounted or locked row's menu: Mount or Unlock and mount, Eject, Copy
+/// path.
 pub(crate) fn device_menu_rows(actions: DeviceActions) -> Vec<MenuRow> {
     let mut rows = device_command_rows(actions);
     if !rows.is_empty() {
@@ -308,6 +336,17 @@ pub(crate) fn plan_notice(
             Severity::Success,
             format!("{} can be removed safely", plan.label),
         ),
+        Ok(())
+            if plan
+                .unmount
+                .iter()
+                .any(|step| step.via == UnmountVia::UdisksLock) =>
+        {
+            (
+                Severity::Success,
+                format!("Unmounted and locked {}", plan.label),
+            )
+        }
         Ok(()) => (Severity::Success, format!("Unmounted {}", plan.label)),
         Err(error) => {
             let verb = if eject { "eject" } else { "unmount" };
@@ -364,6 +403,7 @@ pub(crate) fn gvfs_actions(kind: VolumeKind, gio: bool) -> DeviceActions {
         mount: false,
         unmount: gio && kind.is_gvfs(),
         eject: false,
+        unlock: None,
     }
 }
 
@@ -507,6 +547,8 @@ impl DeviceHub {
             Some("udisksctl was not found: mounting and ejecting are unavailable")
         } else if self.lsblk.is_none() {
             Some("lsblk was not found: devices that are not mounted are not listed")
+        } else if self.gio.is_none() && self.list.iter().any(Device::can_unlock) {
+            Some(MISSING_GIO_UNLOCK)
         } else {
             None
         }
@@ -550,7 +592,11 @@ impl Explorer {
     /// What the device with block node `path` offers right now.
     pub(crate) fn device_actions(&self, path: &Path) -> Option<DeviceActions> {
         if let Some(device) = self.devices.find(path) {
-            return Some(actions_for(device, self.devices.udisksctl.is_some()));
+            return Some(actions_for(
+                device,
+                self.devices.udisksctl.is_some(),
+                self.devices.gio.is_some(),
+            ));
         }
         let volume = self.gvfs_volume(path)?;
         Some(gvfs_actions(volume.kind, self.devices.gio.is_some()))
@@ -672,19 +718,7 @@ impl Explorer {
     ) {
         match self.devices.find(&path).map(|device| device.state.clone()) {
             Some(DeviceState::Unmounted) => self.mount_device(path, window, cx),
-            Some(DeviceState::Locked) => {
-                let label = self
-                    .devices
-                    .find(&path)
-                    .map(|device| device.label.clone())
-                    .unwrap_or_default();
-                self.say(
-                    Severity::Info,
-                    format!("{label} is encrypted. Unlocking is not supported yet"),
-                    window,
-                    cx,
-                );
-            }
+            Some(DeviceState::Locked) => self.unlock_device(path, window, cx),
             Some(DeviceState::Mounted(mount)) => {
                 self.navigate(Transition::Visit(Location::Directory(mount)), window, cx);
             }
@@ -702,6 +736,7 @@ impl Explorer {
     ) {
         match command {
             MenuCommand::Mount => self.mount_device(path, window, cx),
+            MenuCommand::Unlock => self.unlock_device(path, window, cx),
             MenuCommand::Unmount => self.unmount_device(&path, window, cx),
             MenuCommand::Eject => self.eject_device(&path, window, cx),
             MenuCommand::CopyPath => {
@@ -1241,6 +1276,7 @@ mod tests {
             state,
             mounts,
             ejectable,
+            container: None,
         }
     }
 
@@ -1280,43 +1316,58 @@ mod tests {
     fn actions_follow_the_device_and_vanish_without_udisksctl() {
         let unmounted = device(DeviceState::Unmounted, true);
         assert_eq!(
-            actions_for(&unmounted, true),
+            actions_for(&unmounted, true, true),
             DeviceActions {
                 mount: true,
                 unmount: false,
-                eject: true
+                eject: true,
+                unlock: None,
             }
         );
         assert_eq!(
-            actions_for(&mounted(true), true),
+            actions_for(&mounted(true), true, true),
             DeviceActions {
                 mount: false,
                 unmount: true,
-                eject: true
+                eject: true,
+                unlock: None,
             }
         );
         let fstab = device(DeviceState::Mounted(p("/mnt/data")), false);
         assert_eq!(
-            actions_for(&fstab, true),
+            actions_for(&fstab, true, true),
             DeviceActions {
                 mount: false,
                 unmount: false,
-                eject: false
+                eject: false,
+                unlock: None,
             },
             "an internal mount outside the media roots is not the session's"
         );
-        let locked = device(DeviceState::Locked, true);
+        let mut locked = device(DeviceState::Locked, true);
+        locked.fstype = Some("crypto_LUKS".to_owned());
         assert_eq!(
-            actions_for(&locked, true),
+            actions_for(&locked, true, true),
             DeviceActions {
                 mount: false,
                 unmount: false,
-                eject: true
+                eject: true,
+                unlock: Some(true),
             }
         );
-        for device in [unmounted, mounted(true), locked] {
-            assert_eq!(actions_for(&device, false), DeviceActions::default());
+        for device in [unmounted, mounted(true)] {
+            assert_eq!(actions_for(&device, false, true), DeviceActions::default());
         }
+        // Unlock needs gio, not udisksctl: disabled without gio, on without
+        // udisksctl.
+        assert_eq!(actions_for(&locked, true, false).unlock, Some(false));
+        assert_eq!(
+            actions_for(&locked, false, true),
+            DeviceActions {
+                unlock: Some(true),
+                ..DeviceActions::default()
+            }
+        );
     }
 
     #[test]
@@ -1325,20 +1376,41 @@ mod tests {
             mount: true,
             unmount: false,
             eject: true,
+            unlock: None,
         });
         assert_eq!(labels(&rows), ["Mount", "Eject", "-", "Copy path"]);
         let internal = device_menu_rows(DeviceActions {
             mount: true,
             unmount: false,
             eject: false,
+            unlock: None,
         });
         assert_eq!(labels(&internal), ["Mount", "-", "Copy path"]);
         let locked = device_menu_rows(DeviceActions {
             mount: false,
             unmount: false,
             eject: true,
+            unlock: None,
         });
         assert_eq!(labels(&locked), ["Eject", "-", "Copy path"]);
+        let unlock = |enabled| DeviceActions {
+            unlock: Some(enabled),
+            eject: true,
+            ..DeviceActions::default()
+        };
+        assert_eq!(
+            labels(&device_menu_rows(unlock(true))),
+            ["Unlock and mount", "Eject", "-", "Copy path"]
+        );
+        let off = device_menu_rows(unlock(false));
+        assert_eq!(
+            labels(&off),
+            ["Unlock and mount (needs gio)", "Eject", "-", "Copy path"]
+        );
+        assert!(matches!(
+            off.first(),
+            Some(MenuRow::Item(item)) if item.command == MenuCommand::Unlock && !item.enabled
+        ));
         let none = device_menu_rows(DeviceActions::default());
         assert_eq!(labels(&none), ["Copy path"]);
         assert!(
@@ -1368,6 +1440,7 @@ mod tests {
                 mount: false,
                 unmount: true,
                 eject: true,
+                unlock: None,
             },
         );
         assert_eq!(
@@ -1389,6 +1462,7 @@ mod tests {
                 mount: false,
                 unmount: true,
                 eject: false,
+                unlock: None,
             },
         );
         assert_eq!(
@@ -1452,6 +1526,40 @@ mod tests {
             }]
         );
         assert!(unlisted_volumes(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_locked_volume_without_gio_says_so_in_the_devices_notice() {
+        let mut locked = device(DeviceState::Locked, true);
+        locked.fstype = Some("crypto_LUKS".to_owned());
+        let hub = |gio: Option<&str>, list: Vec<Device>| DeviceHub {
+            udisksctl: Some(p("/bin/udisksctl")),
+            lsblk: Some(p("/bin/lsblk")),
+            gio: gio.map(p),
+            list,
+            ..DeviceHub::default()
+        };
+        assert_eq!(
+            hub(None, vec![locked.clone()]).notice(),
+            Some(MISSING_GIO_UNLOCK)
+        );
+        assert_eq!(hub(Some("/bin/gio"), vec![locked]).notice(), None);
+        assert_eq!(hub(None, vec![mounted(true)]).notice(), None);
+    }
+
+    #[test]
+    fn unmounting_an_unlocked_volume_says_it_was_locked_too() {
+        let mut locked_too = plan("K", "/run/media/u/K");
+        locked_too.power_off = None;
+        locked_too.unmount.push(UnmountStep {
+            device: p("/dev/sdb1"),
+            mounts: Vec::new(),
+            via: UnmountVia::UdisksLock,
+        });
+        assert_eq!(
+            plan_notice(&locked_too, &Ok(())),
+            (Severity::Success, "Unmounted and locked K".to_owned())
+        );
     }
 
     // --- running operations ---------------------------------------------------
@@ -2092,7 +2200,8 @@ mod tests {
                 DeviceActions {
                     mount: false,
                     unmount: true,
-                    eject: false
+                    eject: false,
+                    unlock: None,
                 },
                 "{kind:?}"
             );

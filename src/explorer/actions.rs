@@ -1516,7 +1516,10 @@ impl Explorer {
                     );
                 }
             }
-            MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
+            MenuCommand::Mount
+            | MenuCommand::Unlock
+            | MenuCommand::Unmount
+            | MenuCommand::Eject => {}
             MenuCommand::ConnectToServer => self.connect_to_server(window, cx),
             MenuCommand::ConnectBookmark | MenuCommand::RemoveBookmark => {}
             MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
