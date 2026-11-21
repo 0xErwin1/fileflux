@@ -179,19 +179,61 @@ fn chart_panel(
         .items_center()
         .justify_start();
     let Some(tree) = session.tree() else {
+        // While the analysis runs there is no tree yet, but the per-child
+        // totals measured so far are enough for one ring: the chart grows
+        // with the measurement instead of waiting for it.
+        let rows = session.rows();
+        let shares: Vec<f32> = rows.iter().map(|row| row.share).collect();
+        let segments = usage_chart::layout_rows(&shares);
+        if segments.is_empty() {
+            return panel.child(
+                div()
+                    .id("explorer-usage-chart-wait")
+                    .h(px(CHART_SIZE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(colors.muted)
+                    .child(if session.is_walking() {
+                        "Measuring\u{2026}"
+                    } else {
+                        "No chart"
+                    }),
+            );
+        }
+        let measured = rows
+            .iter()
+            .fold(0_u64, |sum, row| sum.saturating_add(row.bytes));
+        let canvas = canvas(
+            move |bounds, _window, _cx| bounds,
+            move |bounds, _prepaint, window, _cx| {
+                paint(bounds, &segments, None, None, window);
+            },
+        )
+        .size_full();
         return panel.child(
             div()
-                .id("explorer-usage-chart-wait")
+                .id("explorer-usage-chart")
+                .relative()
+                .w(px(CHART_SIZE))
                 .h(px(CHART_SIZE))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(colors.muted)
-                .child(if session.is_walking() {
-                    "The chart appears when the measuring ends"
-                } else {
-                    "No chart"
-                }),
+                .child(canvas)
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(2.0))
+                        .child(div().text_color(colors.muted).child("measuring"))
+                        .child(
+                            div()
+                                .text_color(colors.strong)
+                                .child(format_bytes(measured)),
+                        ),
+                ),
         );
     };
     if session.segments.is_empty() {
@@ -292,7 +334,7 @@ fn segment_color(segment: &Segment, highlighted: bool) -> Hsla {
             l: 0.5,
             a: 1.0,
         },
-        Target::Item(_) => hsla(usage_chart::color(segment.branch, segment.depth)),
+        Target::Item(_) | Target::Row(_) => hsla(usage_chart::color(segment.branch, segment.depth)),
     };
     if highlighted { lighter(color) } else { color }
 }
@@ -372,6 +414,9 @@ fn chart_tooltip(
             )
         }
         Target::Other { bytes, count, .. } => ("Other".to_owned(), bytes, count),
+        // Only the chart drawn while measuring carries row segments, and it
+        // has no tooltip.
+        Target::Row(_) => return None,
     };
     let share = bytes as f64 / segment.parent_bytes.max(1) as f64 * 100.0;
     Some(
@@ -536,7 +581,7 @@ fn list_panel(
 ) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let rows: Arc<Vec<ShownRow>> = Arc::new(session.rows());
-    let panel = div()
+    let mut panel = div()
         .id("explorer-usage-list-panel")
         .flex_1()
         .min_w_0()
@@ -556,6 +601,32 @@ fn list_panel(
                 .child(note),
         );
     }
+    panel = panel.child(
+        div()
+            .id("explorer-usage-head")
+            .flex_none()
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .pl(px(8.0))
+            .pr(px(8.0))
+            .border_b_1()
+            .border_color(colors.line)
+            .text_color(colors.muted)
+            .child(div().flex_none().w(px(16.0)))
+            .child(div().flex_none().w(px(14.0)))
+            .child(div().flex_1().min_w_0().truncate().child("Name"))
+            .child(div().flex_none().w(px(BAR_WIDTH)).child("Share"))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(72.0))
+                    .text_right()
+                    .child("Size on disk"),
+            )
+            .child(div().flex_none().w(px(84.0)).text_right().child("Items")),
+    );
     let selected = session.selected.clone();
     let actionable = session.tree().is_some();
     let weak_for_rows = weak.clone();
@@ -649,6 +720,7 @@ fn render_row(
         .id(id)
         .h(px(ROW_HEIGHT))
         .flex_none()
+        .overflow_hidden()
         .flex()
         .items_center()
         .gap(px(8.0))

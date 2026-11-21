@@ -417,7 +417,7 @@ impl UsageSession {
             .iter()
             .position(|segment| match segment.target {
                 usage_chart::Target::Item(item) => item_path(tree, item) == *selected,
-                usage_chart::Target::Other { .. } => false,
+                usage_chart::Target::Other { .. } | usage_chart::Target::Row(_) => false,
             })
     }
 }

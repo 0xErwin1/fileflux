@@ -31,6 +31,10 @@ pub enum Target {
         bytes: u64,
         count: u64,
     },
+    /// A row of the list while the analysis runs: there is no tree yet, so
+    /// the segment stands for one measured child, by its position in the
+    /// ranked list.
+    Row(usize),
 }
 
 /// One drawn slice of a ring. Angles run clockwise from twelve o'clock.
@@ -54,6 +58,7 @@ impl Segment {
     #[must_use]
     pub fn bytes(&self, tree: &UsageTree) -> u64 {
         match self.target {
+            Target::Row(_) => 0,
             Target::Item(Item::Folder(id)) => tree.total(id),
             Target::Item(item) => tree
                 .items(item_dir(item))
@@ -200,13 +205,77 @@ pub fn color(branch: usize, depth: u32) -> (f32, f32, f32) {
     (hue, 0.55, lightness)
 }
 
+/// One ring for the chart shown while the analysis runs: the shares measured
+/// so far, in list order, each `Row(index)` into that list. The ring always
+/// closes on itself, so the chart reads as a whole even when the numbers are
+/// still growing.
+#[must_use]
+pub fn layout_rows(shares: &[f32]) -> Vec<Segment> {
+    let total: f32 = shares.iter().filter(|share| **share > 0.0).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0.0;
+    for (index, share) in shares.iter().enumerate() {
+        if *share <= 0.0 {
+            continue;
+        }
+        let sweep = share / total * TAU;
+        out.push(Segment {
+            target: Target::Row(index),
+            depth: 1,
+            branch: index,
+            start,
+            end: start + sweep,
+            inner: CENTER_HOLE,
+            outer: 1.0,
+            parent_bytes: 0,
+        });
+        start += sweep;
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::fs;
-
     use super::*;
+
+    /// The ring drawn while measuring closes on itself and keeps every row
+    /// addressable, so the chart reads as a whole and grows with the walk.
+    #[test]
+    fn the_measured_ring_closes_and_keeps_every_row() {
+        let segments = layout_rows(&[0.5, 0.0, 0.25, 0.25]);
+        assert_eq!(segments.len(), 3, "a zero share draws nothing");
+        let first = &segments[0];
+        assert_eq!(first.start, 0.0);
+        assert!((segments[2].end - TAU).abs() < 1e-5, "the ring closes");
+        assert_eq!(segments[0].target, Target::Row(0));
+        assert_eq!(segments[1].target, Target::Row(2), "the index is the row's");
+        assert!(
+            segments
+                .windows(2)
+                .all(|w| (w[0].end - w[1].start).abs() < 1e-6)
+        );
+    }
+
+    /// Shares are relative to what has been measured, not to a guessed total,
+    /// so a half-measured tree still fills the ring.
+    #[test]
+    fn a_partial_measurement_still_fills_the_ring() {
+        let segments = layout_rows(&[1.0, 3.0]);
+        let sweep: f32 = segments
+            .iter()
+            .map(|segment| segment.end - segment.start)
+            .sum();
+        assert!((sweep - TAU).abs() < 1e-5);
+        assert!((segments[0].end - segments[0].start - TAU / 4.0).abs() < 1e-5);
+        assert!(layout_rows(&[]).is_empty());
+        assert!(layout_rows(&[0.0, 0.0]).is_empty());
+    }
     use crate::core::usage::tests::{Scratch, run};
+    use std::fs;
 
     fn segment_of<'a>(
         segments: &'a [Segment],
@@ -294,7 +363,7 @@ mod tests {
             .iter()
             .find_map(|segment| match segment.target {
                 Target::Other { dir, bytes, count } => Some((dir, bytes, count)),
-                Target::Item(_) => None,
+                Target::Item(_) | Target::Row(_) => None,
             })
             .ok_or_else(|| std::io::Error::other("no fold"))?;
         assert_eq!(other.0, UsageTree::ROOT);
