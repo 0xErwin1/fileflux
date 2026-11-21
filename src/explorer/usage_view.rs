@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use bolt::controls::Button;
 use bolt::primitives::Icon;
-use bolt::tokens::{ChromeColors, Spacing};
+use bolt::tokens::ChromeColors;
 use fileflux::core::places::format_bytes;
 use fileflux::core::usage::{Item, UsageTree};
 use fileflux::core::usage_chart::{self, Segment, Target};
@@ -28,19 +28,27 @@ use super::icon;
 use super::usage::{ChartHover, ShownKind, ShownRow, UsageSession, item_path};
 use super::view::{ENTRIES_CONTEXT, Explorer};
 
-/// The side of the square the chart is drawn in.
-const CHART_SIZE: f32 = 340.0;
-/// The height of one list row.
+/// The width of the chart column, its padding, and the side of the square
+/// the chart is drawn in.
+const CHART_COLUMN: f32 = 360.0;
+const CHART_PADDING: f32 = 14.0;
+const CHART_SIZE: f32 = CHART_COLUMN - 2.0 * CHART_PADDING;
+/// The heights of the header row, the list head, one list row and the footer.
+const HEADER_HEIGHT: f32 = 44.0;
+const HEAD_HEIGHT: f32 = 34.0;
 const ROW_HEIGHT: f32 = 28.0;
-/// The width of a row's proportional bar.
-const BAR_WIDTH: f32 = 170.0;
-/// The width of the size-on-disk column; wide enough for "999.9 GB".
-const SIZE_WIDTH: f32 = 96.0;
-/// The width of the items column.
-const ITEMS_WIDTH: f32 = 84.0;
-/// The two leading cells of a row: the chevron and the glyph.
-const LEAD_WIDTH: f32 = 16.0;
-const GLYPH_WIDTH: f32 = 14.0;
+const FOOTER_HEIGHT: f32 = 38.0;
+/// The horizontal padding of every list cell.
+const CELL_PADDING: f32 = 12.0;
+/// The widths of the share, size-on-disk and items columns, padding
+/// included; the size column fits "999.9 GB".
+const SHARE_WIDTH: f32 = 170.0;
+const SIZE_WIDTH: f32 = 110.0;
+const ITEMS_WIDTH: f32 = 96.0;
+/// The chevron cell before a row's glyph.
+const LEAD_WIDTH: f32 = 14.0;
+/// The indentation of one level of an expanded folder.
+const INDENT: f32 = 16.0;
 
 fn hsla((h, s, l): (f32, f32, f32)) -> Hsla {
     Hsla { h, s, l, a: 1.0 }
@@ -66,10 +74,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .min_w_0()
         .flex()
         .flex_col()
-        .px(Spacing::XL)
-        .pt(Spacing::SM)
-        .pb(Spacing::SM)
-        .gap(Spacing::SM);
+        .text_size(px(13.0));
     let Some(session) = this.usage() else {
         return container.justify_center().child(
             div()
@@ -85,7 +90,6 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .min_h_0()
         .min_w_0()
         .flex()
-        .gap(Spacing::LG)
         .child(chart_panel(this, session, &weak, cx))
         .child(list_panel(this, session, &weak, cx));
     container
@@ -113,7 +117,9 @@ fn header(session: &UsageSession, cx: &mut Context<Explorer>) -> Stateful<Div> {
         .flex()
         .items_center()
         .gap(px(6.0))
-        .overflow_hidden();
+        .overflow_hidden()
+        .font_family(bolt::fonts::editor_family(cx))
+        .text_size(px(12.0));
     for (index, path) in chain.into_iter().enumerate() {
         let label = if index == 0 {
             path.to_string_lossy().into_owned()
@@ -164,9 +170,13 @@ fn header(session: &UsageSession, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let mut header = div()
         .id("explorer-usage-header")
         .flex_none()
+        .h(px(HEADER_HEIGHT))
         .flex()
         .items_center()
-        .gap(Spacing::SM)
+        .gap(px(10.0))
+        .px(px(20.0))
+        .border_b_1()
+        .border_color(colors.row_divider)
         .child(
             div()
                 .flex_none()
@@ -180,39 +190,76 @@ fn header(session: &UsageSession, cx: &mut Context<Explorer>) -> Stateful<Div> {
         header = header.child(
             div()
                 .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .font_family(bolt::fonts::editor_family(cx))
                 .text_size(px(11.0))
                 .text_color(colors.warning)
+                .child(
+                    Icon::new(icon(gpui_kit_assets::IconName::TriangleAlert))
+                        .size(px(12.0))
+                        .color(colors.warning),
+                )
                 .child("freed space is an estimate"),
         );
     }
     header.child(action)
 }
 
-/// The totals of the shown folder, and how much of the walk they cover: the
-/// numbers are read here, not guessed from the chart.
+/// The footer: the totals of the shown folder and how much of the walk they
+/// cover (the numbers are read here, not guessed from the chart), then the
+/// counting rules.
 fn status(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElement {
     let colors = bolt::colors(cx);
+    let footer = div()
+        .id("explorer-usage-status")
+        .flex_none()
+        .h(px(FOOTER_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(14.0))
+        .px(px(16.0))
+        .border_t_1()
+        .border_color(colors.line)
+        .text_size(px(12.0))
+        .text_color(colors.muted);
+    let rules = div()
+        .ml_auto()
+        .flex_none()
+        .flex()
+        .gap(px(14.0))
+        .child("hard links count once")
+        .child("links and other drives are not entered");
     let Some(summary) = session.summary() else {
-        return div().into_any_element();
+        return footer.child(rules).into_any_element();
     };
-    let mut text = format!("{} in {} items", format_bytes(summary.bytes), summary.items);
+    let totals = div()
+        .flex_none()
+        .flex()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_color(colors.foreground)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(format_bytes(summary.bytes)),
+        )
+        .child(format!("in {} items", summary.items));
+    let mut text = String::new();
     if session.is_walking() {
         let rows = session.rows();
         let total = rows.len();
         let done = rows.iter().filter(|row| !row.pending).count();
-        text.push_str(&format!(" \u{00b7} {done} of {total} children measured"));
+        text.push_str(&format!("{done} of {total} children measured"));
     } else if summary.incomplete {
-        text.push_str(" \u{00b7} some folders could not be read");
+        text.push_str("some folders could not be read");
     }
-    div()
-        .id("explorer-usage-status")
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(Spacing::SM)
-        .text_size(px(11.0))
-        .text_color(colors.muted)
-        .child(text)
+    footer
+        .child(totals)
+        .when(!text.is_empty(), |footer| {
+            footer.child(div().min_w_0().truncate().child(text))
+        })
+        .child(rules)
         .into_any_element()
 }
 
@@ -229,12 +276,14 @@ fn legend(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElemen
     if rows.is_empty() {
         return div().into_any_element();
     }
+    let mono = bolt::fonts::editor_family(cx);
     let mut list = div()
         .id("explorer-usage-legend")
         .flex_none()
+        .w_full()
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(6.0))
         .text_size(px(12.0));
     for (index, row) in rows.iter().enumerate() {
         let swatch = if row.kind == ShownKind::Other {
@@ -259,6 +308,7 @@ fn legend(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElemen
                 .child(
                     div()
                         .flex_none()
+                        .font_family(mono.clone())
                         .text_color(colors.strong)
                         .child(format_bytes(row.bytes)),
                 ),
@@ -279,11 +329,16 @@ fn chart_panel(
     let panel = div()
         .id("explorer-usage-chart-panel")
         .flex_none()
-        .w(px(CHART_SIZE))
+        .w(px(CHART_COLUMN))
+        .min_h_0()
+        .p(px(CHART_PADDING))
+        .border_r_1()
+        .border_color(colors.line)
         .flex()
         .flex_col()
         .items_center()
-        .justify_start();
+        .justify_between()
+        .gap(px(12.0));
     let Some(tree) = session.tree() else {
         // While the analysis runs there is no tree yet, but the per-child
         // totals measured so far are enough for one ring: the chart grows
@@ -318,6 +373,7 @@ fn chart_panel(
         )
         .size_full();
         return panel
+            .child(div().flex_1())
             .child(
                 div()
                     .id("explorer-usage-chart")
@@ -334,14 +390,23 @@ fn chart_panel(
                             .items_center()
                             .justify_center()
                             .gap(px(2.0))
-                            .child(div().text_color(colors.muted).child("measuring"))
                             .child(
                                 div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(colors.strong)
                                     .child(format_bytes(measured)),
+                            )
+                            .child(
+                                div()
+                                    .font_family(bolt::fonts::editor_family(cx))
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted)
+                                    .child("measuring"),
                             ),
                     ),
             )
+            .child(div().flex_1())
             .child(legend(session, cx));
     };
     if session.segments.is_empty() {
@@ -402,6 +467,7 @@ fn chart_panel(
         .and_then(|hover| chart_tooltip(tree, session, hover, cx));
     let _ = this;
     panel
+        .child(div().flex_1())
         .child(
             div()
                 .id("explorer-usage-chart")
@@ -420,28 +486,35 @@ fn chart_panel(
                         .gap(px(2.0))
                         .child(
                             div()
-                                .max_w(px(110.0))
+                                .max_w(px(120.0))
                                 .truncate()
+                                .text_size(px(15.0))
+                                .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(colors.strong)
                                 .child(centre_name),
                         )
                         .child(
                             div()
+                                .font_family(bolt::fonts::editor_family(cx))
+                                .text_size(px(11.0))
                                 .text_color(colors.muted)
                                 .child(format_bytes(tree.total(root))),
                         ),
                 )
                 .children(tooltip),
         )
+        .child(div().flex_1())
         .child(legend(session, cx))
 }
 
 fn segment_color(segment: &Segment, highlighted: bool) -> Hsla {
     let color = match segment.target {
+        // The design's line-2 grey: the folded rest reads as background, not
+        // as one more slice.
         Target::Other { .. } | Target::Item(Item::OtherFiles(_)) => Hsla {
-            h: 0.0,
-            s: 0.0,
-            l: 0.5,
+            h: 0.76,
+            s: 0.08,
+            l: 0.28,
             a: 1.0,
         },
         Target::Item(_) | Target::Row(_) => hsla(usage_chart::color(segment.branch, segment.depth)),
@@ -712,31 +785,38 @@ fn list_panel(
                 .child(note),
         );
     }
+    let head_cell = |width: f32, label: &'static str| {
+        div()
+            .flex_none()
+            .w(px(width))
+            .px(px(CELL_PADDING))
+            .whitespace_nowrap()
+            .text_right()
+            .child(label)
+    };
     panel = panel.child(
         div()
             .id("explorer-usage-head")
             .flex_none()
-            .h(px(24.0))
+            .h(px(HEAD_HEIGHT))
             .flex()
             .items_center()
-            .gap(px(8.0))
-            .pl(px(8.0))
-            .pr(px(8.0))
             .border_b_1()
             .border_color(colors.line)
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(colors.muted)
-            .child(div().flex_none().w(px(LEAD_WIDTH)))
-            .child(div().flex_none().w(px(GLYPH_WIDTH)))
-            .child(div().flex_1().min_w_0().truncate().child("Name"))
-            .child(div().flex_none().w(px(BAR_WIDTH)).child("Share"))
             .child(
                 div()
-                    .flex_none()
-                    .w(px(72.0))
-                    .text_right()
-                    .child("Size on disk"),
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(CELL_PADDING))
+                    .truncate()
+                    .child("Name"),
             )
-            .child(div().flex_none().w(px(84.0)).text_right().child("Items")),
+            .child(head_cell(SHARE_WIDTH, "Share"))
+            .child(head_cell(SIZE_WIDTH, "Size on disk"))
+            .child(head_cell(ITEMS_WIDTH, "Items")),
     );
     let selected = session.selected.clone();
     let actionable = session.tree().is_some();
@@ -825,73 +905,93 @@ fn render_row(
     if row.incomplete {
         name.push_str(" (incomplete)");
     }
+    let bar_width = SHARE_WIDTH - 2.0 * CELL_PADDING;
     let bar_fill =
-        (row.share.clamp(0.0, 1.0) * BAR_WIDTH).max(if row.bytes > 0 { 2.0 } else { 0.0 });
+        (row.share.clamp(0.0, 1.0) * bar_width).max(if row.bytes > 0 { 2.0 } else { 0.0 });
+    let mono = bolt::fonts::editor_family(cx);
+    let number_cell = |width: f32| {
+        div()
+            .flex_none()
+            .w(px(width))
+            .px(px(CELL_PADDING))
+            .whitespace_nowrap()
+            .text_right()
+            .font_family(mono.clone())
+            .text_size(px(12.0))
+    };
     let mut element = div()
         .id(id)
+        .relative()
+        .w_full()
         .h(px(ROW_HEIGHT))
         .flex_none()
         .overflow_hidden()
         .flex()
         .items_center()
-        .gap(px(8.0))
-        .pl(px(8.0 + row.depth as f32 * 16.0))
-        .pr(px(8.0))
-        .when(selected, |element| element.bg(tint.opacity(0.18)))
-        .hover(|style| style.bg(colors.strong.opacity(0.06)))
-        .child(chevron)
-        .child(Icon::new(icon(glyph)).size(px(14.0)).color(glyph_color))
+        .border_b_1()
+        .border_color(colors.row_divider)
+        .when(selected, |element| {
+            element.bg(tint.opacity(0.12)).child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(tint),
+            )
+        })
+        .hover(|style| style.bg(colors.hover))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
-                .text_color(if row.pending {
-                    colors.muted
-                } else {
-                    colors.foreground
-                })
-                .child(name),
-        )
-        .child(
-            div()
-                .flex_none()
-                .w(px(BAR_WIDTH))
-                .h(px(8.0))
-                .rounded(px(2.0))
-                .bg(colors.line)
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .pl(px(CELL_PADDING - 4.0 + row.depth as f32 * INDENT))
+                .pr(px(CELL_PADDING))
+                .child(chevron)
+                .child(Icon::new(icon(glyph)).size(px(14.0)).color(glyph_color))
                 .child(
                     div()
-                        .h_full()
-                        .w(px(bar_fill))
-                        .rounded(px(2.0))
-                        .bg(if row.pending {
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if row.pending {
                             colors.muted
+                        } else if selected {
+                            colors.strong
                         } else {
-                            colors.info
-                        }),
+                            colors.foreground
+                        })
+                        .child(name),
                 ),
         )
         .child(
             div()
                 .flex_none()
-                .w(px(SIZE_WIDTH))
-                .whitespace_nowrap()
-                .text_right()
+                .w(px(SHARE_WIDTH))
+                .px(px(CELL_PADDING))
+                .child(div().w_full().h(px(6.0)).bg(colors.line).child(
+                    div().h_full().w(px(bar_fill)).bg(if row.pending {
+                        colors.muted
+                    } else {
+                        colors.info
+                    }),
+                )),
+        )
+        .child(
+            number_cell(SIZE_WIDTH)
                 .text_color(colors.strong)
                 .child(format_bytes(row.bytes)),
         )
         .child(
-            div()
-                .flex_none()
-                .w(px(ITEMS_WIDTH))
-                .whitespace_nowrap()
-                .text_right()
+            number_cell(ITEMS_WIDTH)
                 .text_color(colors.muted)
                 .child(match row.kind {
-                    ShownKind::File => String::new(),
-                    _ if row.items == 1 => "1 item".to_owned(),
-                    _ => format!("{} items", row.items),
+                    ShownKind::File => "\u{2014}".to_owned(),
+                    _ => row.items.to_string(),
                 }),
         );
     if actionable && row.kind != ShownKind::Other {

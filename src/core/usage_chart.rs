@@ -14,7 +14,7 @@ use super::usage::{Item, NodeId, UsageTree};
 /// How many rings the chart draws below the root.
 pub const RING_DEPTH: u32 = 3;
 /// The radius of the empty centre, as a fraction of the chart radius.
-pub const CENTER_HOLE: f32 = 0.22;
+pub const CENTER_HOLE: f32 = 0.38;
 /// Segments thinner than this (radians) are folded into one "other" segment
 /// of their parent, which bounds the segment count however wide a folder is.
 pub const MIN_SEGMENT_ANGLE: f32 = 0.025;

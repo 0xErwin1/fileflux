@@ -3137,8 +3137,10 @@ impl Explorer {
 
     /// Whether the details panel draws at this window width.
     fn inspector_wanted(&self, window: &Window) -> bool {
-        // The split view has no room for the panel beside two panes.
+        // The split view has no room for the panel beside two panes, and the
+        // usage view needs the width for its chart and ranked list.
         !self.tabs.is_split()
+            && !matches!(self.tab().state.current(), Location::Usage { .. })
             && inspector::panel_visible(
                 self.inspector_open,
                 f32::from(window.viewport_size().width),
@@ -4098,11 +4100,9 @@ impl Explorer {
                     ""
                 }
             ))
-        } else if let Location::Usage { root } = self.tab().state.current() {
-            Some(format!(
-                "Space on disk under {}, largest first. Hard links count once; links and other drives are not entered. Freed space is an estimate: shared or snapshotted data may free less than it measures.",
-                root.to_string_lossy(),
-            ))
+        } else if matches!(self.tab().state.current(), Location::Usage { .. }) {
+            // The usage view states its counting rules in its own footer.
+            None
         } else if self.tab().state.current() == &Location::Recent {
             Some(
                 "Recent \u{2014} files other applications opened, newest first. Open containing folder shows where one lives."
