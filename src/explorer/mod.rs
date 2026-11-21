@@ -23,6 +23,7 @@ pub(crate) mod tabs;
 pub(crate) mod tabstrip;
 pub(crate) mod toasts;
 pub(crate) mod toolbar;
+pub(crate) mod typeahead;
 pub(crate) mod util;
 pub(crate) mod view;
 

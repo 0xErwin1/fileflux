@@ -39,9 +39,9 @@ use fileflux::core::watch::{
 use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Div, Entity, FocusHandle, Focusable,
-    InteractiveElement, KeyBinding, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Render, ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, actions, deferred, div, prelude::*, px,
+    InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, deferred, div, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::table::{TableEvent, TableState};
@@ -69,6 +69,7 @@ use crate::explorer::state::{
 use crate::explorer::table::{EntryTableDelegate, ListWidths};
 use crate::explorer::tabs::{Affected, Placement};
 use crate::explorer::toasts;
+use crate::explorer::typeahead::{self, TypeAhead};
 use crate::explorer::{entries, overlay, progress, rubber, sidebar, tabstrip, toolbar, util};
 
 /// How many images one background thumbnail lookup covers before the tiles
@@ -770,6 +771,8 @@ pub(crate) struct Explorer {
     /// The inline rename in progress, if any: it belongs to the active tab
     /// and is cancelled when the tab changes.
     pub(crate) renaming: Option<Renaming>,
+    /// The type-ahead prefix of the entries area (see [`typeahead`]).
+    pub(crate) typeahead: TypeAhead,
     /// The open context menu, if any.
     pub(crate) menu: Option<MenuState>,
     /// The focus of the open context menu.
@@ -1010,6 +1013,7 @@ impl Explorer {
             op_contexts: HashMap::new(),
             undo: UndoStack::default(),
             renaming: None,
+            typeahead: TypeAhead::default(),
             menu: None,
             menu_focus: cx.focus_handle(),
             dialogs: DialogQueue::default(),
@@ -2443,6 +2447,7 @@ impl Explorer {
     /// the focus to the shell, so a second Escape never reaches the
     /// window close path by accident.
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.typeahead.reset();
         // Escape while dragging cancels the drag and nothing else.
         if cx.stop_active_drag(window) {
             return;
@@ -2521,6 +2526,58 @@ impl Explorer {
         self.tab_mut().state.select_visible(target);
         self.scroll_selected_row(target, cx);
         cx.notify();
+    }
+
+    /// A printable key typed in the entries area: moves the selection to
+    /// the first visible entry whose name starts with what was typed. Only
+    /// the entries area itself handles it (not a text field or the rename
+    /// editor inside it); returns whether the key was used.
+    pub(crate) fn type_ahead(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return false;
+        }
+        if !self.entries_focus().is_focused(window)
+            || self.renaming.is_some()
+            || self.menu.is_some()
+        {
+            return false;
+        }
+        let Some(ch) = keystroke
+            .key_char
+            .as_deref()
+            .and_then(|text| typeahead::typeable(text, !self.typeahead.prefix().is_empty()))
+        else {
+            return false;
+        };
+        let (names, paths): (Vec<String>, Vec<PathBuf>) = self
+            .tab()
+            .state
+            .visible_entries()
+            .iter()
+            .map(|entry| (entry.display_name().into_owned(), entry.path.clone()))
+            .unzip();
+        let current = self.tab().state.cursor_position();
+        let cursor = current.and_then(|at| paths.get(at)).cloned();
+        self.typeahead.sync_cursor(cursor.as_deref());
+        let target = self.typeahead.press(ch, Instant::now(), &names, current);
+        let landed = match target {
+            Some(position) => {
+                self.tab_mut().state.select_visible(position);
+                self.scroll_selected_row(position, cx);
+                paths.get(position).cloned()
+            }
+            None => cursor,
+        };
+        self.typeahead.remember_cursor(landed);
+        cx.notify();
+        true
     }
 
     /// Shift+Arrow: extends the selection by `delta` visible positions.

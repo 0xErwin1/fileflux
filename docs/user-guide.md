@@ -167,6 +167,7 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | ↑ ↓ ← →, Home, End | Move through the visible entries and scroll them into view |
 | Shift + those keys | Extend the selection from the anchor |
 | Ctrl+A | Select every entry visible under the filter |
+| Type a name | Type-ahead find: the selection jumps to the first visible entry whose name starts with the letters you type (case-insensitive, following the sort, filter and hidden-file rules). Pause for about a second, press Escape, change folder or move the selection with the mouse or arrow keys to start over; repeating one letter cycles through the entries that start with it. Ctrl+F still filters |
 | Escape | Clear the selection |
 | Click on empty space | Clear the selection (Ctrl or Shift held: leave it) |
 | Drag on empty space | Draw a selection rectangle; the entries it touches are selected live. Every point inside a tile is the entry, so the rectangle starts from the gaps between tiles, the margins and the space right of the last column and below the last row |

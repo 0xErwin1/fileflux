@@ -20,7 +20,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 | Editable properties | Change permissions, owner and group; recursive folder size; properties of several entries | The details panel is read-only and shows the mode string only |
 | Recursive folder size | Bytes used by a folder | Folders show "N items" |
 | Archives | Compress a selection; extract here or to a folder | Nothing |
-| Type-ahead find | Typing a name moves the selection to the matching entry | Nothing; Ctrl+F filters instead |
 
 ## Priority 2: expected file manager features
 

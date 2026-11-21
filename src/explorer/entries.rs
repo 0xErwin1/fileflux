@@ -24,9 +24,9 @@ use bolt::tokens::{Borders, ChromeColors, Spacing};
 use fileflux::core::places::format_bytes;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
-    App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, Modifiers,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, RenderImage, Stateful, Styled,
-    WeakEntity, Window, canvas, div, prelude::*, px,
+    App, ClickEvent, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
+    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, RenderImage, Stateful,
+    Styled, WeakEntity, Window, canvas, div, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 use image::{Frame, RgbaImage};
@@ -461,6 +461,11 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .id("explorer-entries")
         .key_context(ENTRIES_CONTEXT)
         .track_focus(this.entries_focus())
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if this.type_ahead(event, window, cx) {
+                cx.stop_propagation();
+            }
+        }))
         .flex_1()
         .min_h_0()
         .min_w_0()
