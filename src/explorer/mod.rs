@@ -10,6 +10,7 @@ pub(crate) mod dnd;
 pub(crate) mod entries;
 pub(crate) mod favorites;
 pub(crate) mod inspector;
+pub(crate) mod links;
 pub(crate) mod menu_tree;
 pub(crate) mod ops;
 pub(crate) mod overlay;

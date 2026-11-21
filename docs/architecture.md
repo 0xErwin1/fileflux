@@ -37,6 +37,7 @@ One package, one library and one binary.
 | `bookmarks` | The GTK bookmarks file as the favorites: parsing, labels, order-preserving atomic edits |
 | `terminal` | "Open in terminal": the xdg-terminal-exec lookup and the command per terminal (no shell) |
 | `apps` | "Open with…": `.desktop` discovery and `Exec=` parsing (no shell) |
+| `links` | Symbolic links: "Link to" naming, create-then-retry for a free name (never replaces), absolute targets |
 | `archive` | Compress and extract through `bsdtar` (no shell): suffix rules, member and symlink safety checks, temp-then-rename, cancel by killing the child |
 | `images`, `kinds` | Which files are images; the file categories used by sort and filter |
 

@@ -73,4 +73,5 @@ Mouse: the wheel and the back/forward buttons navigate, Ctrl+wheel zooms around 
 | Middle-click a folder, sidebar row or breadcrumb | Open in a background tab |
 | Middle-click a tab | Close it |
 | Drop with Ctrl | Copy |
-| Drop with Shift | Move (Ctrl wins when both are held) |
+| Drop with Shift | Move |
+| Drop with Ctrl+Shift | Link: creates symbolic links to the dropped entries in the target folder (see [Links](user-guide.md#links)) |

@@ -118,6 +118,7 @@ fn undo_paths(action: &UndoAction) -> Vec<PathBuf> {
             .flat_map(|entry| [entry.item.original.clone(), entry.item.files_path()])
             .collect(),
         UndoAction::Create { path, .. } | UndoAction::Archive { path, .. } => vec![path.clone()],
+        UndoAction::Links { items } => items.iter().map(|item| item.link.clone()).collect(),
         UndoAction::Permissions { items } => items.iter().map(|item| item.path.clone()).collect(),
         UndoAction::Copy { items } | UndoAction::Move { items } => items
             .iter()
@@ -1533,6 +1534,16 @@ mod tests {
         assert_eq!(
             job_paths(&Job::Undo(create), Path::new("/t")),
             [p("/mnt/a/n")]
+        );
+        let links = UndoAction::Links {
+            items: vec![crate::explorer::links::LinkedEntry {
+                link: p("/mnt/a/Link to n"),
+                identity,
+            }],
+        };
+        assert_eq!(
+            job_paths(&Job::Undo(links), Path::new("/t")),
+            [p("/mnt/a/Link to n")]
         );
         let placed = |from: &str, to: &str| crate::explorer::ops::PlacedEntry {
             from: p(from),

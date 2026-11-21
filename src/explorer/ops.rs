@@ -90,7 +90,7 @@ pub(crate) struct Identity {
 }
 
 impl Identity {
-    fn from_meta(meta: &fs::Metadata) -> Identity {
+    pub(crate) fn from_meta(meta: &fs::Metadata) -> Identity {
         Identity {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -148,6 +148,11 @@ pub(crate) enum UndoAction {
     /// Undo of a compress or an extract: move the created archive or
     /// folder to the Trash, only if it is still the item that was created.
     Archive { path: PathBuf, identity: Identity },
+    /// Undo of "Make Link", "Paste as link" or a link drop: unlink the
+    /// created links, each only if it is still the link that was created.
+    Links {
+        items: Vec<super::links::LinkedEntry>,
+    },
 }
 
 /// An undo action with the id a toast's Undo button names it by.
@@ -956,6 +961,7 @@ fn undo(action: &UndoAction, ctx: &JobCtx, sink: &Sink) -> Result<Report, String
         UndoAction::Move { items } => Ok(paste::undo_move(items, sink)),
         UndoAction::Permissions { items } => Ok(super::permissions::undo(items, sink)),
         UndoAction::Archive { path, identity } => undo_archive(path, *identity, ctx),
+        UndoAction::Links { items } => Ok(super::links::undo(items, sink)),
     }
 }
 
@@ -1332,6 +1338,10 @@ pub(crate) enum MenuCommand {
     ExtractHere,
     /// Archives: extract the selected archive into a chosen folder.
     ExtractTo,
+    /// Links: a symbolic link beside each selected entry.
+    MakeLink,
+    /// Links: symbolic links to the clipboard's entries in a folder.
+    PasteAsLink,
     /// Devices: unmount the mounted filesystem.
     Unmount,
     /// Devices: unmount every partition of the disk and power it off.

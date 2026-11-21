@@ -1015,7 +1015,10 @@ impl Explorer {
         // what was not restored stays undoable.
         let cancellable = !matches!(
             entry.action,
-            UndoAction::Rename { .. } | UndoAction::Create { .. } | UndoAction::Archive { .. }
+            UndoAction::Rename { .. }
+                | UndoAction::Create { .. }
+                | UndoAction::Archive { .. }
+                | UndoAction::Links { .. }
         );
         let job = Job::Undo(entry.action);
         let ctx = self.job_ctx();
@@ -1095,6 +1098,11 @@ impl Explorer {
             );
             super::archive::add_rows(&mut rows, offer);
         }
+        let in_folder = matches!(self.tab().state.current(), Location::Directory(_));
+        super::links::add_rows(
+            &mut rows,
+            super::links::offer_for(in_folder, &selected, target.can_paste),
+        );
         if rows.is_empty() {
             cx.notify();
             return;
@@ -1406,6 +1414,8 @@ impl Explorer {
             MenuCommand::Compress => self.compress_selected(window, cx),
             MenuCommand::ExtractHere => self.extract_here(window, cx),
             MenuCommand::ExtractTo => self.extract_to(window, cx),
+            MenuCommand::MakeLink => self.make_links_of_selection(window, cx),
+            MenuCommand::PasteAsLink => self.paste_as_link(window, cx),
         }
     }
 

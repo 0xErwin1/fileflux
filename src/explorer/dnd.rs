@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, Spacing};
+use fileflux::core::links::Naming;
 use gpui::{
     App, AppContext as _, Context, ExternalDragPayload, ExternalPaths, FileDragPaths,
     InteractiveElement, IntoElement, ParentElement as _, Pixels, Point, Render,
@@ -100,13 +101,24 @@ pub(crate) enum DropPlan {
     Ignore,
     /// A paste of the dragged paths into `dest`.
     Paste { mode: ClipMode, dest: PathBuf },
+    /// Symbolic links to the dragged paths in `dest`; nothing is copied or
+    /// moved.
+    Link { dest: PathBuf },
     /// The existing Trash job.
     Trash,
 }
 
+/// Whether the modifiers held at the drop ask for links: Ctrl and Shift
+/// together (a copy is Ctrl, a move is Shift). Both origins: links to files
+/// dragged in from other applications point at where those files are.
+pub(crate) fn links_on_drop(ctrl: bool, shift: bool) -> bool {
+    ctrl && shift
+}
+
 /// The mode of a drop into a folder: Move on the same device and Copy
 /// across devices, Ctrl forces Copy and Shift forces Move (Ctrl wins when
-/// both are held: the one that cannot lose data). Files from other
+/// both are held here; [`plan_drop`] turns that combination into a link
+/// before asking). Files from other
 /// applications are always copied.
 pub(crate) fn drop_mode(
     origin: DragOrigin,
@@ -123,7 +135,9 @@ pub(crate) fn drop_mode(
     }
 }
 
-/// Decides a drop. `same_device` is asked only when the answer matters.
+/// Decides a drop. `same_device` is asked only when the answer matters. Ctrl+Shift
+/// links; a link drop into the folder the items already live in does nothing
+/// (Make Link in the context menu links there).
 pub(crate) fn plan_drop(
     origin: DragOrigin,
     sources: &[PathBuf],
@@ -137,6 +151,9 @@ pub(crate) fn plan_drop(
     }
     match target {
         DropTarget::Trash => DropPlan::Trash,
+        DropTarget::Folder(dest) if links_on_drop(ctrl, shift) => {
+            DropPlan::Link { dest: dest.clone() }
+        }
         DropTarget::Folder(dest) => {
             // The device only decides a plain internal drop.
             let plain_internal = origin == DragOrigin::Internal && !ctrl && !shift;
@@ -563,6 +580,9 @@ impl Explorer {
             DropPlan::Paste { mode, dest } => {
                 self.start_paste(sources, dest, mode, None, window, cx)
             }
+            DropPlan::Link { dest } => {
+                self.start_links(sources, Some(dest), Naming::Source, window, cx)
+            }
             DropPlan::Trash => self.trash_paths(sources, window, cx),
         }
         cx.notify();
@@ -831,6 +851,82 @@ mod tests {
                 true
             ),
             DropPlan::Ignore
+        );
+    }
+
+    #[test]
+    fn ctrl_and_shift_together_link_instead_of_copying_or_moving() {
+        for origin in [DragOrigin::Internal, DragOrigin::External] {
+            assert_eq!(
+                plan(origin, &["/h/a"], &folder("/h/d"), true, true, true),
+                DropPlan::Link { dest: p("/h/d") }
+            );
+        }
+        assert!(links_on_drop(true, true));
+        assert!(!links_on_drop(true, false));
+        assert!(!links_on_drop(false, true));
+        assert!(!links_on_drop(false, false));
+    }
+
+    #[test]
+    fn one_modifier_alone_still_copies_or_moves() {
+        let copy =
+            |origin, ctrl, shift| plan(origin, &["/h/a"], &folder("/m/d"), ctrl, shift, true);
+        assert_eq!(
+            copy(DragOrigin::Internal, true, false),
+            DropPlan::Paste {
+                mode: ClipMode::Copy,
+                dest: p("/m/d")
+            }
+        );
+        assert_eq!(
+            copy(DragOrigin::Internal, false, true),
+            DropPlan::Paste {
+                mode: ClipMode::Cut,
+                dest: p("/m/d")
+            }
+        );
+    }
+
+    #[test]
+    fn a_link_drop_the_check_refuses_or_skips_is_ignored() {
+        let internal = DragOrigin::Internal;
+        assert_eq!(
+            plan(internal, &["/h/d"], &folder("/h/d/x"), true, true, true),
+            DropPlan::Ignore
+        );
+        assert_eq!(
+            plan(internal, &["/h/a"], &folder("/h"), true, true, true),
+            DropPlan::Ignore
+        );
+    }
+
+    #[test]
+    fn a_link_drop_never_asks_for_the_device() {
+        let sources = [p("/h/a")];
+        let plan = plan_drop(
+            DragOrigin::Internal,
+            &sources,
+            &folder("/h/d"),
+            true,
+            true,
+            |_| unreachable!("a link does not depend on the device"),
+        );
+        assert_eq!(plan, DropPlan::Link { dest: p("/h/d") });
+    }
+
+    #[test]
+    fn the_trash_row_still_trashes_with_ctrl_and_shift() {
+        assert_eq!(
+            plan(
+                DragOrigin::Internal,
+                &["/h/a"],
+                &DropTarget::Trash,
+                true,
+                true,
+                false
+            ),
+            DropPlan::Trash
         );
     }
 

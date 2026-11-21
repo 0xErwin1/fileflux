@@ -19,7 +19,7 @@ use rustix::io::Errno;
 use super::places::FuseRoots;
 
 /// Longest file name the filesystems we target accept, in bytes.
-const MAX_NAME_BYTES: usize = 255;
+pub(crate) const MAX_NAME_BYTES: usize = 255;
 /// Bytes copied between cancel checks and progress reports.
 const CHUNK: usize = 1 << 20;
 

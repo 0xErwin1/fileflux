@@ -45,6 +45,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::Cut => IconName::Scissors,
         MenuCommand::Copy => IconName::Copy,
         MenuCommand::Paste | MenuCommand::PasteIntoFolder => IconName::ClipboardPaste,
+        MenuCommand::MakeLink | MenuCommand::PasteAsLink => IconName::Link2,
         MenuCommand::Compress => IconName::Archive,
         MenuCommand::ExtractHere | MenuCommand::ExtractTo => IconName::PackageOpen,
         MenuCommand::Mount => IconName::HardDrive,

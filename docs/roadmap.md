@@ -23,7 +23,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Links | Create a symbolic link; a link action on drop | Links are copied and shown, never created |
 | Templates | The entries of `~/Templates` in the New menu | New folder and New file only |
 | Selection | Invert selection; select by pattern | Ctrl+A and the rubber band |
 | Views | A compact view, an icon size control, and Type, Permissions and Owner columns | Grid and a list with Name, Size and Modified |

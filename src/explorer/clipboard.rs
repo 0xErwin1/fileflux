@@ -86,7 +86,7 @@ impl Explorer {
     /// forgotten when something else was put on the system clipboard since,
     /// and replaced when what was put there is files another application
     /// copied or cut (see [`system_clipboard_action`]).
-    fn reconcile_clipboard(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reconcile_clipboard(&mut self, cx: &mut Context<Self>) {
         let system = cx.read_from_clipboard().and_then(|item| item.text());
         let action =
             system_clipboard_action(self.clipboard_text.as_deref(), system.as_deref(), |path| {

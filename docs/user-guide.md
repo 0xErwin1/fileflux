@@ -23,6 +23,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [File operations](#file-operations)
 - [Trash](#trash)
 - [Archives](#archives)
+- [Links](#links)
 - [Undo](#undo)
 - [Clipboard](#clipboard)
 - [Drag and drop](#drag-and-drop)
@@ -148,7 +149,7 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 | Switch pane | F6, or click anywhere in a pane |
 | Copy to the other pane | F5: the selection is copied into the folder the other pane shows |
 | Move to the other pane | Shift+F5: the selection is moved there |
-| Drag and drop | Drag between panes like anywhere else: a move on the same device, a copy across devices, Ctrl copies, Shift moves |
+| Drag and drop | Drag between panes like anywhere else: a move on the same device, a copy across devices, Ctrl copies, Shift moves, Ctrl+Shift links |
 
 - **Each pane is a tab strip of its own** (Ctrl+T, Ctrl+W, Ctrl+Tab and Alt+1 … Alt+9 act on the focused pane), and every tab keeps its location, history, view, sort, filters and selection. The focused pane has a 3 px tinted edge on top.
 - **The focused pane is the one you are working in.** The sidebar, breadcrumbs, path field, search, toolbar and every keyboard shortcut act on it. Clicking in the other pane focuses it first (an open dialog or context menu keeps the press for itself).
@@ -195,7 +196,7 @@ The sidebar's Favorites are the local lines of `$XDG_CONFIG_HOME/gtk-3.0/bookmar
 - **Open in terminal** (context menu on one selected folder, on a sidebar row and on empty space): starts your terminal in that folder (the shown folder on empty space), with no shell. The terminal is the first that exists of: `$TERMINAL`, `xdg-terminal-exec`, the desktop ids in `xdg-terminals.list`, a desktop entry with `Categories=TerminalEmulator` (known terminals first), then ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, kgx, konsole, xfce4-terminal, xterm. Terminals that ignore the working directory of the process get their own argument: `--working-directory=DIR` (ghostty, foot, gnome-terminal, kgx, xfce4-terminal), `--working-directory DIR` (alacritty), `--directory DIR` (kitty), `--workdir DIR` (konsole), `start --cwd DIR` (wezterm); xterm uses its working directory, and a terminal found through a desktop entry uses the entry's `X-TerminalArgDir` when it has one. `<desktop>-xdg-terminals.list` variants for `$XDG_CURRENT_DESKTOP` are tried first, and the lists are read from `$XDG_CONFIG_HOME` then `$XDG_CONFIG_DIRS`. The lookup reads `.desktop` files, so it runs off the UI thread at startup; the item is omitted until a terminal is found, and when none is.
 - **Open in viewer** (context menu, one selected image), and **Open in new tab**, **Add to favorites** / **Remove from favorites** (selected folder, not in the Trash).
 
-The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), [Extract here, Extract to… and Compress…](#archives), Rename, Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, Paste, **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
+The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), **Paste as link** (on one selected folder), [Extract here, Extract to… and Compress…](#archives), Rename, [Make Link](#links), Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, Paste, [Paste as link](#links), **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
 
 ## File operations
 
@@ -233,9 +234,18 @@ Compressing and extracting use `bsdtar` (libarchive) as an external program, off
 - **Safety.** The member list is read first (`bsdtar -tf`): an archive with an absolute member name or a `..` component is refused whole with an error, and nothing is extracted. Extraction runs in a hidden folder inside the destination with `--no-same-owner --no-same-permissions` (never `-P`) and is renamed into place only at the end; a failure or cancel removes it. Afterwards any symlink whose resolved target leaves the new folder is removed and the toast says how many. Folders the archive made unreadable for you are given owner access so they can be browsed and deleted.
 - **Undo** moves the created archive or folder to the Trash (if it is still the item that was created), never deleting it.
 
+## Links
+
+Symbolic links are created, never copied. They run as ordinary operations (progress card when several, one summary toast, per-item errors under **Details**) and are offered only in a real folder: not in the Trash, Recent or search results, and never onto a device that is being ejected. A link's target is the absolute path of the entry as Fileflux shows it (not resolved through links of its own), so a link keeps working when you move it to another folder. Nothing is ever replaced: a taken name gets a number.
+
+- **Make Link** (context menu, any selection in a folder): creates "Link to <name>" next to each selected entry ("Link to <name> (2)" when taken) and selects the new links.
+- **Paste as link** (context menu on empty space, or on one selected folder; dimmed while the clipboard is empty): creates a link to each entry on the clipboard in that folder, named after the entry (numbered when taken, like a copy). The clipboard is untouched, so a Cut is still waiting for a real Paste.
+- **Drop with Ctrl+Shift** held on a folder (entries dragged inside Fileflux, and files dragged in from other applications) creates the links there instead of copying or moving. Dropping onto the folder the entries already live in does nothing; use **Make Link** there.
+- **Undo** removes exactly the links that were created, each only if it is still the symlink that was created (a link replaced by another file, or already gone, is skipped and reported). A link is unlinked itself: the entry it points to, even a folder, is never touched.
+
 ## Undo
 
-Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file, copy, move, compress or extract. The history is per session and survives navigation.
+Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file, copy, move, compress, extract or link. The history is per session and survives navigation.
 
 | Operation | What undo does |
 |---|---|
@@ -245,6 +255,7 @@ Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no 
 | Copy | Moves the copies it created to the Trash (never deletes them) |
 | Move | Puts items back where they came from, only if each is still the item that was moved, never replacing anything that took the original place |
 | Compress / Extract | The created archive or folder goes to the Trash, only if it is still the item that was created |
+| Make Link / Paste as link / link drop | Unlinks the created links, each only if it is still the symlink that was created; never follows a link |
 
 Each history entry remembers which file it acted on (device and inode). If the item at that place is no longer the same one (replaced, changed, emptied from the Trash), the toast says "Can't undo: … changed since …" and nothing is touched. Items replaced during a paste are not restorable by Undo, and **permanent deletion cannot be undone**.
 
@@ -278,9 +289,9 @@ When an item already exists in the destination, a modal asks "“report.pdf” a
 Drag selected entries from the grid or the list (dragging an unselected entry selects it alone first). A drag starts only once the pointer has moved 8 px from where you pressed, the desktop's usual threshold: before that there is no preview, no target lights up, nothing can be dropped and the selection does not change, and releasing there is just a click. A slip of the hand while clicking never moves a file. The preview shows the icon and name, or "N items". A drop is a paste with explicit sources, so it uses the same conflict dialog, progress card and undo as Ctrl+V.
 
 - **Targets:** a folder tile or row, a sidebar Places, Favorites or Devices row, a breadcrumb segment, and the empty space of the shown folder. A valid target gets a selection wash and a tint border; invalid targets (the dragged item itself, anything inside it, a file, the Trash view) show nothing and refuse the drop.
-- **Action:** by default a drop **moves on the same device and copies across devices**. Hold **Ctrl** to copy or **Shift** to move (Ctrl wins).
+- **Action:** by default a drop **moves on the same device and copies across devices**. Hold **Ctrl** to copy or **Shift** to move (Ctrl wins), or **Ctrl+Shift** to create [links](#links) instead.
 - **Home Trash row:** moves to the Trash through the same undoable job as Del.
-- **From other applications:** files dropped on a folder are always copied, never moved, and cannot be dropped on the Trash row.
+- **From other applications:** files dropped on a folder are always copied (or linked with Ctrl+Shift), never moved, and cannot be dropped on the Trash row.
 - **To other applications:** dragging past the window's edge hands the dragged entries to the desktop as a file list (`text/uri-list`), so a browser, chat or another file manager can take them; the receiving application decides whether it copies, moves or uploads. Wayland only for now: on X11 the drag stays inside Fileflux.
 - **Escape** during a drag cancels it; releasing outside any target does nothing.
 

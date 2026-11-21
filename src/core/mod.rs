@@ -15,6 +15,7 @@ pub mod fs;
 pub mod icons;
 pub mod images;
 pub mod kinds;
+pub mod links;
 pub mod mimes;
 pub mod navigation;
 pub mod ops;
