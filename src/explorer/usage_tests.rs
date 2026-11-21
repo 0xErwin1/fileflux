@@ -350,8 +350,8 @@ fn commands(rows: &[MenuRow]) -> Vec<MenuCommand> {
 
 #[test]
 fn a_row_menu_offers_open_containing_folder_copy_path_trash_and_delete() {
-    for folder in [true, false] {
-        let rows = usage_menu_rows(folder);
+    {
+        let rows = usage_menu_rows();
         assert_eq!(
             commands(&rows),
             [

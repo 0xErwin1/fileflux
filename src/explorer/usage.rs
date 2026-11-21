@@ -517,7 +517,7 @@ fn flatten(
 
 /// The menu of a row of the list or a chart segment: the folder or file it
 /// stands for, opened, shown where it lives, copied, trashed or deleted.
-pub(crate) fn usage_menu_rows(_folder: bool) -> Vec<MenuRow> {
+pub(crate) fn usage_menu_rows() -> Vec<MenuRow> {
     let item = |command, label, shortcut, danger| {
         MenuRow::Item(MenuItemSpec {
             shortcut,
@@ -862,15 +862,13 @@ impl Explorer {
             return;
         }
         session.select(path);
-        let folder = session.activation(path) != Activation::None
-            && matches!(session.activation(path), Activation::Drill(_));
         let title = path
             .file_name()
             .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy())
             .into_owned();
         self.show_menu(
             position,
-            usage_menu_rows(folder),
+            usage_menu_rows(),
             (MenuOn::Entries, Some(title)),
             window,
             cx,
