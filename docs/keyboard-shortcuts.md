@@ -12,7 +12,8 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Ctrl+Shift+Tab / Ctrl+PageUp | Previous tab | Wraps around |
 | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown | Move the active tab left / right | The tab stays active; it stops at the ends (no wrap) |
 | Alt+1 … Alt+9 | Jump to tab 1–9 | Nothing happens when there is no such tab |
-| F3 | Split into two panes / back to one | Also the toolbar's Split view button; see [Dual pane](user-guide.md#dual-pane) |
+| F3 | Split into two panes / back to one | Also the toolbar's Split view row; each pane's **×** closes that pane instead (see [Dual pane](user-guide.md#dual-pane)) |
+| — | Hide / show the sidebar | No key: the hamburger at the top of the sidebar hides it, and the one at the start of the leftmost pane's toolbar shows it |
 | F6 | Switch to the other pane | Only while split |
 | F5 | Copy the selection to the other pane's folder | Conflict dialog, progress and Undo as for paste; refused into Trash, Recent and search results |
 | Shift+F5 | Move the selection to the other pane's folder | Same |

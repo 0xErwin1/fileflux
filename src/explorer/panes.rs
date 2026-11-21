@@ -61,6 +61,20 @@ pub(crate) fn split_refusal(width: f32) -> String {
     )
 }
 
+/// Whether the pane `side` carries the hamburger that brings the sidebar
+/// back: only while the sidebar is hidden, and only the leftmost drawn pane
+/// (the left pane of a side-by-side split, the one drawn pane otherwise).
+pub(crate) fn shows_sidebar_toggle(sidebar_shown: bool, side: Side, layout: PaneLayout) -> bool {
+    !sidebar_shown && (side == Side::Left || layout != PaneLayout::SideBySide)
+}
+
+/// Whether each pane draws its close control: only while two panes are
+/// drawn. A split window too narrow for two panes shows one pane and no
+/// close control (F3 still unsplits).
+pub(crate) fn shows_pane_close(layout: PaneLayout) -> bool {
+    layout == PaneLayout::SideBySide
+}
+
 /// The narrowest a pane gets when the divider is dragged: its toolbar and a
 /// few columns of entries stay usable.
 pub(crate) const MIN_PANE_WIDTH: f32 = 460.0;
@@ -76,6 +90,19 @@ pub(crate) fn clamp_ratio(ratio: f32, available: f32) -> f32 {
     }
     let low = MIN_PANE_WIDTH / available;
     ratio.clamp(low, 1.0 - low)
+}
+
+/// The two panes' widths in `available` (the room they share without the
+/// divider): the clamped ratio's shares, which always add up to `available`
+/// so the panes fit inside the window.
+pub(crate) fn pane_widths(available: f32, ratio: f32) -> (f32, f32) {
+    let available = if available.is_finite() {
+        available.max(0.0)
+    } else {
+        0.0
+    };
+    let left = available * clamp_ratio(ratio, available);
+    (left, available - left)
 }
 
 /// The ratio while the divider is dragged from `start_x` to `x`: the start
@@ -294,6 +321,19 @@ impl<T> Panes<T> {
         self.focus = Side::Left;
         self.split = false;
         swapped
+    }
+
+    /// Closes the pane `side` of a split view: the other pane takes the focus
+    /// and becomes the single pane, and the closed one is parked exactly as
+    /// [`Self::unsplit`] parks it (tabs intact). `None` — nothing changes —
+    /// while not split; otherwise what `unsplit` returns (the tab on screen
+    /// changed hands).
+    pub(crate) fn close_pane(&mut self, side: Side) -> Option<bool> {
+        if !self.split {
+            return None;
+        }
+        self.focus_side(side.other());
+        Some(self.unsplit())
     }
 
     /// The last step of reopening a saved session's second pane, once its
@@ -1263,6 +1303,100 @@ mod tests {
         assert!((dragged_ratio(0.5, 1000.0, -9000.0, 2000.0) - lo).abs() < 1e-6);
         assert!((dragged_ratio(0.5, 1000.0, 9000.0, 2000.0) - (1.0 - lo)).abs() < 1e-6);
         assert!((dragged_ratio(0.6, 1000.0, f32::NAN, 2000.0) - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn closing_a_pane_keeps_the_other_one_and_parks_the_closed_one() {
+        let mut panes = split_panes();
+        // Closing the right pane (focused or not) leaves the left tabs.
+        assert_eq!(panes.close_pane(Side::Right), Some(false));
+        assert!(!panes.is_split());
+        assert_eq!(panes.focus(), Side::Left);
+        assert_eq!(*panes.active(), "l2", "the left pane stayed");
+        assert_eq!(all(&panes), ["l1", "l2", "r1"], "nothing was closed");
+
+        // Closing the left pane while the right one has the focus.
+        let mut panes = split_panes();
+        assert!(panes.switch_focus());
+        assert_eq!(panes.close_pane(Side::Left), Some(true));
+        assert!(!panes.is_split());
+        assert_eq!(*panes.active(), "r1", "the right pane took the left slot");
+        assert_eq!(all(&panes), ["r1", "l1", "l2"], "the closed pane is parked");
+
+        // Closing the left pane while the left one has the focus: the focus
+        // goes to the pane that stays.
+        let mut panes = split_panes();
+        assert_eq!(panes.close_pane(Side::Left), Some(true));
+        assert_eq!(*panes.active(), "r1");
+        assert!(panes.split(None), "the parked pane comes back on a split");
+    }
+
+    #[test]
+    fn closing_a_pane_does_nothing_without_a_split() {
+        let mut panes = Panes::new("a");
+        assert_eq!(panes.close_pane(Side::Left), None);
+        assert_eq!(panes.close_pane(Side::Right), None);
+        assert!(!panes.is_split());
+        assert_eq!(*panes.active(), "a");
+    }
+
+    #[test]
+    fn the_hamburger_shows_in_the_leftmost_pane_only_while_the_sidebar_is_hidden() {
+        // Sidebar shown: it carries its own hamburger, no pane does.
+        for side in [Side::Left, Side::Right] {
+            for layout in [
+                PaneLayout::Single,
+                PaneLayout::SideBySide,
+                PaneLayout::OnePaneAtATime,
+            ] {
+                assert!(!shows_sidebar_toggle(true, side, layout));
+            }
+        }
+        // Hidden: the left pane of a split, the single pane otherwise.
+        assert!(shows_sidebar_toggle(
+            false,
+            Side::Left,
+            PaneLayout::SideBySide
+        ));
+        assert!(!shows_sidebar_toggle(
+            false,
+            Side::Right,
+            PaneLayout::SideBySide
+        ));
+        assert!(shows_sidebar_toggle(false, Side::Left, PaneLayout::Single));
+        // A split narrower than two panes draws only the focused pane: it is
+        // the leftmost one even when it is the right pane.
+        assert!(shows_sidebar_toggle(
+            false,
+            Side::Right,
+            PaneLayout::OnePaneAtATime
+        ));
+    }
+
+    #[test]
+    fn a_pane_close_control_shows_only_while_two_panes_are_drawn() {
+        assert!(shows_pane_close(PaneLayout::SideBySide));
+        assert!(!shows_pane_close(PaneLayout::Single));
+        assert!(!shows_pane_close(PaneLayout::OnePaneAtATime));
+    }
+
+    #[test]
+    fn the_two_panes_always_fit_in_the_room_they_share() {
+        for available in [0.0, 300.0, 778.0, 919.0, 920.0, 938.0, 1500.0] {
+            for ratio in [0.0, 0.2, 0.5, 0.9, 1.0, f32::NAN] {
+                let (left, right) = pane_widths(available, ratio);
+                assert!(left >= 0.0 && right >= 0.0);
+                assert!(
+                    (left + right - available).abs() < 1e-3,
+                    "{available}/{ratio}: {left}+{right}"
+                );
+                if available >= 2.0 * MIN_PANE_WIDTH {
+                    assert!(left >= MIN_PANE_WIDTH - 1e-3 && right >= MIN_PANE_WIDTH - 1e-3);
+                }
+            }
+        }
+        // Too narrow for two minimum panes: even halves, never overflowing.
+        assert_eq!(pane_widths(778.0, 0.9), (389.0, 389.0));
     }
 
     #[test]

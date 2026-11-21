@@ -1,14 +1,16 @@
-//! The toolbar of the document island, six groups: the sidebar toggle, the
+//! The toolbar of the document island, six groups: the sidebar hamburger
+//! (only on the leftmost pane while the sidebar is hidden), the
 //! history buttons with disabled states, the breadcrumb path (Ctrl+L or a
 //! click on its empty space edits it), the current-folder filename search
 //! (Ctrl+F, with its live match count and its options behind a filter
 //! button at the field's trailing edge), the segmented grid/list toggle and
 //! one `⋯` menu holding Split view, Favorite this folder, Refresh and
-//! Properties.
+//! Properties, and — in a split view — the pane's close control.
 //!
-//! The controls keep their sizes from `bolt`'s tokens; on narrow windows
-//! they shrink with flex instead of disappearing, and the sidebar toggle
-//! hides or shows the sidebar at any width.
+//! The controls keep their sizes from `bolt`'s tokens. The row never wraps
+//! and never overflows its pane: the breadcrumbs and the search field give
+//! way first (down to [`CRUMBS_MIN_WIDTH`] and [`SEARCH_MIN_WIDTH`]), and
+//! whatever still does not fit is clipped at the pane edge.
 
 use bolt::controls::{Button, InputEscape, SearchCount, SearchField};
 use bolt::primitives::Icon;
@@ -21,13 +23,28 @@ use gpui_component::tooltip::Tooltip;
 use super::actions::MenuOn;
 use super::dnd::{self, DropTarget};
 use super::icon;
+use super::panes::Side;
 use super::state::{Transition, View};
 use super::tabs::Placement;
 use super::util::{self, CrumbKind};
 use super::view::Explorer;
 
-/// The toolbar row, wrapped rather than clipped.
-pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
+/// The narrowest the breadcrumb bar and the search field get before the row
+/// clips: both shrink from their natural width down to these.
+pub(crate) const CRUMBS_MIN_WIDTH: f32 = 72.0;
+pub(crate) const SEARCH_MIN_WIDTH: f32 = 56.0;
+
+/// What a pane's toolbar carries besides its own controls.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Chrome {
+    /// The hamburger that shows the hidden sidebar (leftmost pane only).
+    pub(crate) sidebar_toggle: bool,
+    /// The pane this toolbar closes with its × control, in a split view.
+    pub(crate) close: Option<Side>,
+}
+
+/// The toolbar row: one line, never wider than its pane.
+pub(crate) fn render(this: &Explorer, chrome: Chrome, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
     let search_options_open = matches!(
         this.menu.as_ref().map(|menu| &menu.on),
@@ -41,8 +58,10 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     div()
         .id("explorer-toolbar")
         .flex_none()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
         .flex()
-        .flex_wrap()
         .items_center()
         .gap(Spacing::XXS)
         .pl(px(14.0))
@@ -50,25 +69,18 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .min_h(px(50.0))
         .border_b_1()
         .border_color(colors.line)
-        // The sidebar toggle works at every width: it hides or shows the
-        // sidebar, and the content island takes the freed space.
-        .child(
-            Button::new("explorer-sidebar-toggle", "Sidebar")
+        // The hamburger that brings the hidden sidebar back: the first
+        // control of the leftmost pane only (the sidebar has its own).
+        .children(chrome.sidebar_toggle.then(|| {
+            Button::new("explorer-sidebar-show", "Show sidebar")
                 .ghost()
                 .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::PanelLeft))
-                .tooltip("Show or hide the places sidebar")
+                .icon(icon(gpui_kit_assets::IconName::Menu))
+                .tooltip("Show sidebar")
                 .on_click(cx.listener(|this, _event, window, cx| {
-                    if f32::from(window.viewport_size().width) < super::view::NARROW_WIDTH {
-                        // Narrow: the toggle opens or closes the overlay and
-                        // leaves the docked preference alone.
-                        this.close_sidebar_overlay(super::sidebar::OverlayEvent::Toggle);
-                    } else {
-                        this.sidebar_open = !this.sidebar_open;
-                    }
-                    cx.notify();
-                })),
-        )
+                    this.toggle_sidebar(window, cx);
+                }))
+        }))
         // History: back, forward, up — with honest disabled states.
         .child(
             div()
@@ -129,7 +141,10 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .child(
             div()
                 .id("explorer-search-frame")
-                .flex_none()
+                // Natural width 13.75 rem, shrinking to its minimum.
+                .flex()
+                .w(gpui::rems(13.75))
+                .min_w(px(SEARCH_MIN_WIDTH))
                 .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
                     this.clear_search_on_escape(window, cx);
                     cx.stop_propagation();
@@ -141,7 +156,6 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         } else {
                             "Search names in current folder"
                         })
-                        .width(gpui::rems(13.75))
                         .count(search_count(this, cx))
                         .trailing(search_filter_button(this, cx, search_options_open)),
                 ),
@@ -211,6 +225,17 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     this.open_toolbar_menu(position, window, cx);
                 })),
         )
+        // In a split view each pane closes itself; the other one stays.
+        .children(chrome.close.map(|side| {
+            Button::new("explorer-close-pane", "Close pane")
+                .ghost()
+                .icon_only()
+                .icon(icon(gpui_kit_assets::IconName::X))
+                .tooltip("Close this pane")
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_pane(side, window, cx);
+                }))
+        }))
 }
 
 /// The search field's filter button: opens the search options popover —
@@ -252,7 +277,7 @@ fn path_editor(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     div()
         .id("explorer-path-frame")
         .flex_1()
-        .min_w(px(160.0))
+        .min_w(px(CRUMBS_MIN_WIDTH))
         .h(px(30.0))
         .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
             this.restore_path_on_escape(window, cx);
@@ -289,7 +314,7 @@ fn crumb_bar(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let mut bar = div()
         .id("explorer-crumbs")
         .flex_1()
-        .min_w(px(160.0))
+        .min_w(px(CRUMBS_MIN_WIDTH))
         .h(px(30.0))
         .flex()
         .items_center()

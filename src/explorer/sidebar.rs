@@ -15,6 +15,7 @@
 //! partitions.
 
 use bolt::composites::{Island, ListRow};
+use bolt::controls::Button;
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, IslandMetrics, Spacing, TreeMetrics};
 use fileflux::core::Location;
@@ -87,6 +88,7 @@ pub(crate) fn render(
     let mut island = Island::new()
         .w(px(this.sidebar_width))
         .h_full()
+        .child(hamburger_row(cx))
         .child(places_section(this, cx))
         .child(favorites_section(this, cx))
         .child(network_section(this, cx))
@@ -154,6 +156,28 @@ fn section_label(id: &'static str, text: &str, cx: &App) -> Stateful<Div> {
 
 /// The Places section: Home, the user directories, Recent and the scoped
 /// Trash.
+/// The top of the sidebar island: the one hamburger that hides the sidebar
+/// (the leftmost pane's toolbar carries the one that shows it again).
+fn hamburger_row(cx: &mut Context<Explorer>) -> Stateful<Div> {
+    div()
+        .id("explorer-sidebar-header")
+        .flex_none()
+        .flex()
+        .items_center()
+        .h(px(44.0))
+        .px(px(10.0))
+        .child(
+            Button::new("explorer-sidebar-hide", "Hide sidebar")
+                .ghost()
+                .icon_only()
+                .icon(super::icon(gpui_kit_assets::IconName::Menu))
+                .tooltip("Hide sidebar")
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_sidebar(window, cx);
+                })),
+        )
+}
+
 fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let colors = bolt::colors(cx);
     let mut section = div().flex_none().flex().flex_col();

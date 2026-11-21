@@ -40,6 +40,8 @@ use super::view::Explorer;
 
 /// Height of the strip and of every tab.
 pub(crate) const TAB_HEIGHT: f32 = 30.0;
+/// The narrowest the drag-time end zone of the strip gets.
+const END_ZONE_MIN: f32 = 24.0;
 /// The narrowest a tab shrinks to before the row clips.
 const TAB_MIN_WIDTH: f32 = 96.0;
 /// The widest a tab grows to.
@@ -157,11 +159,11 @@ fn build(this: &Explorer, cx: &mut Context<Explorer>) -> Option<Stateful<Div>> {
     if dragging {
         // The empty end of the strip: the gap after the last tab. It takes
         // the whole of what the tabs leave free (a grow factor below one
-        // would leave it a sliver no pointer can hit); when the tabs fill the
-        // strip there is none, and the right half of the last tab is the end
-        // gap.
+        // would leave it a sliver no pointer can hit), and never less than
+        // END_ZONE_MIN: when the tabs fill the strip they give up that much,
+        // split across all of them, so the end stays a target.
         let end = this.tabs.focused().len();
-        let filler = div().h_full().flex_1().min_w_0();
+        let filler = div().h_full().flex_1().min_w(px(END_ZONE_MIN));
         let skip =
             grabbed.is_some_and(|(from_side, from)| from_side == side && gap_is_noop(from, end));
         if !skip {

@@ -73,11 +73,11 @@ A sidebar of places on the left, the folder in the middle, and an optional [deta
 
 | Part | What it does |
 |---|---|
-| Toolbar | Sidebar toggle, back, forward, up, the path bar, the search field with its options behind the filter button, the grid/list/compact switch, and one `⋯` menu with Split view, Favorite this folder, Refresh (Ctrl+R) and Properties (Ctrl+I) |
+| Toolbar | Back, forward, up, the path bar, the search field with its options behind the filter button, the grid/list/compact switch, and one `⋯` menu with Split view, Favorite this folder, Refresh (Ctrl+R) and Properties (Ctrl+I). In a split view each pane's toolbar ends with a **×** (Close this pane). While the sidebar is hidden, the leftmost pane's toolbar starts with the hamburger that shows it again |
 | Folder subbar | Current folder name, "4 folders · 7 files" count, **Sort**, **Filter**, **New folder**, active filter chips |
 | Status bar | "N items" or "N selected · size" (with the file type when exactly one entry is selected), loading and error notices, a progress indicator for long operations, free space of the current volume |
 
-Drag the right edge of the sidebar or the left edge of the details panel (a 6 px handle with a tint line on hover) to resize them; double-click a handle to restore the default width (290 px sidebar, 300 px details). The sidebar is clamped to 200–600 px and always leaves the folder pane 360 px; the details panel to 240–600 px and never wider than the window leaves room for the entries. Narrow windows park the sidebar as an overlay, without a resize handle, keeping its width; the sidebar toggle shows or hides it at any width, and the path, search and view controls always stay reachable. The widths are remembered (`sidebar_width`, `details_width` in [settings](settings.md#files-and-locations)).
+Drag the right edge of the sidebar or the left edge of the details panel (a 6 px handle with a tint line on hover) to resize them; double-click a handle to restore the default width (290 px sidebar, 300 px details). The sidebar is clamped to 200–600 px and always leaves the folder pane 360 px; the details panel to 240–600 px and never wider than the window leaves room for the entries. Narrow windows park the sidebar as an overlay, without a resize handle, keeping its width; the hamburger at the top of the sidebar hides it at any width (while it is hidden, the same hamburger starts the leftmost pane's toolbar and shows it; there is no keyboard shortcut for the sidebar), and the path, search and view controls always stay reachable. The widths are remembered (`sidebar_width`, `details_width` in [settings](settings.md#files-and-locations)).
 
 The window title is the current folder plus Fileflux ("Home — Fileflux") and follows the active tab. Fileflux always starts in Bolt's dark palette; there is no theme toggle.
 
@@ -179,6 +179,7 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 
 | Action | How |
 |---|---|
+| Close a pane | The **×** at the end of a pane's toolbar (tooltip "Close this pane") closes that pane and leaves the other one as the single pane; the closed pane's tabs are parked like F3 parks them. It shows only while two panes are drawn |
 | Split / unsplit | F3 or the toolbar button. Unsplitting keeps the pane that has the focus; the other pane's tabs are parked, still open and live, and come back with the next split |
 | Switch pane | F6, or click anywhere in a pane |
 | Copy to the other pane | F5: the selection is copied into the folder the other pane shows |
@@ -191,6 +192,7 @@ F3 or the **Split view** button in the toolbar shows two folders side by side; p
 - **The focused pane is the one you are working in.** The sidebar, breadcrumbs, path field, search, toolbar and every keyboard shortcut act on it. Clicking in the other pane focuses it first (an open dialog or context menu keeps the press for itself).
 - **F5 and Shift+F5 use the paste engine**, so you get the conflict dialog (Skip, Keep both, Replace), the progress card with Cancel, and Undo. They leave the clipboard alone. Without a split they say so in a toast. They are refused, with a toast, when the other pane shows the Trash, Recent or search results (there is no folder to put files in), and out of the Trash (use Restore).
 - **Shared across both panes:** the sidebar and favorites, the clipboard, the undo history, progress cards, dialogs and toasts. When an operation finishes, every tab of both panes showing a folder it changed is re-read; live refresh and device ejects cover the tabs of both panes.
+- **Panes always fit the window.** Each pane's toolbar is one row that gives way before anything overflows: the search field shrinks (down to 56 px) and the breadcrumbs truncate (down to 72 px), then the row is clipped at the pane edge; the folder title in the pane's header truncates as well. The panes share exactly the room between the sidebar and the window edge.
 - **Window width.** Two panes need a window at least **1100 px** wide. In a narrower window F3 refuses with a toast; a window that shrinks while split shows only the focused pane (F6 switches which one) until it widens again. F5 and Shift+F5 still work then.
 - **The details panel is not drawn while split** (there is no room beside two panes); Properties and Ctrl+I show it again once you unsplit.
 - The split, both panes' tabs and which pane had the focus are restored at the next launch (see [Settings](settings.md)).

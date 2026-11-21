@@ -421,6 +421,8 @@ const WATCH_STEP: Duration = Duration::from_millis(100);
 const SUBBAR_HEIGHT: f32 = 44.0;
 /// The subbar's horizontal padding.
 const SUBBAR_PADDING: f32 = 20.0;
+/// The widest the folder title of the subbar gets before it truncates.
+const SUBBAR_TITLE_MAX: f32 = 200.0;
 
 /// The height of the edge above a pane of the split view, tinted while the
 /// pane has the focus.
@@ -3464,6 +3466,37 @@ impl Explorer {
         cx.notify();
     }
 
+    /// The pane `side` of a split view closes: the other pane stays as the
+    /// single pane and the closed one is parked like F3 parks it. Does
+    /// nothing while not split.
+    pub(crate) fn close_pane(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(changed) = self.tabs.close_pane(side) {
+            self.after_tab_switch(changed, window, cx);
+        }
+    }
+
+    /// Whether the sidebar is on screen: docked while `sidebar_open`, or the
+    /// parked overlay of a narrow window while it is open.
+    pub(crate) fn sidebar_visible(&self, window: &Window) -> bool {
+        if f32::from(window.viewport_size().width) < NARROW_WIDTH {
+            self.sidebar_overlay_open
+        } else {
+            self.sidebar_open
+        }
+    }
+
+    /// The hamburger buttons (the sidebar's and the leftmost pane's): hides
+    /// or shows the sidebar. A narrow window opens or closes the overlay
+    /// and leaves the docked preference alone.
+    pub(crate) fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if f32::from(window.viewport_size().width) < NARROW_WIDTH {
+            self.close_sidebar_overlay(sidebar::OverlayEvent::Toggle);
+        } else {
+            self.sidebar_open = !self.sidebar_open;
+        }
+        cx.notify();
+    }
+
     /// Shows `folder` in the other pane: a view that is not split splits
     /// with it (a window too narrow for two panes refuses with the same toast
     /// as F3), a split view opens it in a new tab of the pane that does not
@@ -4198,15 +4231,17 @@ impl Explorer {
             self.set_columns(real, window);
             return area.child(self.render_pane(real, false, true, 1.0, window, cx));
         }
-        let ratio = panes::clamp_ratio(self.split_ratio, self.split_available(window));
+        // The panes share exactly the room there is, so they never overflow.
+        let (left, right) = panes::pane_widths(self.split_available(window), self.split_ratio);
         let mut area = area;
         for side in [Side::Left, Side::Right] {
             self.tabs.focus_side(side);
             self.set_columns(side, window);
             let weight = match side {
-                Side::Left => ratio,
-                Side::Right => 1.0 - ratio,
-            };
+                Side::Left => left,
+                Side::Right => right,
+            }
+            .max(1.0);
             let pane = self.render_pane(side, true, side == real, weight, window, cx);
             area = area.child(pane);
             if side == Side::Left {
@@ -4243,11 +4278,12 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let tint = bolt::tokens::ChromeColors::tint(cx.theme());
-        let island = self.render_document_island(window, cx);
+        let island = self.render_document_island(side, window, cx);
         let mut pane = div()
             .id(("explorer-pane", side.index()))
             .flex_1()
             .min_w_0()
+            .overflow_hidden()
             .h_full()
             .flex()
             .flex_col();
@@ -4283,7 +4319,20 @@ impl Explorer {
     /// The document island: toolbar, scope line, folder subbar, then the
     /// entries beside the details panel, all cut 14 px at the opposing
     /// corners by [`Island`].
-    fn render_document_island(&mut self, window: &Window, cx: &mut Context<Self>) -> Island {
+    fn render_document_island(
+        &mut self,
+        side: Side,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Island {
+        let layout = panes::layout(
+            self.tabs.is_split(),
+            f32::from(window.viewport_size().width),
+        );
+        let chrome = toolbar::Chrome {
+            sidebar_toggle: panes::shows_sidebar_toggle(self.sidebar_visible(window), side, layout),
+            close: panes::shows_pane_close(layout).then_some(side),
+        };
         self.inspector_shown = self.inspector_wanted(window);
         self.sync_permissions(cx);
         self.sync_permission_editor(cx);
@@ -4320,7 +4369,8 @@ impl Explorer {
                 div()
                     .relative()
                     .flex_none()
-                    .child(toolbar::render(self, cx))
+                    .min_w_0()
+                    .child(toolbar::render(self, chrome, cx))
                     .children(tabstrip::overlay(self, cx)),
             )
             .child(
@@ -4427,7 +4477,10 @@ impl Explorer {
             .child(
                 div()
                     .id("explorer-subbar-title")
-                    .min_w_0()
+                    // The folder name keeps its room up to a cap; the meta
+                    // beside it gives way first in a narrow pane.
+                    .flex_shrink_0()
+                    .max_w(px(SUBBAR_TITLE_MAX))
                     .truncate()
                     .text_size(px(16.0))
                     .font_weight(gpui::FontWeight::BOLD)
@@ -4437,7 +4490,8 @@ impl Explorer {
             .child(
                 div()
                     .id("explorer-subbar-meta")
-                    .flex_none()
+                    .min_w_0()
+                    .truncate()
                     .font_family(bolt::fonts::editor_family(cx))
                     .text_size(px(12.0))
                     .text_color(colors.muted)
