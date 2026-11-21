@@ -913,6 +913,10 @@ impl Explorer {
             .map(PathBuf::from);
         let view = view_from_pref(preferences.view);
         let arrangement = arrangement_from_prefs(&preferences.arrangement);
+        let trash_root = startup_trash_root(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+        );
         let mut tab_states: Vec<ExplorerState> = restored
             .as_ref()
             .map(|restored| {
@@ -920,7 +924,11 @@ impl Explorer {
                     .tabs
                     .iter()
                     .map(|tab| {
-                        ExplorerState::new(tab.location.clone(), home.clone()).with_presentation(
+                        let location = crate::explorer::ops::safe_restored_location(
+                            tab.location.clone(),
+                            trash_root.as_deref(),
+                        );
+                        ExplorerState::new(location, home.clone()).with_presentation(
                             view_from_pref(tab.view),
                             arrangement_from_prefs(&tab.arrangement),
                         )
@@ -978,10 +986,7 @@ impl Explorer {
             sidebar_error: None,
             // Known from the environment at once, so Del has a Trash even
             // before the places discovery answers.
-            trash_root: startup_trash_root(
-                std::env::var_os("HOME").as_deref(),
-                std::env::var_os("XDG_DATA_HOME").as_deref(),
-            ),
+            trash_root,
             recent_file: recent::recent_path(
                 std::env::var_os("HOME").as_deref(),
                 std::env::var_os("XDG_DATA_HOME").as_deref(),
@@ -1242,15 +1247,11 @@ impl Explorer {
         // (opening it from the Trash view, the path bar, history): inside it
         // the normal folder menus and shortcuts would change trashed content
         // behind the trash's own records.
-        let into_trash = match (
-            self.trash_root.as_deref(),
-            self.tab().state.target_of(&transition),
-        ) {
-            (Some(root), Some(Location::Directory(path))) => {
-                crate::explorer::ops::inside_trash(&path, root)
-            }
-            _ => false,
-        };
+        let into_trash = self
+            .tab()
+            .state
+            .target_of(&transition)
+            .is_some_and(|target| self.refuses_entering(&target));
         if into_trash {
             self.push_toast(
                 crate::explorer::ops::trashed_folder_notice(),
@@ -2702,6 +2703,17 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A folder in the Trash is not opened in a new tab either.
+        if self.refuses_entering(&location) {
+            self.push_toast(
+                crate::explorer::ops::trashed_folder_notice(),
+                &[],
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
         // A device that is being ejected is not opened in a new tab either.
         let Location::Directory(path) = &location else {
             return self.open_tab_checked(location, placement, window, cx);
@@ -2710,6 +2722,11 @@ impl Explorer {
         self.when_not_ejecting(vec![path], window, cx, move |this, window, cx| {
             this.open_tab_checked(location, placement, window, cx);
         });
+    }
+
+    /// Whether `location` is a folder of the Trash, which no path enters.
+    fn refuses_entering(&self, location: &Location) -> bool {
+        crate::explorer::ops::refuses_entering(location, self.trash_root.as_deref())
     }
 
     fn open_tab_checked(
@@ -2995,8 +3012,11 @@ impl Explorer {
             active,
         } = split;
         let home = self.home.clone();
+        let trash_root = self.trash_root.clone();
         let mut states = tabs.into_iter().map(|tab| {
-            ExplorerState::new(tab.location, home.clone()).with_presentation(
+            let location =
+                crate::explorer::ops::safe_restored_location(tab.location, trash_root.as_deref());
+            ExplorerState::new(location, home.clone()).with_presentation(
                 view_from_pref(tab.view),
                 arrangement_from_prefs(&tab.arrangement),
             )

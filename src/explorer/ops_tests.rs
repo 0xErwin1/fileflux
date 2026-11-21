@@ -2891,3 +2891,40 @@ fn a_folder_inside_the_trash_is_never_entered() {
         "Folders in the Trash cannot be opened. Restore the folder to open it."
     );
 }
+
+/// A saved tab inside the Trash reopens as the Trash view, never as a
+/// normal folder; the tab keeps its place.
+#[test]
+fn a_restored_location_inside_the_trash_becomes_the_trash_view() {
+    let root = std::path::Path::new("/home/me/.local/share/Trash");
+    let inside = Location::Directory(root.join("files/photos"));
+    assert_eq!(safe_restored_location(inside, Some(root)), Location::Trash);
+    let normal = Location::Directory(std::path::PathBuf::from("/home/me/Pictures"));
+    assert_eq!(safe_restored_location(normal.clone(), Some(root)), normal);
+    assert_eq!(
+        safe_restored_location(Location::Trash, Some(root)),
+        Location::Trash
+    );
+    assert_eq!(
+        safe_restored_location(Location::Recent, Some(root)),
+        Location::Recent
+    );
+    let unknown = Location::Directory(root.join("files/photos"));
+    assert_eq!(safe_restored_location(unknown.clone(), None), unknown);
+}
+
+/// Opening in a new tab shares the decision of navigation.
+#[test]
+fn a_new_tab_refuses_a_folder_inside_the_trash() {
+    let root = std::path::Path::new("/home/me/.local/share/Trash");
+    assert!(refuses_entering(
+        &Location::Directory(root.join("files/photos")),
+        Some(root)
+    ));
+    assert!(!refuses_entering(&Location::Trash, Some(root)));
+    assert!(!refuses_entering(&Location::Recent, Some(root)));
+    assert!(!refuses_entering(
+        &Location::Directory(std::path::PathBuf::from("/home/me/Pictures")),
+        Some(root)
+    ));
+}

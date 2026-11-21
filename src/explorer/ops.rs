@@ -26,7 +26,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bolt::controls::InputState;
-use fileflux::core::Entry;
 use fileflux::core::apps::{App, OpenWith, expand_exec, filter_apps};
 use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
@@ -36,6 +35,7 @@ use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
 };
 use fileflux::core::watch::nearest_existing_ancestor;
+use fileflux::core::{Entry, Location};
 use gpui::Entity;
 
 use super::arrange::{ArrangeCommand, Arrangement};
@@ -266,6 +266,26 @@ pub(crate) struct Notice {
 /// a sibling such as `Trash-old` is not inside.
 pub(crate) fn inside_trash(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
+}
+
+/// Whether opening `location` would enter a folder of the Trash, which is
+/// never done (`trash_root` is `None` while the trash is not known).
+pub(crate) fn refuses_entering(location: &Location, trash_root: Option<&Path>) -> bool {
+    match (location, trash_root) {
+        (Location::Directory(path), Some(root)) => inside_trash(path, root),
+        _ => false,
+    }
+}
+
+/// The location a saved tab reopens on: one inside the Trash becomes the
+/// Trash view itself (so the tab positions stay valid), anything else is
+/// kept as it was.
+pub(crate) fn safe_restored_location(location: Location, trash_root: Option<&Path>) -> Location {
+    if refuses_entering(&location, trash_root) {
+        Location::Trash
+    } else {
+        location
+    }
 }
 
 /// What the user is told when opening a folder that is in the Trash.
