@@ -663,8 +663,8 @@ pub(crate) fn listen(weak: &gpui::WeakEntity<Explorer>, side: Side, window: &mut
             })
             .unwrap_or_default();
         let plain_click = dnd::release_is_plain_click(gate, cx.has_active_drag());
-        if plain_click
-            && let Some(place) = place
+        if let Some((pressed_at, place)) = place
+            && dnd::press_owns_release(gate, pressed_at, cx.has_active_drag())
             && let Err(error) = ups.update(cx, |this, cx| this.activate_place(&place, window, cx))
         {
             log::debug!("the entries area outlived its explorer: {error}");

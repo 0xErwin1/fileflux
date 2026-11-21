@@ -322,6 +322,19 @@ pub(crate) fn release_is_plain_click(gate: DragGate, drag_active: bool) -> bool 
     drag_active && matches!(gate, DragGate::Pressed(_))
 }
 
+/// Whether a release is the click of the sidebar press made at `pressed_at`:
+/// a plain click whose gate still holds that very press. A later press
+/// anywhere else re-arms the gate at its own point, so a sidebar press that
+/// was never released through this path cannot click on someone else's
+/// release.
+pub(crate) fn press_owns_release(
+    gate: DragGate,
+    pressed_at: (f32, f32),
+    drag_active: bool,
+) -> bool {
+    release_is_plain_click(gate, drag_active) && gate == DragGate::Pressed(pressed_at)
+}
+
 /// The window's one drag gate, shared by every drag source and target
 /// (they run inside GPUI callbacks that cannot reach the explorer).
 #[derive(Clone, Default)]
@@ -333,7 +346,7 @@ fn gate_cell(cx: &mut App) -> std::rc::Rc<std::cell::Cell<DragGate>> {
     std::rc::Rc::clone(&cx.default_global::<GateCell>().0)
 }
 
-fn point_of(position: Point<Pixels>) -> (f32, f32) {
+pub(crate) fn point_of(position: Point<Pixels>) -> (f32, f32) {
     (f32::from(position.x), f32::from(position.y))
 }
 
@@ -958,6 +971,27 @@ mod tests {
         );
         assert!(!release_is_plain_click(DragGate::Armed, true));
         assert!(!release_is_plain_click(DragGate::Idle, true));
+    }
+
+    #[test]
+    fn a_sidebar_press_is_clicked_only_by_its_own_release() {
+        let at = (10.0, 20.0);
+        // Its own press, released inside the threshold after GPUI started
+        // the drag: the click it was.
+        assert!(press_owns_release(DragGate::Pressed(at), at, true));
+        // No drag started: GPUI's own click on the row handles it, so the
+        // release path must not click it a second time.
+        assert!(!press_owns_release(DragGate::Pressed(at), at, false));
+        // A later press elsewhere (an entry) owns the gate now: a stale
+        // sidebar press must not ride on its release.
+        assert!(!press_owns_release(
+            DragGate::Pressed((300.0, 40.0)),
+            at,
+            true
+        ));
+        // Past the threshold it is a drag, and with no press it is nothing.
+        assert!(!press_owns_release(DragGate::Armed, at, true));
+        assert!(!press_owns_release(DragGate::Idle, at, true));
     }
 
     fn p(path: &str) -> PathBuf {

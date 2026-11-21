@@ -942,9 +942,10 @@ pub(crate) struct Explorer {
     pub(crate) rubber_band: Option<rubber::Band>,
     /// The entry the left button went down on, until it goes up.
     pub(crate) entry_press: Option<rubber::EntryPress>,
-    /// The sidebar row the left button went down on, until it goes up: a
-    /// release before the drag threshold is the click it was.
-    pub(crate) place_press: Option<super::sidebar::PlaceTarget>,
+    /// The draggable sidebar row the left button went down on and where: a
+    /// release before the drag threshold is the click it was, and only its
+    /// own release (see `dnd::press_owns_release`).
+    pub(crate) place_press: Option<((f32, f32), super::sidebar::PlaceTarget)>,
 }
 
 impl Focusable for Explorer {

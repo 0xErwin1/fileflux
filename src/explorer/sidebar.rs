@@ -938,7 +938,7 @@ fn row_shell(
                     let row = row.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                            this.place_press = Some(press.clone());
+                            this.place_press = Some((dnd::point_of(event.position), press.clone()));
                             dnd::press_gate(event.position, cx);
                         }),
                     );
