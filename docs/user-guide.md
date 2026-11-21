@@ -95,7 +95,7 @@ A segmented toggle in the toolbar switches between two presentations. The toggle
 | Grid | Fixed-size tiles with two-tone folders, file thumbnails and a size line (folders show "N items"). Rows are equal; the last partial row is left-aligned |
 | List | Columns Name, Size and Modified. Click a header to sort (folders stay first). Columns fill the pane; drag to resize. Folder item counts are filled in the background after the listing appears |
 
-Sizes use one SI formatter everywhere. Modified dates are shown in UTC.
+Sizes use one SI formatter everywhere. Modified dates are shown in the system's local time zone (`TZ`, else `/etc/localtime`).
 
 File icons come from the freedesktop icon theme the desktop is configured to use, so a Blender file, a shell script, a PDF or a spreadsheet shows the icon of the application that handles it. The lookup follows `gtk-icon-theme-name` in `~/.config/gtk-3.0/settings.ini`, that theme's `Inherits=` chain, and then `Adwaita`, `breeze`, `Papirus` and `hicolor`, in `$XDG_DATA_HOME/icons` and every `$XDG_DATA_DIRS/*/icons`; each type is resolved once per session. Themed icons keep their colours because Fileflux rasterizes them at the size it draws, and a type the theme does not name keeps the built-in glyph.
 
@@ -345,7 +345,5 @@ Right-click a row of Places, Favorites or Devices: **Open**, **Open in new tab**
 ## Current scope
 
 - Search matches file names only, not their content.
-- No dual-pane view; tabs cannot be reordered or dragged between windows.
-- The details panel previews image files only.
-- Modified dates are shown in UTC without a timezone database.
+- Tabs cannot be reordered or dragged between windows.
 - Per-folder view memory is not implemented: the active tab's view, sort and filters are the default for the next launch.

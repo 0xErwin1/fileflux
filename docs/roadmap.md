@@ -21,7 +21,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 | Recursive folder size | Bytes used by a folder | Folders show "N items" |
 | Archives | Compress a selection; extract here or to a folder | Nothing |
 | Type-ahead find | Typing a name moves the selection to the matching entry | Nothing; Ctrl+F filters instead |
-| Local dates | Modified times in the user's timezone | Shown in UTC |
 
 ## Priority 2: expected file manager features
 
@@ -35,7 +34,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 | Network | A "Connect to server" dialog; network bookmarks in the sidebar | Only mounts gvfs already made are browsed; `sftp://` and `smb://` bookmarks are hidden |
 | Encrypted drives | Unlock a LUKS container | Shown as Locked |
 | Desktop integration | The `org.freedesktop.FileManager1` D-Bus interface ("Show in folder" from other applications) and a single instance | Nothing |
-| Drag to other applications on X11 | Hand dragged entries to another window | Wayland only |
 
 ## Priority 3: refinements
 
@@ -83,7 +81,3 @@ The audit did not settle these:
 - [ ] Is Fileflux registered as a handler for `inode/directory`?
 - [ ] Can favorites be renamed or reordered from the sidebar?
 - [ ] Do the mouse back and forward buttons navigate in the explorer?
-
-## Known documentation debt
-
-"Current scope" in the [user guide](user-guide.md#current-scope) still says there is no dual-pane view and that the details panel previews image files only; the same guide documents both.
