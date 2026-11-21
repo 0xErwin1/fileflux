@@ -896,6 +896,7 @@ mod tests {
                     path: p(&format!("/x/{n}")),
                     dev: 1,
                     ino: n as u64,
+                    born: None,
                     mode: 0o644,
                     gid: 1,
                 })

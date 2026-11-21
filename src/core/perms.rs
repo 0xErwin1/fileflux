@@ -477,6 +477,10 @@ pub struct Previous {
     pub path: PathBuf,
     pub dev: u64,
     pub ino: u64,
+    /// The birth time, where the filesystem records it: ext4 hands a
+    /// deleted file's inode number to the next file created, so device and
+    /// inode alone cannot tell a replaced file from the edited one.
+    pub born: Option<std::time::SystemTime>,
     /// The permission bits including setuid, setgid and sticky (`0o7777`).
     pub mode: u32,
     pub gid: u32,
@@ -598,6 +602,7 @@ impl Walk<'_> {
                 path: path.to_path_buf(),
                 dev: meta.dev(),
                 ino: meta.ino(),
+                born: meta.created().ok(),
                 mode: before,
                 gid: meta.gid(),
             });
@@ -785,7 +790,7 @@ fn restore_one(item: &Previous) -> io::Result<bool> {
     if meta.file_type().is_symlink() {
         return Err(io::Error::other("it is a symbolic link now, left alone"));
     }
-    if (meta.dev(), meta.ino()) != (item.dev, item.ino) {
+    if (meta.dev(), meta.ino(), meta.created().ok()) != (item.dev, item.ino, item.born) {
         return Err(io::Error::other(
             "it changed since it was edited, left alone",
         ));
