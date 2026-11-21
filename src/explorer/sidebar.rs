@@ -6,23 +6,26 @@
 //! reference design. Favorites are the GTK bookmarks (see
 //! [`super::favorites`]), shown with their label when the bookmark has one;
 //! they are added and removed for the current directory with the toolbar's
-//! star button, from a folder's context menu and from a sidebar row's menu;
+//! ⋯ menu, from a folder's context menu and from a sidebar row's menu;
 //! the virtual Trash is never favorited. Devices add a 3 px usage
 //! meter and a "free of" line only when `statvfs` answered; nothing is
-//! invented otherwise.
+//! invented otherwise. Every device row carries a `⋯` button at its
+//! trailing edge (revealed on hover) that opens the device's menu: the
+//! disk-usage analysis, a new tab, properties, and the disk's mounted
+//! partitions.
 
 use bolt::composites::{Island, ListRow};
 use bolt::primitives::Icon;
 use bolt::tokens::{ChromeColors, IslandMetrics, Spacing, TreeMetrics};
 use fileflux::core::Location;
 use fileflux::core::devices::{Device, DeviceState, device_for_mount};
-use fileflux::core::places::{Volume, VolumeKind};
+use fileflux::core::places::{Volume, VolumeKind, format_bytes};
 use std::path::{Path, PathBuf};
 
 use fileflux::core::settings::{DETAILS_WIDTH_RANGE, SIDEBAR_WIDTH_RANGE};
 use gpui::{
-    App, Context, Div, ElementId, MouseButton, MouseDownEvent, ParentElement, Pixels, Stateful,
-    Styled, Window, div, prelude::*, px, relative,
+    App, Context, Div, ElementId, MouseButton, MouseDownEvent, ParentElement, Pixels, SharedString,
+    Stateful, Styled, Window, div, prelude::*, px, relative,
 };
 use gpui_component::{ActiveTheme, tooltip::Tooltip};
 
@@ -31,6 +34,7 @@ use super::devices::{actions_for, caption, unlisted_volumes};
 use super::dnd::{self, DropTarget};
 use super::entries;
 use super::icon;
+use super::ops::{MenuCommand, MenuItemSpec, MenuRow};
 use super::state::Transition;
 use super::tabs::Placement;
 use super::view::Explorer;
@@ -490,8 +494,90 @@ fn menu_target(volume: &Volume, device: Option<&Device>) -> Option<PathBuf> {
     }
 }
 
+/// One mounted partition of a device row's disk, for the row's ⋯ menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DevicePartition {
+    /// The partition's name: the label `lsblk` reported.
+    pub(crate) name: String,
+    /// Where it is mounted; activating the row analyzes this.
+    pub(crate) mount: PathBuf,
+    /// Its free space, when the matching volume's `statvfs` answered.
+    pub(crate) free: Option<String>,
+}
+
+/// The mounted partitions of the disk behind `device`: every mounted
+/// filesystem of it, in device-tree order, with the free space the matching
+/// volume of `volumes` reported. A row without a block device (a gvfs
+/// mount, or a system volume the device list leaves out) is its own single
+/// partition, named as the row shows it (`own_name`).
+pub(crate) fn device_partitions(
+    devices: &[Device],
+    volumes: &[Volume],
+    own: &Volume,
+    own_name: &str,
+    device: Option<&Device>,
+) -> Vec<DevicePartition> {
+    let Some(disk) = device.map(|device| device.disk.as_path()) else {
+        return vec![DevicePartition {
+            name: own_name.to_owned(),
+            mount: own.path.clone(),
+            free: own.usage.map(|usage| format_bytes(usage.free)),
+        }];
+    };
+    devices
+        .iter()
+        .filter(|device| device.disk.as_path() == disk && device.mount_point().is_some())
+        .filter_map(|device| {
+            let mount = device.mount_point()?.to_path_buf();
+            Some(DevicePartition {
+                name: device.label.clone(),
+                free: volumes
+                    .iter()
+                    .find(|volume| volume.path == mount)
+                    .and_then(|volume| volume.usage)
+                    .map(|usage| format_bytes(usage.free)),
+                mount,
+            })
+        })
+        .collect()
+}
+
+/// The ⋯ menu of a sidebar device row: the device-level actions above the
+/// disk's mounted partitions, each of which opens its own usage analysis
+/// (see [`MenuOn::DeviceMenu`], whose custom rows these partitions fill).
+pub(crate) fn device_row_menu_rows(partitions: &[DevicePartition]) -> Vec<MenuRow> {
+    let mut rows = vec![
+        MenuRow::Item(MenuItemSpec::new(
+            MenuCommand::AnalyzeDiskUsage,
+            "Analyze disk usage",
+        )),
+        MenuRow::Item(MenuItemSpec::new(
+            MenuCommand::OpenInNewTab,
+            "Open in a new tab",
+        )),
+        MenuRow::Item(MenuItemSpec::new(MenuCommand::Properties, "Properties")),
+    ];
+    if partitions.is_empty() {
+        return rows;
+    }
+    rows.push(MenuRow::Separator);
+    rows.extend(
+        partitions
+            .iter()
+            .enumerate()
+            .map(|(index, partition)| MenuRow::Custom {
+                label: partition.name.clone(),
+                index,
+            }),
+    );
+    rows
+}
+
 /// One device row: icon and name, then the 3 px meter and the mono
-/// "free of" line, both left out without usage numbers.
+/// "free of" line, both left out without usage numbers. The row's trailing
+/// `⋯` opens the device's menu (revealed on hover, held open while the
+/// menu is); the eject button, where the device has one, keeps its place
+/// before it.
 fn volume_row(
     index: usize,
     (volume, device): (&Volume, Option<&Device>),
@@ -504,6 +590,7 @@ fn volume_row(
     let location = Location::Directory(volume.path.clone());
     let active = this.tab().state.current() == &location;
     let glyph = volume_glyph(volume, device);
+    let row_id = format!("volume-{index}");
     let name = if volume.path == home {
         "Home".to_owned()
     } else {
@@ -529,9 +616,11 @@ fn volume_row(
         .child(name);
     // The eject button of the reference design: right-aligned on removable
     // rows, "Eject <name>" on hover.
+    let mut has_eject = false;
     if let (Some(device), Some(actions)) = (device, actions)
         && actions.eject
     {
+        has_eject = true;
         let target = device.path.clone();
         let tooltip = format!("Eject {}", device.label);
         top = top.child(
@@ -553,15 +642,75 @@ fn volume_row(
                 .child(Icon::new(icon(gpui_kit_assets::IconName::Eject)).size(px(13.0))),
         );
     }
+    // The ⋯ of the device menu: revealed while the row is hovered or its
+    // menu is open, so the name keeps its room.
+    let menu_open = matches!(
+        this.menu.as_ref().map(|menu| &menu.on),
+        Some(MenuOn::DeviceMenu { row, .. }) if *row == row_id
+    );
+    let group: SharedString = format!("explorer-volume-group-{index}").into();
+    let hover_group = group.clone();
+    let dots = (
+        volume.clone(),
+        name_for_menu.clone(),
+        device.map(|device| device.path.clone()),
+    );
+    let dots_row = row_id.clone();
+    top = top.child(
+        div()
+            .id(("volume-dots", index))
+            .flex_none()
+            .when(!has_eject, |dots| dots.ml_auto())
+            .size(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(colors.muted)
+            .when(!menu_open, |dots| {
+                dots.invisible()
+                    .hover(|dots| dots.bg(colors.line).text_color(colors.strong))
+                    .group_hover(hover_group.clone(), |dots| dots.visible())
+            })
+            .when(menu_open, |dots| {
+                dots.border_1()
+                    .border_color(colors.line_2)
+                    .bg(colors.raised)
+                    .text_color(colors.foreground)
+            })
+            .tooltip(|window, cx| {
+                Tooltip::new(
+                    "Analyze disk usage, open in a new tab, properties and the disk's partitions",
+                )
+                .build(window, cx)
+            })
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    let position = super::overlay::under_button(event.position());
+                    let (volume, name, device) = dots.clone();
+                    this.open_device_row_menu(
+                        position,
+                        dots_row.clone(),
+                        volume,
+                        name,
+                        device,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .child(Icon::new(icon(gpui_kit_assets::IconName::Ellipsis)).size(px(13.0))),
+    );
     let mut row = row_shell(
         this,
-        format!("volume-{index}"),
+        row_id,
         name_for_menu,
         volume.path.to_string_lossy().into_owned(),
         (Some(location), menu_target(volume, device)),
         active,
         cx,
     )
+    .group(group)
     .py(Spacing::SM)
     .flex_col()
     .items_stretch()
@@ -615,7 +764,11 @@ fn row_shell(
     // The row its context menu is open on keeps the tint outline.
     let outlined = matches!(
         this.menu.as_ref().map(|menu| &menu.on),
-        Some(MenuOn::Sidebar { row, .. } | MenuOn::Network { row, .. }) if *row == id
+        Some(
+            MenuOn::Sidebar { row, .. }
+                | MenuOn::Network { row, .. }
+                | MenuOn::DeviceMenu { row, .. }
+        ) if *row == id
     );
     let menu_row = id.clone();
     let menu_target = (location.clone(), device.clone());
@@ -1119,5 +1272,137 @@ mod tests {
         let phone = volume(VolumeKind::Phone, false);
         assert_eq!(menu_target(&phone, None), Some(PathBuf::from("/x")));
         assert_eq!(menu_target(&volume(VolumeKind::Disk, false), None), None);
+    }
+
+    fn partition_device(path: &str, disk: &str, label: &str, mount: Option<&str>) -> Device {
+        Device {
+            path: PathBuf::from(path),
+            disk: PathBuf::from(disk),
+            label: label.to_owned(),
+            fstype: Some("ext4".to_owned()),
+            size: 0,
+            state: match mount {
+                Some(mount) => DeviceState::Mounted(PathBuf::from(mount)),
+                None => DeviceState::Unmounted,
+            },
+            mounts: mount
+                .map(|mount| vec![PathBuf::from(mount)])
+                .unwrap_or_default(),
+            ejectable: false,
+            container: None,
+            optical: false,
+        }
+    }
+
+    fn usage_volume(path: &str, label: &str, free: Option<u64>) -> Volume {
+        Volume {
+            label: label.to_owned(),
+            path: PathBuf::from(path),
+            removable: false,
+            usage: free.map(|free| fileflux::core::places::Usage {
+                total: free * 2,
+                free,
+            }),
+            kind: VolumeKind::Disk,
+        }
+    }
+
+    /// A device row's ⋯ menu lists the mounted partitions of its disk, with
+    /// the free space the matching volume reported; the unmounted siblings
+    /// and other disks' partitions stay out.
+    #[test]
+    fn a_device_row_lists_the_mounted_partitions_of_its_disk() {
+        let devices = vec![
+            partition_device("/dev/sdb1", "/dev/sdb", "vault1", Some("/home")),
+            partition_device("/dev/sdb2", "/dev/sdb", "vault2", Some("/")),
+            partition_device("/dev/sdb3", "/dev/sdb", "vault3", None),
+            partition_device("/dev/sdc1", "/dev/sdc", "other", Some("/mnt/c")),
+        ];
+        let volumes = vec![
+            usage_volume("/home", "home", Some(186)),
+            usage_volume("/", "System", None),
+        ];
+        let own = usage_volume("/home", "home", Some(186));
+        assert_eq!(
+            device_partitions(&devices, &volumes, &own, "Home", devices.first()),
+            vec![
+                DevicePartition {
+                    name: "vault1".to_owned(),
+                    mount: PathBuf::from("/home"),
+                    free: Some("186 B".to_owned()),
+                },
+                DevicePartition {
+                    name: "vault2".to_owned(),
+                    mount: PathBuf::from("/"),
+                    // A volume statvfs could not be read invents no number.
+                    free: None,
+                },
+            ]
+        );
+    }
+
+    /// A row without a block device (a gvfs mount, or a system volume the
+    /// device list leaves out) is its own single partition, named as the
+    /// row shows it.
+    #[test]
+    fn a_row_without_a_block_device_is_its_own_partition() {
+        let own = Volume {
+            label: "Pixel".to_owned(),
+            path: PathBuf::from("/run/user/1000/gvfs/mtp:host=x"),
+            removable: false,
+            usage: Some(fileflux::core::places::Usage {
+                total: 64,
+                free: 12,
+            }),
+            kind: VolumeKind::Phone,
+        };
+        assert_eq!(
+            device_partitions(&[], &[], &own, "Pixel", None),
+            vec![DevicePartition {
+                name: "Pixel".to_owned(),
+                mount: own.path.clone(),
+                free: Some("12 B".to_owned()),
+            }]
+        );
+    }
+
+    /// The ⋯ menu holds the device-level actions above the partitions; a
+    /// partition is the custom row whose index the activation reads.
+    #[test]
+    fn the_device_row_menu_holds_the_device_actions_then_its_partitions() {
+        let partitions = [DevicePartition {
+            name: "vault1".to_owned(),
+            mount: PathBuf::from("/home"),
+            free: Some("186 B".to_owned()),
+        }];
+        let rows = device_row_menu_rows(&partitions);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                MenuRow::Separator => "-".to_owned(),
+                MenuRow::Item(spec) => spec.label.to_owned(),
+                MenuRow::Custom { label, .. } => label.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Analyze disk usage",
+                "Open in a new tab",
+                "Properties",
+                "-",
+                "vault1"
+            ]
+        );
+        assert!(matches!(
+            rows.last(),
+            Some(MenuRow::Custom {
+                label,
+                index: 0
+            }) if label == "vault1"
+        ));
+        // Without partitions there is no separator either.
+        assert_eq!(device_row_menu_rows(&[]).len(), 3);
     }
 }

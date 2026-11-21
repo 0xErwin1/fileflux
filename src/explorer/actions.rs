@@ -24,6 +24,7 @@ use gpui::{
 
 use fileflux::core::apps::{self, AppGroup, OpenWith};
 use fileflux::core::images::is_image_path;
+use fileflux::core::places::Volume;
 
 use super::arrange::ArrangeCommand;
 use super::arrange_menu;
@@ -33,12 +34,14 @@ use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, AppLaunch, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job,
     JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenTarget, OpenWithPick,
-    RenameCheck, RenameStep, Report, Severity, Unavailable, UndoAction, UndoEntry, add_viewer_row,
-    check_rename, dismissed_notice, launch_confirmation, menu_rows, no_trash_dialog, open_target,
-    plan_launches, rename_seed, rename_step, run_launches, start_failure_notice, stem_range,
+    RenameCheck, RenameStep, Report, SearchOption, Severity, Unavailable, UndoAction, UndoEntry,
+    add_viewer_row, check_rename, dismissed_notice, launch_confirmation, menu_rows,
+    no_trash_dialog, open_target, plan_launches, rename_seed, rename_step, run_launches,
+    search_option_rows, start_failure_notice, stem_range, toolbar_menu_rows,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
+use super::sidebar::DevicePartition;
 use super::state::Transition;
 use super::tabs::{Affected, Placement, tabs_to_refresh};
 use super::toasts::{make_room, toast_timeout};
@@ -100,6 +103,19 @@ pub(crate) enum MenuOn {
     Network {
         row: String,
         bookmark: fileflux::core::bookmarks::NetworkBookmark,
+    },
+    /// The toolbar's ⋯ menu: Split view, Favorite this folder, Refresh and
+    /// Properties — what stayed when the toolbar was reduced to six groups.
+    Toolbar,
+    /// The search field's filter popover: the search option toggles.
+    SearchOptions,
+    /// The ⋯ button of a sidebar device row, by its element id, on the place
+    /// the row stands for. Its [`MenuRow::Custom`] rows are the disk's
+    /// mounted `partitions`, by index.
+    DeviceMenu {
+        row: String,
+        location: Location,
+        partitions: Vec<DevicePartition>,
     },
 }
 
@@ -1338,6 +1354,91 @@ impl Explorer {
         self.show_menu(position, rows, (MenuOn::Arrange(menu), None), window, cx);
     }
 
+    /// The toolbar's ⋯ menu: Split view, Favorite this folder, Refresh and
+    /// Properties, each with the shortcut the app binds.
+    pub(crate) fn open_toolbar_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_rename(window, cx);
+        let can_favorite = !matches!(
+            self.tab().state.current(),
+            Location::Trash | Location::Recent | Location::Search { .. }
+        );
+        self.show_menu(
+            position,
+            toolbar_menu_rows(can_favorite),
+            (MenuOn::Toolbar, None),
+            window,
+            cx,
+        );
+    }
+
+    /// The search field's filter popover: the three query toggles and the
+    /// subfolder scope, checked from the live search state.
+    pub(crate) fn open_search_options_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_rename(window, cx);
+        let rows = search_option_rows(
+            self.search_options,
+            self.tab().deep_search,
+            self.tab().state.can_search_subfolders(),
+        );
+        self.show_menu(position, rows, (MenuOn::SearchOptions, None), window, cx);
+    }
+
+    /// The ⋯ menu of a sidebar device row: the device-level actions and the
+    /// disk's mounted partitions. `own` is the row's volume, `own_name` the
+    /// name the row shows, `device` its block device.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_device_row_menu(
+        &mut self,
+        position: Point<Pixels>,
+        row: String,
+        own: Volume,
+        own_name: String,
+        device: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_rename(window, cx);
+        let device_ref = device.as_deref().and_then(|path| self.devices.find(path));
+        let volumes: Vec<Volume> = self
+            .places
+            .as_ref()
+            .map(|places| places.volumes.clone())
+            .unwrap_or_default();
+        let partitions = super::sidebar::device_partitions(
+            &self.devices.list,
+            &volumes,
+            &own,
+            &own_name,
+            device_ref,
+        );
+        let location = Location::Directory(own.path.clone());
+        let rows = super::sidebar::device_row_menu_rows(&partitions);
+        self.show_menu(
+            position,
+            rows,
+            (
+                MenuOn::DeviceMenu {
+                    row,
+                    location,
+                    partitions,
+                },
+                None,
+            ),
+            window,
+            cx,
+        );
+    }
+
     /// Changes the active tab's sort or filters (menus, chips, Ctrl+H).
     /// Selection stays; the grid, list, keyboard and viewer follow the new
     /// order on the next frame.
@@ -1376,6 +1477,28 @@ impl Explorer {
                 _ => arrange_menu::refresh(&mut menu.rows, &arrangement, &columns),
             }
         }
+    }
+
+    /// The open search options popover redraws its checks from the search
+    /// state as it is now (a toggle flipped it, or Ctrl+Shift+F flipped the
+    /// scope behind its back).
+    pub(crate) fn refresh_search_options_menu(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| matches!(menu.on, MenuOn::SearchOptions))
+        {
+            return;
+        }
+        let rows = search_option_rows(
+            self.search_options,
+            self.tab().deep_search,
+            self.tab().state.can_search_subfolders(),
+        );
+        if let Some(menu) = self.menu.as_mut() {
+            menu.rows = rows;
+        }
+        cx.notify();
     }
 
     pub(crate) fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1486,6 +1609,22 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A device menu's custom rows are its partitions (see
+        // [`MenuOn::DeviceMenu`]): activating one opens that partition's
+        // usage analysis.
+        if let Some(root) = self.menu.as_ref().and_then(|menu| match &menu.on {
+            MenuOn::DeviceMenu { partitions, .. } => {
+                let index = menu.custom_action_at(path)?;
+                partitions
+                    .get(index)
+                    .map(|partition| partition.mount.clone())
+            }
+            _ => None,
+        }) {
+            self.close_menu(window, cx);
+            self.analyze_usage_of(root, window, cx);
+            return;
+        }
         if let Some(index) = self
             .menu
             .as_ref()
@@ -1524,12 +1663,16 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         // Sort and filter rows keep the menu open: several categories can
-        // be ticked in a row, and the checks redraw.
+        // be ticked in a row, and the checks redraw. The search options
+        // popover's rows do the same.
         if let MenuCommand::Arrange(change) = command {
             return self.arrange(change, cx);
         }
         if let MenuCommand::ToggleColumn(column) = command {
             return self.toggle_column(column, cx);
+        }
+        if let MenuCommand::SearchOption(option) = command {
+            return self.run_search_option(option, window, cx);
         }
         // A sidebar row's menu acts on that row's place, not on the entries.
         let network_row = match self.menu.as_ref().map(|menu| &menu.on) {
@@ -1542,6 +1685,10 @@ impl Explorer {
             }) => (Some((location.clone(), device.clone())), None),
             Some(MenuOn::Device { device, .. }) => (None, Some(device.clone())),
             _ => (None, None),
+        };
+        let device_menu = match self.menu.as_ref().map(|menu| &menu.on) {
+            Some(MenuOn::DeviceMenu { location, .. }) => Some(location.clone()),
+            _ => None,
         };
         self.close_menu(window, cx);
         if let Some(bookmark) = network_row {
@@ -1561,7 +1708,16 @@ impl Explorer {
         if let Some(device) = device_row {
             return self.run_device_command(command, device, window, cx);
         }
+        if let Some(location) = device_menu {
+            return self.run_device_row_command(command, location, window, cx);
+        }
         match command {
+            MenuCommand::SplitView => self.toggle_split(window, cx),
+            MenuCommand::FavoriteFolder => self.toggle_favorite(cx),
+            MenuCommand::Reload => {
+                let current = self.tab().state.current().clone();
+                self.navigate(Transition::Visit(current), window, cx);
+            }
             MenuCommand::AddFavorite | MenuCommand::RemoveFavorite => {
                 if let Some(folder) = self.single_selected_folder() {
                     self.set_favorite(
@@ -1625,6 +1781,64 @@ impl Explorer {
             MenuCommand::ExtractTo => self.extract_to(window, cx),
             MenuCommand::MakeLink => self.make_links_of_selection(window, cx),
             MenuCommand::PasteAsLink => self.paste_as_link(window, cx),
+            // Handled before the menu closes; unreachable here.
+            MenuCommand::SearchOption(_) => {}
+        }
+    }
+
+    /// One row of the search options popover: flips its toggle through the
+    /// same commands the toolbar buttons ran (each of which redraws the
+    /// open popover's checks), keeping the popover open.
+    fn run_search_option(
+        &mut self,
+        option: SearchOption,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match option {
+            SearchOption::MatchCase => self.change_search_options(
+                |options| options.match_case = !options.match_case,
+                window,
+                cx,
+            ),
+            SearchOption::Regex => {
+                self.change_search_options(|options| options.regex = !options.regex, window, cx)
+            }
+            SearchOption::Contents => self.change_search_options(
+                |options| options.contents = !options.contents,
+                window,
+                cx,
+            ),
+            SearchOption::Subfolders => self.toggle_deep_search(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// What a device row's ⋯ menu does to the row's `location`, reusing the
+    /// commands the sidebar and the usage view already have.
+    fn run_device_row_command(
+        &mut self,
+        command: MenuCommand,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            MenuCommand::AnalyzeDiskUsage => {
+                if let Location::Directory(folder) = &location {
+                    self.analyze_usage_of(folder.clone(), window, cx);
+                }
+            }
+            MenuCommand::OpenInNewTab => {
+                self.open_tab(location, Placement::Background, window, cx);
+            }
+            // Properties: show the folder, with the details panel open.
+            MenuCommand::Properties => {
+                self.navigate(Transition::Visit(location), window, cx);
+                self.inspector_open = true;
+                cx.notify();
+            }
+            _ => {}
         }
     }
 

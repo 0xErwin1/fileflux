@@ -21,8 +21,8 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Ctrl+Shift+F | Search in subfolders | Turns on *Search in subfolders* and focuses the search field; see [Search in subfolders](user-guide.md#search-in-subfolders) |
 | Alt+← / Alt+→ | Back / Forward | |
 | Alt+↑ | Up one folder | |
-| Ctrl+R | Reload | |
-| Ctrl+I | Toggle the details panel | Same as Properties |
+| Ctrl+R | Refresh (also in the toolbar `⋯` menu) | |
+| Ctrl+I | Toggle the details panel | Same as Properties, also in the toolbar `⋯` menu |
 | Ctrl+= / Ctrl++ | Zoom in | One icon size larger in the view that is shown (grid: small, medium, large, larger; list and compact: small, medium, large); `Ctrl+Shift+=` is the same chord on layouts where `+` is typed with Shift. Stops at the largest; see [Icon size](user-guide.md#icon-size) |
 | Ctrl+- | Zoom out | One size smaller; stops at the smallest |
 | Ctrl+0 | Reset zoom | Back to medium, the size Fileflux had before the zoom existed |

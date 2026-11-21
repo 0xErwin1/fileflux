@@ -844,7 +844,8 @@ pub(crate) struct Explorer {
     /// A settings problem for the status bar (an invalid file at startup, a
     /// failed save); the next navigation dismisses it.
     settings_notice: Option<String>,
-    /// Whether the user wants the details panel (Ctrl+I, toolbar button).
+    /// Whether the user wants the details panel (Ctrl+I, or the toolbar ⋯
+    /// menu's Properties row).
     pub(crate) inspector_open: bool,
     /// Whether the panel drew in the last render: wanted and wide enough.
     pub(crate) inspector_shown: bool,
@@ -2542,8 +2543,8 @@ impl Explorer {
         }
     }
 
-    /// Changes how the query is read and runs it again: the toolbar toggles
-    /// Match case, Regular expression and Search contents.
+    /// Changes how the query is read and runs it again: the search options
+    /// popover's rows flip Match case, Regular expression and File contents.
     pub(crate) fn change_search_options(
         &mut self,
         change: impl FnOnce(&mut QueryOptions),
@@ -2551,6 +2552,8 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         change(&mut self.search_options);
+        // An open search options popover redraws its checks.
+        self.refresh_search_options_menu(cx);
         let id = self.active_id();
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
@@ -2585,7 +2588,7 @@ impl Explorer {
         self.focus_search(window, cx);
     }
 
-    /// The toolbar toggle of "Search in subfolders".
+    /// The search options popover's row for "Search in subfolders".
     pub(crate) fn toggle_deep_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.active_id();
         let on = !self.tab().deep_search;
@@ -2641,6 +2644,9 @@ impl Explorer {
             tab.state.set_query(text);
             self.arrange_tab(id, cx);
         }
+        // An open search options popover redraws its checks (Ctrl+Shift+F
+        // can flip the scope while it is open).
+        self.refresh_search_options_menu(cx);
         cx.notify();
     }
 
@@ -3397,7 +3403,8 @@ impl Explorer {
 // --- panes --------------------------------------------------------------------
 
 impl Explorer {
-    /// F3 and the toolbar button: splits the window into two panes, or goes
+    /// F3 and the toolbar ⋯ menu's Split view row: splits the window into
+    /// two panes, or goes
     /// back to one. The new pane opens on the folder the focused pane shows,
     /// with its presentation, and a pane parked by an earlier un-split comes
     /// back as it was. A window narrower than [`panes::SPLIT_MIN_WIDTH`]

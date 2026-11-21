@@ -31,6 +31,7 @@ use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::places::{FuseRoots, Places};
+use fileflux::core::search_match::QueryOptions;
 use fileflux::core::settings::ColumnPref;
 use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
@@ -1398,6 +1399,17 @@ pub(crate) enum MenuCommand {
     Unmount,
     /// Devices: unmount every partition of the disk and power it off.
     Eject,
+    /// The search options popover: flips one of the search option toggles;
+    /// the menu stays open and redraws its checks.
+    SearchOption(SearchOption),
+    /// The toolbar's ⋯ menu: splits the window into two panes, or goes back
+    /// to one (F3).
+    SplitView,
+    /// The toolbar's ⋯ menu: pins or unpins the current folder as a
+    /// favorite.
+    FavoriteFolder,
+    /// The toolbar's ⋯ menu: re-reads the shown folder (Ctrl+R).
+    Reload,
 }
 
 /// Which arrangement menu a submenu row opens: the empty-space context menu
@@ -1832,6 +1844,90 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
         item(MenuCommand::Properties, "Properties", false),
     ]);
     rows
+}
+
+/// One of the search field's option toggles, flipped by a row of the search
+/// options popover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchOption {
+    MatchCase,
+    Regex,
+    Contents,
+    /// "Search in subfolders": the scope of the search field.
+    Subfolders,
+}
+
+/// The rows of the search field's options popover: the same toggles the
+/// toolbar held as buttons — Match case, Regular expression, File contents
+/// and the subfolder scope — drawn as checkable rows that keep the popover
+/// open. `deep`: the subfolder scope is on; `can_search_subfolders`:
+/// the shown location can be searched through its subfolders.
+pub(crate) fn search_option_rows(
+    options: QueryOptions,
+    deep: bool,
+    can_search_subfolders: bool,
+) -> Vec<MenuRow> {
+    let row = |option, label, checked, enabled| {
+        MenuRow::Item(MenuItemSpec {
+            checked: Some(checked),
+            enabled,
+            ..MenuItemSpec::new(MenuCommand::SearchOption(option), label)
+        })
+    };
+    vec![
+        MenuRow::Header("SEARCH OPTIONS"),
+        row(
+            SearchOption::MatchCase,
+            "Match case",
+            options.match_case,
+            true,
+        ),
+        row(
+            SearchOption::Regex,
+            "Regular expression",
+            options.regex,
+            true,
+        ),
+        row(
+            SearchOption::Contents,
+            "File contents",
+            options.contents,
+            true,
+        ),
+        MenuRow::Separator,
+        row(
+            SearchOption::Subfolders,
+            "Subfolders",
+            deep,
+            can_search_subfolders,
+        ),
+    ]
+}
+
+/// The rows of the toolbar's ⋯ menu: what stayed when the toolbar was
+/// reduced to six groups — Split view, Favorite this folder, Refresh and
+/// Properties. `can_favorite`: the shown location can be pinned (the Trash,
+/// Recent and search results cannot).
+pub(crate) fn toolbar_menu_rows(can_favorite: bool) -> Vec<MenuRow> {
+    vec![
+        MenuRow::Item(MenuItemSpec {
+            shortcut: Some("F3"),
+            ..MenuItemSpec::new(MenuCommand::SplitView, "Split view")
+        }),
+        MenuRow::Separator,
+        MenuRow::Item(MenuItemSpec {
+            enabled: can_favorite,
+            ..MenuItemSpec::new(MenuCommand::FavoriteFolder, "Favorite this folder")
+        }),
+        MenuRow::Item(MenuItemSpec {
+            shortcut: Some("Ctrl+R"),
+            ..MenuItemSpec::new(MenuCommand::Reload, "Refresh")
+        }),
+        MenuRow::Item(MenuItemSpec {
+            shortcut: Some("Ctrl+I"),
+            ..MenuItemSpec::new(MenuCommand::Properties, "Properties")
+        }),
+    ]
 }
 
 // --- confirmation dialogs -----------------------------------------------------------

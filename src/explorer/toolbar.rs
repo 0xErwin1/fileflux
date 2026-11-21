@@ -1,8 +1,10 @@
-//! The toolbar of the document island: history buttons with disabled
-//! states, the breadcrumb path (Ctrl+L or a click on its empty space edits
-//! it), the current-folder filename
-//! search (Ctrl+F, with its live match count), the segmented grid/list toggle,
-//! the details-panel toggle and the session-favorites star.
+//! The toolbar of the document island, six groups: the sidebar toggle, the
+//! history buttons with disabled states, the breadcrumb path (Ctrl+L or a
+//! click on its empty space edits it), the current-folder filename search
+//! (Ctrl+F, with its live match count and its options behind a filter
+//! button at the field's trailing edge), the segmented grid/list toggle and
+//! one `⋯` menu holding Split view, Favorite this folder, Refresh and
+//! Properties.
 //!
 //! The controls keep their sizes from `bolt`'s tokens; on narrow windows
 //! they shrink with flex instead of disappearing, and the sidebar toggle
@@ -16,6 +18,7 @@ use gpui::{Context, Div, MouseButton, Stateful, Styled, div, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 use gpui_component::tooltip::Tooltip;
 
+use super::actions::MenuOn;
 use super::dnd::{self, DropTarget};
 use super::icon;
 use super::state::{Transition, View};
@@ -26,6 +29,14 @@ use super::view::Explorer;
 /// The toolbar row, wrapped rather than clipped.
 pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Div> {
     let colors = bolt::colors(cx);
+    let search_options_open = matches!(
+        this.menu.as_ref().map(|menu| &menu.on),
+        Some(MenuOn::SearchOptions)
+    );
+    let toolbar_menu_open = matches!(
+        this.menu.as_ref().map(|menu| &menu.on),
+        Some(MenuOn::Toolbar)
+    );
 
     div()
         .id("explorer-toolbar")
@@ -33,9 +44,10 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         .flex()
         .flex_wrap()
         .items_center()
-        .gap(Spacing::SM)
-        .px(Spacing::LG)
-        .py(Spacing::MD)
+        .gap(Spacing::XXS)
+        .pl(px(14.0))
+        .pr(px(10.0))
+        .min_h(px(50.0))
         .border_b_1()
         .border_color(colors.line)
         // The sidebar toggle works at every width: it hides or shows the
@@ -109,10 +121,11 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
         } else {
             crumb_bar(this, cx).into_any_element()
         })
-        // Current-folder filename search with its live count. The frame
-        // wrapping the field captures the input's own Escape here too: it
-        // clears the query, restores the full listing and returns the
-        // entries focus.
+        // Current-folder filename search with its live count, and its
+        // options behind the filter button at the field's trailing edge.
+        // The frame wrapping the field captures the input's own Escape here
+        // too: it clears the query, restores the full listing and returns
+        // the entries focus.
         .child(
             div()
                 .id("explorer-search-frame")
@@ -128,77 +141,9 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                         } else {
                             "Search names in current folder"
                         })
-                        .width(gpui::rems(13.125))
-                        .count(search_count(this, cx)),
-                ),
-        )
-        // "Search in subfolders": the box searches everything under the
-        // folder instead of filtering what it lists.
-        .child(
-            Button::new("explorer-search-subfolders", "Search in subfolders")
-                .ghost()
-                .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::FolderSearch))
-                .tooltip("Search in subfolders (Ctrl+Shift+F)")
-                .selected(this.tab().deep_search)
-                .toggled(this.tab().deep_search)
-                .disabled(!this.tab().state.can_search_subfolders())
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.toggle_deep_search(window, cx);
-                })),
-        )
-        // How the subfolder search reads its query: three toggles, kept for
-        // the session. They apply to the subfolder search only.
-        .child(
-            div()
-                .id("explorer-search-options")
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .child(
-                    Button::new("explorer-search-match-case", "Aa")
-                        .ghost()
-                        .tooltip("Match case")
-                        .selected(this.search_options.match_case)
-                        .toggled(this.search_options.match_case)
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.change_search_options(
-                                |options| options.match_case = !options.match_case,
-                                window,
-                                cx,
-                            );
-                        })),
-                )
-                .child(
-                    Button::new("explorer-search-regex", ".*")
-                        .ghost()
-                        .tooltip("Regular expression")
-                        .selected(this.search_options.regex)
-                        .toggled(this.search_options.regex)
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.change_search_options(
-                                |options| options.regex = !options.regex,
-                                window,
-                                cx,
-                            );
-                        })),
-                )
-                .child(
-                    Button::new("explorer-search-contents", "Search file contents")
-                        .ghost()
-                        .icon_only()
-                        .icon(icon(gpui_kit_assets::IconName::FileText))
-                        .tooltip("Search file contents")
-                        .selected(this.search_options.contents)
-                        .toggled(this.search_options.contents)
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.change_search_options(
-                                |options| options.contents = !options.contents,
-                                window,
-                                cx,
-                            );
-                        })),
+                        .width(gpui::rems(13.75))
+                        .count(search_count(this, cx))
+                        .trailing(search_filter_button(this, cx, search_options_open)),
                 ),
         )
         // An invalid regular expression: why nothing ran.
@@ -250,80 +195,53 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
                     View::Compact,
                 )),
         )
-        // The split view toggle: tinted while two panes show.
-        .child(
-            Button::new("explorer-split-toggle", "Split view")
-                .ghost()
-                .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::Columns2))
-                .tooltip("Split into two panes (F3); F6 switches pane, F5 copies, Shift+F5 moves")
-                .selected(this.tabs.is_split())
-                .toggled(this.tabs.is_split())
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.toggle_split(window, cx);
-                })),
-        )
-        // The details panel toggle: tinted while the panel is open.
-        .child(
-            Button::new("explorer-inspector-toggle", "Details panel")
-                .ghost()
-                .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::PanelRight))
-                .tooltip("Show or hide the details panel (Ctrl+I)")
-                .selected(this.inspector_open)
-                .toggled(this.inspector_open)
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.inspector_open = !this.inspector_open;
-                    cx.notify();
-                })),
-        )
-        // The favorites toggle for the current directory.
-        .child(
-            Button::new("explorer-favorite", "Favorite")
-                .ghost()
-                .icon_only()
-                .icon(icon(
-                    if this.favorites.contains(this.tab().state.current()) {
-                        gpui_kit_assets::IconName::StarFill
-                    } else {
-                        gpui_kit_assets::IconName::Star
-                    },
-                ))
-                .tooltip("Add or remove the current folder as a favorite")
-                .disabled(matches!(
-                    this.tab().state.current(),
-                    Location::Trash | Location::Recent | Location::Search { .. }
-                ))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.toggle_favorite(cx);
-                })),
-        )
-        // Reload, the recoverable-error path.
-        .child(
-            Button::new("explorer-reload", "Reload")
-                .ghost()
-                .icon_only()
-                .icon(icon(gpui_kit_assets::IconName::RefreshCw))
-                .tooltip("Reload current folder (Ctrl+R)")
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    let current = this.tab().state.current().clone();
-                    this.navigate(Transition::Visit(current), window, cx);
-                })),
-        )
-        // The context menu for keyboard-less pointer users: the same menu
-        // as a right click, on the current selection or the folder.
+        // The one overflow control: Split view, Favorite this folder,
+        // Refresh and Properties, each with its shortcut. It stays raised
+        // while its menu is open.
         .child(
             Button::new("explorer-more", "More actions")
                 .ghost()
                 .icon_only()
                 .icon(icon(gpui_kit_assets::IconName::Ellipsis))
-                .tooltip("More actions (right click, Menu key or Shift+F10)")
+                .tooltip("Split view, favorite this folder, refresh and properties")
+                .selected(toolbar_menu_open)
+                .toggled(toolbar_menu_open)
                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                     let position = super::overlay::below(event.position());
-                    let on = this.tab().state.activation_candidate();
-                    this.open_context_menu(position, on.as_deref(), window, cx);
+                    this.open_toolbar_menu(position, window, cx);
                 })),
         )
+}
+
+/// The search field's filter button: opens the search options popover —
+/// Match case, Regular expression, File contents and the subfolder scope —
+/// and carries the field's tinted look while any of them is on or the
+/// popover is open.
+fn search_filter_button(this: &Explorer, cx: &mut Context<Explorer>, open: bool) -> Stateful<Div> {
+    let colors = bolt::colors(cx);
+    let tint = ChromeColors::tint(cx.theme());
+    let on = this.search_options.match_case
+        || this.search_options.regex
+        || this.search_options.contents
+        || this.tab().deep_search;
+    div()
+        .id("explorer-search-options")
+        .flex_none()
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_color(if on || open { tint } else { colors.muted })
+        .when(on || open, |button| {
+            button.bg(tint.opacity(0.12)).border_1().border_color(tint)
+        })
+        .tooltip(|window, cx| Tooltip::new("Search options").build(window, cx))
+        .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+            let position = super::overlay::under_button(event.position());
+            this.open_search_options_menu(position, window, cx);
+        }))
+        .child(Icon::new(icon(gpui_kit_assets::IconName::ListFilter)).size(px(13.0)))
 }
 
 /// The editable path field in the breadcrumb bar's place.
@@ -526,4 +444,145 @@ fn search_count(this: &Explorer, _cx: &mut Context<Explorer>) -> Option<SearchCo
         return Some(SearchCount::new(format!("{total} of {total}")));
     }
     Some(SearchCount::new(format!("{shown} of {total}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::explorer::ops::{
+        MenuCommand, MenuItemSpec, MenuRow, SearchOption, search_option_rows, toolbar_menu_rows,
+    };
+    use fileflux::core::search_match::QueryOptions;
+
+    /// (label, command, checked, enabled) of every item row.
+    fn items(rows: &[MenuRow]) -> Vec<(&'static str, MenuCommand, Option<bool>, bool)> {
+        rows.iter()
+            .filter_map(|row| match row {
+                MenuRow::Item(spec) => Some((spec.label, spec.command, spec.checked, spec.enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn spec_of<'a>(rows: &'a [MenuRow], label: &str) -> Option<&'a MenuItemSpec> {
+        rows.iter().find_map(|row| match row {
+            MenuRow::Item(spec) if spec.label == label => Some(spec),
+            _ => None,
+        })
+    }
+
+    /// The search options popover holds the three query toggles and the
+    /// subfolder scope under its uppercase heading, checked from the live
+    /// search state.
+    #[test]
+    fn the_search_options_popover_holds_the_four_toggles_with_checks() {
+        let rows = search_option_rows(
+            QueryOptions {
+                match_case: true,
+                regex: false,
+                contents: true,
+            },
+            true,
+            true,
+        );
+        assert_eq!(
+            rows.first(),
+            Some(&MenuRow::Header("SEARCH OPTIONS")),
+            "the panel is headed by the uppercase label"
+        );
+        assert_eq!(
+            items(&rows),
+            vec![
+                (
+                    "Match case",
+                    MenuCommand::SearchOption(SearchOption::MatchCase),
+                    Some(true),
+                    true
+                ),
+                (
+                    "Regular expression",
+                    MenuCommand::SearchOption(SearchOption::Regex),
+                    Some(false),
+                    true
+                ),
+                (
+                    "File contents",
+                    MenuCommand::SearchOption(SearchOption::Contents),
+                    Some(true),
+                    true
+                ),
+                (
+                    "Subfolders",
+                    MenuCommand::SearchOption(SearchOption::Subfolders),
+                    Some(true),
+                    true
+                ),
+            ]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| **row == MenuRow::Separator)
+                .count(),
+            1,
+            "the subfolder scope sits apart, under a separator"
+        );
+    }
+
+    /// The subfolder scope stays disabled where the search cannot run, as
+    /// the toolbar button it replaces was.
+    #[test]
+    fn the_subfolders_row_is_disabled_where_the_search_cannot_run() {
+        let rows = search_option_rows(QueryOptions::default(), false, false);
+        assert_eq!(
+            spec_of(&rows, "Subfolders").map(|spec| (spec.checked, spec.enabled)),
+            Some((Some(false), false)),
+            "the scope row stays disabled where the search cannot run"
+        );
+    }
+
+    /// The toolbar's ⋯ menu holds Split view, Favorite this folder, Refresh
+    /// and Properties, each with the shortcut the app really binds.
+    #[test]
+    fn the_toolbar_menu_holds_split_favorite_refresh_and_properties() {
+        let rows = toolbar_menu_rows(true);
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows.get(1), Some(MenuRow::Separator)));
+        assert_eq!(
+            items(&rows),
+            vec![
+                ("Split view", MenuCommand::SplitView, None, true),
+                (
+                    "Favorite this folder",
+                    MenuCommand::FavoriteFolder,
+                    None,
+                    true
+                ),
+                ("Refresh", MenuCommand::Reload, None, true),
+                ("Properties", MenuCommand::Properties, None, true),
+            ]
+        );
+        assert_eq!(
+            spec_of(&rows, "Split view").and_then(|spec| spec.shortcut),
+            Some("F3")
+        );
+        assert_eq!(
+            spec_of(&rows, "Favorite this folder").and_then(|spec| spec.shortcut),
+            None,
+            "the app binds no key for favoriting"
+        );
+        assert_eq!(
+            spec_of(&rows, "Refresh").and_then(|spec| spec.shortcut),
+            Some("Ctrl+R")
+        );
+        assert_eq!(
+            spec_of(&rows, "Properties").and_then(|spec| spec.shortcut),
+            Some("Ctrl+I")
+        );
+    }
+
+    /// The favorite row is refused where the star button it replaces was.
+    #[test]
+    fn the_favorite_row_is_disabled_where_favoriting_is_refused() {
+        let rows = toolbar_menu_rows(false);
+        assert!(spec_of(&rows, "Favorite this folder").is_some_and(|spec| !spec.enabled));
+    }
 }

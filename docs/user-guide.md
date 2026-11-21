@@ -73,7 +73,7 @@ A sidebar of places on the left, the folder in the middle, and an optional [deta
 
 | Part | What it does |
 |---|---|
-| Toolbar | Sidebar toggle, back, forward, up, the path bar, grid/list toggle, details toggle, favorite star, reload (Ctrl+R), "more" menu (…) |
+| Toolbar | Sidebar toggle, back, forward, up, the path bar, the search field with its options behind the filter button, the grid/list/compact switch, and one `⋯` menu with Split view, Favorite this folder, Refresh (Ctrl+R) and Properties (Ctrl+I) |
 | Folder subbar | Current folder name, "4 folders · 7 files" count, **Sort**, **Filter**, **New folder**, active filter chips |
 | Status bar | "N items" or "N selected · size" (with the file type when exactly one entry is selected), loading and error notices, a progress indicator for long operations, free space of the current volume |
 
@@ -89,7 +89,7 @@ The window title is the current folder plus Fileflux ("Home — Fileflux") and f
 | Breadcrumbs | A Home icon and "Home" under `$HOME`, else `/`, with chevron separators. Each segment navigates and the current folder reads strong. Long paths collapse their leading segments instead of overflowing |
 | Path field | Click the bar's empty space or press Ctrl+L. Enter navigates to an absolute, relative or `~/…` path (no shell evaluation). Escape or leaving the field restores the committed path. An invalid or missing path reports an error and changes nothing |
 | History | Alt+←, Alt+→ and Alt+↑ (back, forward, up). A failed load changes nothing |
-| Favorites | Your GTK bookmarks (`~/.config/gtk-3.0/bookmarks`, shared with Nautilus and Thunar). The toolbar star, a folder's context menu and a sidebar row's menu add or remove one; an edit made by another program shows live. The Trash cannot be a favorite. See [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks) |
+| Favorites | Your GTK bookmarks (`~/.config/gtk-3.0/bookmarks`, shared with Nautilus and Thunar). The `⋯` menu, a folder's context menu and a sidebar row's menu add or remove one; an edit made by another program shows live. The Trash cannot be a favorite. See [Favorites and GTK bookmarks](#favorites-and-gtk-bookmarks) |
 
 Non-UTF-8 file names keep their exact bytes for navigation; lossy text appears only in what is displayed.
 

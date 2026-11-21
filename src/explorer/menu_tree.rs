@@ -15,7 +15,7 @@ use bolt::composites::{
 
 use super::actions::MenuState;
 use super::icon;
-use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow};
+use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow, SearchOption};
 use fileflux::core::zoom::ZoomCommand;
 
 /// The rows the target title takes at the top of the root level: the header
@@ -61,6 +61,15 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::RemoveBookmark => IconName::StarFill,
         MenuCommand::Unmount | MenuCommand::Eject => IconName::Eject,
         MenuCommand::AnalyzeDiskUsage => IconName::ChartPie,
+        MenuCommand::SearchOption(SearchOption::MatchCase) => IconName::CaseSensitive,
+        MenuCommand::SearchOption(SearchOption::Regex) => IconName::Regex,
+        MenuCommand::SearchOption(SearchOption::Contents) => IconName::FileText,
+        MenuCommand::SearchOption(SearchOption::Subfolders) => IconName::FolderSearch,
+        // The toolbar's ⋯ rows show their shortcut only, as the artboard
+        // draws them.
+        MenuCommand::SplitView | MenuCommand::FavoriteFolder | MenuCommand::Reload => {
+            return None;
+        }
     })
 }
 
@@ -92,10 +101,11 @@ fn item_node(spec: &MenuItemSpec) -> MenuNode {
         item = item.disabled();
     }
     let node = MenuNode::new(item);
-    // A sort or filter choice keeps the menu open and redraws its checks.
+    // A sort, filter or search-option choice keeps the menu open: several
+    // can be ticked in a row, and the checks redraw.
     if matches!(
         spec.command,
-        MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_)
+        MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) | MenuCommand::SearchOption(_)
     ) {
         node.keep_open(true)
     } else {
@@ -183,7 +193,39 @@ impl MenuState {
 
     /// The cascade to draw, from the rows as they are now.
     pub(crate) fn nodes(&self) -> Vec<MenuNode> {
-        nodes(self.title.as_deref(), &self.rows)
+        let mut root = nodes(self.title.as_deref(), &self.rows);
+        self.draw_partitions(&mut root);
+        root
+    }
+
+    /// A device menu's partition rows are [`MenuRow::Custom`] rows that
+    /// carry the partition's name only: the mount point and the free space
+    /// the menu was opened with (see [`super::actions::MenuOn::DeviceMenu`])
+    /// draw as the row's detail line and mono hint. The menu carries no
+    /// title, so its rows and nodes line up one to one.
+    fn draw_partitions(&self, root: &mut [MenuNode]) {
+        let super::actions::MenuOn::DeviceMenu { partitions, .. } = &self.on else {
+            return;
+        };
+        if self.title.is_some() {
+            return;
+        }
+        for (node, row) in root.iter_mut().zip(&self.rows) {
+            let MenuRow::Custom { index, .. } = row else {
+                continue;
+            };
+            let Some(partition) = partitions.get(*index) else {
+                continue;
+            };
+            let mut item = node
+                .item
+                .clone()
+                .detail(partition.mount.to_string_lossy().into_owned());
+            if let Some(free) = &partition.free {
+                item = item.shortcut(free.clone());
+            }
+            node.item = item;
+        }
     }
 
     /// The item an activation `path` names; `None` for a submenu row, a
@@ -314,6 +356,12 @@ mod tests {
     use crate::explorer::arrange::{ArrangeCommand, Arrangement, SortKey};
     use crate::explorer::arrange_menu;
     use crate::explorer::ops::{MenuTarget, menu_rows};
+    use crate::explorer::sidebar::{DevicePartition, device_row_menu_rows};
+    use std::path::PathBuf;
+
+    use crate::explorer::ops::{SearchOption, search_option_rows};
+    use fileflux::core::Location;
+    use fileflux::core::search_match::QueryOptions;
 
     fn at(millis: u64) -> Instant {
         static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -562,5 +610,87 @@ mod tests {
             [4],
             "past Clear, the separator and Type"
         );
+    }
+
+    #[test]
+    fn the_search_options_popover_rows_keep_it_open_and_name_their_toggle() {
+        let rows = search_option_rows(
+            QueryOptions {
+                match_case: false,
+                regex: true,
+                contents: false,
+            },
+            false,
+            true,
+        );
+        let menu = MenuState::new(MenuOn::SearchOptions, None, point(px(0.0), px(0.0)), rows);
+        let root = menu.nodes();
+        assert!(root.first().is_some_and(|node| node.item.is_header));
+        assert_eq!(
+            root.iter().filter(|node| node.keeps_menu_open()).count(),
+            4,
+            "the four toggles keep the popover open"
+        );
+        assert_eq!(
+            menu.item_at(&[1]).map(|spec| spec.command),
+            Some(MenuCommand::SearchOption(SearchOption::MatchCase))
+        );
+        assert_eq!(
+            menu.item_at(&[2]).map(|spec| (spec.command, spec.checked)),
+            Some((MenuCommand::SearchOption(SearchOption::Regex), Some(true)))
+        );
+    }
+
+    #[test]
+    fn a_device_menu_names_its_partitions_with_their_mounts_and_free_space() {
+        let partitions = vec![
+            DevicePartition {
+                name: "vault1".to_owned(),
+                mount: PathBuf::from("/home"),
+                free: Some("186 GB".to_owned()),
+            },
+            DevicePartition {
+                name: "vault2".to_owned(),
+                mount: PathBuf::from("/"),
+                free: None,
+            },
+        ];
+        let location = Location::Directory(PathBuf::from("/home"));
+        let rows = device_row_menu_rows(&partitions);
+        let menu = MenuState::new(
+            MenuOn::DeviceMenu {
+                row: "volume-0".to_owned(),
+                location,
+                partitions,
+            },
+            None,
+            point(px(0.0), px(0.0)),
+            rows,
+        );
+        let root = menu.nodes();
+        let partition_row = |at: usize| {
+            root.get(at).map(|node| {
+                (
+                    node.item.label.to_string(),
+                    node.item.detail.as_deref(),
+                    node.item.shortcut.as_deref(),
+                )
+            })
+        };
+        assert_eq!(
+            partition_row(4),
+            Some(("vault1".to_owned(), Some("/home"), Some("186 GB"))),
+            "the first partition names its mount point and free space"
+        );
+        assert_eq!(
+            partition_row(5),
+            Some(("vault2".to_owned(), Some("/"), None)),
+            "no statvfs answer, no invented number"
+        );
+        // The activation reads the row's index back, and a partition row is
+        // no command.
+        assert_eq!(menu.custom_action_at(&[4]), Some(0));
+        assert_eq!(menu.custom_action_at(&[5]), Some(1));
+        assert!(menu.item_at(&[4]).is_none());
     }
 }
