@@ -56,6 +56,7 @@ use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
 use crate::explorer::devices::{CheckedStep, DeviceHub};
 use crate::explorer::favorites::{BookmarkSync, favorites_of};
+use crate::explorer::folder_memory::FolderMemory;
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{ArrangeMenu, DialogQueue};
@@ -812,6 +813,11 @@ pub(crate) struct Explorer {
     pub(crate) panel_drag: Option<PanelDrag>,
     /// When and whether settings and session are written.
     persistence: Persistence,
+    /// The view remembered for each folder, and when it is written.
+    folders: FolderMemory,
+    /// The view and arrangement the settings held at launch: what "Reset
+    /// View for This Folder" goes back to.
+    default_presentation: (View, crate::explorer::arrange::Arrangement),
     /// Restored tabs whose saved folder has not been read yet, by tab: if the
     /// first scan finds it gone, the tab falls back to an existing ancestor.
     restore_pending: HashMap<TabId, PathBuf>,
@@ -982,6 +988,7 @@ impl Explorer {
             bookmarks_path,
             restored,
             persistence,
+            folders,
             notices,
         } = startup;
         let home = std::env::var_os("HOME")
@@ -989,6 +996,7 @@ impl Explorer {
             .map(PathBuf::from);
         let view = view_from_pref(preferences.view);
         let arrangement = arrangement_from_prefs(&preferences.arrangement);
+        let default_presentation = (view, arrangement.clone());
         let trash_root = startup_trash_root(
             std::env::var_os("HOME").as_deref(),
             std::env::var_os("XDG_DATA_HOME").as_deref(),
@@ -1083,6 +1091,8 @@ impl Explorer {
             details_width: preferences.details_width as f32,
             panel_drag: None,
             persistence,
+            folders,
+            default_presentation,
             restore_pending,
             restore_fallbacks: 0,
             settings_notice: None,
@@ -1235,6 +1245,8 @@ impl Explorer {
     /// still for the debounce. The write runs on the background executor; a
     /// failure shows one status notice and never blocks.
     fn persist_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.remember_changed_views();
+        self.save_folders_in_background(cx);
         let (settings, session) = self.persist_snapshot(window);
         let Some(job) = self.persistence.observe(settings, session, Instant::now()) else {
             return;
@@ -1254,9 +1266,67 @@ impl Explorer {
         .detach();
     }
 
+    /// Records, for every tab, the view the user changed in the folder it
+    /// shows (the folder memory).
+    fn remember_changed_views(&mut self) {
+        for tab in self.tabs.iter_mut() {
+            if let Some((path, view, arrangement)) = tab.state.take_unsaved_presentation() {
+                self.folders.remember(&path, view, &arrangement);
+            }
+        }
+    }
+
+    /// Writes the folder memory once it has settled, off the UI thread.
+    fn save_folders_in_background(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.folders.observe(Instant::now()) else {
+            return;
+        };
+        let write = cx.background_executor().spawn(async move { job.run() });
+        cx.spawn(async move |this, cx| {
+            let report = write.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if let Some(notice) = this.folders.finished(&report, Instant::now()) {
+                    this.settings_notice = Some(notice);
+                    cx.notify();
+                }
+            }) {
+                log::debug!("the explorer closed before its save settled: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// "Reset View for This Folder": forgets what is remembered for the
+    /// shown folder and shows the default view again.
+    pub(crate) fn reset_folder_view(&mut self, cx: &mut Context<Self>) {
+        let Location::Directory(path) = self.tab().state.current().clone() else {
+            return;
+        };
+        // What the user changed a moment ago is dropped with the record.
+        drop(self.tab_mut().state.take_unsaved_presentation());
+        if !self.folders.forget(&path) {
+            return;
+        }
+        let (view, arrangement) = self.default_presentation.clone();
+        self.tab_mut().state.apply_presentation(view, arrangement);
+        cx.notify();
+    }
+
+    /// Whether the shown folder has a remembered view (the empty-space menu
+    /// then offers to reset it).
+    pub(crate) fn shown_folder_has_memory(&self) -> bool {
+        matches!(self.tab().state.current(), Location::Directory(path) if self.folders.has(path))
+    }
+
     /// Saves what is still pending, on the spot: the window is closing and
     /// the process ends right after, so there is no later to wait for.
     pub(crate) fn flush_persistence(&mut self, window: &Window) {
+        self.remember_changed_views();
+        if let Some(job) = self.folders.flush()
+            && let Some(error) = job.run().error
+        {
+            log::warn!("folder views were not saved on close: {error}");
+        }
         let (settings, session) = self.persist_snapshot(window);
         if let Some(job) = self.persistence.flush(settings, session) {
             for error in job.run().errors() {
@@ -1510,8 +1580,24 @@ impl Explorer {
                 snapshot,
                 folder_label,
             }) => {
+                // The folder the tab was on is the one a change made until
+                // now belongs to: it is remembered before the tab moves.
+                if let Some((path, view, arrangement)) = tab.state.take_unsaved_presentation() {
+                    self.folders.remember(&path, view, &arrangement);
+                }
                 if !tab.state.commit_indexed(scan.clone(), listing, index) {
                     return;
+                }
+                // Arriving in a folder (a visit, Back, Forward, Up, a restored
+                // tab) shows what is remembered for it; a reload or a
+                // background refresh keeps what the tab shows.
+                if !scan.live && !scan.refresh {
+                    let (view, arrangement) = self.folders.presentation_for(
+                        &scan.location,
+                        tab.state.view(),
+                        tab.state.arrangement(),
+                    );
+                    tab.state.apply_presentation(view, arrangement);
                 }
                 tab.snapshot = snapshot;
                 tab.folder_label = folder_label;
@@ -3021,6 +3107,13 @@ impl Explorer {
     ) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
+        let mut state = state;
+        // The tab opens showing what is remembered for its folder, not what
+        // the tab it came from shows.
+        let (view, arrangement) =
+            self.folders
+                .presentation_for(&location, state.view(), state.arrangement());
+        state.apply_presentation(view, arrangement);
         let mut tab = Tab::new(id, state, window, cx);
         let scan = tab.state.begin(Transition::Visit(location));
         self.tabs.open(tab, placement);

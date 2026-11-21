@@ -1351,6 +1351,8 @@ pub(crate) enum MenuCommand {
     ToggleColumn(ColumnPref),
     /// A step of the shown view's icon size; the menu closes.
     Zoom(ZoomCommand),
+    /// Forget the shown folder's remembered view and go back to the default.
+    ResetFolderView,
     /// Sidebar rows: pin the row's folder to the Favorites.
     AddFavorite,
     /// Sidebar rows: unpin the row's folder from the Favorites.

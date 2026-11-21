@@ -28,6 +28,7 @@ use fileflux::core::images::is_image_path;
 use super::arrange::ArrangeCommand;
 use super::arrange_menu;
 use super::devices::{device_menu_rows, job_paths, with_device_rows};
+use super::folder_memory;
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job, JobCtx,
@@ -1154,6 +1155,10 @@ impl Explorer {
         if selected.is_empty() && !target.in_trash {
             rows = arrange_menu::with_zoom(rows);
         }
+        // A folder with a remembered view offers to forget it.
+        if selected.is_empty() && !target.in_trash && self.shown_folder_has_memory() {
+            rows = folder_memory::with_reset_row(rows);
+        }
         if self.tab().state.current().lists_files_from_elsewhere() {
             rows = recent_menu_rows(rows, target.selected);
         }
@@ -1557,6 +1562,7 @@ impl Explorer {
             MenuCommand::ConnectBookmark | MenuCommand::RemoveBookmark => {}
             MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
             MenuCommand::Zoom(zoom) => self.zoom(zoom, cx),
+            MenuCommand::ResetFolderView => self.reset_folder_view(cx),
             MenuCommand::SelectAll => self.select_all(cx),
             MenuCommand::InvertSelection => self.invert_selection(cx),
             MenuCommand::SelectMatching => self.select_matching(window, cx),

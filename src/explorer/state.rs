@@ -237,6 +237,10 @@ pub(crate) struct ExplorerState {
     /// displayed order the keyboard, range selection, grid and table all
     /// follow. Plain data, so a new tab can inherit it as it is.
     arrangement: Arrangement,
+    /// The user changed the view, sort or filters since the presentation was
+    /// last taken for the folder memory (see
+    /// [`Self::take_unsaved_presentation`]).
+    unsaved_presentation: bool,
     /// The item count of each folder of the listing, counted off the UI
     /// thread after the scan; what a folder sorts by under "Size".
     child_counts: Arc<FolderCounts>,
@@ -286,6 +290,7 @@ impl ExplorerState {
             listing: Listing::default(),
             view: View::Grid,
             arrangement: Arrangement::default(),
+            unsaved_presentation: false,
             child_counts: Arc::new(FolderCounts::new()),
             anchor: None,
             cursor: None,
@@ -1297,6 +1302,31 @@ impl ExplorerState {
     /// Switches the presentation; selection, folder and query are kept.
     pub(crate) fn set_view(&mut self, view: View) {
         self.view = view;
+        self.unsaved_presentation = true;
+    }
+
+    /// Puts a presentation on the tab that is not the user's doing here: a
+    /// folder's remembered view, or the defaults after a reset. It is not
+    /// something to remember again.
+    pub(crate) fn apply_presentation(&mut self, view: View, arrangement: Arrangement) {
+        self.view = view;
+        self.arrangement = arrangement;
+    }
+
+    /// The view and arrangement to remember for the shown folder when the
+    /// user changed them since the last call; `None` when nothing changed or
+    /// the location is not a folder (the Trash, the recent files and a
+    /// search are not remembered). The location only changes when a scan
+    /// commits, so a change made while a navigation is pending is still the
+    /// shown folder's.
+    pub(crate) fn take_unsaved_presentation(&mut self) -> Option<(PathBuf, View, Arrangement)> {
+        if !std::mem::take(&mut self.unsaved_presentation) {
+            return None;
+        }
+        match self.nav.current() {
+            Location::Directory(path) => Some((path.clone(), self.view, self.arrangement.clone())),
+            _ => None,
+        }
     }
 
     /// The sort.
@@ -1313,12 +1343,14 @@ impl ExplorerState {
     /// anchor are paths, so they survive the reorder.
     pub(crate) fn click_sort(&mut self, key: SortKey) {
         self.arrangement.sort = self.arrangement.sort.clicked(key);
+        self.unsaved_presentation = true;
     }
 
     /// Applies a sort or filter change from a menu, chip or shortcut. The
     /// selection is untouched: a filtered-out entry stays selected.
     pub(crate) fn arrange(&mut self, command: ArrangeCommand) {
         self.arrangement.apply(command);
+        self.unsaved_presentation = true;
     }
 
     /// The folder item counts the size sort reads.
@@ -1384,6 +1416,7 @@ impl ExplorerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::explorer::arrange::SortDir;
     use fileflux::core::EntryKind;
     use fileflux::core::Listing;
     use std::ffi::OsString;
@@ -1908,6 +1941,109 @@ mod tests {
         ));
         assert!(indexed.commit_indexed(scan, listing, index));
         assert_eq!(displayed(&indexed), ["notes.txt"]);
+        Ok(())
+    }
+
+    // --- per-folder view memory ----------------------------------------------
+
+    #[test]
+    fn every_presentation_change_in_a_folder_is_there_to_be_remembered() {
+        use crate::explorer::arrange::{ArrangeCommand, DateRange, SizeRange};
+        use fileflux::core::kinds::FileCategory;
+        type Change = Box<dyn Fn(&mut ExplorerState)>;
+        let changes: Vec<(&str, Change)> = vec![
+            ("view", Box::new(|s| s.set_view(View::List))),
+            ("header sort", Box::new(|s| s.click_sort(SortKey::Size))),
+            (
+                "sort key",
+                Box::new(|s| s.arrange(ArrangeCommand::SortBy(SortKey::Type))),
+            ),
+            (
+                "direction",
+                Box::new(|s| s.arrange(ArrangeCommand::SetDir(SortDir::Ascending))),
+            ),
+            (
+                "folders first",
+                Box::new(|s| s.arrange(ArrangeCommand::ToggleFoldersFirst)),
+            ),
+            (
+                "hidden",
+                Box::new(|s| s.arrange(ArrangeCommand::ToggleHidden)),
+            ),
+            (
+                "type filter",
+                Box::new(|s| s.arrange(ArrangeCommand::ToggleCategory(FileCategory::Images))),
+            ),
+            (
+                "date filter",
+                Box::new(|s| s.arrange(ArrangeCommand::ToggleDate(DateRange::Older))),
+            ),
+            (
+                "size filter",
+                Box::new(|s| s.arrange(ArrangeCommand::ToggleSize(SizeRange::Over1Gb))),
+            ),
+            (
+                "clear filters",
+                Box::new(|s| s.arrange(ArrangeCommand::ClearFilters)),
+            ),
+        ];
+        for (name, change) in changes {
+            let mut state = ExplorerState::new(dir("/fixture/a"), None);
+            assert_eq!(state.take_unsaved_presentation(), None, "{name}: untouched");
+            change(&mut state);
+            let taken = state.take_unsaved_presentation();
+            assert_eq!(
+                taken,
+                Some((
+                    PathBuf::from("/fixture/a"),
+                    state.view(),
+                    state.arrangement().clone()
+                )),
+                "{name}"
+            );
+            assert_eq!(state.take_unsaved_presentation(), None, "{name}: once");
+        }
+    }
+
+    #[test]
+    fn only_a_folder_is_remembered_not_the_trash_a_search_or_recent() {
+        for location in [
+            Location::Trash,
+            Location::Recent,
+            Location::Search {
+                root: PathBuf::from("/fixture/a"),
+                query: "x".to_owned(),
+            },
+        ] {
+            let mut state = ExplorerState::new(location.clone(), None);
+            state.set_view(View::List);
+            assert_eq!(state.take_unsaved_presentation(), None, "{location:?}");
+            assert_eq!(state.view(), View::List, "the change itself still applies");
+        }
+    }
+
+    #[test]
+    fn applying_a_remembered_presentation_is_not_a_change_to_remember() {
+        let mut state = ExplorerState::new(dir("/fixture/a"), None);
+        let mut arrangement = Arrangement::default();
+        arrangement.sort.key = SortKey::Size;
+        state.apply_presentation(View::Compact, arrangement.clone());
+        assert_eq!(state.view(), View::Compact);
+        assert_eq!(state.arrangement(), &arrangement);
+        assert_eq!(state.take_unsaved_presentation(), None);
+    }
+
+    #[test]
+    fn a_change_made_while_a_navigation_is_pending_belongs_to_the_folder_shown() -> TestResult {
+        let mut state = ExplorerState::new(dir("/fixture/a"), None);
+        state.set_view(View::List);
+        state
+            .begin(Transition::Visit(dir("/fixture/b")))
+            .ok_or("a scan")?;
+        let (path, view, _) = state
+            .take_unsaved_presentation()
+            .ok_or("the change is still unsaved")?;
+        assert_eq!((path, view), (PathBuf::from("/fixture/a"), View::List));
         Ok(())
     }
 

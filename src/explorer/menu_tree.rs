@@ -29,7 +29,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => return None,
         MenuCommand::Zoom(ZoomCommand::In) => IconName::ZoomIn,
         MenuCommand::Zoom(ZoomCommand::Out) => IconName::ZoomOut,
-        MenuCommand::Zoom(ZoomCommand::Reset) => IconName::RotateCcw,
+        MenuCommand::Zoom(ZoomCommand::Reset) | MenuCommand::ResetFolderView => IconName::RotateCcw,
         MenuCommand::AddFavorite => IconName::Star,
         MenuCommand::RemoveFavorite => IconName::StarFill,
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,

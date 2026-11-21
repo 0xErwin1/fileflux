@@ -70,7 +70,7 @@ const DEFAULT_WINDOW: (u32, u32) = (1440, 900);
 /// `<base>/fileflux/<file>` where `base` is the absolute XDG variable, else
 /// `home/<fallback>`. A relative or empty variable is ignored, as the XDG
 /// specification says.
-fn xdg_file(
+pub(super) fn xdg_file(
     home: Option<&OsStr>,
     xdg: Option<&OsStr>,
     fallback: &[&str],
@@ -107,7 +107,7 @@ pub fn session_path(home: Option<&OsStr>, xdg_state_home: Option<&OsStr>) -> Opt
 /// How a path sits in the file: its text when it is UTF-8, else its bytes.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
-enum PathRepr {
+pub(super) enum PathRepr {
     Text(String),
     Bytes { bytes: Vec<u8> },
 }
@@ -152,6 +152,20 @@ mod path_list {
             .into_iter()
             .map(PathBuf::from)
             .collect())
+    }
+}
+
+/// `#[serde(with)]` for one path.
+pub(super) mod path_one {
+    use super::{Path, PathBuf, PathRepr};
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(path: &Path, out: S) -> Result<S::Ok, S::Error> {
+        PathRepr::from(path).serialize(out)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<PathBuf, D::Error> {
+        Ok(PathBuf::from(PathRepr::deserialize(input)?))
     }
 }
 
@@ -496,7 +510,7 @@ impl Default for Session {
 }
 
 /// A file kind: what loading and saving need to know about it.
-trait Stored: Serialize + DeserializeOwned + Default {
+pub(super) trait Stored: Serialize + DeserializeOwned + Default {
     /// How the file is named in notices.
     const LABEL: &'static str;
     /// The newest `version` this build understands.
@@ -665,7 +679,7 @@ fn parse<T: Stored>(bytes: &[u8]) -> Parsed<T> {
     }
 }
 
-fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
+pub(super) fn load<T: Stored>(path: &Path, now: SystemTime) -> Loaded<T> {
     let file_name = path
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
@@ -881,12 +895,27 @@ pub fn save_session_ordered(
     session: &Session,
     generation: u64,
 ) -> io::Result<SaveOutcome> {
+    save_ordered(path, session, generation)
+}
+
+/// Writes any stored file for a numbered snapshot: under the write lock, a
+/// `generation` older than the newest one written to `path` is skipped. The
+/// last writer wins (no merge).
+///
+/// # Errors
+///
+/// Any I/O failure; the previous file is left as it was.
+pub(super) fn save_ordered<T: Stored>(
+    path: &Path,
+    value: &T,
+    generation: u64,
+) -> io::Result<SaveOutcome> {
     let mut written = writer();
     let entry = written.entry(path.to_path_buf()).or_default();
     if generation < entry.generation {
         return Ok(SaveOutcome::Superseded);
     }
-    write_value(path, session)?;
+    write_value(path, value)?;
     entry.generation = generation;
     Ok(SaveOutcome::Written)
 }

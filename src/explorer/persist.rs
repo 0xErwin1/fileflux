@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use fileflux::core::Location;
 use fileflux::core::bookmarks::{self, Bookmark};
+use fileflux::core::folder_views;
 use fileflux::core::kinds::FileCategory;
 use fileflux::core::settings::{
     self, ArrangementPrefs, CategoryPref, DatePref, Preferences, Restored, Session, Settings,
@@ -28,6 +29,7 @@ use fileflux::core::settings::{
 };
 
 use super::arrange::{Arrangement, DateRange, Filters, SizeRange, SortDir, SortKey, SortSpec};
+use super::folder_memory::FolderMemory;
 use super::state::View;
 
 /// How long the persisted state must stay unchanged before it is written, so
@@ -509,6 +511,8 @@ pub(crate) struct Startup {
     /// The tabs to reopen; `None` opens the command-line path (or home).
     pub(crate) restored: Option<Restored>,
     pub(crate) persistence: Persistence,
+    /// The remembered view of each folder (`folders.toml`).
+    pub(crate) folders: FolderMemory,
     /// Load problems for the status bar, in the order they happened.
     pub(crate) notices: Vec<String>,
 }
@@ -530,14 +534,27 @@ impl Startup {
             home.as_deref(),
             std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         );
-        Self::load_from(
+        let now = SystemTime::now();
+        let mut startup = Self::load_from(
             settings_path,
             session_path,
             bookmarks_path,
             start,
             home.as_deref().map(Path::new),
-            SystemTime::now(),
-        )
+            now,
+        );
+        // The folder memory applies whether or not the session does: a
+        // command-line folder still shows the view remembered for it.
+        let (folders, notice) = FolderMemory::load(
+            folder_views::folders_path(
+                home.as_deref(),
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+            ),
+            now,
+        );
+        startup.folders = folders;
+        startup.notices.extend(notice);
+        startup
     }
 
     /// [`Self::load`] against explicit files and clock. Nothing here probes
@@ -688,6 +705,7 @@ impl Startup {
                 }),
                 (!session_heal).then_some(session),
             ),
+            folders: FolderMemory::disabled(),
             notices,
         }
     }

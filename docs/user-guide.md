@@ -128,7 +128,7 @@ File icons come from the freedesktop icon theme the desktop is configured to use
 
 ## Sort and filter
 
-Sort and filter live in the tab and apply to the grid, the list and the compact view alike. Selection, arrow keys, ranges, Ctrl+A, Enter, the image viewer's list, paste targets and the details panel all follow the filtered and sorted result. A new tab inherits them.
+Sort and filter live in the tab and apply to the grid, the list and the compact view alike. Selection, arrow keys, ranges, Ctrl+A, Enter, the image viewer's list, paste targets and the details panel all follow the filtered and sorted result. A new tab inherits them, unless the folder it opens has its own [remembered view](#per-folder-view-memory).
 
 Use the subbar's **Sort** and **Filter** buttons, the same two pages in the empty-space context menu, or the list header.
 
@@ -146,6 +146,10 @@ Use the subbar's **Sort** and **Filter** buttons, the same two pages in the empt
 Each active filter is a removable chip next to the folder title, with **Clear all** when there are several. While anything filters, the subbar, status bar and details panel read "N of M items". **New folder** and **New file** clear the search and filters so the new item is visible.
 
 **Large folders** (more than a few thousand entries) are arranged on a background thread, so typing and clicking never wait. The previous order stays on screen meanwhile, and a **Sorting…** indicator appears in the status bar only when a result takes longer than about 150 ms. A folder of a million entries stays responsive.
+
+### Per-folder view memory
+
+Fileflux remembers how you like each folder: change the view (grid, list, compact), the sort, **Folders first**, hidden files or a type, date or size filter in a folder and it comes back that way whenever you open the folder again, in any tab and on the next launch. A folder you never changed keeps what the tab shows, so your last choice still carries over to new folders. The Trash, Recent and search results are not remembered. To forget a folder's view, right-click the empty space and choose **Reset View for This Folder** (shown only for a folder that has one); it returns to the view the settings held at launch. Up to 1000 folders are kept, the least recently changed going first. See [Settings and files](settings.md#per-folder-view-memory).
 
 ## Tabs
 
@@ -470,4 +474,3 @@ Right-click a row of Places, Favorites or Devices (a Network bookmark's menu is 
 ## Current scope
 
 - Tabs cannot be reordered or dragged between windows.
-- Per-folder view memory is not implemented: the active tab's view, sort and filters are the default for the next launch.

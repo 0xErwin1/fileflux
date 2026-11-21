@@ -11,6 +11,7 @@ pub(crate) mod devices;
 pub(crate) mod dnd;
 pub(crate) mod entries;
 pub(crate) mod favorites;
+pub(crate) mod folder_memory;
 pub(crate) mod inspector;
 pub(crate) mod links;
 pub(crate) mod menu_tree;

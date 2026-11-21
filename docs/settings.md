@@ -15,13 +15,15 @@ Fileflux remembers your preferences, favorites and open tabs in two small TOML f
 | `settings.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Preferences: default view (`grid`, `list` or `compact`; a file with the older values loads unchanged), default sort and filters (sort, `hide_hidden`, folders first, natural order, categories, date and size), sidebar and details panel widths (`sidebar_width`, `details_width`; a file without `details_width` loads the default), the optional list columns (`list_columns`, see below), the icon size of each view (`grid_zoom`, `list_zoom`, `compact_zoom`, see below), whether the sidebar starts collapsed, whether the details panel is open, and the window size |
 | `session.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The open tabs (folder, Trash or Recent, view, sort and filters of each) and which one is active, and for the dual-pane view the second pane's tabs, its active tab, whether the view was split and which pane had the focus (a `[split]` table, written only once the view has been split; a file without it opens as a single pane, so older files load unchanged). A tab showing the results of a subfolder search is saved as the folder it searched: the query and results are not restored |
 
+| `folders.toml` | `$XDG_STATE_HOME/fileflux/` (default `~/.local/state/fileflux/`) | The [view remembered for each folder](#per-folder-view-memory): `[[folders]]` entries, least recently used first, each with the absolute `path`, the `view` and the `arrangement` (sort key and direction, folders first, natural order, hidden files, and the type, date and size filters) |
+
 A third, optional file is written by you, never by Fileflux:
 
 | File | Location | Holds |
 |---|---|---|
 | `actions.toml` | `$XDG_CONFIG_HOME/fileflux/` (default `~/.config/fileflux/`) | Your [custom actions](#custom-actions-actionstoml) |
 
-`settings.toml` and `session.toml` are created with mode `0600` because they list your folders.
+`settings.toml`, `session.toml` and `folders.toml` are created with mode `0600` because they list your folders.
 
 Favorites are **not** in `settings.toml`: they are the lines of the GTK bookmarks file, `$XDG_CONFIG_HOME/gtk-3.0/bookmarks` (default `~/.config/gtk-3.0/bookmarks`), shared with Nautilus, Thunar and the GTK file chooser. See [Favorites and GTK bookmarks](user-guide.md#favorites-and-gtk-bookmarks).
 
@@ -71,10 +73,19 @@ A file without the keys (every file written before they existed, in version 1 or
 A saved tab whose folder is inside the Trash reopens as the Trash view: folders in the Trash are never opened as normal folders.
 
 
-- **The default view, sort and filters are the active tab's.** A new tab already starts from the tab it was opened from, so whatever the active tab shows is saved as the default for the next launch. Per-folder memory is not implemented.
+- **The default view, sort and filters are the active tab's.** A new tab already starts from the tab it was opened from, so whatever the active tab shows is saved as the default for the next launch. A folder whose view you changed is the exception: it shows its own (see below).
 - **Restoring.** Starting `fileflux` without a path reopens the saved tabs, in order, with the saved one active, and the split view with both panes' tabs when it was split (in a window narrower than 1100 px it shows one pane at a time). Startup never checks the folders on the UI thread: each tab opens as saved and loads in the background. A tab whose folder no longer exists then switches to its nearest existing parent (home if none), with a status-bar notice.
 - **A path on the command line wins.** `fileflux ~/x` opens only that folder and neither reads nor overwrites the saved session, so a quick launch never replaces the tabs of your last regular run. Preferences are still loaded and saved.
 - **Autosave.** A change is written once it has stayed unchanged for about 500 ms, so a drag or a burst of clicks is one write.
+
+## Per-folder view memory
+
+`folders.toml` remembers, for each folder where you changed the view (grid, list or compact), the sort key and direction, *Folders first*, the hidden-files toggle or a type, date or size filter, what that tab showed afterwards. Changing any of them in a folder tab records the folder; the Trash, Recent and search results are never recorded. Going into a folder (opening it, the path bar, Back, Forward, Up, a new tab, a restored session) shows what is remembered for it. A folder without an entry keeps what the tab shows, as before: the last choice carries over to folders you have not customized.
+
+- **Key.** The absolute path as Fileflux shows it; symlinks are not resolved, so a link and its target are remembered separately. A path that is not UTF-8 is stored as `{ bytes = [...] }`.
+- **Bounded.** At most 1000 folders. Recording a folder makes it the most recently used; past the limit the least recently used is forgotten. Only a change counts as a use: merely visiting a folder does not reorder the file.
+- **Reset.** The empty-space menu of a remembered folder has **Reset View for This Folder**: it deletes the entry and shows the view, sort and filters the settings held at launch.
+- **Saving.** Written like `session.toml`: atomically, once the memory has stayed unchanged for about 500 ms, and when the window closes. It is a separate file with its own `version` (currently 1) and, like the others, is moved aside as `folders.toml.bad-<UTC timestamp>` with one notice when it cannot be parsed, and never overwritten when a newer Fileflux wrote it. The last writer wins when two instances run.
 
 ## Safe to break
 
@@ -82,7 +93,7 @@ A saved tab whose folder is inside the Trash reopens as the Trash view: folders 
 |---|---|
 | Unknown keys | Ignored. Keys you add by hand are dropped the next time Fileflux writes the file |
 | Missing keys | Take their defaults |
-| File cannot be parsed | Loads the defaults, shows a status-bar notice, and first copies the file beside it as `settings.toml.bad-<UTC timestamp>` (same for `session.toml`). The next autosave writes a valid file, so the notice shows once. If the copy cannot be made, the file is left exactly as it is and Fileflux does not write it |
+| File cannot be parsed | Loads the defaults, shows a status-bar notice, and first copies the file beside it as `settings.toml.bad-<UTC timestamp>` (same for `session.toml` and `folders.toml`). The next autosave writes a valid file, so the notice shows once. If the copy cannot be made, the file is left exactly as it is and Fileflux does not write it |
 | File written by a newer Fileflux | Loads the defaults with a notice and never overwrites it |
 | A save fails | One notice, never blocks the app. The change stays pending, the background retries after 30 seconds, and closing the window tries once more |
 
@@ -111,10 +122,10 @@ A UTF-8 path is stored as a plain string; any other path is stored as `{ bytes =
 
 ## Resetting
 
-Delete `settings.toml`, `session.toml`, or both; the next launch starts from the defaults.
+Delete `settings.toml`, `session.toml`, `folders.toml`, or any of them; the next launch starts from the defaults (deleting `folders.toml` forgets every folder's view).
 
 ```sh
-rm ~/.config/fileflux/settings.toml ~/.local/state/fileflux/session.toml
+rm ~/.config/fileflux/settings.toml ~/.local/state/fileflux/session.toml ~/.local/state/fileflux/folders.toml
 ```
 
 Adjust the paths if you set `XDG_CONFIG_HOME` or `XDG_STATE_HOME`.
