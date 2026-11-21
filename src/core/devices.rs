@@ -458,13 +458,14 @@ fn lock_step(container: &Path) -> UnmountStep {
 /// The unlocked LUKS containers at or below `node`: they have a mapped
 /// child.
 fn unlocked_below(node: &BlockNode, out: &mut Vec<UnmountStep>) {
+    // Inside out: a container cannot be locked while one is open in it.
+    for child in &node.children {
+        unlocked_below(child, out);
+    }
     if node.fstype.as_deref() == Some(LUKS)
         && node.children.iter().any(|child| child.kind == "crypt")
     {
         out.push(lock_step(&node.path));
-    }
-    for child in &node.children {
-        unlocked_below(child, out);
     }
 }
 
@@ -640,9 +641,9 @@ pub fn unlock_target(nodes: &[BlockNode], requested: &Path) -> Result<UnlockTarg
         && parts.next() == Some(Component::Normal(OsStr::new("dev")))
         && parts.clone().next().is_some()
         && parts.all(|part| matches!(part, Component::Normal(_)));
-    // `/dev/sde1/` normalizes to a listed path: only the exact text is
-    // accepted.
-    if !shaped || requested.as_os_str().as_encoded_bytes().ends_with(b"/") {
+    // `/dev/sde1/`, `//dev/sde1`, `/dev/./sde1` normalize to a listed path
+    // by component: only the exact text is accepted.
+    if !shaped || requested.components().collect::<PathBuf>().as_os_str() != requested.as_os_str() {
         return Err(UnlockError::NotADevicePath);
     }
     if requested
@@ -2283,6 +2284,66 @@ mod tests {
         assert!(run_unmount(&busy, &step).is_err());
         let program = unmount_program(&step, Some(Path::new("/bin/udisksctl")), None);
         assert_eq!(program, Ok(Path::new("/bin/udisksctl")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unlock_target_must_be_the_exact_listing_text() {
+        let nodes = luks();
+        for request in ["//dev/sde1", "/dev//sde1", "/dev/./sde1", "/dev/sde1/."] {
+            assert_eq!(
+                unlock_target(&nodes, Path::new(request)).map(|t| t.path().to_path_buf()),
+                Err(UnlockError::NotADevicePath),
+                "{request}"
+            );
+        }
+        assert!(unlock_target(&nodes, Path::new("/dev/sde1")).is_ok());
+    }
+
+    const NESTED: &str = r#"{"blockdevices":[
+      {"name":"sde","path":"/dev/sde","fstype":null,"size":8000000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"disk","pkname":null,"uuid":null,
+         "children":[{"name":"sde1","path":"/dev/sde1","fstype":"crypto_LUKS","size":7999000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"part","pkname":"sde","uuid":"u1",
+            "children":[{"name":"outer","path":"/dev/mapper/outer","fstype":"crypto_LUKS","size":7900000000,"mountpoints":[null],"rm":true,"hotplug":true,"type":"crypt","pkname":"sde1","uuid":"m1",
+               "children":[{"name":"inner","path":"/dev/mapper/inner","fstype":"ext4","size":7800000000,"mountpoints":["/run/media/iperez/Deep"],"rm":true,"hotplug":true,"type":"crypt","pkname":"outer","uuid":"m2"}]}]}]}
+    ]}"#;
+
+    #[test]
+    fn nested_luks_is_locked_inside_out_before_power_off() {
+        let nodes = parse_lsblk(NESTED).unwrap_or_default();
+        let plan = eject_plan(&nodes, Path::new("/dev/sde"), "Deep");
+        let steps: Vec<(PathBuf, UnmountVia)> = plan
+            .iter()
+            .flat_map(|p| p.unmount.iter().map(|s| (s.device.clone(), s.via)))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (PathBuf::from("/dev/mapper/inner"), UnmountVia::Udisks),
+                (PathBuf::from("/dev/mapper/outer"), UnmountVia::UdisksLock),
+                (PathBuf::from("/dev/sde1"), UnmountVia::UdisksLock),
+            ]
+        );
+        assert_eq!(
+            plan.and_then(|p| p.power_off),
+            Some(PathBuf::from("/dev/sde"))
+        );
+    }
+
+    #[test]
+    fn only_an_unlocked_message_is_tolerated_by_a_lock_step() -> TestResult {
+        let fixture = Fixture::new()?;
+        let step = UnmountStep {
+            device: PathBuf::from("/dev/sdf1"),
+            mounts: Vec::new(),
+            via: UnmountVia::UdisksLock,
+        };
+        for (name, message) in [
+            ("mounted", "Cleartext device /dev/dm-3 is mounted"),
+            ("lookup", "Error looking up object for device"),
+        ] {
+            let tool = fixture.script(name, &format!("echo '{message}' >&2; exit 1"))?;
+            assert!(run_unmount(&tool, &step).is_err(), "{message}");
+        }
         Ok(())
     }
 }

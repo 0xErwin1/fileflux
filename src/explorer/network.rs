@@ -594,6 +594,13 @@ impl Explorer {
             Ok(target) => target,
             Err(error) => return self.say(Severity::Info, error.to_string(), window, cx),
         };
+        if let Some(text) = self
+            .devices
+            .find(target.path())
+            .and_then(|device| self.devices.refusal_for(device))
+        {
+            return self.say(Severity::Info, text, window, cx);
+        }
         let label = target.label().to_owned();
         match spawn_unlock(&gio, &target) {
             Ok(session) => {

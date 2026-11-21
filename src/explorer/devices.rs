@@ -570,6 +570,38 @@ impl DeviceHub {
         self.list.iter().find(|device| device.path == path)
     }
 
+    /// Why no unlock or mount may start on `device`: its disk is being
+    /// ejected (working) or a plan for it or its container is queued or
+    /// running.
+    pub(crate) fn refusal_for(&self, device: &Device) -> Option<String> {
+        let going = self.draining().find(|plan| {
+            plan.power_off.as_deref() == Some(device.disk.as_path())
+                || plan.unmount.iter().any(|step| step.device == device.path)
+        });
+        if let Some(plan) = going {
+            return Some(format!("{} is being ejected", plan.label));
+        }
+        self.working
+            .contains_key(&device.disk)
+            .then(|| format!("{} is being ejected", device.label))
+    }
+
+    /// Why `plan` must not start: an unlock or mount is still running on
+    /// the disk it ejects (or on a device it unmounts). It is refused, never
+    /// waited for or cancelled: the user retries once the prompt is done.
+    pub(crate) fn busy_before(&self, plan: &DevicePlan) -> Option<String> {
+        self.list.iter().find_map(|device| {
+            let touched = plan.power_off.as_deref() == Some(device.disk.as_path())
+                || plan.unmount.iter().any(|step| step.device == device.path);
+            let busy = matches!(
+                self.working.get(&device.path),
+                Some(&("Unlocking\u{2026}" | "Mounting\u{2026}"))
+            );
+            (touched && busy)
+                .then(|| format!("{} is still being unlocked or mounted", device.label))
+        })
+    }
+
     /// The word an action in progress shows on the row of `device`.
     pub(crate) fn working_on(&self, device: &Device) -> Option<&'static str> {
         self.working
@@ -767,6 +799,9 @@ impl Explorer {
             return;
         };
         let label = device.label.clone();
+        if let Some(text) = self.devices.refusal_for(device) {
+            return self.say(Severity::Info, text, window, cx);
+        }
         if self.devices.working.contains_key(&path) {
             return;
         }
@@ -1067,6 +1102,9 @@ impl Explorer {
     /// stops if one uses the device. `udisksctl` and every read of the
     /// filesystem run off the UI thread.
     fn run_device_plan(&mut self, plan: DevicePlan, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.devices.busy_before(&plan) {
+            return self.say(Severity::Info, text, window, cx);
+        }
         let udisksctl = self.devices.udisksctl.clone();
         let gio = self.devices.gio.clone();
         let eject = plan.power_off.is_some();
@@ -2353,5 +2391,48 @@ mod tests {
         assert_eq!(hub.working_on(&device), Some("Ejecting\u{2026}"));
         hub.working.insert(p("/dev/sdb1"), "Mounting\u{2026}");
         assert_eq!(hub.working_on(&device), Some("Mounting\u{2026}"));
+    }
+
+    #[test]
+    fn a_device_whose_disk_is_going_away_refuses_unlock_and_mount() {
+        let device = device(DeviceState::Unmounted, true);
+        let mut hub = DeviceHub::default();
+        assert_eq!(hub.refusal_for(&device), None);
+        hub.working.insert(p("/dev/sdb"), "Ejecting\u{2026}");
+        assert_eq!(
+            hub.refusal_for(&device),
+            Some(format!("{} is being ejected", device.label))
+        );
+        hub.working.clear();
+        // Queued or running plans count even before `working` has the key.
+        hub.pending.push(plan("USB", "/run/media/u/USB"));
+        assert_eq!(
+            hub.refusal_for(&device),
+            Some("USB is being ejected".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_plan_waits_for_an_unlock_or_mount_in_progress_on_its_disk() {
+        let device = device(DeviceState::Unmounted, true);
+        let mut hub = DeviceHub::default();
+        hub.list.push(device.clone());
+        let eject = plan("USB", "/run/media/u/USB");
+        assert_eq!(hub.busy_before(&eject), None);
+        hub.working.insert(p("/dev/sdb1"), "Unlocking\u{2026}");
+        assert_eq!(
+            hub.busy_before(&eject),
+            Some(format!(
+                "{} is still being unlocked or mounted",
+                device.label
+            ))
+        );
+        // A device of another disk does not hold it.
+        let other = DevicePlan {
+            power_off: Some(p("/dev/sdz")),
+            unmount: Vec::new(),
+            ..eject
+        };
+        assert_eq!(hub.busy_before(&other), None);
     }
 }

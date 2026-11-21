@@ -45,7 +45,8 @@ A busy or unauthorized device shows a toast with the reason `udisksctl` gave ("C
 
 - On success the devices are listed again and the unlocked volume's mount point opens.
 - A wrong passphrase shows gio's message in a notice (the passphrase redacted); the volume stays **Locked** and you can try again.
-- **Unmount** and **Eject** also lock the container: after the unmount (or after the last unmount of an ejected disk) `udisksctl lock --block-device=<container> --no-user-interaction` runs. A container that is already locked counts as done. If the lock fails the toast says so, although the unmount already happened.
+- **Unmount** and **Eject** also lock the container: after the unmount (or after the last unmount of an ejected disk) `udisksctl lock --block-device=<container> --no-user-interaction` runs. A container that is already locked counts as done; any other failure is reported. Containers nested in containers are locked inside out.
+- **Unlock** and **Mount** are refused ("<name> is being ejected") while the disk is being ejected or unmounted. **Eject** and **Unmount** are refused ("<name> is still being unlocked or mounted") while an unlock or mount of that disk is in progress; try again when it finishes. If the lock fails the toast says so, although the unmount already happened.
 - Unlocking needs `gio` (glib, with gvfs's udisks2 monitor); without it the action is disabled and the Devices section says so. TCRYPT (VeraCrypt) volumes are not detected by `lsblk`, so they are not offered. An unlocked volume that is not mounted can be mounted but has no separate **Lock** action: eject the disk instead.
 
 ## Safety rules
