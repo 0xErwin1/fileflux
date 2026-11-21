@@ -458,6 +458,14 @@ pub(crate) struct Tab {
     pub(crate) permission_in_flight: Option<PathBuf>,
     /// The retained permission probe task.
     pub(crate) permission_task: Option<Task<()>>,
+    /// The measured (or being measured) folder size of the details panel.
+    pub(crate) du: Option<inspector::DuView>,
+    /// The folder-size walk in flight (see [`inspector::du_plan`]).
+    pub(crate) du_run: Option<inspector::DuRun>,
+    /// The retained folder-size task.
+    pub(crate) du_task: Option<Task<()>>,
+    /// The folder the user pressed Calculate for (gvfs mounts only).
+    pub(crate) du_calculated: Option<PathBuf>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
     /// The thumbnail lookups of the listing, filled by `thumbs_task`.
@@ -585,6 +593,10 @@ impl Tab {
             permissions: None,
             permission_in_flight: None,
             permission_task: None,
+            du: None,
+            du_run: None,
+            du_task: None,
+            du_calculated: None,
             counts_task: None,
             thumbs: Arc::new(entries::Thumbs::new()),
             thumbs_task: None,
@@ -3558,6 +3570,7 @@ impl Explorer {
     fn render_document_island(&mut self, window: &Window, cx: &mut Context<Self>) -> Island {
         self.inspector_shown = self.inspector_wanted(window);
         self.sync_permissions(cx);
+        self.sync_du(cx);
         let panel = self.inspector_shown.then(|| inspector::render(self, cx));
         // The details handle covers the panel's left edge.
         let handle = self.inspector_shown.then(|| {

@@ -8,9 +8,12 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bolt::primitives::Icon;
+use fileflux::core::du::{self, DiskUsage, Progress, WalkEnd};
 use fileflux::core::places::format_bytes;
 #[cfg(test)]
 use fileflux::core::settings::DEFAULT_DETAILS_WIDTH;
@@ -33,6 +36,8 @@ pub(crate) const ISLAND_PADDING: f32 = 2.0 * 16.0;
 /// How long a selection must rest before its permissions are probed, so
 /// arrowing through a folder does not stat every entry on the way.
 const PROBE_DEBOUNCE: Duration = Duration::from_millis(100);
+/// How often a running folder-size walk publishes its partial total.
+const DU_TICK: Duration = Duration::from_millis(100);
 /// The entries area keeps at least this much room; below it the panel hides.
 pub(crate) const MIN_ENTRIES_WIDTH: f32 = 520.0;
 /// Height of the preview box.
@@ -222,6 +227,124 @@ pub(crate) fn probe_row(outcome: &ProbeOutcome) -> Option<(String, bool)> {
     }
 }
 
+/// What the folder-size walk of a tab shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DuState {
+    /// Still walking: the totals so far.
+    Walking(DiskUsage),
+    Done(DiskUsage),
+    /// The folder itself could not be inspected.
+    Failed,
+}
+
+/// The folder-size result (or partial total) of one path.
+#[derive(Clone, Debug)]
+pub(crate) struct DuView {
+    pub(crate) path: PathBuf,
+    pub(crate) state: DuState,
+}
+
+/// The walk in flight: its folder and the flag that stops it.
+#[derive(Clone, Debug)]
+pub(crate) struct DuRun {
+    pub(crate) path: PathBuf,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
+/// What the folder-size machinery does next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DuAction {
+    /// The wanted folder is already measured or being measured.
+    Idle,
+    /// No folder is wanted: drop the cached result.
+    Clear,
+    /// Walk this folder (after the debounce).
+    Start(PathBuf),
+}
+
+/// The pure folder-size policy: a decision plus whether the walk in flight
+/// must be cancelled first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DuPlan {
+    /// A walk for another folder is running: raise its cancel flag, so a
+    /// newer selection never waits for an older walk (and at most one walk
+    /// runs per tab).
+    pub(crate) cancel_in_flight: bool,
+    pub(crate) action: DuAction,
+}
+
+/// `wanted` is the folder to measure, `cached` the folder of the cached
+/// result, `in_flight` the folder being walked now.
+pub(crate) fn du_plan(
+    wanted: Option<&Path>,
+    cached: Option<&Path>,
+    in_flight: Option<&Path>,
+) -> DuPlan {
+    let cancel_in_flight = in_flight.is_some() && in_flight != wanted;
+    let running = if cancel_in_flight { None } else { in_flight };
+    let action = match wanted {
+        None if cached.is_some() => DuAction::Clear,
+        None => DuAction::Idle,
+        Some(path) if cached == Some(path) || running == Some(path) => DuAction::Idle,
+        Some(path) => DuAction::Start(path.to_path_buf()),
+    };
+    DuPlan {
+        cancel_in_flight,
+        action,
+    }
+}
+
+/// Whether a finished walk of `result_for` may be shown: only while that
+/// folder is still the one measured; a stale result is dropped.
+pub(crate) fn accepts_du_result(result_for: &Path, wanted: Option<&Path>) -> bool {
+    wanted == Some(result_for)
+}
+
+/// Whether `path` is walked without being asked: not under the gvfs mount
+/// directory (phones, network shares), where a walk is slow and may wake a
+/// sleeping device, unless the user pressed Calculate for this very folder.
+pub(crate) fn du_auto_allowed(
+    path: &Path,
+    gvfs_root: Option<&Path>,
+    calculated: Option<&Path>,
+) -> bool {
+    calculated == Some(path) || !gvfs_root.is_some_and(|root| path.starts_with(root))
+}
+
+/// The Size on disk value and whether it is muted.
+pub(crate) fn du_text(state: &DuState) -> (String, bool) {
+    match state {
+        DuState::Walking(usage) if usage.bytes == 0 && usage.files == 0 => {
+            ("Calculating\u{2026}".to_owned(), true)
+        }
+        DuState::Walking(usage) => (
+            format!("{} so far\u{2026}", format_bytes(usage.bytes)),
+            false,
+        ),
+        DuState::Done(usage) if usage.incomplete => {
+            (format!("{} (incomplete)", format_bytes(usage.bytes)), false)
+        }
+        DuState::Done(usage) => (format_bytes(usage.bytes), false),
+        DuState::Failed => ("unavailable".to_owned(), true),
+    }
+}
+
+/// The count line of a finished walk: `1204 files \u{b7} 36 folders`.
+pub(crate) fn du_counts_text(usage: &DiskUsage) -> String {
+    let plural = |count: u64, one: &str, many: &str| {
+        if count == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{count} {many}")
+        }
+    };
+    format!(
+        "{} \u{b7} {}",
+        plural(usage.files, "file", "files"),
+        plural(usage.folders, "folder", "folders")
+    )
+}
+
 impl Explorer {
     /// Drives the permission probe for the active tab's single selected
     /// entry while the panel shows. At most one probe is in flight per tab;
@@ -313,6 +436,173 @@ impl Explorer {
         });
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.permission_task = Some(task);
+        }
+    }
+
+    /// The folder the panel measures for tab `id`, if any: the one selected
+    /// folder (a symbolic link is not a folder to measure), or the current
+    /// folder when nothing is selected.
+    pub(crate) fn du_target(&self, id: TabId) -> Option<PathBuf> {
+        if !self.inspector_shown {
+            return None;
+        }
+        let tab = self.tabs.iter().find(|tab| tab.id == id)?;
+        match tab.state.selected_entries().as_slice() {
+            [] => match tab.state.current() {
+                Location::Directory(path) => Some(path.clone()),
+                _ => None,
+            },
+            [entry] => (entry.is_directory() && !entry.is_symlink).then(|| entry.path.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether `path` waits for the Calculate button.
+    fn du_needs_calculate(&self, id: TabId, path: &Path) -> bool {
+        let calculated = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.du_calculated.as_deref());
+        let root = fileflux::core::places::gvfs_root_from_env();
+        !du_auto_allowed(path, root.as_deref(), calculated)
+    }
+
+    /// The folder to walk now: the target unless it waits for Calculate.
+    fn du_wanted(&self, id: TabId) -> Option<PathBuf> {
+        self.du_target(id)
+            .filter(|path| !self.du_needs_calculate(id, path))
+    }
+
+    /// Drives the folder-size walk of the active tab: one walk in flight, a
+    /// newer target cancels the older walk, the result of a superseded walk
+    /// is dropped. Called from every render, like [`Self::sync_permissions`].
+    pub(crate) fn sync_du(&mut self, cx: &mut Context<Self>) {
+        let id = self.active_id();
+        let wanted = self.du_wanted(id);
+        let tab = self.tab_mut();
+        let plan = du_plan(
+            wanted.as_deref(),
+            tab.du.as_ref().map(|view| view.path.as_path()),
+            tab.du_run.as_ref().map(|run| run.path.as_path()),
+        );
+        if plan.cancel_in_flight {
+            if let Some(run) = tab.du_run.take() {
+                run.cancel.store(true, Ordering::Relaxed);
+            }
+            tab.du_task = None;
+        }
+        match plan.action {
+            DuAction::Idle => {}
+            DuAction::Clear => tab.du = None,
+            DuAction::Start(path) => self.start_du(id, path, cx),
+        }
+    }
+
+    fn start_du(&mut self, id: TabId, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        tab.du = Some(DuView {
+            path: path.clone(),
+            state: DuState::Walking(DiskUsage::default()),
+        });
+        tab.du_run = Some(DuRun {
+            path: path.clone(),
+            cancel: Arc::clone(&cancel),
+        });
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PROBE_DEBOUNCE).await;
+            let current = |this: &Self| {
+                this.tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| tab.du_run.as_ref())
+                    .is_some_and(|run| Arc::ptr_eq(&run.cancel, &cancel))
+            };
+            let go = this.update(cx, |this, _| {
+                current(this) && accepts_du_result(&path, this.du_wanted(id).as_deref())
+            });
+            match go {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Superseded during the debounce: the next render
+                    // decides again.
+                    if let Err(error) = this.update(cx, |this, cx| {
+                        if current(this)
+                            && let Some(tab) = this.tabs.by_id_mut(id)
+                        {
+                            tab.du_run = None;
+                            tab.du = None;
+                        }
+                        cx.notify();
+                    }) {
+                        log::debug!("the explorer closed before the size walk ran: {error}");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    log::debug!("the explorer closed before the size walk ran: {error}");
+                    return;
+                }
+            }
+            let progress = Arc::new(Progress::default());
+            let walker = {
+                let (path, cancel, progress) =
+                    (path.clone(), Arc::clone(&cancel), Arc::clone(&progress));
+                cx.background_executor()
+                    .spawn(async move { du::walk(&path, &cancel, &progress) })
+            };
+            while !progress.is_finished() {
+                cx.background_executor().timer(DU_TICK).await;
+                let usage = progress.snapshot();
+                let alive = this.update(cx, |this, cx| {
+                    if current(this)
+                        && let Some(tab) = this.tabs.by_id_mut(id)
+                    {
+                        tab.du = Some(DuView {
+                            path: path.clone(),
+                            state: DuState::Walking(usage),
+                        });
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            let result = walker.await;
+            if let Err(error) = &result {
+                log::debug!("could not measure {}: {error}", path.display());
+            }
+            if let Err(error) = this.update(cx, |this, cx| {
+                if !current(this) {
+                    return; // superseded: its cancel flag was raised
+                }
+                let wanted = this.du_wanted(id);
+                let Some(tab) = this.tabs.by_id_mut(id) else {
+                    return;
+                };
+                tab.du_run = None;
+                let state = match result {
+                    Ok(WalkEnd::Done(usage)) => Some(DuState::Done(usage)),
+                    Ok(WalkEnd::Cancelled) => None,
+                    Err(_) => Some(DuState::Failed),
+                };
+                tab.du = match state {
+                    Some(state) if accepts_du_result(&path, wanted.as_deref()) => {
+                        Some(DuView { path, state })
+                    }
+                    _ => None,
+                };
+                cx.notify();
+            }) {
+                log::debug!("the explorer closed before the size walk settled: {error}");
+            }
+        });
+        if let Some(tab) = self.tabs.by_id_mut(id) {
+            tab.du_task = Some(task);
         }
     }
 
@@ -460,6 +750,51 @@ fn facts(rows: Vec<Fact>, cx: &Context<Explorer>) -> Div {
         }))
 }
 
+/// The Size on disk rows of `path` (a folder), and the Calculate button
+/// when the folder waits for it.
+fn du_rows(
+    this: &Explorer,
+    path: &Path,
+    cx: &mut Context<Explorer>,
+) -> (Vec<Fact>, Option<AnyElement>) {
+    let id = this.active_id();
+    if this.du_needs_calculate(id, path) {
+        let colors = bolt::colors(cx);
+        let target = path.to_path_buf();
+        let button = div()
+            .id("inspector-calculate-size")
+            .mx(px(16.0))
+            .text_size(px(12.0))
+            .text_color(colors.info)
+            .cursor_pointer()
+            .child("Calculate size")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tab_mut().du_calculated = Some(target.clone());
+                cx.notify();
+            }))
+            .into_any_element();
+        let row = Fact {
+            term: "Size on disk",
+            value: "not calculated".to_owned(),
+            muted: true,
+        };
+        return (vec![row], Some(button));
+    }
+    let Some(view) = this.tab().du.as_ref().filter(|view| view.path == path) else {
+        return (Vec::new(), None);
+    };
+    let (value, muted) = du_text(&view.state);
+    let mut rows = vec![Fact {
+        term: "Size on disk",
+        value,
+        muted,
+    }];
+    if let DuState::Done(usage) = &view.state {
+        rows.push(Fact::new("In total", du_counts_text(usage)));
+    }
+    (rows, None)
+}
+
 fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement> {
     let colors = bolt::colors(cx);
     // The folder's total; "N of M" while a filter hides some of it.
@@ -470,23 +805,27 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         .shows_fewer_than_listed()
         .then(|| this.tab().state.visible_shared().len());
     let items = util::items_label(total, shown);
-    vec![
+    let mut rows = vec![Fact::new("Items", items)];
+    let mut calculate = None;
+    if let Location::Directory(path) = this.tab().state.current() {
+        let (size, button) = du_rows(this, path, cx);
+        rows.extend(size);
+        calculate = button;
+    }
+    rows.push(Fact::new(
+        "Location",
+        wrappable(&location_text(this.tab().state.current())),
+    ));
+    let mut body = vec![
         preview_box(folder_glyph(cx), cx).into_any_element(),
         title(this.current_label(), cx)
             .mt(px(16.0))
             .into_any_element(),
         subtitle("Folder".to_owned(), cx).into_any_element(),
-        facts(
-            vec![
-                Fact::new("Items", items),
-                Fact::new(
-                    "Location",
-                    wrappable(&location_text(this.tab().state.current())),
-                ),
-            ],
-            cx,
-        )
-        .into_any_element(),
+        facts(rows, cx).into_any_element(),
+    ];
+    body.extend(calculate);
+    body.push(
         div()
             .p(px(24.0))
             .text_center()
@@ -495,7 +834,8 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
             .text_color(colors.muted)
             .child("Select an item to preview it.")
             .into_any_element(),
-    ]
+    );
+    body
 }
 
 /// What the preview box shows for a file: the image itself when the app
@@ -546,6 +886,7 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
     };
 
     let mut rows = Vec::new();
+    let mut calculate = None;
     if entry.is_directory() {
         if let Some(count) = this
             .tab()
@@ -556,6 +897,11 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
             .flatten()
         {
             rows.push(Fact::new("Contains", util::format_item_count(count)));
+        }
+        if !entry.is_symlink {
+            let (size, button) = du_rows(this, &entry.path, cx);
+            rows.extend(size);
+            calculate = button;
         }
     } else {
         rows.push(Fact::new(
@@ -594,14 +940,16 @@ fn one_selected(this: &Explorer, entry: &Entry, cx: &mut Context<Explorer>) -> V
         None => rows.push(Fact::new("Path", wrappable(&entry.path.to_string_lossy()))),
     }
 
-    vec![
+    let mut body = vec![
         preview_box(tile, cx).into_any_element(),
         title(entry.display_name().into_owned(), cx)
             .mt(px(16.0))
             .into_any_element(),
         subtitle(kind_label(entry), cx).into_any_element(),
         facts(rows, cx).into_any_element(),
-    ]
+    ];
+    body.extend(calculate);
+    body
 }
 
 fn many_selected(selected: &[&Entry], cx: &mut Context<Explorer>) -> Vec<AnyElement> {
@@ -803,6 +1151,122 @@ mod tests {
         assert_eq!(probe_outcome(Ok(Some(0o600))), ProbeOutcome::Mode(0o600));
         let failure = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         assert_eq!(probe_outcome(Err(failure)), ProbeOutcome::Unavailable);
+    }
+
+    #[test]
+    fn du_plan_starts_the_wanted_folder_when_nothing_runs() {
+        let a = p("/a");
+        assert_eq!(
+            du_plan(Some(&a), None, None),
+            DuPlan {
+                cancel_in_flight: false,
+                action: DuAction::Start(p("/a"))
+            }
+        );
+        assert_eq!(
+            du_plan(None, None, None),
+            DuPlan {
+                cancel_in_flight: false,
+                action: DuAction::Idle
+            }
+        );
+    }
+
+    #[test]
+    fn du_plan_never_restarts_a_measured_or_running_folder() {
+        let a = p("/a");
+        for (cached, running) in [(Some(&a), None), (Some(&a), Some(&a)), (None, Some(&a))] {
+            assert_eq!(
+                du_plan(
+                    Some(&a),
+                    cached.map(PathBuf::as_path),
+                    running.map(PathBuf::as_path)
+                ),
+                DuPlan {
+                    cancel_in_flight: false,
+                    action: DuAction::Idle
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_selection_cancels_the_older_walk_and_starts_the_latest() {
+        let (a, b) = (p("/a"), p("/b"));
+        assert_eq!(
+            du_plan(Some(&b), Some(&a), Some(&a)),
+            DuPlan {
+                cancel_in_flight: true,
+                action: DuAction::Start(p("/b"))
+            },
+            "one walk in flight: the old one is cancelled, not awaited"
+        );
+        assert_eq!(
+            du_plan(None, Some(&a), Some(&a)),
+            DuPlan {
+                cancel_in_flight: true,
+                action: DuAction::Clear
+            }
+        );
+    }
+
+    #[test]
+    fn a_stale_walk_result_is_dropped() {
+        let (a, b) = (p("/a"), p("/b"));
+        assert!(accepts_du_result(&a, Some(&a)));
+        assert!(!accepts_du_result(&a, Some(&b)));
+        assert!(!accepts_du_result(&a, None));
+    }
+
+    #[test]
+    fn gvfs_folders_wait_for_calculate_and_everything_else_walks() {
+        let root = p("/run/user/1000/gvfs");
+        let phone = p("/run/user/1000/gvfs/mtp:host=x/DCIM");
+        let home = p("/home/me");
+        assert!(!du_auto_allowed(&phone, Some(&root), None));
+        assert!(du_auto_allowed(&phone, Some(&root), Some(&phone)));
+        assert!(
+            !du_auto_allowed(&phone, Some(&root), Some(&home)),
+            "Calculate applies to its own folder only"
+        );
+        assert!(du_auto_allowed(&home, Some(&root), None));
+        assert!(du_auto_allowed(&phone, None, None), "no gvfs, no gate");
+    }
+
+    #[test]
+    fn size_on_disk_streams_then_settles_and_flags_incomplete() {
+        let usage = |bytes, files, incomplete| DiskUsage {
+            bytes,
+            files,
+            folders: 1,
+            incomplete,
+        };
+        assert_eq!(
+            du_text(&DuState::Walking(DiskUsage::default())),
+            ("Calculating\u{2026}".to_owned(), true)
+        );
+        assert_eq!(
+            du_text(&DuState::Walking(usage(12_400_000_000, 5, false))),
+            ("12.4 GB so far\u{2026}".to_owned(), false)
+        );
+        assert_eq!(
+            du_text(&DuState::Done(usage(12_400_000_000, 5, false))),
+            ("12.4 GB".to_owned(), false)
+        );
+        assert_eq!(
+            du_text(&DuState::Done(usage(1_500_000, 5, true))),
+            ("1.5 MB (incomplete)".to_owned(), false)
+        );
+        assert_eq!(du_text(&DuState::Failed), ("unavailable".to_owned(), true));
+        assert_eq!(
+            du_counts_text(&DiskUsage {
+                bytes: 0,
+                files: 1,
+                folders: 2,
+                incomplete: false
+            }),
+            "1 file \u{b7} 2 folders"
+        );
     }
 
     #[test]

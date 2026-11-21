@@ -285,11 +285,13 @@ A read-only panel on the right (300 px by default, resizable), toggled by the to
 
 | Selection | Shows |
 |---|---|
-| Nothing | Folder glyph, name, item total ("N of M" while a filter is active) and full location |
-| One entry | A preview (image files draw the image, videos and documents their thumbnail; others the folder or file icon), name, kind ("Image · JPG"), size, modified time, permissions (`rw-r--r--`, or `unavailable`), item count for folders, and path (Trash entries show their original location) |
+| Nothing | Folder glyph, name, item total ("N of M" while a filter is active), size on disk of the folder (see below) and full location |
+| One entry | A preview (image files draw the image, videos and documents their thumbnail; others the folder or file icon), name, kind ("Image · JPG"), size, modified time, permissions (`rw-r--r--`, or `unavailable`), item count for folders, size on disk of a folder (see below), and path (Trash entries show their original location) |
 | Several | The count and the total size of the selected files |
 
 Images, videos, PDFs, office documents and vector images are previewed; the rest show their file icon.
+
+**Size on disk** appears for one selected folder, or for the current folder when nothing is selected. It is measured in the background after a short pause, so arrowing through folders does not walk each one: a growing "12.4 GB so far…" turns into the final value, with "N files · M folders" beside it. Selecting something else cancels the walk. The number follows the rules of `du`: allocated blocks rather than the apparent size (a sparse file counts what it occupies), each hard-linked file once, symbolic links never followed, and only the folder's own filesystem (a mount below it is skipped). Subfolders that cannot be read are skipped and the value reads "(incomplete)". Folders on gvfs mounts (phones, network shares) are not walked on their own: the panel shows **Calculate size** instead. The list and grid Size column keeps showing "N items" for folders, as GNOME Files does.
 
 ## Thumbnails
 
