@@ -13,7 +13,10 @@ use super::usage::{Item, NodeId, UsageTree};
 
 /// How many rings the chart draws below the root.
 pub const RING_DEPTH: u32 = 3;
-/// The radius of the empty centre, as a fraction of the chart radius.
+/// The radius of the empty centre, as a fraction of the chart radius. It was
+/// 0.22; the centre label (the folder name over a size such as "70.3 MB")
+/// does not fit in a hole that small, so the rings start further out and
+/// share the remaining radius. [`in_center`] and the first ring both use it.
 pub const CENTER_HOLE: f32 = 0.38;
 /// Segments thinner than this (radians) are folded into one "other" segment
 /// of their parent, which bounds the segment count however wide a folder is.
@@ -55,6 +58,21 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Whether the slice stands for the folded rest, not for one item.
+    #[must_use]
+    pub fn is_folded(&self) -> bool {
+        matches!(
+            self.target,
+            Target::Other { .. } | Target::Item(Item::OtherFiles(_))
+        )
+    }
+
+    /// The slice's colour (hue, saturation, lightness).
+    #[must_use]
+    pub fn fill(&self) -> (f32, f32, f32) {
+        fill(self.is_folded(), self.branch, self.depth)
+    }
+
     #[must_use]
     pub fn bytes(&self, tree: &UsageTree) -> u64 {
         match self.target {
@@ -195,15 +213,62 @@ pub fn in_center(radius: f32) -> bool {
     radius < CENTER_HOLE
 }
 
+/// The hue of the first branch: the design's blue.
+const BASE_HUE: f32 = 0.600;
+/// How far the hue moves each time the lightness ladder wraps, so a branch
+/// and the one a ladder later (`branch + LADDER_STEPS`) differ. Small enough
+/// that every colour stays inside the blue family.
+const HUE_PER_LADDER: f32 = 0.015;
+/// Hue shifts before they repeat (the hue stays within 0.600 to 0.630).
+const HUE_LADDERS: usize = 3;
+/// Lightness steps in the ladder; neighbouring branches are one step apart.
+const LADDER_STEPS: usize = 4;
+const SATURATION: f32 = 0.78;
+/// Lightness of the first branch on the first ring.
+const BRANCH_LIGHTNESS: f32 = 0.66;
+/// How much darker each further branch of the ladder is.
+const LIGHTNESS_PER_STEP: f32 = 0.07;
+/// How much darker each further ring is, so a ring reads as inside its parent.
+const LIGHTNESS_PER_RING: f32 = 0.05;
+/// Lightness bounds: below, slices melt into the dark background; above, they
+/// glare against it.
+const MIN_LIGHTNESS: f32 = 0.28;
+const MAX_LIGHTNESS: f32 = 0.70;
+/// The least lightness difference between neighbouring branches (one ladder
+/// step, with margin for rounding).
+#[cfg(test)]
+const MIN_NEIGHBOUR_CONTRAST: f32 = LIGHTNESS_PER_STEP - 1e-3;
+
+/// The folded rest ("other"), as hue, saturation and lightness: the design's
+/// line-2 grey, so it reads as background and not as one more slice. The one
+/// source for the chart slice and the legend swatch.
+pub const OTHER_COLOR: (f32, f32, f32) = (0.76, 0.08, 0.28);
+
 /// The colour of a segment as hue (0 to 1), saturation and lightness: the
 /// design's blues, stepped per top-level branch and darker per ring, so the
-/// chart reads as one family instead of a colour wheel.
+/// chart reads as one family instead of a colour wheel. Neighbouring
+/// branches differ in lightness; branches a ladder apart differ in hue.
 #[must_use]
 pub fn color(branch: usize, depth: u32) -> (f32, f32, f32) {
-    let step = (branch % 4) as f32;
-    let hue = (0.600 + step * 0.006).rem_euclid(1.0);
-    let lightness = (0.66 - step * 0.07 - depth.saturating_sub(1) as f32 * 0.05).clamp(0.28, 0.70);
-    (hue, 0.78, lightness)
+    let step = (branch % LADDER_STEPS) as f32;
+    let ladder = (branch / LADDER_STEPS % HUE_LADDERS) as f32;
+    let hue = (BASE_HUE + ladder * HUE_PER_LADDER).rem_euclid(1.0);
+    let lightness = (BRANCH_LIGHTNESS
+        - step * LIGHTNESS_PER_STEP
+        - depth.saturating_sub(1) as f32 * LIGHTNESS_PER_RING)
+        .clamp(MIN_LIGHTNESS, MAX_LIGHTNESS);
+    (hue, SATURATION, lightness)
+}
+
+/// The colour a slice and its legend swatch both use: the grey for the folded
+/// rest, else the branch's blue at that ring.
+#[must_use]
+pub fn fill(folded: bool, branch: usize, depth: u32) -> (f32, f32, f32) {
+    if folded {
+        OTHER_COLOR
+    } else {
+        color(branch, depth)
+    }
 }
 
 /// One ring for the chart shown while the analysis runs: the shares measured
@@ -420,9 +485,80 @@ mod tests {
     }
 
     #[test]
-    fn branches_get_distinct_hues_and_deeper_rings_are_darker() {
-        assert_ne!(color(0, 1).0, color(1, 1).0);
+    fn deeper_rings_are_darker_and_stay_legible() {
         assert!(color(0, 3).2 < color(0, 1).2);
-        assert!(color(0, 99).2 >= 0.28);
+        assert!(color(0, 99).2 >= MIN_LIGHTNESS);
+        assert!(color(0, 1).2 <= MAX_LIGHTNESS);
+    }
+
+    /// Branches beside each other on the ring never share a colour and differ
+    /// visibly in lightness, however many branches there are: the ladder has
+    /// four steps, so `branch` and `branch + 4` differ by hue instead.
+    #[test]
+    fn neighbouring_branches_differ_visibly_for_any_branch_count() {
+        for branch in 0..400 {
+            for depth in 1..=RING_DEPTH {
+                let (a, b) = (color(branch, depth), color(branch + 1, depth));
+                assert_ne!(
+                    a,
+                    b,
+                    "branches {branch} and {} at depth {depth}",
+                    branch + 1
+                );
+                assert!(
+                    (a.2 - b.2).abs() >= MIN_NEIGHBOUR_CONTRAST,
+                    "branches {branch} and {} too close in lightness",
+                    branch + 1
+                );
+            }
+            assert_ne!(color(branch, 1), color(branch + 4, 1));
+        }
+        assert!((0..400).all(|branch| (0.55..=0.65).contains(&color(branch, 1).0)));
+    }
+
+    /// The legend swatch and the slice are the same colour because both ask
+    /// `fill`; the folded rest is one grey whatever its branch.
+    #[test]
+    fn a_slice_and_its_legend_swatch_share_one_colour() {
+        let segment = Segment {
+            target: Target::Row(7),
+            depth: 1,
+            branch: 7,
+            start: 0.0,
+            end: 1.0,
+            inner: CENTER_HOLE,
+            outer: 1.0,
+            parent_bytes: 0,
+        };
+        assert_eq!(segment.fill(), fill(false, 7, 1));
+        assert_eq!(segment.fill(), color(7, 1));
+        let folded = Segment {
+            target: Target::Other {
+                dir: UsageTree::ROOT,
+                bytes: 1,
+                count: 1,
+            },
+            branch: 2,
+            ..segment
+        };
+        assert_eq!(folded.fill(), OTHER_COLOR);
+        assert_eq!(fill(true, 0, 1), fill(true, 9, 3));
+        assert_eq!(fill(true, 0, 1), OTHER_COLOR);
+    }
+
+    /// The hole is wide enough for the centre label ("70.3 MB"): a click in
+    /// it is the centre, one on the first ring is not, and the first ring
+    /// starts exactly where the hole ends.
+    #[test]
+    fn the_centre_hole_and_the_first_ring_meet_at_the_hole_radius() {
+        assert_eq!(CENTER_HOLE, 0.38);
+        assert!(in_center(0.0) && in_center(CENTER_HOLE - 1e-4));
+        assert!(!in_center(CENTER_HOLE) && !in_center(CENTER_HOLE + 1e-4));
+        let ring = layout_rows(&[1.0]);
+        assert_eq!(ring[0].inner, CENTER_HOLE);
+        assert_eq!(hit_test(&ring, 0.1, CENTER_HOLE - 1e-4), None);
+        assert_eq!(hit_test(&ring, 0.1, CENTER_HOLE), ring.first());
+        let tree_ring = (1.0 - CENTER_HOLE) / RING_DEPTH as f32;
+        assert!(tree_ring > 0.0 && CENTER_HOLE + tree_ring * RING_DEPTH as f32 - 1.0 < 1e-6);
     }
 }

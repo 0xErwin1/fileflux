@@ -234,13 +234,7 @@ fn status(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElemen
     // The one status line of the view (the window's status bar leaves it
     // here): the totals with what qualifies them, and while measuring, how
     // many children are done because the final total is not known yet.
-    let mut text = session.status_text();
-    if session.is_walking() {
-        let rows = session.rows();
-        let total = rows.len();
-        let done = rows.iter().filter(|row| !row.pending).count();
-        text.push_str(&format!(" \u{b7} {done} of {total} children measured"));
-    }
+    let text = session.status_line();
     footer
         .child(
             div()
@@ -277,11 +271,8 @@ fn legend(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElemen
         .gap(px(6.0))
         .text_size(px(12.0));
     for (index, row) in rows.iter().enumerate() {
-        let swatch = if row.kind == ShownKind::Other {
-            colors.line_2
-        } else {
-            hsla(usage_chart::color(index, 1))
-        };
+        // The chart's branch of a top-level row is its position among them.
+        let swatch = hsla(usage_chart::fill(row.kind == ShownKind::Other, index, 1));
         list = list.child(
             div()
                 .flex()
@@ -499,17 +490,7 @@ fn chart_panel(
 }
 
 fn segment_color(segment: &Segment, highlighted: bool) -> Hsla {
-    let color = match segment.target {
-        // The design's line-2 grey: the folded rest reads as background, not
-        // as one more slice.
-        Target::Other { .. } | Target::Item(Item::OtherFiles(_)) => Hsla {
-            h: 0.76,
-            s: 0.08,
-            l: 0.28,
-            a: 1.0,
-        },
-        Target::Item(_) | Target::Row(_) => hsla(usage_chart::color(segment.branch, segment.depth)),
-    };
+    let color = hsla(segment.fill());
     if highlighted { lighter(color) } else { color }
 }
 

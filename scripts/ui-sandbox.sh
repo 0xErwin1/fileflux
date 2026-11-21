@@ -17,20 +17,64 @@
 #   history are read or rewritten. XDG_RUNTIME_DIR stays real, because the
 #   gpui-mcp discovery descriptors live there.
 #
+# - The sandbox root is private to the user: ${XDG_RUNTIME_DIR:-/tmp}/fileflux-ui-sandbox-$UID,
+#   mode 0700, refused when it is a symlink or owned by someone else (a shared
+#   /tmp path could otherwise be planted). Recorded pids are only signalled
+#   when the process still looks like what this script started.
+#
 # The MCP server must run with DISPLAY set to the same display to take
 # screenshots: `DISPLAY=:97 gpui-mcp --app-id fileflux`.
 set -euo pipefail
 
 display="${FILEFLUX_UI_DISPLAY:-:97}"
-root="${TMPDIR:-/tmp}/fileflux-ui-sandbox"
+root="${XDG_RUNTIME_DIR:-/tmp}/fileflux-ui-sandbox-$UID"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary="$repo/target/debug/fileflux"
 
-running() { [[ -f "$root/$1.pid" ]] && kill -0 "$(cat "$root/$1.pid")" 2>/dev/null; }
+# The root must be a real directory this user owns, with no group or other access.
+check_root() {
+    [[ -e "$root" || -L "$root" ]] || return 0
+    if [[ -L "$root" || ! -d "$root" || "$(stat -c %u "$root")" != "$UID" ]]; then
+        echo "refusing $root: it must be a directory owned by uid $UID, not a symlink" >&2
+        exit 1
+    fi
+    chmod 0700 "$root"
+}
+
+make_root() {
+    check_root
+    [[ -d "$root" ]] || mkdir -m 0700 -- "$root"
+    check_root
+}
+
+# What each recorded process must look like on its command line.
+expected_command() {
+    case "$1" in
+        xvfb) echo "Xvfb" ;;
+        wm) echo "openbox" ;;
+        app) echo "dbus-run-session" ;;
+    esac
+}
+
+# A pid file is live when the pid exists and is still the process started for
+# that part; anything else is stale and is dropped without signalling it.
+running() {
+    local file="$root/$1.pid" pid cmd
+    [[ -f "$file" ]] || return 1
+    pid="$(cat "$file")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && cmd="$({ tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null)" \
+        && [[ "$cmd" == *"$(expected_command "$1")"* ]]; then
+        return 0
+    fi
+    rm -f "$file"
+    return 1
+}
 
 stop_one() {
     if running "$1"; then
-        kill -- "-$(cat "$root/$1.pid")" 2>/dev/null || kill "$(cat "$root/$1.pid")" 2>/dev/null || true
+        local pid
+        pid="$(cat "$root/$1.pid")"
+        kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     fi
     rm -f "$root/$1.pid"
 }
@@ -38,6 +82,7 @@ stop_one() {
 start() {
     local folder="${1:-$root/home/demo}"
     cargo build --manifest-path "$repo/Cargo.toml" --features ui-automation
+    make_root
     mkdir -p "$root"/{home/demo/folder-a,home/demo/folder-b,config,data,state,cache}
     [[ -e "$root/home/demo/notes.txt" ]] || echo "sandbox" >"$root/home/demo/notes.txt"
 
@@ -77,8 +122,9 @@ start() {
 
 case "${1:-}" in
     start) shift; start "$@" ;;
-    stop) stop_one app; stop_one wm; stop_one xvfb; echo "sandbox stopped" ;;
+    stop) check_root; stop_one app; stop_one wm; stop_one xvfb; echo "sandbox stopped" ;;
     status)
+        check_root
         for part in xvfb wm app; do
             running "$part" && echo "$part: running" || echo "$part: stopped"
         done ;;

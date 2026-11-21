@@ -219,8 +219,9 @@ fn places_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     ))
 }
 
-/// The analysis the active tab is showing, so it can be re-entered after
-/// browsing elsewhere. Absent unless that tab is a usage view.
+/// The analysis the active tab is showing, with its state (measuring or
+/// analyzed), so the sidebar points back at the root being analyzed. Absent
+/// unless the active tab is a usage view: browsing elsewhere hides it.
 fn analyzed_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
     let mut section = div().flex_none().flex().flex_col();
     let Some(session) = this.usage() else {

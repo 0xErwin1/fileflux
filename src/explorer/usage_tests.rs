@@ -195,6 +195,70 @@ fn a_stopped_or_failed_analysis_says_so() {
     assert!(failed.rows().is_empty());
 }
 
+#[test]
+fn the_footer_line_counts_measured_children_only_while_walking() {
+    use fileflux::core::usage::{Partial, PartialRow};
+    let mut session = UsageSession::walking(PathBuf::from("/data"));
+    session.progress(Partial {
+        rows: vec![
+            PartialRow {
+                name: "small".into(),
+                is_folder: false,
+                bytes: 10,
+                items: 1,
+                incomplete: false,
+                done: true,
+            },
+            PartialRow {
+                name: "big".into(),
+                is_folder: true,
+                bytes: 90,
+                items: 9,
+                incomplete: false,
+                done: false,
+            },
+        ],
+        bytes: 100,
+        items: 10,
+        ..Partial::default()
+    });
+    assert_eq!(
+        session.status_line(),
+        format!(
+            "Measuring\u{2026} {} in 10 items so far \u{b7} 1 of 2 children measured",
+            fileflux::core::places::format_bytes(100)
+        )
+    );
+    session.stop();
+    assert_eq!(
+        session.status_line(),
+        format!(
+            "Stopped \u{2014} {} in 10 items counted so far",
+            fileflux::core::places::format_bytes(100)
+        )
+    );
+    session.fail("Permission denied".to_owned());
+    assert_eq!(
+        session.status_line(),
+        "Could not analyze: Permission denied"
+    );
+}
+
+#[test]
+fn the_footer_line_of_a_finished_analysis_is_the_status_text() -> io::Result<()> {
+    let scratch = Scratch::new("status-line")?;
+    sample(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    assert_eq!(session.status_line(), session.status_text());
+    session.mark_stale();
+    assert!(
+        session
+            .status_line()
+            .ends_with(" \u{b7} may have changed since the analysis")
+    );
+    Ok(())
+}
+
 // --- drill down and cache ---------------------------------------------------------
 
 #[test]

@@ -302,6 +302,21 @@ impl UsageSession {
         }
     }
 
+    /// The footer line of the usage view: the status, and while measuring,
+    /// how many children are done because the final total is not known yet.
+    pub(crate) fn status_line(&self) -> String {
+        let mut text = self.status_text();
+        if self.is_walking() {
+            let rows = self.rows();
+            let done = rows.iter().filter(|row| !row.pending).count();
+            text.push_str(&format!(
+                " \u{b7} {done} of {} children measured",
+                rows.len()
+            ));
+        }
+        text
+    }
+
     /// The rows of the list, in order: the shown folder's children ranked,
     /// with the opened folders' children under them.
     pub(crate) fn rows(&self) -> Vec<ShownRow> {

@@ -86,7 +86,7 @@ DISPLAY=:97 gpui-mcp --app-id fileflux  # screenshots need the same DISPLAY
 scripts/ui-sandbox.sh stop
 ```
 
-The script runs Xvfb with openbox (native capture finds no window without a window manager), a private D-Bus session (on the real bus the single-instance check hands the folder to an already running Fileflux and exits), and a synthetic HOME and XDG config/data/state/cache. `XDG_RUNTIME_DIR` stays real because the discovery descriptors live there. `FILEFLUX_UI_DISPLAY` overrides the display.
+The script runs Xvfb with openbox (native capture finds no window without a window manager), a private D-Bus session (on the real bus the single-instance check hands the folder to an already running Fileflux and exits), and a synthetic HOME and XDG config/data/state/cache. `XDG_RUNTIME_DIR` stays real because the discovery descriptors live there. The sandbox root is `${XDG_RUNTIME_DIR:-/tmp}/fileflux-ui-sandbox-$UID`, created with mode 0700 and refused when it is a symlink or owned by another user; a recorded pid is only signalled when its command line still matches what the script started. `FILEFLUX_UI_DISPLAY` overrides the display.
 
 Use it to check what a screenshot cannot: which element a click actually lands on, where a drag preview sits relative to the pointer, what the status bar renders for a given selection. The bridge reads frames in-process, so it works on Wayland; the server's native **screenshots** are X11-only, so on Wayland capture the window another way. Prefer this over XTest-driven checks above when the question is about the element tree rather than pixels, and keep both when the question is visual.
 
