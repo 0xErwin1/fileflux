@@ -4358,9 +4358,10 @@ impl Explorer {
                 selected_kind.as_deref(),
             ),
         };
-        // A disk usage view reports its total instead of a listing count.
-        if let Some(session) = self.usage() {
-            count_text = session.status_text();
+        // A disk usage view states its totals in its own footer; the bar
+        // does not repeat them.
+        if self.usage().is_some() {
+            count_text.clear();
         }
         // A single selected Trash entry keeps its recorded origin; a Recent
         // one, its folder.

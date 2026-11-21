@@ -231,34 +231,25 @@ fn status(session: &UsageSession, cx: &mut Context<Explorer>) -> gpui::AnyElemen
         .gap(px(14.0))
         .child("hard links count once")
         .child("links and other drives are not entered");
-    let Some(summary) = session.summary() else {
-        return footer.child(rules).into_any_element();
-    };
-    let totals = div()
-        .flex_none()
-        .flex()
-        .gap(px(4.0))
-        .child(
-            div()
-                .text_color(colors.foreground)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(format_bytes(summary.bytes)),
-        )
-        .child(format!("in {} items", summary.items));
-    let mut text = String::new();
+    // The one status line of the view (the window's status bar leaves it
+    // here): the totals with what qualifies them, and while measuring, how
+    // many children are done because the final total is not known yet.
+    let mut text = session.status_text();
     if session.is_walking() {
         let rows = session.rows();
         let total = rows.len();
         let done = rows.iter().filter(|row| !row.pending).count();
-        text.push_str(&format!("{done} of {total} children measured"));
-    } else if summary.incomplete {
-        text.push_str("some folders could not be read");
+        text.push_str(&format!(" \u{b7} {done} of {total} children measured"));
     }
     footer
-        .child(totals)
-        .when(!text.is_empty(), |footer| {
-            footer.child(div().min_w_0().truncate().child(text))
-        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(colors.foreground)
+                .child(text),
+        )
         .child(rules)
         .into_any_element()
 }
