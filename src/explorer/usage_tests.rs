@@ -603,3 +603,35 @@ fn only_a_change_under_the_analysis_root_can_make_it_stale() {
         root
     ));
 }
+
+/// The usage list draws folders filled like the design's folder (a tab on a
+/// body, `M3 6.5h6l2 2.5h10v10.5H3z` in a 24 unit box), scaled into the box
+/// it is given: every corner is inside the box, the tab sits above the body,
+/// and the shape fills most of the box instead of outlining it.
+#[test]
+fn the_filled_folder_glyph_is_the_designs_shape_scaled_into_its_box() {
+    let outline = crate::explorer::usage_view::folder_outline((10.0, 20.0), 24.0);
+    assert_eq!(
+        outline,
+        [
+            (13.0, 26.5),
+            (19.0, 26.5),
+            (21.0, 29.0),
+            (31.0, 29.0),
+            (31.0, 39.5),
+            (13.0, 39.5),
+        ]
+    );
+    let half = crate::explorer::usage_view::folder_outline((0.0, 0.0), 12.0);
+    assert_eq!(half[0], (1.5, 3.25));
+    assert_eq!(half[4], (10.5, 9.75));
+    // Shoelace: the filled area is a good share of the box, never a hairline.
+    let area = outline
+        .iter()
+        .zip(outline.iter().cycle().skip(1))
+        .map(|((x1, y1), (x2, y2))| x1 * y2 - x2 * y1)
+        .sum::<f32>()
+        .abs()
+        / 2.0;
+    assert!(area > 0.3 * 24.0 * 24.0, "area {area}");
+}

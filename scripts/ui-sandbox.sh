@@ -20,7 +20,11 @@
 # - The sandbox root is private to the user: ${XDG_RUNTIME_DIR:-/tmp}/fileflux-ui-sandbox-$UID,
 #   mode 0700, refused when it is a symlink or owned by someone else (a shared
 #   /tmp path could otherwise be planted). Recorded pids are only signalled
-#   when the process still looks like what this script started.
+#   when the process still looks like what this script started: its command
+#   line arguments (Xvfb's display, the build's binary) and the sandbox HOME
+#   match, not just a program name. stop and status also look under the old
+#   root "${TMPDIR:-/tmp}/fileflux-ui-sandbox", so a sandbox started before the
+#   move is still found and stopped (same checks, never created or chmod-ed).
 #
 # The MCP server must run with DISPLAY set to the same display to take
 # screenshots: `DISPLAY=:97 gpui-mcp --app-id fileflux`.
@@ -31,8 +35,14 @@ root="${XDG_RUNTIME_DIR:-/tmp}/fileflux-ui-sandbox-$UID"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary="$repo/target/debug/fileflux"
 
-# The root must be a real directory this user owns, with no group or other access.
-check_root() {
+# The pre-move root, still looked at by stop and status so a sandbox started
+# by an older version of this script is not left running unseen.
+legacy_root="${TMPDIR:-/tmp}/fileflux-ui-sandbox"
+
+# Creates the private root when missing and tightens its mode to 0700. It
+# mutates, so only start/stop/status of the current root call it. The root
+# must be a real directory this user owns, never a symlink.
+ensure_private_root() {
     [[ -e "$root" || -L "$root" ]] || return 0
     if [[ -L "$root" || ! -d "$root" || "$(stat -c %u "$root")" != "$UID" ]]; then
         echo "refusing $root: it must be a directory owned by uid $UID, not a symlink" >&2
@@ -42,42 +52,76 @@ check_root() {
 }
 
 make_root() {
-    check_root
+    ensure_private_root
     [[ -d "$root" ]] || mkdir -m 0700 -- "$root"
-    check_root
+    ensure_private_root
 }
 
-# What each recorded process must look like on its command line.
-expected_command() {
-    case "$1" in
-        xvfb) echo "Xvfb" ;;
-        wm) echo "openbox" ;;
-        app) echo "dbus-run-session" ;;
+# Whether a root other than the current one can be trusted for pid files:
+# a real directory of this user, not a symlink. Read only, nothing is created
+# or changed there.
+trusted_root() {
+    [[ -d "$1" && ! -L "$1" && "$(stat -c %u "$1")" == "$UID" ]]
+}
+
+# Whether the process still looks like the one started for that part under
+# that root. The command line is compared argument by argument (a substring
+# of the whole line would match any process that merely mentions the name):
+# - xvfb: the program is Xvfb and its display argument is this display.
+# - wm: one argument is openbox, and the process was started with the
+#   sandbox's HOME, so it is this sandbox's window manager.
+# - app: the program is dbus-run-session, it runs this build's binary, and
+#   its HOME is the sandbox root's.
+matches_part() {
+    local part="$1" dir="$2" pid="$3" argv=() arg found=1
+    mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
+    [[ ${#argv[@]} -gt 0 ]] || return 1
+    case "$part" in
+        xvfb)
+            [[ "${argv[0]##*/}" == Xvfb && "${argv[1]:-}" == "$display" ]] ;;
+        wm)
+            for arg in "${argv[@]}"; do
+                [[ "${arg##*/}" == openbox ]] && found=0
+            done
+            [[ $found == 0 ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+                | grep -Fxq "HOME=$dir/home" ;;
+        app)
+            for arg in "${argv[@]:1}"; do
+                [[ "$arg" == "$binary" ]] && found=0
+            done
+            [[ "${argv[0]##*/}" == dbus-run-session && $found == 0 ]] \
+                && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+                | grep -Fxq "HOME=$dir/home" ;;
+        *) return 1 ;;
     esac
 }
 
-# A pid file is live when the pid exists and is still the process started for
-# that part; anything else is stale and is dropped without signalling it.
-running() {
-    local file="$root/$1.pid" pid cmd
-    [[ -f "$file" ]] || return 1
+# A pid file under `dir` is live when the pid exists and is still the process
+# started for that part; anything else is stale and is dropped without
+# signalling it.
+running_in() {
+    local dir="$1" part="$2" file pid
+    file="$dir/$part.pid"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
     pid="$(cat "$file")"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && cmd="$({ tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null)" \
-        && [[ "$cmd" == *"$(expected_command "$1")"* ]]; then
+    if [[ "$pid" =~ ^[0-9]+$ ]] && matches_part "$part" "$dir" "$pid"; then
         return 0
     fi
     rm -f "$file"
     return 1
 }
 
-stop_one() {
-    if running "$1"; then
-        local pid
-        pid="$(cat "$root/$1.pid")"
+stop_in() {
+    local dir="$1" part="$2" pid
+    if running_in "$dir" "$part"; then
+        pid="$(cat "$dir/$part.pid")"
         kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     fi
-    rm -f "$root/$1.pid"
+    rm -f "$dir/$part.pid"
 }
+
+running() { running_in "$root" "$1"; }
+stop_one() { stop_in "$root" "$1"; }
 
 start() {
     local folder="${1:-$root/home/demo}"
@@ -108,13 +152,16 @@ start() {
         setsid dbus-run-session -- "$binary" "$folder" >"$root/app.log" 2>&1 &
     echo $! >"$root/app.pid"
 
-    for _ in $(seq 1 20); do
+    # The pid is that of the launching shell until it execs dbus-run-session;
+    # sleep before the first identity check so that gap is not read as a stale
+    # pid (which would drop the pid file).
+    for _ in $(seq 1 40); do
+        sleep 0.5
         if grep -q "UI automation bridge listening" "$root/app.log" 2>/dev/null; then
             echo "Fileflux running on $display, sandbox $root"
             return 0
         fi
         running app || break
-        sleep 0.5
     done
     echo "Fileflux did not start its automation bridge; see $root/app.log" >&2
     return 1
@@ -122,11 +169,24 @@ start() {
 
 case "${1:-}" in
     start) shift; start "$@" ;;
-    stop) check_root; stop_one app; stop_one wm; stop_one xvfb; echo "sandbox stopped" ;;
+    stop)
+        ensure_private_root
+        for part in app wm xvfb; do stop_one "$part"; done
+        if trusted_root "$legacy_root"; then
+            for part in app wm xvfb; do stop_in "$legacy_root" "$part"; done
+        fi
+        echo "sandbox stopped" ;;
     status)
-        check_root
+        ensure_private_root
         for part in xvfb wm app; do
             running "$part" && echo "$part: running" || echo "$part: stopped"
-        done ;;
+        done
+        if trusted_root "$legacy_root"; then
+            for part in xvfb wm app; do
+                if running_in "$legacy_root" "$part"; then
+                    echo "$part: running (old root $legacy_root)"
+                fi
+            done
+        fi ;;
     *) echo "usage: $0 start [folder] | stop | status" >&2; exit 2 ;;
 esac

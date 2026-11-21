@@ -820,6 +820,63 @@ fn list_panel(
     )
 }
 
+/// The size of a row's glyph.
+const GLYPH_SIZE: f32 = 14.0;
+
+/// The design's folder (`M3 6.5h6l2 2.5h10v10.5H3z` in a 24 unit box) as its
+/// corners inside a box of `size` whose top left is `origin`. The icon set
+/// only has outlined folders, and the design fills this one.
+pub(in crate::explorer) fn folder_outline(origin: (f32, f32), size: f32) -> [(f32, f32); 6] {
+    const CORNERS: [(f32, f32); 6] = [
+        (3.0, 6.5),
+        (9.0, 6.5),
+        (11.0, 9.0),
+        (21.0, 9.0),
+        (21.0, 19.5),
+        (3.0, 19.5),
+    ];
+    let scale = size / 24.0;
+    CORNERS.map(|(x, y)| (origin.0 + x * scale, origin.1 + y * scale))
+}
+
+/// A row's glyph: folders are filled like the design, files and the folded
+/// rest keep their outlined icons.
+fn row_glyph(
+    kind: ShownKind,
+    outlined: gpui_kit_assets::IconName,
+    color: Hsla,
+) -> gpui::AnyElement {
+    if kind != ShownKind::Folder {
+        return Icon::new(icon(outlined))
+            .size(px(GLYPH_SIZE))
+            .color(color)
+            .into_any_element();
+    }
+    canvas(
+        move |bounds, _window, _cx| bounds,
+        move |bounds, _prepaint, window, _cx| {
+            let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            let corners = folder_outline(origin, GLYPH_SIZE);
+            let mut builder = PathBuilder::fill();
+            for (index, (x, y)) in corners.iter().enumerate() {
+                let corner = point(px(*x), px(*y));
+                if index == 0 {
+                    builder.move_to(corner);
+                } else {
+                    builder.line_to(corner);
+                }
+            }
+            builder.close();
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .flex_none()
+    .size(px(GLYPH_SIZE))
+    .into_any_element()
+}
+
 fn render_row(
     row: &ShownRow,
     selected: bool,
@@ -924,7 +981,7 @@ fn render_row(
                 .pl(px(CELL_PADDING - 4.0 + row.depth as f32 * INDENT))
                 .pr(px(CELL_PADDING))
                 .child(chevron)
-                .child(Icon::new(icon(glyph)).size(px(14.0)).color(glyph_color))
+                .child(row_glyph(row.kind, glyph, glyph_color))
                 .child(
                     div()
                         .flex_1()

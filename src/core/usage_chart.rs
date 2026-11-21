@@ -100,7 +100,27 @@ fn item_dir(item: Item) -> NodeId {
 pub fn layout(tree: &UsageTree, root: NodeId, max_depth: u32) -> Vec<Segment> {
     let mut out = Vec::new();
     layout_children(tree, root, None, (0.0, TAU), 1, max_depth, &mut out);
+    close_the_ring(&mut out);
     out
+}
+
+/// Re-colours the last top-level branch (and its descendants) so the ring's
+/// closing edge differs. The folded rest is grey and needs nothing.
+fn close_the_ring(segments: &mut [Segment]) {
+    let Some(last) = segments.iter().rfind(|s| s.depth == 1) else {
+        return;
+    };
+    if last.is_folded() {
+        return;
+    }
+    // A branch's colour index is its position, so the last has `count - 1`
+    // before it; rows skipped for a zero share leave a gap, and the last
+    // drawn row then counts the gap too.
+    let from = last.branch;
+    let to = ring_branch(from, from + 1);
+    for segment in segments.iter_mut().filter(|s| s.branch == from) {
+        segment.branch = to;
+    }
 }
 
 fn layout_children(
@@ -260,6 +280,21 @@ pub fn color(branch: usize, depth: u32) -> (f32, f32, f32) {
     (hue, SATURATION, lightness)
 }
 
+/// The colour slot of top-level branch `index` among `count` branches around
+/// the ring. The ladder repeats its lightness every `LADDER_STEPS` branches
+/// and its colour every `LADDER_STEPS * HUE_LADDERS`, so the last branch
+/// could meet the first with the same lightness or the same colour. When its
+/// step equals the first's, it moves two steps down the ladder: that differs
+/// visibly from the first and from the branch before it (one step apart).
+#[must_use]
+pub fn ring_branch(index: usize, count: usize) -> usize {
+    if count > 1 && index + 1 == count && index.is_multiple_of(LADDER_STEPS) {
+        index + LADDER_STEPS / 2
+    } else {
+        index
+    }
+}
+
 /// The colour a slice and its legend swatch both use: the grey for the folded
 /// rest, else the branch's blue at that ring.
 #[must_use]
@@ -300,6 +335,7 @@ pub fn layout_rows(shares: &[f32]) -> Vec<Segment> {
         });
         start += sweep;
     }
+    close_the_ring(&mut out);
     out
 }
 
@@ -493,9 +529,11 @@ mod tests {
 
     /// Branches beside each other on the ring never share a colour and differ
     /// visibly in lightness, however many branches there are: the ladder has
-    /// four steps, so `branch` and `branch + 4` differ by hue instead.
+    /// `LADDER_STEPS` steps, so `branch` and `branch + LADDER_STEPS` differ by
+    /// hue instead, inside the documented hue range.
     #[test]
     fn neighbouring_branches_differ_visibly_for_any_branch_count() {
+        let last_hue = BASE_HUE + (HUE_LADDERS - 1) as f32 * HUE_PER_LADDER;
         for branch in 0..400 {
             for depth in 1..=RING_DEPTH {
                 let (a, b) = (color(branch, depth), color(branch + 1, depth));
@@ -511,9 +549,89 @@ mod tests {
                     branch + 1
                 );
             }
-            assert_ne!(color(branch, 1), color(branch + 4, 1));
+            assert_ne!(
+                color(branch, 1),
+                color(branch + LADDER_STEPS, 1),
+                "a ladder apart must differ"
+            );
+            let hue = color(branch, 1).0;
+            assert!(
+                (BASE_HUE - 1e-6..=last_hue + 1e-6).contains(&hue),
+                "hue {hue} of branch {branch} is outside {BASE_HUE}..={last_hue}"
+            );
         }
-        assert!((0..400).all(|branch| (0.55..=0.65).contains(&color(branch, 1).0)));
+    }
+
+    /// The ring closes on itself: for any number of top-level branches the
+    /// last slice differs from the first (and from the one before it), in
+    /// colour and visibly in lightness, not only every 12th count.
+    #[test]
+    fn adjacent_slices_around_the_whole_ring_differ_for_every_branch_count() {
+        for count in 2..=64_usize {
+            for depth in 1..=RING_DEPTH {
+                let colors: Vec<_> = (0..count)
+                    .map(|index| color(ring_branch(index, count), depth))
+                    .collect();
+                for (index, a) in colors.iter().enumerate() {
+                    let b = &colors[(index + 1) % count];
+                    assert_ne!(a, b, "count {count}: {index} and its next at depth {depth}");
+                    assert!(
+                        (a.2 - b.2).abs() >= MIN_NEIGHBOUR_CONTRAST,
+                        "count {count}: {index} and its next too close in lightness"
+                    );
+                }
+            }
+        }
+        assert_eq!(ring_branch(0, 1), 0, "one branch keeps its colour");
+    }
+
+    /// The drawn ring, not only the colour function: the last top-level slice
+    /// of a real layout differs from the first, for a count where the plain
+    /// ladder repeats the lightness (5) and one where it repeats the colour
+    /// (13).
+    #[test]
+    fn the_last_drawn_slice_differs_from_the_first() -> std::io::Result<()> {
+        for count in [5_usize, 13] {
+            let scratch = Scratch::new(&format!("chart-ring-{count}"))?;
+            for index in 0..count {
+                let size = 1_000_000 - index * 40_000;
+                fs::write(scratch.path().join(format!("f{index:02}")), vec![1u8; size])?;
+            }
+            let tree = run(scratch.path())?;
+            let segments = layout(&tree, UsageTree::ROOT, 1);
+            assert_eq!(segments.len(), count, "no slice folds");
+            let (first, last) = (segments[0].fill(), segments[count - 1].fill());
+            assert_ne!(first, last, "{count} branches");
+            assert!((first.2 - last.2).abs() >= MIN_NEIGHBOUR_CONTRAST);
+        }
+        Ok(())
+    }
+
+    /// The rings share the radius between the hole and the chart edge in equal
+    /// bands: the first starts at the hole, each starts where the previous
+    /// ends, and the last ends at the chart radius.
+    #[test]
+    fn the_rings_split_the_radius_between_the_hole_and_the_edge() -> std::io::Result<()> {
+        let scratch = Scratch::new("chart-bands")?;
+        fs::create_dir_all(scratch.path().join("mid/leafdir"))?;
+        fs::write(scratch.path().join("mid/leafdir/f"), vec![1u8; 200_000])?;
+        let tree = run(scratch.path())?;
+        let segments = layout(&tree, UsageTree::ROOT, RING_DEPTH);
+        let mut bands: Vec<_> = segments
+            .iter()
+            .map(|s| (s.depth, s.inner, s.outer))
+            .collect();
+        bands.sort_by_key(|(depth, ..)| *depth);
+        assert_eq!(bands.len() as u32, RING_DEPTH);
+        let width = (1.0 - CENTER_HOLE) / RING_DEPTH as f32;
+        assert!((bands[0].1 - CENTER_HOLE).abs() < 1e-6);
+        assert!((bands[2].2 - 1.0).abs() < 1e-6);
+        for (depth, inner, outer) in &bands {
+            assert!((outer - inner - width).abs() < 1e-6, "ring {depth} width");
+        }
+        assert!((bands[0].2 - bands[1].1).abs() < 1e-6);
+        assert!((bands[1].2 - bands[2].1).abs() < 1e-6);
+        Ok(())
     }
 
     /// The legend swatch and the slice are the same colour because both ask
@@ -558,7 +676,5 @@ mod tests {
         assert_eq!(ring[0].inner, CENTER_HOLE);
         assert_eq!(hit_test(&ring, 0.1, CENTER_HOLE - 1e-4), None);
         assert_eq!(hit_test(&ring, 0.1, CENTER_HOLE), ring.first());
-        let tree_ring = (1.0 - CENTER_HOLE) / RING_DEPTH as f32;
-        assert!(tree_ring > 0.0 && CENTER_HOLE + tree_ring * RING_DEPTH as f32 - 1.0 < 1e-6);
     }
 }
