@@ -891,19 +891,9 @@ fn row_shell(
         } else {
             colors.foreground
         })
-        .on_click(
-            cx.listener(move |this, _event, window, cx| match &click_target {
-                (Some(location), _) => {
-                    this.navigate(Transition::Visit(location.clone()), window, cx);
-                    this.close_sidebar_overlay(OverlayEvent::RowChosen);
-                }
-                (None, Some(device)) => {
-                    this.activate_device(device.clone(), window, cx);
-                    this.close_sidebar_overlay(OverlayEvent::RowChosen);
-                }
-                (None, None) => {}
-            }),
-        )
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            this.activate_place(&click_target, window, cx);
+        }))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -941,6 +931,17 @@ fn row_shell(
             // A row that stands for a folder is dragged as that folder.
             let row = match draggable_folder(location) {
                 Some(path) => {
+                    // GPUI starts a drag after 2 px; the press goes through
+                    // the same 8 px gate as an entry, and a release inside
+                    // it is the click it was.
+                    let press = (Some(location.clone()), device.clone());
+                    let row = row.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.place_press = Some(press.clone());
+                            dnd::press_gate(event.position, cx);
+                        }),
+                    );
                     dnd::place_drag_source(row, path.to_path_buf(), &cx.entity().downgrade())
                 }
                 None => row,
@@ -1141,7 +1142,30 @@ pub(crate) fn resize_handle(
         )
 }
 
+/// What a sidebar row opens: a location, or a device to mount first.
+pub(crate) type PlaceTarget = (Option<Location>, Option<PathBuf>);
+
 impl Explorer {
+    /// Opens what a sidebar row stands for (its click).
+    pub(crate) fn activate_place(
+        &mut self,
+        target: &PlaceTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            (Some(location), _) => {
+                self.navigate(Transition::Visit(location.clone()), window, cx);
+                self.close_sidebar_overlay(OverlayEvent::RowChosen);
+            }
+            (None, Some(device)) => {
+                self.activate_device(device.clone(), window, cx);
+                self.close_sidebar_overlay(OverlayEvent::RowChosen);
+            }
+            (None, None) => {}
+        }
+    }
+
     /// Starts dragging `panel`'s handle with the pointer at `x`.
     pub(crate) fn begin_panel_drag(
         &mut self,

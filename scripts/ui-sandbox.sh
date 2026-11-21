@@ -39,9 +39,10 @@ binary="$repo/target/debug/fileflux"
 # by an older version of this script is not left running unseen.
 legacy_root="${TMPDIR:-/tmp}/fileflux-ui-sandbox"
 
-# Creates the private root when missing and tightens its mode to 0700. It
-# mutates, so only start/stop/status of the current root call it. The root
-# must be a real directory this user owns, never a symlink.
+# Checks the private root and tightens its mode to 0700 when it exists; it
+# never creates it (make_root does). It mutates the mode, so only
+# start/stop/status of the current root call it. The root must be a real
+# directory this user owns, never a symlink.
 ensure_private_root() {
     [[ -e "$root" || -L "$root" ]] || return 0
     if [[ -L "$root" || ! -d "$root" || "$(stat -c %u "$root")" != "$UID" ]]; then
@@ -73,7 +74,7 @@ trusted_root() {
 # - app: the program is dbus-run-session, it runs this build's binary, and
 #   its HOME is the sandbox root's.
 matches_part() {
-    local part="$1" dir="$2" pid="$3" argv=() arg found=1
+    local part="$1" dir="$2" pid="$3" argv=() arg matched=false
     mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
     [[ ${#argv[@]} -gt 0 ]] || return 1
     case "$part" in
@@ -81,15 +82,15 @@ matches_part() {
             [[ "${argv[0]##*/}" == Xvfb && "${argv[1]:-}" == "$display" ]] ;;
         wm)
             for arg in "${argv[@]}"; do
-                [[ "${arg##*/}" == openbox ]] && found=0
+                [[ "${arg##*/}" == openbox ]] && matched=true
             done
-            [[ $found == 0 ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+            [[ $matched == true ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
                 | grep -Fxq "HOME=$dir/home" ;;
         app)
             for arg in "${argv[@]:1}"; do
-                [[ "$arg" == "$binary" ]] && found=0
+                [[ "$arg" == "$binary" ]] && matched=true
             done
-            [[ "${argv[0]##*/}" == dbus-run-session && $found == 0 ]] \
+            [[ "${argv[0]##*/}" == dbus-run-session && $matched == true ]] \
                 && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
                 | grep -Fxq "HOME=$dir/home" ;;
         *) return 1 ;;

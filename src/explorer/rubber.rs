@@ -657,13 +657,19 @@ pub(crate) fn listen(weak: &gpui::WeakEntity<Explorer>, side: Side, window: &mut
             return;
         }
         let gate = dnd::finish_gate(event.position, cx);
-        let press = ups
-            .update(cx, |this, _| this.entry_press.take())
-            .ok()
-            .flatten();
-        if dnd::release_is_plain_click(gate, cx.has_active_drag())
-            && let Some(press) = press
+        let (press, place) = ups
+            .update(cx, |this, _| {
+                (this.entry_press.take(), this.place_press.take())
+            })
+            .unwrap_or_default();
+        let plain_click = dnd::release_is_plain_click(gate, cx.has_active_drag());
+        if plain_click
+            && let Some(place) = place
+            && let Err(error) = ups.update(cx, |this, cx| this.activate_place(&place, window, cx))
         {
+            log::debug!("the entries area outlived its explorer: {error}");
+        }
+        if plain_click && let Some(press) = press {
             // Released before the drag threshold: the click it was.
             super::entries::handle_entry_click(
                 &ups,

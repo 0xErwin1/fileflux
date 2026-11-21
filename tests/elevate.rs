@@ -326,6 +326,9 @@ fn the_same_file_runs_the_exact_argv_once_and_maps_the_exit_code() -> TestResult
     fs::write(&path, "one")?;
     let seen = Identity::of(&path)?;
 
+    // The fake runner does not chown, so the requested uid is the owner the
+    // file already has: exit 0 then is a real change as far as the re-read sees.
+    let uid = seen.owner;
     for (code, expect) in [
         (Some(0), "changed"),
         (Some(126), "cancelled"),
@@ -333,7 +336,7 @@ fn the_same_file_runs_the_exact_argv_once_and_maps_the_exit_code() -> TestResult
         (Some(1), "failed"),
     ] {
         let calls = RefCell::new(Vec::<Vec<OsString>>::new());
-        let outcome = change_owner(&elevation(), 4242, &path, &seen, |argv| {
+        let outcome = change_owner(&elevation(), uid, &path, &seen, |argv| {
             calls.borrow_mut().push(argv.to_vec());
             Ok(Finished {
                 code,
@@ -355,7 +358,7 @@ fn the_same_file_runs_the_exact_argv_once_and_maps_the_exit_code() -> TestResult
                 os("/usr/bin/chown"),
                 os("--no-dereference"),
                 os(&format!("--from=+{}", seen.owner)),
-                os("+4242"),
+                os(&format!("+{uid}")),
                 os("--"),
                 path.clone().into_os_string(),
             ])
@@ -435,6 +438,30 @@ fn a_path_removed_or_made_a_symlink_during_the_authorization_is_reported() -> Te
     });
     assert!(
         matches!(&outcome, Outcome::Failed(r) if r.contains("replaced")),
+        "{outcome:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn exit_zero_without_the_owner_changing_is_a_failure_naming_the_owner_found() -> TestResult {
+    // `chown --from=+<shown>` exits 0 and does nothing when the current owner
+    // differs; the runner here also changes nothing.
+    let scratch = Scratch::new("noop")?;
+    let path = scratch.0.join("a");
+    fs::write(&path, "one")?;
+    let seen = Identity::of(&path)?;
+    let other = seen.owner.wrapping_add(1);
+    let outcome = change_owner(&elevation(), other, &path, &seen, |_| {
+        Ok(Finished {
+            code: Some(0),
+            stderr: String::new(),
+        })
+    });
+    let found = seen.owner.to_string();
+    assert!(
+        matches!(&outcome, Outcome::Failed(r)
+            if r.contains(&found) && r.contains("not the one chosen") && r.contains("changed elsewhere")),
         "{outcome:?}"
     );
     Ok(())

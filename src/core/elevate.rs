@@ -219,7 +219,9 @@ fn with_detail(head: String, stderr: &str) -> String {
 /// now-symbolic-link path is refused and nothing is run; chown itself only
 /// acts if the file still has the owner shown (`--from`). After a success
 /// the path is read once more: if it is no longer that file the outcome is a
-/// failure that names the path, because the change ran on something else.
+/// failure that names the path, because the change ran on something else; if
+/// its owner is not the requested one (`--from` skipped it) the failure
+/// names the owner found.
 ///
 /// Known debt: a folder *above* the file can still be swapped for a symbolic
 /// link during the polkit wait (`chown --no-dereference` only protects the
@@ -249,18 +251,35 @@ pub fn change_owner(
     };
     match run(&argv) {
         Ok(finished) => match outcome_of(finished.code, &finished.stderr) {
-            Outcome::Changed => verify_after(expected, path),
+            Outcome::Changed => verify_after(expected, uid, path),
             other => other,
         },
         Err(error) => Outcome::Failed(format!("Could not start pkexec: {error}")),
     }
 }
 
-/// After a successful chown: is `path` still the chosen file?
-fn verify_after(expected: &Identity, path: &Path) -> Outcome {
-    if Identity::of(path).is_ok_and(|now| expected.check(&now).is_ok()) {
-        return Outcome::Changed;
+/// After a successful chown: is `path` still the chosen file, and does it
+/// have the chosen owner? `chown --from` exits 0 without changing anything
+/// when the current owner differs from the one shown, so the exit code alone
+/// does not prove the change.
+fn verify_after(expected: &Identity, uid: u32, path: &Path) -> Outcome {
+    let Ok(now) = Identity::of(path) else {
+        return replaced(path);
+    };
+    if expected.check(&now).is_err() {
+        return replaced(path);
     }
+    if now.owner != uid {
+        return Outcome::Failed(format!(
+            "The owner was not changed: the owner is now {}, not the one chosen; \
+             it was changed elsewhere",
+            now.owner
+        ));
+    }
+    Outcome::Changed
+}
+
+fn replaced(path: &Path) -> Outcome {
     Outcome::Failed(format!(
         "The owner change ran, but {} no longer points at the file that was chosen \
          (it was replaced while waiting for authorization); check its owner",

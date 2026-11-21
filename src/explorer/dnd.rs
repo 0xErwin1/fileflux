@@ -27,6 +27,7 @@ use gpui_component::ActiveTheme as _;
 
 use super::entries::ENTRIES_PADDING;
 use super::icon;
+use super::ops::Severity;
 use super::ops::paste::ClipMode;
 use super::panes::Side;
 use super::rubber::past_threshold;
@@ -228,6 +229,35 @@ pub(crate) fn plan_drop(
             }
         }
     }
+}
+
+/// Why a drop of a whole volume or the home folder is refused, or `None`.
+/// Dragging such a root onto a folder (or the Trash) with no modifier would
+/// default to a move on the same device and to a copy of a whole volume
+/// across devices, a gesture too easy to make by accident from the sidebar:
+/// it needs the explicit Ctrl (copy) or Shift (move) the user holds on
+/// purpose. Files from other applications and links (Ctrl+Shift) are not
+/// affected.
+pub(crate) fn root_drop_refusal(
+    origin: DragOrigin,
+    sources: &[PathBuf],
+    is_root: impl Fn(&Path) -> bool,
+    ctrl: bool,
+    shift: bool,
+) -> Option<&'static str> {
+    let plain = origin == DragOrigin::Internal && !ctrl && !shift;
+    (plain && sources.iter().any(|source| is_root(source))).then_some(
+        "Hold Ctrl to copy or Shift to move the whole home folder or volume; nothing was changed",
+    )
+}
+
+/// Whether `path` is the home folder or the root of a mounted volume.
+pub(crate) fn is_home_or_mount_root(
+    path: &Path,
+    home: Option<&Path>,
+    mounts: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> bool {
+    home == Some(path) || mounts.into_iter().any(|mount| mount.as_ref() == path)
 }
 
 /// Whether every source lives on the device of `target` (links count as
@@ -825,6 +855,28 @@ impl Explorer {
             |dest| same_device(&sources, dest),
         );
         let from = self.folder_drag.take();
+        if matches!(
+            action,
+            DropAction::Plan(DropPlan::Paste { .. } | DropPlan::Trash)
+        ) {
+            let home = self.home.as_deref();
+            let mounts: Vec<&Path> = self
+                .places
+                .iter()
+                .flat_map(|places| places.volumes.iter().map(|volume| volume.path.as_path()))
+                .collect();
+            if let Some(reason) = root_drop_refusal(
+                origin,
+                &sources,
+                |path| is_home_or_mount_root(path, home, mounts.iter().copied()),
+                modifiers.control,
+                modifiers.shift,
+            ) {
+                self.say(Severity::Warning, reason, window, cx);
+                cx.notify();
+                return;
+            }
+        }
         match action {
             DropAction::Plan(DropPlan::Ignore) => {}
             DropAction::Plan(DropPlan::Paste { mode, dest }) => {
@@ -1267,6 +1319,47 @@ mod tests {
                 eprintln!("could not remove {}: {error}", self.0.display());
             }
         }
+    }
+
+    #[test]
+    fn a_plain_drop_of_home_or_a_mount_root_is_refused_with_a_reason() {
+        let home = PathBuf::from("/home/ana");
+        let mounts = [PathBuf::from("/run/media/ana/disk")];
+        let is_root =
+            |path: &Path| is_home_or_mount_root(path, Some(home.as_path()), mounts.iter());
+        let refused = |sources: &[&str], origin, ctrl, shift| {
+            let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+            root_drop_refusal(origin, &sources, is_root, ctrl, shift)
+        };
+        let internal = DragOrigin::Internal;
+        // Home and a mount root: refused, the same-device move and the
+        // cross-device copy alike (the plain drop never asks the device).
+        assert!(refused(&["/home/ana"], internal, false, false).is_some());
+        assert!(refused(&["/run/media/ana/disk"], internal, false, false).is_some());
+        // One root among others refuses the whole drop.
+        assert!(refused(&["/tmp/a", "/home/ana"], internal, false, false).is_some());
+        // The explicit modifier is the user asking: copy, move or link.
+        assert!(refused(&["/home/ana"], internal, true, false).is_none());
+        assert!(refused(&["/home/ana"], internal, false, true).is_none());
+        assert!(refused(&["/home/ana"], internal, true, true).is_none());
+        // Ordinary folders, subfolders of home and other applications' files.
+        assert!(refused(&["/home/ana/docs"], internal, false, false).is_none());
+        assert!(refused(&["/home/ana2"], internal, false, false).is_none());
+        assert!(refused(&["/home/ana"], DragOrigin::External, false, false).is_none());
+    }
+
+    #[test]
+    fn the_refusal_names_the_modifiers_and_promises_no_change() {
+        let reason = root_drop_refusal(
+            DragOrigin::Internal,
+            &[PathBuf::from("/h")],
+            |_| true,
+            false,
+            false,
+        );
+        assert!(reason.is_some_and(|text| text.contains("Ctrl")
+            && text.contains("Shift")
+            && text.contains("nothing was changed")));
     }
 
     #[test]

@@ -834,6 +834,27 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElem
     rows
 }
 
+/// Whether the owner menu opens, and the tooltip that says why not.
+#[derive(Debug, PartialEq, Eq)]
+struct OwnerMenu {
+    enabled: bool,
+    reason: Option<String>,
+}
+
+/// The owner menu's state for `editor` while a change is `busy` (the gate is
+/// held) or not: disabled with pkexec's missing-program reason, or with
+/// [`OWNER_BUSY_TOOLTIP`] while another change waits for authorization.
+fn owner_menu(editor: &Editor, busy: bool) -> OwnerMenu {
+    let reason = match editor.loaded.elevation.as_ref().err() {
+        Some(unavailable) => Some(unavailable.to_string()),
+        None => busy.then(|| OWNER_BUSY_TOOLTIP.to_owned()),
+    };
+    OwnerMenu {
+        enabled: reason.is_none(),
+        reason,
+    }
+}
+
 /// The owner row: a menu of users like the group's, enabled for one entry
 /// when pkexec exists; choosing a user asks polkit to authorize the change.
 fn owner_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
@@ -845,9 +866,7 @@ fn owner_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
             label(format!("Owner: {shown}"), cx).into_any_element(),
         ]);
     }
-    let unavailable = editor.loaded.elevation.as_ref().err().copied();
-    let busy = OWNER_GATE.is_busy();
-    let enabled = unavailable.is_none() && !busy;
+    let OwnerMenu { enabled, reason } = owner_menu(editor, OWNER_GATE.is_busy());
     let open = enabled && editor.owner_list_open;
     let mut trigger = div()
         .id("perm-owner-current")
@@ -886,10 +905,7 @@ fn owner_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
                 }
                 cx.notify();
             }));
-    } else if let Some(reason) = unavailable
-        .map(|reason| reason.to_string())
-        .or_else(|| busy.then(|| OWNER_BUSY_TOOLTIP.to_owned()))
-    {
+    } else if let Some(reason) = reason {
         trigger = trigger.tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx));
     }
     let mut children = vec![
@@ -1524,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_job_needs_one_entry_pkexec_a_different_user_and_no_job_running() {
+    fn the_owner_job_needs_one_entry_pkexec_and_a_different_user() {
         let editor = owner_editor(vec![p("/x")], true);
         let job = editor.owner_job(0);
         assert_eq!(
@@ -1564,11 +1580,34 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_menu_says_why_it_is_disabled_while_a_change_waits() {
+    fn the_owner_menu_is_disabled_with_a_reason_while_a_change_waits_or_pkexec_is_missing() {
+        let editor = owner_editor(vec![p("/x")], true);
         assert_eq!(
-            OWNER_BUSY_TOOLTIP,
-            "An owner change is waiting for authorization"
+            owner_menu(&editor, false),
+            OwnerMenu {
+                enabled: true,
+                reason: None
+            }
         );
+        assert_eq!(
+            owner_menu(&editor, true),
+            OwnerMenu {
+                enabled: false,
+                reason: Some("An owner change is waiting for authorization".to_owned()),
+            }
+        );
+        // Without pkexec, the missing program is the reason, busy or not.
+        let without = owner_editor(vec![p("/x")], false);
+        let missing = Unavailable::Pkexec.to_string();
+        for busy in [false, true] {
+            assert_eq!(
+                owner_menu(&without, busy),
+                OwnerMenu {
+                    enabled: false,
+                    reason: Some(missing.clone())
+                }
+            );
+        }
     }
 
     #[test]
@@ -1592,7 +1631,13 @@ mod tests {
         let cancelled = notice(Outcome::Cancelled(
             "Authentication was cancelled".to_owned(),
         ));
-        assert_eq!(cancelled.map(|n| n.severity), Some(Severity::Warning));
+        assert_eq!(
+            cancelled,
+            Some(Notice {
+                severity: Severity::Warning,
+                text: "Authentication was cancelled".to_owned(),
+            })
+        );
         let failed = notice(Outcome::Failed("chown failed (exit 1)".to_owned()));
         assert_eq!(
             failed,
@@ -1601,6 +1646,30 @@ mod tests {
                 text: "Could not change the owner of f.txt: chown failed (exit 1)".to_owned(),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancelled_owner_change_still_toasts_the_reason_and_reads_the_panel_again() -> TestResult {
+        // `finish_job` shows `notice` whatever `cancelled` says (it only holds
+        // back the "no Trash" dialog, which an owner report never carries),
+        // and forgets the permission editors when `permissions_changed`.
+        let job = owner_editor(vec![p("/d/f.txt")], true)
+            .owner_job(0)
+            .ok_or("the owner job exists")?;
+        let reason = "Authentication was cancelled; the owner was not changed";
+        let report = owner_report(&Outcome::Cancelled(reason.to_owned()), &job);
+        assert!(report.cancelled);
+        assert!(report.permissions_changed, "the panel reads again");
+        assert_eq!(
+            report.notice,
+            Some(Notice {
+                severity: Severity::Warning,
+                text: reason.to_owned(),
+            })
+        );
+        assert!(report.needs_permanent.is_empty());
+        assert!(report.undo.is_none());
         Ok(())
     }
 

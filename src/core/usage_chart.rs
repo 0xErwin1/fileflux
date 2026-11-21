@@ -113,11 +113,10 @@ fn close_the_ring(segments: &mut [Segment]) {
     if last.is_folded() {
         return;
     }
-    // A branch's colour index is its position, so the last has `count - 1`
-    // before it; rows skipped for a zero share leave a gap, and the last
-    // drawn row then counts the gap too.
+    // A branch's colour index is its position (rows skipped for a zero share
+    // leave a gap), so the last drawn branch's index is the last index.
     let from = last.branch;
-    let to = ring_branch(from, from + 1);
+    let to = closing_branch(from);
     for segment in segments.iter_mut().filter(|s| s.branch == from) {
         segment.branch = to;
     }
@@ -280,16 +279,32 @@ pub fn color(branch: usize, depth: u32) -> (f32, f32, f32) {
     (hue, SATURATION, lightness)
 }
 
+/// Half a ladder is at least two steps, so a last branch moved that far
+/// differs visibly from both the first (step 0) and the branch before it.
+const _: () = assert!(LADDER_STEPS >= 4);
+
+/// The colour slot of the last of the ring's top-level branches, at index
+/// `last`. The ladder repeats its lightness every `LADDER_STEPS` branches and
+/// its colour every `LADDER_STEPS * HUE_LADDERS`, so the last branch could
+/// meet the first with the same lightness or the same colour. When its step
+/// equals the first's (and it is not also the first), it moves half a ladder
+/// (`LADDER_STEPS / 2` steps) down: that differs visibly from the first and
+/// from the branch before it.
+#[must_use]
+pub fn closing_branch(last: usize) -> usize {
+    if last > 0 && last.is_multiple_of(LADDER_STEPS) {
+        last + LADDER_STEPS / 2
+    } else {
+        last
+    }
+}
+
 /// The colour slot of top-level branch `index` among `count` branches around
-/// the ring. The ladder repeats its lightness every `LADDER_STEPS` branches
-/// and its colour every `LADDER_STEPS * HUE_LADDERS`, so the last branch
-/// could meet the first with the same lightness or the same colour. When its
-/// step equals the first's, it moves two steps down the ladder: that differs
-/// visibly from the first and from the branch before it (one step apart).
+/// the ring: [`closing_branch`] for the last one, its own index otherwise.
 #[must_use]
 pub fn ring_branch(index: usize, count: usize) -> usize {
-    if count > 1 && index + 1 == count && index.is_multiple_of(LADDER_STEPS) {
-        index + LADDER_STEPS / 2
+    if index + 1 == count {
+        closing_branch(index)
     } else {
         index
     }

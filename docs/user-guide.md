@@ -73,7 +73,7 @@ A sidebar of places on the left, the folder in the middle, and an optional [deta
 
 | Part | What it does |
 |---|---|
-| Toolbar | Back, forward, up, the path bar, the search field with its options behind the filter button, the grid/list/compact switch, and one `⋯` menu with Split view, Favorite this folder, Refresh (Ctrl+R) and Properties (Ctrl+I). In a split view each pane's toolbar ends with a **×** (Close this pane). A pane too narrow for everything on one row (about 580 px, so every pane of a split on a window under roughly 1500 px) puts the search field and the grid/list/compact switch on a second row under the path; nothing is ever clipped While the sidebar is hidden, the leftmost pane's toolbar starts with the hamburger that shows it again |
+| Toolbar | Back, forward, up, the path bar, the search field with its options behind the filter button, the grid/list/compact switch, and one `⋯` menu with Split view, Favorite this folder, Refresh (Ctrl+R) and Properties (Ctrl+I). In a split view each pane's toolbar ends with a **×** (Close this pane). A pane too narrow for everything on one row (about 580 px, so every pane of a split on a window under roughly 1500 px) puts the search field and the grid/list/compact switch on a second row under the path; nothing is ever clipped. While the sidebar is hidden, the leftmost pane's toolbar starts with the hamburger that shows it again |
 | Folder subbar | Current folder name, "4 folders · 7 files" count, **Sort**, **Filter**, **New folder**, active filter chips |
 | Status bar | "N items" or "N selected · size" (with the file type when exactly one entry is selected), loading and error notices, a progress indicator for long operations, free space of the current volume |
 

@@ -942,6 +942,9 @@ pub(crate) struct Explorer {
     pub(crate) rubber_band: Option<rubber::Band>,
     /// The entry the left button went down on, until it goes up.
     pub(crate) entry_press: Option<rubber::EntryPress>,
+    /// The sidebar row the left button went down on, until it goes up: a
+    /// release before the drag threshold is the click it was.
+    pub(crate) place_press: Option<super::sidebar::PlaceTarget>,
 }
 
 impl Focusable for Explorer {
@@ -1178,6 +1181,7 @@ impl Explorer {
             network: super::network::NetworkHub::default(),
             rubber_band: None,
             entry_press: None,
+            place_press: None,
         };
         this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -3594,6 +3598,8 @@ impl Explorer {
 
     /// The width of `side`'s document island: its share of the room between
     /// the sidebar and the window edge when both panes draw, else all of it.
+    /// The details panel is not subtracted: it sits inside the island beside
+    /// the entries, under the toolbar, so the toolbar spans the full island.
     fn pane_width(&self, side: Side, layout: PaneLayout, window: &Window) -> f32 {
         if layout != PaneLayout::SideBySide {
             return (f32::from(window.viewport_size().width) - self.shell_width(window)).max(0.0);
