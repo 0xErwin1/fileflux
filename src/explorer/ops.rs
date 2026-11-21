@@ -145,6 +145,9 @@ pub(crate) enum UndoAction {
     Permissions {
         items: Vec<fileflux::core::perms::Previous>,
     },
+    /// Undo of a compress or an extract: move the created archive or
+    /// folder to the Trash, only if it is still the item that was created.
+    Archive { path: PathBuf, identity: Identity },
 }
 
 /// An undo action with the id a toast's Undo button names it by.
@@ -328,7 +331,7 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    fn say(severity: Severity, text: impl Into<String>) -> Report {
+    pub(crate) fn say(severity: Severity, text: impl Into<String>) -> Report {
         Report {
             notice: Some(Notice {
                 severity,
@@ -338,7 +341,7 @@ impl Report {
         }
     }
 
-    fn error(text: impl Into<String>) -> Report {
+    pub(crate) fn error(text: impl Into<String>) -> Report {
         Report::say(Severity::Error, text)
     }
 }
@@ -952,6 +955,7 @@ fn undo(action: &UndoAction, ctx: &JobCtx, sink: &Sink) -> Result<Report, String
         UndoAction::Copy { items } => Ok(paste::undo_copy(items, ctx, sink)),
         UndoAction::Move { items } => Ok(paste::undo_move(items, sink)),
         UndoAction::Permissions { items } => Ok(super::permissions::undo(items, sink)),
+        UndoAction::Archive { path, identity } => undo_archive(path, *identity, ctx),
     }
 }
 
@@ -1158,6 +1162,17 @@ fn undo_create(
     if !untouched {
         return Err(format!("{} is no longer empty", quote_path(path)));
     }
+    trash_created(path, ctx)
+}
+
+/// Undo of a compress or an extract: the created item goes to the Trash,
+/// whatever it holds now (the Trash keeps it), if it is still that item.
+fn undo_archive(path: &Path, identity: Identity, ctx: &JobCtx) -> Result<Report, String> {
+    same_item(path, identity, "created")?;
+    trash_created(path, ctx)
+}
+
+fn trash_created(path: &Path, ctx: &JobCtx) -> Result<Report, String> {
     // To the Trash, never a permanent delete; without a Trash it stays.
     let target = (ctx.target_for)(path).map_err(|error| match error {
         TrashError::NoTrash(_) => format!("there is no Trash for {}", quote_path(path)),
@@ -1311,6 +1326,12 @@ pub(crate) enum MenuCommand {
     RemoveFavorite,
     /// Devices: mount the unmounted filesystem.
     Mount,
+    /// Archives: write a new archive of the selection.
+    Compress,
+    /// Archives: extract the selected archive into a new folder beside it.
+    ExtractHere,
+    /// Archives: extract the selected archive into a chosen folder.
+    ExtractTo,
     /// Devices: unmount the mounted filesystem.
     Unmount,
     /// Devices: unmount every partition of the disk and power it off.
@@ -1743,6 +1764,8 @@ pub(crate) enum DialogKind {
         existing: String,
         incoming: String,
     },
+    /// "Compress…" (a name and a format) or "Extract to…" (a folder).
+    Archive { extract: bool },
     /// Running operations use the device that is about to be unmounted or
     /// ejected; `count` of them, the device is called `label`.
     DeviceBusy {
@@ -1770,6 +1793,8 @@ pub(crate) enum DialogAction {
     },
     /// "Wait and eject": queue the plan until nothing uses the device.
     DeviceWhenIdle(DevicePlan),
+    /// The archive dialog: its field and what confirming starts.
+    Archive(super::archive::ArchiveDialog),
 }
 
 /// The "Open with…" chooser. Its rows are the applications for `mime` and
@@ -2000,7 +2025,7 @@ impl DialogState {
     /// destroys nothing, so Enter there launches the selected application.
     pub(crate) fn initial_focus(&self) -> DialogChoice {
         match self.kind {
-            DialogKind::OpenWith { .. } => DialogChoice::Confirm,
+            DialogKind::OpenWith { .. } | DialogKind::Archive { .. } => DialogChoice::Confirm,
             DialogKind::Conflict { .. } => CONFLICT_DEFAULT,
             _ => DIALOG_DEFAULT,
         }
@@ -2263,6 +2288,24 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
             },
             "Open",
         ),
+        DialogKind::Archive { extract: false } => (
+            if count == 1 {
+                format!("Compress {first}")
+            } else {
+                format!("Compress {count} items")
+            },
+            "Name the archive, then choose a format. An existing file is never replaced: \
+             a numbered name is used instead."
+                .to_owned(),
+            "Compress",
+        ),
+        DialogKind::Archive { extract: true } => (
+            format!("Extract {first} to\u{2026}"),
+            "Type the folder to extract into. The files go into a new folder named after \
+             the archive; nothing existing is replaced."
+                .to_owned(),
+            "Extract",
+        ),
         DialogKind::DeviceBusy {
             label,
             count,
@@ -2306,6 +2349,8 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         ],
         // Every application is a row of its own: none is folded away.
         DialogKind::OpenWith { .. } => names.to_vec(),
+        // The field says what the dialog is about.
+        DialogKind::Archive { .. } => Vec::new(),
         _ => listed(names),
     };
     DialogText {

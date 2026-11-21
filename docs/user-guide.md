@@ -22,6 +22,7 @@ How to browse, organize and manage files with Fileflux. Every key is in [Keyboar
 - [Open, Open with and terminal](#open-open-with-and-terminal)
 - [File operations](#file-operations)
 - [Trash](#trash)
+- [Archives](#archives)
 - [Undo](#undo)
 - [Clipboard](#clipboard)
 - [Drag and drop](#drag-and-drop)
@@ -194,7 +195,7 @@ The sidebar's Favorites are the local lines of `$XDG_CONFIG_HOME/gtk-3.0/bookmar
 - **Open in terminal** (context menu on one selected folder, on a sidebar row and on empty space): starts your terminal in that folder (the shown folder on empty space), with no shell. The terminal is the first that exists of: `$TERMINAL`, `xdg-terminal-exec`, the desktop ids in `xdg-terminals.list`, a desktop entry with `Categories=TerminalEmulator` (known terminals first), then ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, kgx, konsole, xfce4-terminal, xterm. Terminals that ignore the working directory of the process get their own argument: `--working-directory=DIR` (ghostty, foot, gnome-terminal, kgx, xfce4-terminal), `--working-directory DIR` (alacritty), `--directory DIR` (kitty), `--workdir DIR` (konsole), `start --cwd DIR` (wezterm); xterm uses its working directory, and a terminal found through a desktop entry uses the entry's `X-TerminalArgDir` when it has one. `<desktop>-xdg-terminals.list` variants for `$XDG_CURRENT_DESKTOP` are tried first, and the lists are read from `$XDG_CONFIG_HOME` then `$XDG_CONFIG_DIRS`. The lookup reads `.desktop` files, so it runs off the UI thread at startup; the item is omitted until a terminal is found, and when none is.
 - **Open in viewer** (context menu, one selected image), and **Open in new tab**, **Add to favorites** / **Remove from favorites** (selected folder, not in the Trash).
 
-The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), Rename, Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, Paste, **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
+The context menu on an entry offers, as they apply: Open, Open in new tab, Add to / Remove from favorites, Open in terminal, Open in viewer, Open with…, Cut, Copy, Paste (**Paste into folder** when exactly one folder is selected; dimmed while the clipboard is empty), [Extract here, Extract to… and Compress…](#archives), Rename, Copy path, Properties, Move to Trash and Delete permanently…. On empty space: New folder, New file, Paste, **Sort by ›** and **Filter ›** (cascading submenus holding the same options as the subbar menus: hovering the row, or pressing → or Enter on it, opens the submenu beside the menu, which stays open; near the right edge of the window it opens on the left), Open in terminal and Copy folder path. Choices in these submenus (a sort key, a filter) apply at once and keep the menu open, with their check marks updating; the subbar **Sort** and **Filter** buttons open the same options directly.
 
 ## File operations
 
@@ -223,9 +224,18 @@ Everything that changes the disk runs off the UI thread, reports its result in a
 - **Trash view** (sidebar row **Home Trash**): **Restore** puts items back; on a name conflict both are kept and the restored one gets "name (2)". **Delete permanently…** and **Empty Trash** each ask first. The view refreshes after every operation.
 - A name whose `.trashinfo` file would not fit (over 245 bytes) is stored under a shortened name; the recorded original path stays exact, so Restore returns the original name.
 
+## Archives
+
+Compressing and extracting use `bsdtar` (libarchive) as an external program, off the UI thread, with a progress card and **Cancel** (which stops the program and removes what it made). The entries appear in the context menu of a selection in a real folder (not in the Trash, Recent or search results), after the Paste group. Without `bsdtar` on `$PATH` they are shown dimmed ("needs bsdtar") and a notice says "Install libarchive (bsdtar) to compress and extract".
+
+- **Compress…** (any selection): asks for the archive name (the entry's name, or "Archive" for several) and a format: **.zip** (default), **.tar.gz** or **.tar.xz**. The archive is written in the shown folder under a hidden temporary name and renamed into place only when `bsdtar` succeeded, so a failure or a cancel leaves no partial archive. An existing file is never replaced: the name is numbered ("Archive (2).zip"). The new archive is selected.
+- **Extract here** (one archive file): extracts into a new folder next to it, named after the archive without its suffix ("backup.tar.gz" → "backup"; numbered when taken). **Extract to…** asks for a destination folder (prefilled with the other pane's folder while the view is split, else the shown folder; `~` and relative paths work) and extracts into a new folder inside it. Archives are recognised by extension: `.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`, `.tar.zst`/`.tzst`, `.7z` and `.rar` (read what the installed libarchive can read; Fileflux only writes zip, tar.gz and tar.xz).
+- **Safety.** The member list is read first (`bsdtar -tf`): an archive with an absolute member name or a `..` component is refused whole with an error, and nothing is extracted. Extraction runs in a hidden folder inside the destination with `--no-same-owner --no-same-permissions` (never `-P`) and is renamed into place only at the end; a failure or cancel removes it. Afterwards any symlink whose resolved target leaves the new folder is removed and the toast says how many. Folders the archive made unreadable for you are given owner access so they can be browsed and deleted.
+- **Undo** moves the created archive or folder to the Trash (if it is still the item that was created), never deleting it.
+
 ## Undo
 
-Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file, copy or move. The history is per session and survives navigation.
+Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no stale button stays), undoes the last rename, Move to Trash, New folder/file, copy, move, compress or extract. The history is per session and survives navigation.
 
 | Operation | What undo does |
 |---|---|
@@ -234,6 +244,7 @@ Ctrl+Z, or the toast's Undo button (undoing with Ctrl+Z closes that toast so no 
 | New folder / file | A new, still-empty item goes to the Trash, never straight to deletion |
 | Copy | Moves the copies it created to the Trash (never deletes them) |
 | Move | Puts items back where they came from, only if each is still the item that was moved, never replacing anything that took the original place |
+| Compress / Extract | The created archive or folder goes to the Trash, only if it is still the item that was created |
 
 Each history entry remembers which file it acted on (device and inode). If the item at that place is no longer the same one (replaced, changed, emptied from the Trash), the toast says "Can't undo: … changed since …" and nothing is touched. Items replaced during a paste are not restorable by Undo, and **permanent deletion cannot be undone**.
 

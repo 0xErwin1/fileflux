@@ -19,9 +19,11 @@ use gpui::{
 };
 
 use super::actions::RenameView;
+use super::archive::ArchiveAction;
 use super::icon;
 use super::ops::{DialogAction, DialogChoice, DialogKind};
 use super::view::{Explorer, MENU_CONTEXT};
+use fileflux::core::archive::Format;
 
 /// The menu and the dialog, when open. Also hands the keyboard back to the
 /// entries when the menu or dialog was closed by something that had no
@@ -180,8 +182,14 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         DialogAction::OpenWith(state) => Some(state),
         _ => None,
     };
+    let archive = match &dialog.action {
+        DialogAction::Archive(state) => Some(state),
+        _ => None,
+    };
     // Waiting for a device to be free destroys nothing: not a danger button.
-    let calm = open_with.is_some() || matches!(dialog.kind, DialogKind::DeviceBusy { .. });
+    let calm = open_with.is_some()
+        || archive.is_some()
+        || matches!(dialog.kind, DialogKind::DeviceBusy { .. });
     let body = div()
         .flex()
         .flex_col()
@@ -198,6 +206,46 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                         .aria_label("Filter applications")
                         .w_full()
                         .small()
+                }),
+        )
+        // "Compress…" and "Extract to…": one text field, and for Compress
+        // the format choice.
+        .children(archive.map(|state| {
+            Input::new(&state.input)
+                .id("explorer-archive-input")
+                .aria_label(match state.action {
+                    ArchiveAction::Compress { .. } => "Archive name",
+                    ArchiveAction::ExtractTo { .. } => "Destination folder",
+                })
+                .w_full()
+                .small()
+        }))
+        .children(
+            archive
+                .and_then(|state| match &state.action {
+                    ArchiveAction::Compress { format, .. } => Some(*format),
+                    ArchiveAction::ExtractTo { .. } => None,
+                })
+                .map(|chosen| {
+                    div().flex().items_center().gap(Spacing::SM).children(
+                        Format::ALL.into_iter().enumerate().map(|(index, format)| {
+                            let pick_weak = weak.clone();
+                            let button =
+                                Button::new(("explorer-archive-format", index), format.suffix());
+                            let button = if format == chosen {
+                                button.primary()
+                            } else {
+                                button.secondary()
+                            };
+                            button.on_click(move |_event, _window, cx| {
+                                if let Err(error) = pick_weak.update(cx, |this, cx| {
+                                    this.set_archive_format(format, cx);
+                                }) {
+                                    log::debug!("the dialog outlived its explorer: {error}");
+                                }
+                            })
+                        }),
+                    )
                 }),
         )
         .children(open_with.map(|state| {
@@ -340,7 +388,9 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         );
 
     let modal = Modal::new(text.title.clone()).id("explorer-dialog");
-    let modal = if open_with.is_some() {
+    let modal = if archive.is_some() {
+        modal.icon(icon(gpui_kit_assets::IconName::Archive))
+    } else if open_with.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::FolderOpen))
     } else if calm {
         modal.icon(icon(gpui_kit_assets::IconName::Usb))

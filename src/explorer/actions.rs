@@ -894,6 +894,14 @@ impl Explorer {
             self.confirm_open_with(window, cx);
             return;
         }
+        if self
+            .dialogs
+            .current()
+            .is_some_and(|dialog| matches!(dialog.action, DialogAction::Archive(_)))
+        {
+            self.confirm_archive(window, cx);
+            return;
+        }
         let Some(dialog) = self.dialogs.close() else {
             return;
         };
@@ -913,7 +921,7 @@ impl Explorer {
             DialogAction::EmptyTrash(names) => {
                 ("Emptying the Trash".to_owned(), Job::EmptyTrash(names))
             }
-            DialogAction::OpenWith(_) => return,
+            DialogAction::OpenWith(_) | DialogAction::Archive(_) => return,
             DialogAction::DeviceWhenIdle(plan) => {
                 self.queue_device_plan(plan, window, cx);
                 return;
@@ -1007,7 +1015,7 @@ impl Explorer {
         // what was not restored stays undoable.
         let cancellable = !matches!(
             entry.action,
-            UndoAction::Rename { .. } | UndoAction::Create { .. }
+            UndoAction::Rename { .. } | UndoAction::Create { .. } | UndoAction::Archive { .. }
         );
         let job = Job::Undo(entry.action);
         let ctx = self.job_ctx();
@@ -1077,6 +1085,15 @@ impl Explorer {
             matches!(self.selected_visible_paths().as_slice(), [path] if is_image_path(path));
         if target.single_file && one_image && !target.in_trash {
             add_viewer_row(&mut rows);
+        }
+        if target.selected > 0 {
+            let in_folder = matches!(self.tab().state.current(), Location::Directory(_));
+            let offer = super::archive::offer_for(
+                in_folder,
+                &selected,
+                fileflux::core::archive::tool().is_some(),
+            );
+            super::archive::add_rows(&mut rows, offer);
         }
         if rows.is_empty() {
             cx.notify();
@@ -1386,6 +1403,9 @@ impl Explorer {
             MenuCommand::Copy => self.copy_selection(ClipMode::Copy, cx),
             MenuCommand::Paste => self.paste(PasteInto::CurrentFolder, window, cx),
             MenuCommand::PasteIntoFolder => self.paste(PasteInto::SelectedFolder, window, cx),
+            MenuCommand::Compress => self.compress_selected(window, cx),
+            MenuCommand::ExtractHere => self.extract_here(window, cx),
+            MenuCommand::ExtractTo => self.extract_to(window, cx),
         }
     }
 

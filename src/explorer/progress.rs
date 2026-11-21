@@ -126,6 +126,10 @@ pub(crate) fn fraction(state: &ProgressState) -> Option<f32> {
 
 /// "3 of 10 items" or "1.5 KB of 3 MB".
 pub(crate) fn describe(state: &ProgressState) -> String {
+    // An operation that cannot count its work (an archive tool) says so.
+    if state.total == 0 && state.done == 0 && state.unit == Unit::Items {
+        return "Working\u{2026}".to_owned();
+    }
     match state.unit {
         Unit::Items => format!(
             "{} of {} item{}",

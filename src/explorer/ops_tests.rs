@@ -2928,3 +2928,22 @@ fn a_new_tab_refuses_a_folder_inside_the_trash() {
         Some(root)
     ));
 }
+
+#[test]
+fn archive_dialogs_say_what_they_do() {
+    let compress = dialog_text(&DialogKind::Archive { extract: false }, &["a".to_owned()]);
+    assert_eq!(compress.title, "Compress \u{201c}a\u{201d}");
+    assert_eq!(compress.confirm, "Compress");
+    assert!(compress.names.is_empty());
+    let several = dialog_text(
+        &DialogKind::Archive { extract: false },
+        &["a".to_owned(), "b".to_owned()],
+    );
+    assert_eq!(several.title, "Compress 2 items");
+    let extract = dialog_text(
+        &DialogKind::Archive { extract: true },
+        &["a.zip".to_owned()],
+    );
+    assert_eq!(extract.title, "Extract \u{201c}a.zip\u{201d} to\u{2026}");
+    assert_eq!(extract.confirm, "Extract");
+}

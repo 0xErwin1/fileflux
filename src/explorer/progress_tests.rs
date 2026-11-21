@@ -41,6 +41,12 @@ fn the_progress_text_counts_items_or_bytes() {
     );
 }
 
+#[test]
+fn work_that_cannot_be_counted_says_working() {
+    assert_eq!(describe(&state(0, 0, Unit::Items)), "Working\u{2026}");
+    assert_eq!(describe(&state(0, 1, Unit::Items)), "0 of 1 item");
+}
+
 /// ETA and speed only appear when they mean something: after a couple of
 /// seconds, with work done and left, and speed only for bytes.
 #[test]

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 pub mod apps;
+pub mod archive;
 pub mod bookmarks;
 pub mod clipboard;
 pub mod devices;

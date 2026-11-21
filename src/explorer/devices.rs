@@ -117,7 +117,7 @@ fn undo_paths(action: &UndoAction) -> Vec<PathBuf> {
             .iter()
             .flat_map(|entry| [entry.item.original.clone(), entry.item.files_path()])
             .collect(),
-        UndoAction::Create { path, .. } => vec![path.clone()],
+        UndoAction::Create { path, .. } | UndoAction::Archive { path, .. } => vec![path.clone()],
         UndoAction::Permissions { items } => items.iter().map(|item| item.path.clone()).collect(),
         UndoAction::Copy { items } | UndoAction::Move { items } => items
             .iter()

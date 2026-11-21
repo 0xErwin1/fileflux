@@ -18,7 +18,6 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 |---|---|---|
 | File clipboard interchange | Copy or cut files in Fileflux and paste them in another application. Needs the `x-special/gnome-copied-files` and `text/uri-list` clipboard targets, which the GPUI clipboard (text and images only) cannot offer or read until DBFlux's `gpui-pre-linux` gains custom MIME types | Pasting files other applications copied as `file://` URIs or absolute paths in text works, as a copy (cut only with a leading `cut` line). Other applications still receive only the paths as plain text, and cannot tell copy from cut |
 | Change the owner | Change an entry's owner, which needs root or `CAP_CHOWN`: an elevation flow (polkit or a helper), which Fileflux does not have | The details panel edits permissions and group of one or several entries, and shows the owner read-only |
-| Archives | Compress a selection; extract here or to a folder | Nothing |
 
 ## Priority 2: expected file manager features
 
