@@ -56,7 +56,7 @@ use crate::explorer::arrange::{ArrangeCommand, ArrangeIndex};
 use crate::explorer::clipboard::PasteHandle;
 use crate::explorer::devices::{CheckedStep, DeviceHub};
 use crate::explorer::favorites::{BookmarkSync, favorites_of};
-use crate::explorer::folder_memory::FolderMemory;
+use crate::explorer::folder_memory::{self, FolderMemory};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{ArrangeMenu, DialogQueue};
@@ -1214,8 +1214,8 @@ impl Explorer {
             version: SETTINGS_VERSION,
             favorites: self.legacy_favorites.clone(),
             preferences: Preferences {
-                view: view_to_pref(active.state.view()),
-                arrangement: arrangement_to_prefs(active.state.arrangement()),
+                view: view_to_pref(active.state.own_presentation().0),
+                arrangement: arrangement_to_prefs(&active.state.own_presentation().1),
                 sidebar_width: self.sidebar_width.round() as u32,
                 details_width: self.details_width.round() as u32,
                 list_columns: self.list_columns.clone(),
@@ -1232,11 +1232,8 @@ impl Explorer {
         // The panes as they are laid out: the left one first, whichever of
         // them has the focus. A parked second pane is saved too.
         let session = panes::session_of(&self.tabs, |tab| {
-            session_tab(
-                tab.state.current(),
-                tab.state.view(),
-                tab.state.arrangement(),
-            )
+            let (view, arrangement) = tab.state.own_presentation();
+            session_tab(tab.state.current(), view, &arrangement)
         });
         (settings, session)
     }
@@ -1302,13 +1299,18 @@ impl Explorer {
         let Location::Directory(path) = self.tab().state.current().clone() else {
             return;
         };
-        // What the user changed a moment ago is dropped with the record.
-        drop(self.tab_mut().state.take_unsaved_presentation());
+        // Every tab and pane on the folder goes back, and what the user
+        // changed a moment ago is dropped with the record.
         if !self.folders.forget(&path) {
+            drop(self.tab_mut().state.take_unsaved_presentation());
             return;
         }
-        let (view, arrangement) = self.default_presentation.clone();
-        self.tab_mut().state.apply_presentation(view, arrangement);
+        let default = self.default_presentation.clone();
+        folder_memory::reset_states(
+            self.tabs.iter_mut().map(|tab| &mut tab.state),
+            &path,
+            &default,
+        );
         cx.notify();
     }
 
@@ -1585,18 +1587,18 @@ impl Explorer {
                 if let Some((path, view, arrangement)) = tab.state.take_unsaved_presentation() {
                     self.folders.remember(&path, view, &arrangement);
                 }
+                let first_scan = tab.state.is_unscanned();
                 if !tab.state.commit_indexed(scan.clone(), listing, index) {
                     return;
                 }
                 // Arriving in a folder (a visit, Back, Forward, Up, a restored
                 // tab) shows what is remembered for it; a reload or a
                 // background refresh keeps what the tab shows.
-                if !scan.live && !scan.refresh {
-                    let (view, arrangement) = self.folders.presentation_for(
-                        &scan.location,
-                        tab.state.view(),
-                        tab.state.arrangement(),
-                    );
+                if folder_memory::applies_on_commit(scan.live, scan.refresh, first_scan) {
+                    let (own_view, own_arrangement) = tab.state.own_presentation();
+                    let (view, arrangement) =
+                        self.folders
+                            .presentation_for(&scan.location, own_view, &own_arrangement);
                     tab.state.apply_presentation(view, arrangement);
                 }
                 tab.snapshot = snapshot;
@@ -3110,9 +3112,10 @@ impl Explorer {
         let mut state = state;
         // The tab opens showing what is remembered for its folder, not what
         // the tab it came from shows.
+        let (own_view, own_arrangement) = state.own_presentation();
         let (view, arrangement) =
             self.folders
-                .presentation_for(&location, state.view(), state.arrangement());
+                .presentation_for(&location, own_view, &own_arrangement);
         state.apply_presentation(view, arrangement);
         let mut tab = Tab::new(id, state, window, cx);
         let scan = tab.state.begin(Transition::Visit(location));

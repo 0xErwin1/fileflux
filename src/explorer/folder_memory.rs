@@ -20,7 +20,7 @@ use super::persist::{
     DEBOUNCE, RETRY_AFTER_FAILURE, arrangement_from_prefs, arrangement_to_prefs, view_from_pref,
     view_to_pref,
 };
-use super::state::View;
+use super::state::{ExplorerState, View};
 
 /// The label of the empty-space row that forgets a folder's view.
 pub(crate) const RESET_LABEL: &str = "Reset View for This Folder";
@@ -218,7 +218,14 @@ impl FolderMemory {
     /// The save for the window closing, without waiting. Run it on the spot.
     pub(crate) fn flush(&mut self) -> Option<FolderSaveJob> {
         self.seen = None;
-        if self.dirty() { self.take_job() } else { None }
+        // A save still in flight may not land before the process ends: the
+        // latest snapshot is written here too (it carries a newer
+        // generation, so the late one is skipped).
+        if self.dirty() || self.in_flight {
+            self.take_job()
+        } else {
+            None
+        }
     }
 
     /// A background save ended. A failed write rolls the baseline back, so
@@ -242,6 +249,29 @@ impl FolderMemory {
             return None;
         }
         Some(format!("Could not save folder views ({error})"))
+    }
+}
+
+/// Whether a scan that commits shows the folder's remembered view: on an
+/// arrival (a visit, Back, Forward, Up) and on a tab's first scan (which is
+/// a visit of its own location, so it reads as a refresh); not on a reload
+/// or a background refresh, which keep what the tab shows.
+pub(crate) fn applies_on_commit(live: bool, refresh: bool, first_scan: bool) -> bool {
+    !live && (!refresh || first_scan)
+}
+
+/// "Reset View for This Folder" for every tab in `states` that shows `path`:
+/// back to `default`, with nothing left to record again.
+pub(crate) fn reset_states<'a>(
+    states: impl Iterator<Item = &'a mut ExplorerState>,
+    path: &Path,
+    default: &(View, Arrangement),
+) {
+    for state in states {
+        if matches!(state.current(), Location::Directory(shown) if shown == path) {
+            drop(state.take_unsaved_presentation());
+            state.apply_presentation(default.0, default.1.clone());
+        }
     }
 }
 
@@ -472,6 +502,79 @@ mod tests {
                 .is_none()
         );
         assert!(memory.has(Path::new("/a")), "still remembered in memory");
+    }
+
+    #[test]
+    fn a_remembered_folder_does_not_leak_into_the_next_unremembered_one() {
+        use crate::explorer::state::ExplorerState;
+        let mut memory = FolderMemory::disabled();
+        memory.remember(Path::new("/a"), View::List, &sorted_by_size());
+        let mut state = ExplorerState::new(dir("/start"), None);
+        let (view, arrangement) = memory.presentation_for(
+            &dir("/a"),
+            state.own_presentation().0,
+            &state.own_presentation().1,
+        );
+        state.apply_presentation(view, arrangement);
+        assert_eq!(state.view(), View::List, "A shows its memory");
+        let own = state.own_presentation();
+        assert_eq!(own, (View::Grid, Arrangement::default()), "not A's");
+        let (view, arrangement) = memory.presentation_for(&dir("/b"), own.0, &own.1);
+        assert_eq!((view, arrangement), (View::Grid, Arrangement::default()));
+        // What the user chooses is the tab's own choice from then on.
+        state.set_view(View::Compact);
+        assert_eq!(state.own_presentation().0, View::Compact);
+    }
+
+    #[test]
+    fn closing_writes_the_latest_even_while_a_save_is_in_flight() {
+        let scratch = Scratch::new("inflight");
+        let mut memory = writing_to(scratch.file());
+        memory.remember(Path::new("/a"), View::List, &sorted_by_size());
+        let start = Instant::now();
+        memory.observe(start);
+        let in_flight = memory.observe(start + DEBOUNCE).expect("in flight");
+        // Nothing changed since the job was queued, but it has not landed.
+        let job = memory
+            .flush()
+            .expect("close does not rely on the background");
+        assert_eq!(job.run().error, None);
+        // The slow background write arrives late and is superseded.
+        assert_eq!(in_flight.run().error, None);
+        let (reloaded, _) = FolderMemory::load(Some(scratch.file()), SystemTime::now());
+        assert!(reloaded.has(Path::new("/a")));
+    }
+
+    #[test]
+    fn reset_returns_every_tab_on_the_folder_to_the_default_and_clears_unsaved() {
+        use crate::explorer::state::ExplorerState;
+        let default = (View::Grid, Arrangement::default());
+        let mut shown_twice = [
+            ExplorerState::new(dir("/a"), None),
+            ExplorerState::new(dir("/a"), None),
+            ExplorerState::new(dir("/b"), None),
+        ];
+        for state in &mut shown_twice {
+            state.set_view(View::List);
+        }
+        reset_states(shown_twice.iter_mut(), Path::new("/a"), &default);
+        for state in &shown_twice[..2] {
+            assert_eq!(state.view(), View::Grid);
+        }
+        assert!(shown_twice[0].take_unsaved_presentation().is_none());
+        assert!(shown_twice[1].take_unsaved_presentation().is_none());
+        assert_eq!(shown_twice[2].view(), View::List, "another folder");
+        assert!(shown_twice[2].take_unsaved_presentation().is_some());
+    }
+
+    #[test]
+    fn the_memory_applies_on_arrival_only() {
+        // (live, refresh, first scan of the tab)
+        assert!(applies_on_commit(false, false, false), "visit, back, up");
+        assert!(applies_on_commit(false, true, true), "a tab's first scan");
+        assert!(!applies_on_commit(false, true, false), "reload");
+        assert!(!applies_on_commit(true, false, false), "live refresh");
+        assert!(!applies_on_commit(true, true, true), "live refresh");
     }
 
     fn empty_space() -> Vec<MenuRow> {

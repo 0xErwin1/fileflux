@@ -241,6 +241,10 @@ pub(crate) struct ExplorerState {
     /// last taken for the folder memory (see
     /// [`Self::take_unsaved_presentation`]).
     unsaved_presentation: bool,
+    /// What the user last chose in this tab (or the launch default): the
+    /// presentation of folders without a remembered view and the saved
+    /// default. A remembered view that is merely applied never replaces it.
+    own: (View, Arrangement),
     /// The item count of each folder of the listing, counted off the UI
     /// thread after the scan; what a folder sorts by under "Size".
     child_counts: Arc<FolderCounts>,
@@ -291,6 +295,7 @@ impl ExplorerState {
             view: View::Grid,
             arrangement: Arrangement::default(),
             unsaved_presentation: false,
+            own: (View::Grid, Arrangement::default()),
             child_counts: Arc::new(FolderCounts::new()),
             anchor: None,
             cursor: None,
@@ -313,9 +318,25 @@ impl ExplorerState {
     /// The state with this presentation (view, sort and filters), as saved
     /// preferences or a restored tab ask for.
     pub(crate) fn with_presentation(mut self, view: View, arrangement: Arrangement) -> Self {
+        self.own = (view, arrangement.clone());
         self.view = view;
         self.arrangement = arrangement;
         self
+    }
+
+    /// The tab's own choice, which a folder without a memory shows.
+    pub(crate) fn own_presentation(&self) -> (View, Arrangement) {
+        self.own.clone()
+    }
+
+    /// Whether no scan has committed yet: the tab's first arrival.
+    pub(crate) fn is_unscanned(&self) -> bool {
+        self.listing_epoch == 0
+    }
+
+    fn user_changed_presentation(&mut self) {
+        self.own = (self.view, self.arrangement.clone());
+        self.unsaved_presentation = true;
     }
 
     /// The committed current location.
@@ -1302,7 +1323,7 @@ impl ExplorerState {
     /// Switches the presentation; selection, folder and query are kept.
     pub(crate) fn set_view(&mut self, view: View) {
         self.view = view;
-        self.unsaved_presentation = true;
+        self.user_changed_presentation();
     }
 
     /// Puts a presentation on the tab that is not the user's doing here: a
@@ -1343,14 +1364,14 @@ impl ExplorerState {
     /// anchor are paths, so they survive the reorder.
     pub(crate) fn click_sort(&mut self, key: SortKey) {
         self.arrangement.sort = self.arrangement.sort.clicked(key);
-        self.unsaved_presentation = true;
+        self.user_changed_presentation();
     }
 
     /// Applies a sort or filter change from a menu, chip or shortcut. The
     /// selection is untouched: a filtered-out entry stays selected.
     pub(crate) fn arrange(&mut self, command: ArrangeCommand) {
         self.arrangement.apply(command);
-        self.unsaved_presentation = true;
+        self.user_changed_presentation();
     }
 
     /// The folder item counts the size sort reads.
@@ -1370,8 +1391,9 @@ impl ExplorerState {
     /// filters) of this tab.
     pub(crate) fn for_new_tab(&self, location: Location) -> Self {
         Self {
-            view: self.view,
-            arrangement: self.arrangement.clone(),
+            view: self.own.0,
+            arrangement: self.own.1.clone(),
+            own: self.own.clone(),
             ..Self::new(location, self.home.clone())
         }
     }
