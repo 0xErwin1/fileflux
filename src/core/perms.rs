@@ -1705,18 +1705,26 @@ mod tests {
     #[test]
     fn the_undo_record_stops_at_the_cap_and_says_so() -> TestResult {
         let dir = scratch("cap")?;
-        let top = dir.root.join("top");
-        fs::create_dir_all(&top)?;
-        for name in ["a", "b", "c"] {
-            put(&top.join(name), 0o644)?;
-        }
+        // Two fresh trees with explicit modes, so the result does not
+        // depend on the process umask.
+        let tree = |name: &str| -> io::Result<PathBuf> {
+            let top = dir.root.join(name);
+            fs::create_dir_all(&top)?;
+            fs::set_permissions(&top, fs::Permissions::from_mode(0o755))?;
+            for file in ["a", "b", "c"] {
+                put(&top.join(file), 0o644)?;
+            }
+            Ok(top)
+        };
+        let capped_top = tree("capped")?;
+        let exact_top = tree("exact")?;
         let change = Change {
             edit: edit(None, None, Some(Access::None)),
             gid: None,
         };
-        let go = |cap: usize| {
+        let go = |top: &PathBuf, cap: usize| {
             apply_inner(
-                std::slice::from_ref(&top),
+                std::slice::from_ref(top),
                 &change,
                 true,
                 &AtomicBool::new(false),
@@ -1725,12 +1733,15 @@ mod tests {
                 cap,
             )
         };
-        let capped = go(2);
+        let capped = go(&capped_top, 2);
         assert_eq!(capped.changed, 4, "everything still changed");
         assert_eq!(capped.previous.len(), 2);
         assert!(capped.undo_dropped);
-        let exact = go(4);
-        assert!(exact.changed == 0 && exact.previous.is_empty() && !exact.undo_dropped);
+        // Exactly the cap: every change is recorded and Undo is kept.
+        let exact = go(&exact_top, 4);
+        assert_eq!(exact.changed, 4);
+        assert_eq!(exact.previous.len(), 4);
+        assert!(!exact.undo_dropped);
         Ok(())
     }
 }
