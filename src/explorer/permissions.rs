@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use bolt::controls::Button;
+use bolt::primitives::Icon;
 use fileflux::core::Location;
 use fileflux::core::perms::{
     self, Access, Applied, Change, Class, Edit, Exec, Group, Merged, Summary,
@@ -457,6 +458,10 @@ fn label(text: String, cx: &Context<Explorer>) -> gpui::Div {
 }
 
 /// One choice chip.
+/// The width of one choice cell in the access grid; the header uses the same
+/// number so the columns line up.
+const CELL_WIDTH: f32 = 74.0;
+
 fn chip(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
@@ -466,13 +471,20 @@ fn chip(
     let colors = bolt::colors(cx);
     div()
         .id(id)
-        .px(px(8.0))
-        .py(px(3.0))
-        .text_size(px(12.0))
+        .w(px(CELL_WIDTH))
+        .h(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(11.0))
         .border_1()
-        .rounded(px(4.0))
         .cursor_pointer()
         .border_color(if on { colors.info } else { colors.line })
+        .bg(if on {
+            colors.info.opacity(0.14)
+        } else {
+            colors.background
+        })
         .text_color(if on { colors.info } else { colors.foreground })
         .child(text.into())
 }
@@ -547,6 +559,23 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElem
         .into_any_element(),
     ]));
 
+    // One column per choice, labelled once: the same three buttons repeated
+    // per class read as a wall of chips.
+    rows.push(
+        div()
+            .mx(px(16.0))
+            .mb(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(px(10.0))
+            .text_color(colors.muted)
+            .child(div().flex_1().child("Who"))
+            .child(div().w(px(CELL_WIDTH)).text_center().child("None"))
+            .child(div().w(px(CELL_WIDTH)).text_center().child("Read"))
+            .child(div().w(px(CELL_WIDTH)).text_center().child("Read + write"))
+            .into_any_element(),
+    );
     for class in Class::ALL {
         let shown = summary.access(class);
         let draft = editor.draft.get(class);
@@ -584,15 +613,25 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElem
                 .into_any_element()
             })
             .collect::<Vec<_>>();
-        rows.push(section(vec![
-            label(title, cx).into_any_element(),
+        rows.push(
             div()
+                .mx(px(16.0))
+                .mb(px(2.0))
                 .flex()
-                .flex_wrap()
+                .items_center()
                 .gap(px(4.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(colors.foreground)
+                        .child(title),
+                )
                 .children(chips)
                 .into_any_element(),
-        ]));
+        );
     }
 
     if summary.files > 0 {
@@ -634,6 +673,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElem
 }
 
 fn group_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
+    let colors = bolt::colors(cx);
     let summary = &editor.loaded.summary;
     let current = editor.group_choice.map(Merged::Same).or(summary.gid);
     let shown = name_or_id(&editor.loaded.group_names, current);
@@ -642,37 +682,78 @@ fn group_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
             label(format!("Group: {shown} (groups unavailable)"), cx).into_any_element(),
         ]);
     }
+    // A select trigger, then the groups as full-width rows: a wrapping row of
+    // chips hides most of them and reads like a filter, not a choice.
     let mut children = vec![
         label("Group".to_owned(), cx).into_any_element(),
-        chip(
-            "perm-group-current",
-            // The chip carries the name; the list below picks another.
-            shown,
-            editor.group_list_open,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            if let Some(editor) = this.editor_mut() {
-                editor.group_list_open = !editor.group_list_open;
-            }
-            cx.notify();
-        }))
-        .into_any_element(),
+        div()
+            .id("perm-group-current")
+            .h(px(30.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .border_1()
+            .border_color(if editor.group_list_open {
+                colors.line_2
+            } else {
+                colors.line
+            })
+            .bg(colors.background)
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(editor) = this.editor_mut() {
+                    editor.group_list_open = !editor.group_list_open;
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.0))
+                    .text_color(colors.strong)
+                    .child(shown),
+            )
+            .child(
+                Icon::new(super::icon(if editor.group_list_open {
+                    gpui_kit_assets::IconName::ChevronUp
+                } else {
+                    gpui_kit_assets::IconName::ChevronDown
+                }))
+                .size(px(12.0))
+                .color(colors.muted),
+            )
+            .into_any_element(),
     ];
     if editor.group_list_open {
-        let chips = editor
+        let choices = editor
             .loaded
             .groups
             .iter()
             .map(|group| {
                 let gid = group.gid;
-                chip(
-                    ("perm-group-choice", u64::from(gid)),
-                    group.label(),
-                    current == Some(Merged::Same(gid)),
-                    cx,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
+                let chosen = current == Some(Merged::Same(gid));
+                let mut row = div()
+                    .id(("perm-group-choice", u64::from(gid)))
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(if chosen {
+                        colors.strong
+                    } else {
+                        colors.foreground
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(group.label()));
+                if chosen {
+                    row = row.bg(colors.info.opacity(0.14));
+                }
+                row.on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(editor) = this.editor_mut() {
                         editor.group_choice = Some(gid);
                         editor.group_list_open = false;
@@ -685,10 +766,12 @@ fn group_section(editor: &Editor, cx: &mut Context<Explorer>) -> AnyElement {
             .collect::<Vec<_>>();
         children.push(
             div()
-                .flex()
-                .flex_wrap()
-                .gap(px(4.0))
-                .children(chips)
+                .mt(px(4.0))
+                .max_h(px(198.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(colors.line)
+                .children(choices)
                 .into_any_element(),
         );
     }
