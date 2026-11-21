@@ -31,6 +31,7 @@ use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::places::{FuseRoots, Places};
+use fileflux::core::settings::ColumnPref;
 use fileflux::core::trash::{
     self, RestoreConflict, TrashError, TrashTarget, TrashedItem, trash_dir_for,
 };
@@ -1344,6 +1345,9 @@ pub(crate) enum MenuCommand {
     SelectMatching,
     /// A sort or filter change; the menu stays open and redraws its checks.
     Arrange(ArrangeCommand),
+    /// Shows or hides one optional column of the list view; the menu stays
+    /// open and redraws its checks.
+    ToggleColumn(ColumnPref),
     /// Sidebar rows: pin the row's folder to the Favorites.
     AddFavorite,
     /// Sidebar rows: unpin the row's folder from the Favorites.
@@ -1375,6 +1379,8 @@ pub(crate) enum ArrangeMenu {
     Filter,
     /// Select all, Invert selection, Select items matching…
     Select,
+    /// The optional columns of the list view.
+    Columns,
 }
 
 impl ArrangeMenu {
@@ -1384,6 +1390,7 @@ impl ArrangeMenu {
             Self::Sort => "Sort by",
             Self::Filter => "Filter",
             Self::Select => "Select",
+            Self::Columns => "Columns",
         }
     }
 }
@@ -1580,7 +1587,7 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
             vec![
                 item(MenuCommand::EmptyTrash, "Empty Trash", None, true),
                 MenuRow::Separator,
-                arrange_menu::submenu(ArrangeMenu::Select, arrangement),
+                arrange_menu::submenu(ArrangeMenu::Select, arrangement, &[]),
             ]
         } else {
             Vec::new()
@@ -1661,9 +1668,9 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
         MenuRow::Separator,
         paste(MenuCommand::Paste, "Paste"),
         MenuRow::Separator,
-        arrange_menu::submenu(ArrangeMenu::Select, arrangement),
-        arrange_menu::submenu(ArrangeMenu::Sort, arrangement),
-        arrange_menu::submenu(ArrangeMenu::Filter, arrangement),
+        arrange_menu::submenu(ArrangeMenu::Select, arrangement, &[]),
+        arrange_menu::submenu(ArrangeMenu::Sort, arrangement, &[]),
+        arrange_menu::submenu(ArrangeMenu::Filter, arrangement, &[]),
         MenuRow::Separator,
     ];
     if target.terminal {

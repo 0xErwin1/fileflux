@@ -185,6 +185,7 @@ fn entry(path: PathBuf, used: Option<SystemTime>) -> Option<Entry> {
     Some(Entry {
         name: path.file_name()?.to_os_string(),
         origin: path.parent().map(Path::to_path_buf),
+        unix: None,
         size: (kind != EntryKind::Directory).then_some(meta.len()),
         modified: used.or_else(|| meta.modified().ok()),
         path,

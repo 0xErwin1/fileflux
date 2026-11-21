@@ -13,7 +13,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::{Entry, EntryKind, Listing};
+use super::idnames::IdResolver;
+use super::{Entry, EntryKind, Listing, UnixInfo};
 
 /// Scans one directory level and returns a deterministically sorted listing.
 ///
@@ -23,6 +24,12 @@ use super::{Entry, EntryKind, Listing};
 /// [`Listing::warnings`] with the affected path. Broken symlinks stay in the
 /// listing as [`EntryKind::Symlink`] without size/modified metadata.
 pub fn read_directory(path: &Path) -> io::Result<Listing> {
+    read_directory_with(path, &mut IdResolver::system())
+}
+
+/// [`read_directory`] resolving owners and groups through `ids`: one
+/// resolver per scan, so the id files are read once for the whole folder.
+pub fn read_directory_with(path: &Path, ids: &mut IdResolver) -> io::Result<Listing> {
     let mut listing = Listing::default();
     // A failed root read is the caller's navigation error, not a warning.
     let reader = fs::read_dir(path)?;
@@ -41,7 +48,7 @@ pub fn read_directory(path: &Path) -> io::Result<Listing> {
         if crate::core::ops::is_transfer_temp(&dir_entry.file_name()) {
             continue;
         }
-        match build_entry(dir_entry) {
+        match build_entry_with(dir_entry, Some(ids)) {
             Ok(entry) => listing.entries.push(entry),
             Err(warning) => listing.warnings.push(warning),
         }
@@ -353,8 +360,19 @@ pub fn child_counts(entries: &[Entry]) -> HashMap<PathBuf, Option<usize>> {
         .collect()
 }
 
-/// Builds one listing entry; `Err` carries a ready-to-push warning string.
+/// Builds one listing entry without owner and group (search results);
+/// `Err` carries a ready-to-push warning string.
 pub(crate) fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
+    build_entry_with(dir_entry, None)
+}
+
+/// Builds one listing entry; `Err` carries a ready-to-push warning string.
+/// With `ids`, the entry carries its mode, owner and group, read from the
+/// metadata the scan already has.
+fn build_entry_with(
+    dir_entry: fs::DirEntry,
+    ids: Option<&mut IdResolver>,
+) -> Result<Entry, String> {
     let name: OsString = dir_entry.file_name();
     let path: PathBuf = dir_entry.path();
     let file_type: FileType = dir_entry
@@ -362,13 +380,13 @@ pub(crate) fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
         .map_err(|err| format!("could not read type of {}: {err}", path.display()))?;
     let is_symlink = file_type.is_symlink();
 
-    let (kind, size, modified) = if is_symlink {
+    let (kind, size, modified, unix) = if is_symlink {
         // Resolve the target kind through metadata only; never open contents.
         match fs::metadata(&path) {
-            Ok(meta) => metadata_facts(&meta),
+            Ok(meta) => metadata_facts(&meta, ids),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // Broken link: keep it explicit rather than hiding it.
-                (EntryKind::Symlink, None, None)
+                (EntryKind::Symlink, None, None, None)
             }
             Err(err) => {
                 return Err(format!(
@@ -379,7 +397,7 @@ pub(crate) fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
         }
     } else {
         match dir_entry.metadata() {
-            Ok(meta) => metadata_facts(&meta),
+            Ok(meta) => metadata_facts(&meta, ids),
             Err(err) => {
                 return Err(format!(
                     "could not read metadata for {}: {err}",
@@ -397,11 +415,18 @@ pub(crate) fn build_entry(dir_entry: fs::DirEntry) -> Result<Entry, String> {
         size,
         modified,
         origin: None,
+        unix,
     })
 }
 
-/// `(kind, size, modified)` facts for an already-followed metadata read.
-fn metadata_facts(meta: &Metadata) -> (EntryKind, Option<u64>, Option<SystemTime>) {
+/// `(kind, size, modified, unix)` facts for an already-followed metadata
+/// read. The unix facts need a resolver.
+fn metadata_facts(
+    meta: &Metadata,
+    ids: Option<&mut IdResolver>,
+) -> (EntryKind, Option<u64>, Option<SystemTime>, Option<UnixInfo>) {
+    use std::os::unix::fs::MetadataExt as _;
+
     let kind = if meta.is_dir() {
         EntryKind::Directory
     } else if meta.is_file() {
@@ -415,7 +440,14 @@ fn metadata_facts(meta: &Metadata) -> (EntryKind, Option<u64>, Option<SystemTime
     } else {
         Some(meta.len())
     };
-    (kind, size, meta.modified().ok())
+    let unix = ids.map(|ids| UnixInfo {
+        mode: meta.mode() & 0o7777,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        owner: ids.user(meta.uid()),
+        group: ids.group(meta.gid()),
+    });
+    (kind, size, meta.modified().ok(), unix)
 }
 
 #[cfg(test)]
@@ -533,6 +565,44 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// The scan reads mode, owner and group with the metadata it already has,
+    /// resolving names through the injected resolver (numbers when unknown);
+    /// a broken link has none.
+    #[test]
+    fn scan_carries_mode_owner_and_group_from_the_injected_resolver()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::idnames::IdResolver;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let scratch = scratch("unix")?;
+        let file = scratch.path().join("f.txt");
+        fs::write(&file, "x")?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640))?;
+        std::os::unix::fs::symlink("nowhere", scratch.path().join("dead"))?;
+        let meta = fs::metadata(&file)?;
+        let passwd = format!("tester:x:{}:{}::/:/bin/sh\n", meta.uid(), meta.gid());
+
+        let known = super::super::fs::read_directory_with(
+            scratch.path(),
+            &mut IdResolver::from_texts(&passwd, ""),
+        )?;
+        let unix = find(&known, "f.txt")?.unix.clone().ok_or("scanned")?;
+        assert_eq!(unix.mode, 0o640, "only the permission bits");
+        assert_eq!((unix.uid, unix.gid), (meta.uid(), meta.gid()));
+        assert_eq!(&*unix.owner, "tester");
+        assert_eq!(
+            &*unix.group,
+            meta.gid().to_string(),
+            "no group name: the number"
+        );
+        assert_eq!(
+            find(&known, "dead")?.unix,
+            None,
+            "a broken link has no metadata"
+        );
+        Ok(())
+    }
+
     #[test]
     fn read_mode_reports_permission_bits_and_missing_paths()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1081,6 +1151,7 @@ last",
                 size: None,
                 modified: None,
                 origin: None,
+                unix: None,
             }
         }
 

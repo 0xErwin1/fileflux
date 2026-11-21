@@ -488,6 +488,7 @@ mod tests {
             size: Some(1),
             modified: None,
             origin: None,
+            unix: None,
         }
     }
 

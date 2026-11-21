@@ -84,6 +84,9 @@ pub(crate) fn arrangement_from_prefs(prefs: &ArrangementPrefs) -> Arrangement {
                 SortKeyPref::Size => SortKey::Size,
                 SortKeyPref::Modified => SortKey::Modified,
                 SortKeyPref::Type => SortKey::Type,
+                SortKeyPref::Permissions => SortKey::Permissions,
+                SortKeyPref::Owner => SortKey::Owner,
+                SortKeyPref::Group => SortKey::Group,
             },
             dir: match prefs.sort_dir {
                 SortDirPref::Ascending => SortDir::Ascending,
@@ -124,6 +127,9 @@ pub(crate) fn arrangement_to_prefs(arrangement: &Arrangement) -> ArrangementPref
             SortKey::Size => SortKeyPref::Size,
             SortKey::Modified => SortKeyPref::Modified,
             SortKey::Type => SortKeyPref::Type,
+            SortKey::Permissions => SortKeyPref::Permissions,
+            SortKey::Owner => SortKeyPref::Owner,
+            SortKey::Group => SortKeyPref::Group,
         },
         sort_dir: match arrangement.sort.dir {
             SortDir::Ascending => SortDirPref::Ascending,

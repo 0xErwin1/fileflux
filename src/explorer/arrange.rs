@@ -31,21 +31,25 @@ pub(crate) enum SortKey {
     Modified,
     /// The category, then the extension, then the name.
     Type,
+    /// The permission bits as a number (the octal mode); no bits sort lowest.
+    Permissions,
+    /// The owner's name, case-insensitive; entries without one sort lowest.
+    Owner,
+    /// The group's name, case-insensitive; entries without one sort lowest.
+    Group,
 }
 
 impl SortKey {
     /// Every key, in menu order.
-    pub(crate) const ALL: [Self; 4] = [Self::Name, Self::Size, Self::Modified, Self::Type];
-
-    /// The sort key of list column `column`, or `None` past the columns.
-    pub(crate) fn of_column(column: usize) -> Option<Self> {
-        match column {
-            0 => Some(Self::Name),
-            1 => Some(Self::Size),
-            2 => Some(Self::Modified),
-            _ => None,
-        }
-    }
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Name,
+        Self::Size,
+        Self::Modified,
+        Self::Type,
+        Self::Permissions,
+        Self::Owner,
+        Self::Group,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -53,6 +57,9 @@ impl SortKey {
             Self::Size => "Size",
             Self::Modified => "Modified",
             Self::Type => "Type",
+            Self::Permissions => "Permissions",
+            Self::Owner => "Owner",
+            Self::Group => "Group",
         }
     }
 }
@@ -176,6 +183,9 @@ pub(crate) fn compare_entries(
                 .then_with(|| extension_of(&a.name).cmp(&extension_of(&b.name)))
                 .then(by_name),
         ),
+        SortKey::Permissions => directed(mode_of(a).cmp(&mode_of(b))),
+        SortKey::Owner => directed(owner_of(a).cmp(&owner_of(b))),
+        SortKey::Group => directed(group_of(a).cmp(&group_of(b))),
     };
     let tie = if spec.key == SortKey::Name || spec.key == SortKey::Type {
         Ordering::Equal
@@ -186,6 +196,21 @@ pub(crate) fn compare_entries(
         .then(by_key)
         .then(tie)
         .then_with(|| a.path.cmp(&b.path))
+}
+
+#[cfg(test)]
+fn mode_of(entry: &Entry) -> Option<u32> {
+    entry.unix.as_ref().map(|unix| unix.mode)
+}
+
+#[cfg(test)]
+fn owner_of(entry: &Entry) -> Option<String> {
+    entry.unix.as_ref().map(|unix| unix.owner.to_lowercase())
+}
+
+#[cfg(test)]
+fn group_of(entry: &Entry) -> Option<String> {
+    entry.unix.as_ref().map(|unix| unix.group.to_lowercase())
 }
 
 /// The size an entry sorts by: a file's bytes, or a folder's item count when
@@ -524,6 +549,10 @@ struct EntryKey {
     hidden: bool,
     /// The name has an extension (possibly empty, as in `name.`).
     has_ext: bool,
+    /// The permission bits, when the scan read them.
+    mode: Option<u32>,
+    /// The scan read the owner and the group (see `owners` and `groups`).
+    has_unix: bool,
 }
 
 /// Texts packed back to back, each followed by a NUL, so a scan can search
@@ -630,6 +659,10 @@ pub(crate) struct ArrangeIndex {
     lower: Arena,
     /// The lowercase extension of the entries that have one.
     exts: Arena,
+    /// The lowercase owner name of the entries the scan read one for.
+    owners: Arena,
+    /// The lowercase group name, likewise.
+    groups: Arena,
     /// The raw bytes of the names that are not UTF-8, by entry; every other
     /// name's raw bytes are its `display` text.
     invalid_names: HashMap<usize, Vec<u8>>,
@@ -670,6 +703,8 @@ impl ArrangeIndex {
         let mut display = Arena::with_capacity(entries.len());
         let mut lower = Arena::with_capacity(entries.len());
         let mut exts = Arena::with_capacity(entries.len());
+        let mut owners = Arena::with_capacity(entries.len());
+        let mut groups = Arena::with_capacity(entries.len());
         let mut invalid_names = HashMap::new();
         let mut dirs = Vec::new();
         let prefix: Vec<u8> = entries
@@ -687,6 +722,8 @@ impl ArrangeIndex {
             lower.push_lowercase(&name);
             let extension = extension_of(&entry.name);
             exts.push(extension.as_deref().unwrap_or_default());
+            owners.push_lowercase(entry.unix.as_ref().map_or("", |unix| &unix.owner));
+            groups.push_lowercase(entry.unix.as_ref().map_or("", |unix| &unix.group));
             let is_dir = entry.is_directory();
             if is_dir {
                 dirs.push((index, entry.path.clone()));
@@ -705,6 +742,8 @@ impl ArrangeIndex {
                 hidden: entry.name.as_encoded_bytes().first() == Some(&b'.')
                     || hidden_names.contains(&entry.name),
                 has_ext: extension.is_some(),
+                mode: entry.unix.as_ref().map(|unix| unix.mode),
+                has_unix: entry.unix.is_some(),
             });
         }
         Self {
@@ -712,6 +751,8 @@ impl ArrangeIndex {
             display,
             lower,
             exts,
+            owners,
+            groups,
             invalid_names,
             dirs,
             paths: (!uniform_paths)
@@ -780,6 +821,9 @@ impl ArrangeIndex {
                     })
                     .then_with(|| self.name_cmp(a, b, natural)),
             ),
+            SortKey::Permissions => directed(key_a.mode.cmp(&key_b.mode)),
+            SortKey::Owner => directed(self.owner(a, key_a).cmp(&self.owner(b, key_b))),
+            SortKey::Group => directed(self.group(a, key_a).cmp(&self.group(b, key_b))),
         };
         let tie = if matches!(sort_by, SortKey::Name | SortKey::Type) {
             Ordering::Equal
@@ -791,6 +835,14 @@ impl ArrangeIndex {
                 .as_ref()
                 .map_or(Ordering::Equal, |paths| paths.get(a).cmp(&paths.get(b)))
         })
+    }
+
+    fn owner<'a>(&'a self, index: usize, key: &EntryKey) -> Option<&'a str> {
+        key.has_unix.then(|| self.owners.get(index))
+    }
+
+    fn group<'a>(&'a self, index: usize, key: &EntryKey) -> Option<&'a str> {
+        key.has_unix.then(|| self.groups.get(index))
     }
 
     /// What the size sort compares: a file's bytes, a folder's item count
@@ -859,6 +911,9 @@ impl ArrangeIndex {
                         };
                         (true, (key.category as u64) << 32 | rank)
                     }
+                    SortKey::Permissions => (key.mode.is_some(), key.mode.map_or(0, u64::from)),
+                    // Names compare through the exact order only.
+                    SortKey::Owner | SortKey::Group => (true, 0),
                 };
                 let text = if natural {
                     self.display.get(index)
@@ -1006,7 +1061,7 @@ impl SortItem {
         };
         match sort_by {
             SortKey::Name => self.name_decided(other).map(directed),
-            SortKey::Size | SortKey::Modified => {
+            SortKey::Size | SortKey::Modified | SortKey::Permissions => {
                 let ordering = (self.has, self.primary).cmp(&(other.has, other.primary));
                 (ordering != Ordering::Equal).then(|| directed(ordering))
             }
@@ -1014,6 +1069,7 @@ impl SortItem {
                 Ordering::Equal => self.name_decided(other).map(directed),
                 ordering => Some(directed(ordering)),
             },
+            SortKey::Owner | SortKey::Group => None,
         }
     }
 
@@ -1598,6 +1654,7 @@ mod tests {
             size: Some(size),
             modified: None,
             origin: None,
+            unix: None,
         }
     }
 
@@ -1868,8 +1925,6 @@ mod tests {
         let size = spec.clicked(SortKey::Size);
         assert_eq!((size.key, size.dir), (SortKey::Size, SortDir::Ascending));
         assert!(!size.folders_first && !size.natural);
-        assert_eq!(SortKey::of_column(3), None);
-        assert_eq!(SortKey::of_column(2), Some(SortKey::Modified));
     }
 
     #[test]
@@ -2279,6 +2334,7 @@ mod fixtures {
             size,
             modified,
             origin: None,
+            unix: None,
         }
     }
 
@@ -2358,6 +2414,23 @@ mod fixtures {
                 _ => Some(rng.below(5)),
             };
             let mut one = entry(name, kind, size, time(rng, epoch));
+            // Mode, owner and group, with repeats (so the tiebreaks run),
+            // mixed case, numbers and entries the scan read none for.
+            one.unix = (!rng.one_in(5)).then(|| fileflux::core::UnixInfo {
+                mode: rng
+                    .pick(&[0o644, 0o600, 0o755, 0o4755, 0o000])
+                    .unwrap_or(0o644),
+                uid: 0,
+                gid: 0,
+                owner: rng
+                    .pick(&["ana", "Ana", "bob", "root", "1000"])
+                    .unwrap_or("ana")
+                    .into(),
+                group: rng
+                    .pick(&["users", "Users", "adm", "wheel", "100"])
+                    .unwrap_or("adm")
+                    .into(),
+            });
             if rng.one_in(10) {
                 // Repeated names live under another parent.
                 one.path = Path::new("/other").join(&one.name);
@@ -2793,6 +2866,7 @@ mod equivalence {
                 size: Some(1),
                 modified: None,
                 origin: None,
+                unix: None,
             })
             .collect();
         let at = now()?;

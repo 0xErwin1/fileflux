@@ -2794,6 +2794,7 @@ fn listed(name: &str, kind: fileflux::core::EntryKind) -> Entry {
         size: None,
         modified: None,
         origin: None,
+        unix: None,
     }
 }
 

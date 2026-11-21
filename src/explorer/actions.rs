@@ -18,6 +18,7 @@ use bolt::composites::{BackAction, ChildAction, HOVER_OPEN_DELAY, HoverIntent, M
 use bolt::controls::{InputEvent, InputState};
 use bolt::toast::{Toast, ToastAction};
 use fileflux::core::Location;
+use fileflux::core::settings::ColumnPref;
 use gpui::{
     AnyWindowHandle, AppContext as _, ClipboardItem, Context, Entity, Pixels, Point, Subscription,
     Window,
@@ -1113,6 +1114,18 @@ impl Explorer {
             ),
         };
         let mut rows = menu_rows(&target, self.tab().state.arrangement());
+        // Only the list view has columns to choose, from the folder's own
+        // empty-space menu.
+        if selected.is_empty()
+            && !target.in_trash
+            && self.tab().state.view() == super::state::View::List
+        {
+            rows = arrange_menu::with_columns(
+                rows,
+                self.tab().state.arrangement(),
+                &self.list_columns,
+            );
+        }
         if self.tab().state.current().lists_files_from_elsewhere() {
             rows = recent_menu_rows(rows, target.selected);
         }
@@ -1252,7 +1265,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         self.cancel_rename(window, cx);
-        let rows = arrange_menu::rows(menu, self.tab().state.arrangement());
+        let rows = arrange_menu::rows(menu, self.tab().state.arrangement(), &self.list_columns);
         self.show_menu(position, rows, (MenuOn::Arrange(menu), None), window, cx);
     }
 
@@ -1269,15 +1282,31 @@ impl Explorer {
         if self.tab().state.arrangement().filters.hide_hidden != hidden_before {
             self.restart_search_in(id, cx);
         }
-        // The open menu redraws its check marks.
+        self.redraw_menu_checks();
+        cx.notify();
+    }
+
+    /// Shows or hides one optional column of the list view (the Columns
+    /// menu). The choice is saved with the other preferences; the table
+    /// follows on the next frame.
+    pub(crate) fn toggle_column(&mut self, column: ColumnPref, cx: &mut Context<Self>) {
+        self.list_columns = arrange_menu::toggled_columns(&self.list_columns, column);
+        self.redraw_menu_checks();
+        cx.notify();
+    }
+
+    /// The open menu redraws its check marks.
+    fn redraw_menu_checks(&mut self) {
         let arrangement = self.tab().state.arrangement().clone();
+        let columns = self.list_columns.clone();
         if let Some(menu) = self.menu.as_mut() {
             match menu.on {
-                MenuOn::Arrange(kind) => menu.rows = arrange_menu::rows(kind, &arrangement),
-                _ => arrange_menu::refresh(&mut menu.rows, &arrangement),
+                MenuOn::Arrange(kind) => {
+                    menu.rows = arrange_menu::rows(kind, &arrangement, &columns);
+                }
+                _ => arrange_menu::refresh(&mut menu.rows, &arrangement, &columns),
             }
         }
-        cx.notify();
     }
 
     pub(crate) fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1421,6 +1450,9 @@ impl Explorer {
         if let MenuCommand::Arrange(change) = command {
             return self.arrange(change, cx);
         }
+        if let MenuCommand::ToggleColumn(column) = command {
+            return self.toggle_column(column, cx);
+        }
         // A sidebar row's menu acts on that row's place, not on the entries.
         let (sidebar, device_row) = match self.menu.as_ref().map(|menu| &menu.on) {
             Some(MenuOn::Sidebar {
@@ -1447,7 +1479,7 @@ impl Explorer {
                 }
             }
             MenuCommand::Mount | MenuCommand::Unmount | MenuCommand::Eject => {}
-            MenuCommand::Arrange(_) => {}
+            MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
             MenuCommand::SelectAll => self.select_all(cx),
             MenuCommand::InvertSelection => self.invert_selection(cx),
             MenuCommand::SelectMatching => self.select_matching(window, cx),

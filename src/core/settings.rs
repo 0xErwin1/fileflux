@@ -195,6 +195,9 @@ pub enum SortKeyPref {
     Size,
     Modified,
     Type,
+    Permissions,
+    Owner,
+    Group,
 }
 
 /// The sort direction.
@@ -239,6 +242,27 @@ pub enum SizePref {
     From1To100Mb,
     From100MbTo1Gb,
     Over1Gb,
+}
+
+/// An optional column of the list view; the Name column is always shown.
+/// The variants are in the order the columns are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnPref {
+    Size,
+    Modified,
+    Type,
+    Permissions,
+    Owner,
+    Group,
+}
+
+impl ColumnPref {
+    /// The columns of a file that never chose any: Name, Size, Modified.
+    #[must_use]
+    pub fn defaults() -> Vec<Self> {
+        vec![Self::Size, Self::Modified]
+    }
 }
 
 /// A sort and the filters: what the explorer calls an arrangement.
@@ -288,6 +312,10 @@ pub struct Preferences {
     /// The details panel's width; files written before it existed load the
     /// default.
     pub details_width: u32,
+    /// The optional columns of the list view, besides Name. A file written
+    /// before the key existed loads the default (Size and Modified), so no
+    /// settings migration is needed.
+    pub list_columns: Vec<ColumnPref>,
     pub sidebar_collapsed: bool,
     /// The details panel (Ctrl+I) is open.
     pub details_open: bool,
@@ -302,6 +330,7 @@ impl Default for Preferences {
             arrangement: ArrangementPrefs::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             details_width: DEFAULT_DETAILS_WIDTH,
+            list_columns: ColumnPref::defaults(),
             sidebar_collapsed: false,
             details_open: true,
             window_width: DEFAULT_WINDOW.0,
@@ -321,6 +350,8 @@ impl Preferences {
         self.details_width = self
             .details_width
             .clamp(DETAILS_WIDTH_RANGE.0, DETAILS_WIDTH_RANGE.1);
+        self.list_columns.sort_unstable();
+        self.list_columns.dedup();
         self.window_width = self
             .window_width
             .clamp(WINDOW_WIDTH_RANGE.0, WINDOW_WIDTH_RANGE.1);
@@ -1123,6 +1154,102 @@ pub fn launch_uses_session(cli_start: Option<&Path>) -> bool {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A fresh scratch directory under the system temp directory.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fileflux-columns-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("scratch directory is created");
+        dir
+    }
+
+    /// The list columns are a new key: a file from before it (version 1 or
+    /// 2) keeps today's three columns, Name, Size and Modified, with no
+    /// notice and no version bump (an older build still reads the file).
+    #[test]
+    fn files_without_list_columns_keep_the_three_columns_of_today() {
+        let today = vec![ColumnPref::Size, ColumnPref::Modified];
+        assert_eq!(Settings::default().preferences.list_columns, today);
+        let dir = scratch("old");
+        for (name, text) in [
+            (
+                "v1",
+                "version = 1\n[preferences]\ndefault_view = \"list\"\n",
+            ),
+            (
+                "v2",
+                "version = 2\n[preferences]\ndefault_view = \"list\"\nsidebar_width = 300\n",
+            ),
+            ("empty", ""),
+        ] {
+            let path = dir.join(format!("{name}.toml"));
+            std::fs::write(&path, text).expect("fixture writes");
+            let loaded = load_settings(&path, SystemTime::now());
+            assert_eq!(loaded.notice, None, "{name}");
+            assert_eq!(loaded.value.preferences.list_columns, today, "{name}");
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn list_columns_round_trip_as_snake_case_names_and_may_be_empty() {
+        let dir = scratch("roundtrip");
+        let path = dir.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.preferences.list_columns = vec![ColumnPref::Group, ColumnPref::Size];
+        save_settings(&path, &settings).expect("settings save");
+        let text = std::fs::read_to_string(&path).expect("file reads");
+        let (group, size) = (text.find("\"group\""), text.find("\"size\""));
+        assert!(group.is_some() && size.is_some() && group < size, "{text}");
+        assert_eq!(load_settings(&path, SystemTime::now()).value, settings);
+
+        settings.preferences.list_columns = Vec::new();
+        save_settings(&path, &settings).expect("settings save");
+        let loaded = load_settings(&path, SystemTime::now());
+        assert!(
+            loaded.value.preferences.list_columns.is_empty(),
+            "Name alone is a choice"
+        );
+        assert_eq!(loaded.value.version, SETTINGS_VERSION, "no version bump");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A hand-edited list is tidied: canonical order, no duplicates.
+    #[test]
+    fn sanitizing_orders_list_columns_and_drops_repeats() {
+        let preferences = Preferences {
+            list_columns: vec![
+                ColumnPref::Owner,
+                ColumnPref::Size,
+                ColumnPref::Owner,
+                ColumnPref::Type,
+            ],
+            ..Preferences::default()
+        };
+        assert_eq!(
+            preferences.sanitized().list_columns,
+            vec![ColumnPref::Size, ColumnPref::Type, ColumnPref::Owner]
+        );
+    }
+
+    #[test]
+    fn an_unknown_column_name_counts_as_corrupt() {
+        let dir = scratch("unknown");
+        let path = dir.join("settings.toml");
+        std::fs::write(
+            &path,
+            "version = 2\n[preferences]\nlist_columns = [\"color\"]\n",
+        )
+        .expect("fixture writes");
+        let loaded = load_settings(&path, SystemTime::now());
+        assert!(loaded.notice.is_some());
+        assert_eq!(loaded.value, Settings::default());
+        drop(std::fs::remove_dir_all(&dir));
+    }
 
     #[test]
     fn temporary_names_carry_the_pid_and_never_repeat() {

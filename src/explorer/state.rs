@@ -1401,6 +1401,7 @@ mod tests {
             size: Some(10),
             modified: None,
             origin: None,
+            unix: None,
         }
     }
 

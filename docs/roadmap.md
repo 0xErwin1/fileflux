@@ -23,7 +23,7 @@ Undo, the dual pane, type/date/size filters, live refresh of every tab, rubber-b
 
 | Item | What is missing | Today |
 |---|---|---|
-| Views | A compact view, an icon size control, and Type, Permissions and Owner columns | Grid and a list with Name, Size and Modified |
+| Views | A compact view and an icon size control | Grid and a list with Name, Size, Modified and optional Type, Permissions, Owner and Group columns |
 | Search | File content, regular expressions, case sensitivity | Case-insensitive name substring, capped at 10,000 matches |
 | Network | A "Connect to server" dialog; network bookmarks in the sidebar | Only mounts gvfs already made are browsed; `sftp://` and `smb://` bookmarks are hidden |
 | Encrypted drives | Unlock a LUKS container | Shown as Locked |

@@ -438,6 +438,7 @@ mod tests {
             size: None,
             modified: None,
             origin: None,
+            unix: None,
         };
         assert_eq!(format_entry_size(&entry, Some(12)), "12 items");
         assert_eq!(format_entry_size(&entry, Some(1)), "1 item");
@@ -592,6 +593,7 @@ mod tests {
             size: None,
             modified: None,
             origin: None,
+            unix: None,
         };
         let mixed: Vec<Entry> = [EntryKind::Directory, EntryKind::Directory, EntryKind::File]
             .into_iter()
@@ -631,6 +633,7 @@ mod tests {
             size: Some(2_900_000),
             modified: None,
             origin: None,
+            unix: None,
         };
         assert_eq!(format_entry_size(&file, None), "2.9 MB");
         file.size = Some(999);
@@ -657,6 +660,7 @@ mod tests {
             size: None,
             modified: None,
             origin: None,
+            unix: None,
         };
         assert_eq!(format_entry_size(&folder, Some(1)), "1 item");
         assert_eq!(format_entry_size(&folder, Some(0)), "0 items");

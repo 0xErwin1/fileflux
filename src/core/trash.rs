@@ -188,6 +188,7 @@ pub fn read_trash(root: &Path) -> io::Result<Listing> {
                 size,
                 modified,
                 origin,
+                unix: None,
             },
         ));
     }

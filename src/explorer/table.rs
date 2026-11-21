@@ -34,6 +34,7 @@ use bolt::fonts;
 use bolt::primitives::Icon;
 use bolt::tokens::ChromeColors;
 use fileflux::core::Entry;
+use fileflux::core::settings::ColumnPref;
 use gpui::{
     App, ClickEvent, Context, InteractiveElement as _, IntoElement, Modifiers, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div,
@@ -53,23 +54,119 @@ use super::state::SortSpec;
 use super::util;
 use super::view::Explorer;
 
-/// The details list's columns, in order. No ordinal column: the table has
-/// exactly these three, nothing numbering the rows.
-pub(crate) const COLUMN_COUNT: usize = 3;
-/// The columns' designed widths, from the reference design (a flexible Name
-/// then Size and Modified).
-pub(crate) const LIST_DEFAULT_WIDTHS: [f32; COLUMN_COUNT] = [220.0, 110.0, 170.0];
-/// Each column's explicit minimum: below their sum the table overflows
-/// sideways instead of squeezing a column unreadable.
-pub(crate) const LIST_MIN_WIDTHS: [f32; COLUMN_COUNT] = [180.0, 80.0, 140.0];
-/// The Name column's explicit minimum width.
-pub(crate) const LIST_NAME_MIN_WIDTH: f32 = LIST_MIN_WIDTHS[0];
+/// One column of the details list. Name is always the first; the others
+/// are the user's choice (see [`columns_for`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub(crate) enum ListColumn {
+    Name,
+    Size,
+    Modified,
+    Type,
+    Permissions,
+    Owner,
+    Group,
+}
+
+impl ListColumn {
+    /// The column an optional-column preference stands for.
+    pub(crate) fn from_pref(pref: ColumnPref) -> Self {
+        match pref {
+            ColumnPref::Size => Self::Size,
+            ColumnPref::Modified => Self::Modified,
+            ColumnPref::Type => Self::Type,
+            ColumnPref::Permissions => Self::Permissions,
+            ColumnPref::Owner => Self::Owner,
+            ColumnPref::Group => Self::Group,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Size => "Size",
+            Self::Modified => "Modified",
+            Self::Type => "Type",
+            Self::Permissions => "Permissions",
+            Self::Owner => "Owner",
+            Self::Group => "Group",
+        }
+    }
+
+    /// The table's stable id of the column.
+    fn table_id(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Modified => "modified",
+            Self::Type => "type",
+            Self::Permissions => "permissions",
+            Self::Owner => "owner",
+            Self::Group => "group",
+        }
+    }
+
+    /// The designed width, from the reference design for the first three
+    /// (a flexible Name then Size and Modified).
+    pub(crate) fn default_width(self) -> f32 {
+        match self {
+            Self::Name => 220.0,
+            Self::Size | Self::Owner | Self::Group | Self::Permissions => 110.0,
+            Self::Modified => 170.0,
+            Self::Type => 150.0,
+        }
+    }
+
+    /// The explicit minimum: below the sum of these the table overflows
+    /// sideways instead of squeezing a column unreadable.
+    pub(crate) fn min_width(self) -> f32 {
+        match self {
+            Self::Name => 180.0,
+            Self::Size | Self::Owner | Self::Group => 80.0,
+            Self::Modified => 140.0,
+            Self::Type => 110.0,
+            Self::Permissions => 90.0,
+        }
+    }
+
+    /// What a header click on the column sorts by.
+    pub(crate) fn sorts_by(self) -> SortKey {
+        match self {
+            Self::Name => SortKey::Name,
+            Self::Size => SortKey::Size,
+            Self::Modified => SortKey::Modified,
+            Self::Type => SortKey::Type,
+            Self::Permissions => SortKey::Permissions,
+            Self::Owner => SortKey::Owner,
+            Self::Group => SortKey::Group,
+        }
+    }
+
+    /// Sizes right-align, everything else reads from the left.
+    pub(crate) fn align(self) -> CellAlign {
+        if self == Self::Size {
+            CellAlign::Right
+        } else {
+            CellAlign::Left
+        }
+    }
+}
+
+/// The columns the table is given for the saved optional `prefs`: Name, then
+/// each chosen column once, in the canonical order whatever the order of the
+/// setting. The default setting yields Name, Size, Modified.
+pub(crate) fn columns_for(prefs: &[ColumnPref]) -> Vec<ListColumn> {
+    let mut chosen: Vec<ColumnPref> = prefs.to_vec();
+    chosen.sort_unstable();
+    chosen.dedup();
+    std::iter::once(ListColumn::Name)
+        .chain(chosen.into_iter().map(ListColumn::from_pref))
+        .collect()
+}
+
 /// How far a recorded drag width may drift from the delegate's applied
 /// widths before it counts as a deliberate user change.
 pub(crate) const DRAG_EPSILON: f32 = 0.5;
 
-const COLUMN_NAMES: [&str; COLUMN_COUNT] = ["Name", "Size", "Modified"];
-const SIZE_COLUMN: usize = 1;
 /// Size of a list row's leading glyph.
 const LIST_ROW_GLYPH: f32 = 14.0;
 
@@ -115,49 +212,21 @@ pub(crate) fn entry_glyph(entry: &Entry) -> Glyph {
     }
 }
 
-/// The alignment of one column: sizes right-align, everything else reads
-/// from the left.
-pub(crate) fn column_align(column: usize) -> CellAlign {
-    if column == SIZE_COLUMN {
-        CellAlign::Right
-    } else {
-        CellAlign::Left
-    }
-}
-
 /// One column's [`Column`] definition: its width, its explicit minimum, no
 /// reordering and no column-selection semantics — the drag-to-resize
 /// handles stay.
-pub(crate) fn column_definition(column: usize, widths: &[f32; COLUMN_COUNT]) -> Column {
-    let width = widths
-        .get(column)
-        .copied()
-        .unwrap_or(LIST_DEFAULT_WIDTHS[0]);
-    let min = LIST_MIN_WIDTHS
-        .get(column)
-        .copied()
-        .unwrap_or(LIST_NAME_MIN_WIDTH);
-    let name = COLUMN_NAMES
-        .get(column)
-        .copied()
-        .unwrap_or(COLUMN_NAMES[0])
-        .to_owned();
-    Column::new(
-        COLUMN_KEYS.get(column).copied().unwrap_or(COLUMN_KEYS[0]),
-        name,
-    )
-    .width(px(width))
-    .min_width(px(min))
-    .movable(false)
-    .selectable(false)
-    .when(column == SIZE_COLUMN, |col| col.text_right())
+pub(crate) fn column_definition(column: ListColumn, width: f32) -> Column {
+    Column::new(column.table_id(), column.label().to_owned())
+        .width(px(width))
+        .min_width(px(column.min_width()))
+        .movable(false)
+        .selectable(false)
+        .when(column == ListColumn::Size, |col| col.text_right())
 }
 
-const COLUMN_KEYS: [&str; COLUMN_COUNT] = ["name", "size", "modified"];
-
-/// The widths the table draws at, given the entries area's measured width
-/// (when the first frame has not measured yet, `None`) and the widths the
-/// user dragged.
+/// The widths the table draws `columns` at (Name first), given the entries
+/// area's measured width (when the first frame has not measured yet,
+/// `None`) and the widths the user dragged.
 ///
 /// The metadata columns keep their designed widths — spaced across the
 /// pane, not crammed left — and the Name column absorbs the whole surplus,
@@ -168,20 +237,24 @@ const COLUMN_KEYS: [&str; COLUMN_COUNT] = ["name", "size", "modified"];
 /// is the user's choice: it is floored at its minimum and never recomputed,
 /// even when that leaves a gap or overflows.
 pub(crate) fn distribute_widths(
+    columns: &[ListColumn],
     available: Option<f32>,
-    dragged: &HashMap<usize, f32>,
-) -> [f32; COLUMN_COUNT] {
-    let mut widths = LIST_DEFAULT_WIDTHS;
-    for (column, width) in widths.iter_mut().enumerate() {
-        if let Some(dragged) = dragged.get(&column) {
-            let min = LIST_MIN_WIDTHS
+    dragged: &HashMap<ListColumn, f32>,
+) -> Vec<f32> {
+    let mut widths: Vec<f32> = columns
+        .iter()
+        .map(|column| {
+            dragged
                 .get(column)
-                .copied()
-                .unwrap_or(LIST_NAME_MIN_WIDTH);
-            *width = (*dragged).max(min);
-        }
-    }
+                .map_or(column.default_width(), |dragged| {
+                    (*dragged).max(column.min_width())
+                })
+        })
+        .collect();
     let Some(available) = available else {
+        return widths;
+    };
+    let Some((name, metadata)) = columns.split_first() else {
         return widths;
     };
 
@@ -189,53 +262,58 @@ pub(crate) fn distribute_widths(
     // their minima (nothing left) up to their designed widths (room to
     // spare), so they stay spaced instead of crammed left. A dragged width
     // holds its ground; the undragged ones share the remaining room.
-    let metadata_min: f32 = LIST_MIN_WIDTHS[1..].iter().sum();
-    let metadata_span: f32 = LIST_DEFAULT_WIDTHS[1..].iter().sum::<f32>() - metadata_min;
-    let name_floor = dragged.get(&0).map_or(LIST_NAME_MIN_WIDTH, |_| {
+    let metadata_min: f32 = metadata.iter().map(|column| column.min_width()).sum();
+    let metadata_span: f32 = metadata
+        .iter()
+        .map(|column| column.default_width())
+        .sum::<f32>()
+        - metadata_min;
+    let name_floor = if dragged.contains_key(name) {
         widths.first().copied().unwrap_or_default()
-    });
+    } else {
+        name.min_width()
+    };
     let room = (available - name_floor - metadata_min).clamp(0.0, metadata_span);
     let share = if metadata_span > 0.0 {
         room / metadata_span
     } else {
         0.0
     };
-    for ((designed, min), (column, width)) in LIST_DEFAULT_WIDTHS
-        .iter()
-        .zip(LIST_MIN_WIDTHS.iter())
-        .skip(1)
-        .zip(widths.iter_mut().enumerate().skip(1))
-    {
-        if dragged.get(&column).is_none() {
-            *width = min + (designed - min) * share;
+    for (column, width) in metadata.iter().zip(widths.iter_mut().skip(1)) {
+        if !dragged.contains_key(column) {
+            let min = column.min_width();
+            *width = min + (column.default_width() - min) * share;
         }
     }
 
     // The Name column absorbs whatever is still left, so the table reaches
     // both edges; below the minima sum it holds its floor and the table
     // overflows sideways instead.
-    if dragged.get(&0).is_none() {
-        let metadata_total: f32 = widths[1..].iter().sum();
-        widths[0] = (available - metadata_total).max(LIST_NAME_MIN_WIDTH);
+    if !dragged.contains_key(name) {
+        let metadata_total: f32 = widths.iter().skip(1).sum();
+        if let Some(first) = widths.first_mut() {
+            *first = (available - metadata_total).max(name.min_width());
+        }
     }
     widths
 }
 
-/// The session widths the user dragged, owned by the [`Explorer`] (not a
-/// global), so two windows never share column widths.
+/// The session widths the user dragged, by column, owned by the
+/// [`Explorer`] (not a global), so two windows never share column widths.
+/// Keyed by column, not position: hiding another column keeps the width.
 #[derive(Default)]
 pub(crate) struct ListWidths {
-    widths: HashMap<usize, f32>,
+    widths: HashMap<ListColumn, f32>,
 }
 
 impl ListWidths {
     /// Records one deliberately dragged width.
-    pub(crate) fn record(&mut self, column: usize, width: f32) {
+    pub(crate) fn record(&mut self, column: ListColumn, width: f32) {
         self.widths.insert(column, width);
     }
 
     /// The dragged widths, read by [`distribute_widths`].
-    pub(crate) fn dragged(&self) -> &HashMap<usize, f32> {
+    pub(crate) fn dragged(&self) -> &HashMap<ListColumn, f32> {
         &self.widths
     }
 }
@@ -258,7 +336,8 @@ pub(crate) struct EntryTableDelegate {
     cut: Arc<BTreeSet<PathBuf>>,
     /// Folder item counts, counted off the UI thread after the scan.
     child_counts: Arc<HashMap<PathBuf, Option<usize>>>,
-    widths: [f32; COLUMN_COUNT],
+    columns: Vec<ListColumn>,
+    widths: Vec<f32>,
     /// The inline rename editor, drawn in the name cell of its row.
     renaming: Option<RenameView>,
     /// The visible selection a row drag carries; `None` in the Trash view.
@@ -284,7 +363,8 @@ impl EntryTableDelegate {
             selected: Arc::new(BTreeSet::new()),
             cut: Arc::new(BTreeSet::new()),
             child_counts: Arc::new(HashMap::new()),
-            widths: LIST_DEFAULT_WIDTHS,
+            columns: columns_for(&ColumnPref::defaults()),
+            widths: distribute_widths(&columns_for(&ColumnPref::defaults()), None, &HashMap::new()),
             renaming: None,
             dragged: None,
             outlined: false,
@@ -365,13 +445,26 @@ impl EntryTableDelegate {
 
     /// Applies recomputed column widths (the caller then calls
     /// [`TableState::refresh`] so the table re-reads them).
-    pub(crate) fn set_widths(&mut self, widths: [f32; COLUMN_COUNT]) {
+    pub(crate) fn set_widths(&mut self, widths: Vec<f32>) {
         self.widths = widths;
     }
 
     /// The widths currently applied to the table.
-    pub(crate) fn widths(&self) -> &[f32; COLUMN_COUNT] {
+    pub(crate) fn widths(&self) -> &[f32] {
         &self.widths
+    }
+
+    /// Points the table at the columns to draw (Name first); `true` when
+    /// they changed. The caller then sets the widths of the new columns.
+    pub(crate) fn set_columns(&mut self, columns: Vec<ListColumn>) -> bool {
+        let changed = self.columns != columns;
+        self.columns = columns;
+        changed
+    }
+
+    /// The columns the table draws, Name first.
+    pub(crate) fn columns(&self) -> &[ListColumn] {
+        &self.columns
     }
 
     /// The entry at visible row `row`, or `None` past the count.
@@ -391,29 +484,41 @@ impl EntryTableDelegate {
     /// counts. Pure, so the mapping tests read exactly what the cells draw.
     pub(crate) fn cell(&self, row: usize, column: usize) -> Option<CellSpec> {
         let entry = self.entry_at(row)?;
-        let spec = match column {
-            0 => CellSpec {
+        let column = *self.columns.get(column)?;
+        let metadata = |text: String| CellSpec {
+            text,
+            muted: true,
+            align: column.align(),
+        };
+        // Owner and group come from the scan; an entry without them is honest.
+        let unix = |read: fn(&fileflux::core::UnixInfo) -> String| {
+            entry
+                .unix
+                .as_ref()
+                .map_or_else(|| "\u{2014}".to_owned(), read)
+        };
+        Some(match column {
+            ListColumn::Name => CellSpec {
                 text: entry.display_name().into_owned(),
                 muted: false,
                 align: CellAlign::Left,
             },
-            SIZE_COLUMN => CellSpec {
-                // Folder counts arrive from a background pass after the scan.
-                text: util::format_entry_size(
-                    entry,
-                    self.child_counts.get(&entry.path).copied().flatten(),
-                ),
-                muted: true,
-                align: CellAlign::Right,
-            },
-            2 => CellSpec {
-                text: util::format_modified(entry.modified, &chrono::Local::now()),
-                muted: true,
-                align: CellAlign::Left,
-            },
-            _ => return None,
-        };
-        Some(spec)
+            // Folder counts arrive from a background pass after the scan.
+            ListColumn::Size => metadata(util::format_entry_size(
+                entry,
+                self.child_counts.get(&entry.path).copied().flatten(),
+            )),
+            ListColumn::Modified => {
+                metadata(util::format_modified(entry.modified, &chrono::Local::now()))
+            }
+            // The same label the details panel's subtitle shows.
+            ListColumn::Type => metadata(super::inspector::kind_label(entry)),
+            ListColumn::Permissions => {
+                metadata(unix(|info| super::inspector::permission_string(info.mode)))
+            }
+            ListColumn::Owner => metadata(unix(|info| info.owner.to_string())),
+            ListColumn::Group => metadata(unix(|info| info.group.to_string())),
+        })
     }
 
     /// Test-only views of the counts the trait methods answer.
@@ -424,7 +529,7 @@ impl EntryTableDelegate {
 
     #[cfg(test)]
     fn columns_count_for_tests(&self) -> usize {
-        COLUMN_COUNT
+        self.columns.len()
     }
 }
 
@@ -437,7 +542,7 @@ impl Glyph {
 
 impl TableDelegate for EntryTableDelegate {
     fn columns_count(&self, _cx: &App) -> usize {
-        COLUMN_COUNT
+        self.columns.len()
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
@@ -445,7 +550,17 @@ impl TableDelegate for EntryTableDelegate {
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        column_definition(col_ix, &self.widths)
+        let column = self
+            .columns
+            .get(col_ix)
+            .copied()
+            .unwrap_or(ListColumn::Name);
+        let width = self
+            .widths
+            .get(col_ix)
+            .copied()
+            .unwrap_or_else(|| column.default_width());
+        column_definition(column, width)
     }
 
     /// The header: the column name, strong with a ↑/↓ arrow when it is the
@@ -460,7 +575,12 @@ impl TableDelegate for EntryTableDelegate {
         let colors = bolt::colors(cx);
         let tint = ChromeColors::tint(cx.theme());
         let weak = self.weak.clone();
-        let sorted = SortKey::of_column(col_ix).filter(|key| *key == self.sort.key);
+        let column = self
+            .columns
+            .get(col_ix)
+            .copied()
+            .unwrap_or(ListColumn::Name);
+        let sorted = Some(column.sorts_by()).filter(|key| *key == self.sort.key);
         let mut head = h_flex()
             .id(("sort-header", col_ix))
             .size_full()
@@ -474,9 +594,7 @@ impl TableDelegate for EntryTableDelegate {
             })
             .hover(|this| this.text_color(colors.foreground))
             .on_click(move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                let Some(key) = SortKey::of_column(col_ix) else {
-                    return;
-                };
+                let key = column.sorts_by();
                 if let Err(error) = weak.update(cx, |explorer, cx| {
                     explorer.tab_mut().state.click_sort(key);
                     let id = explorer.active_id();
@@ -485,13 +603,28 @@ impl TableDelegate for EntryTableDelegate {
                 }) {
                     log::debug!("the list header outlived its explorer: {error}");
                 }
+            })
+            // The header's own menu: which columns the list shows.
+            .on_mouse_down(gpui::MouseButton::Right, {
+                let weak = self.weak.clone();
+                move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                    if let Err(error) = weak.update(cx, |explorer, cx| {
+                        explorer.open_arrange_menu(
+                            super::ops::ArrangeMenu::Columns,
+                            event.position,
+                            window,
+                            cx,
+                        );
+                    }) {
+                        log::debug!("the list header outlived its explorer: {error}");
+                    }
+                }
             });
-        if column_align(col_ix) == CellAlign::Right {
+        if column.align() == CellAlign::Right {
             head = head.justify_end();
         }
-        if let Some(name) = COLUMN_NAMES.get(col_ix) {
-            head = head.child(*name);
-        }
+        head = head.child(column.label());
         if sorted.is_some() {
             head = head.child(div().text_color(tint).child(self.sort.dir.arrow()));
         }
@@ -707,7 +840,12 @@ pub(crate) fn render_list(
     _weak: &WeakEntity<Explorer>,
     cx: &mut Context<Explorer>,
 ) -> impl IntoElement {
-    let desired = distribute_widths(explorer.entries_width(), explorer.list_widths.dragged());
+    let columns = columns_for(&explorer.list_columns);
+    let desired = distribute_widths(
+        &columns,
+        explorer.entries_width(),
+        explorer.list_widths.dragged(),
+    );
     explorer.tab().table.update(cx, |table, cx| {
         let delegate = table.delegate_mut();
         let data_changed =
@@ -729,7 +867,8 @@ pub(crate) fn render_list(
                 .as_ref()
                 .map(super::actions::Renaming::view),
         );
-        let widths_changed = delegate.widths() != &desired;
+        let columns_changed = delegate.set_columns(columns);
+        let widths_changed = delegate.widths() != desired.as_slice();
         if widths_changed {
             delegate.set_widths(desired);
         }
@@ -737,6 +876,7 @@ pub(crate) fn render_list(
             || sort_changed
             || counts_changed
             || widths_changed
+            || columns_changed
             || renaming_changed
             || cut_changed
             || folder_changed
@@ -761,6 +901,7 @@ pub(crate) fn render_list(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::explorer::arrange::{FolderCounts, SortDir, compare_entries};
@@ -769,6 +910,13 @@ mod tests {
     use std::ffi::OsString;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The three columns of before the optional ones, and their widths as
+    /// they were designed: nothing chosen must draw exactly this.
+    const THREE: [ListColumn; 3] = [ListColumn::Name, ListColumn::Size, ListColumn::Modified];
+    const LIST_DEFAULT_WIDTHS: [f32; 3] = [220.0, 110.0, 170.0];
+    const LIST_MIN_WIDTHS: [f32; 3] = [180.0, 80.0, 140.0];
+    const LIST_NAME_MIN_WIDTH: f32 = 180.0;
 
     fn entry(name: &str, kind: EntryKind) -> Entry {
         Entry {
@@ -779,6 +927,7 @@ mod tests {
             size: Some(10),
             modified: None,
             origin: None,
+            unix: None,
         }
     }
 
@@ -805,7 +954,7 @@ mod tests {
         assert_eq!(source.rows_count_for_tests(), 1);
         assert_eq!(
             source.columns_count_for_tests(),
-            COLUMN_COUNT,
+            THREE.len(),
             "Name, Size, Modified — no ordinal column"
         );
 
@@ -823,7 +972,7 @@ mod tests {
 
         assert_eq!(source.cell(1, 0), None, "no row past the count");
         assert_eq!(
-            source.cell(0, COLUMN_COUNT),
+            source.cell(0, THREE.len()),
             None,
             "no column past the count"
         );
@@ -885,17 +1034,12 @@ mod tests {
     /// right alignment.
     #[test]
     fn column_definitions_carry_names_minima_and_no_ordinal() {
-        for (column, name) in ["Name", "Size", "Modified"].iter().enumerate() {
-            let col = column_definition(column, &LIST_DEFAULT_WIDTHS);
+        for (position, name) in ["Name", "Size", "Modified"].iter().enumerate() {
+            let column = THREE[position];
+            let col = column_definition(column, LIST_DEFAULT_WIDTHS[position]);
             assert_eq!(col.name.as_ref(), *name);
-            assert_eq!(
-                f32::from(col.width),
-                LIST_DEFAULT_WIDTHS.get(column).copied().unwrap_or_default()
-            );
-            assert_eq!(
-                f32::from(col.min_width),
-                LIST_MIN_WIDTHS.get(column).copied().unwrap_or_default()
-            );
+            assert_eq!(f32::from(col.width), LIST_DEFAULT_WIDTHS[position]);
+            assert_eq!(f32::from(col.min_width), LIST_MIN_WIDTHS[position]);
             assert!(!col.movable, "columns never reorder");
             assert!(!col.selectable, "columns never join a selection");
             assert!(col.resizable, "columns stay user-resizable");
@@ -905,7 +1049,12 @@ mod tests {
                 "only Size right-aligns"
             );
         }
-        assert_eq!(COLUMN_COUNT, 3);
+        assert_eq!(
+            THREE.map(ListColumn::default_width),
+            LIST_DEFAULT_WIDTHS,
+            "the designed widths did not move"
+        );
+        assert_eq!(THREE.map(ListColumn::min_width), LIST_MIN_WIDTHS);
     }
 
     /// One width source for the whole contract: the columns spread over the
@@ -915,7 +1064,7 @@ mod tests {
     #[test]
     fn widths_fill_the_pane_with_the_name_taking_the_surplus() {
         let no_drags = HashMap::new();
-        let wide = distribute_widths(Some(1_200.0), &no_drags);
+        let wide = distribute_widths(&THREE, Some(1_200.0), &no_drags);
         let total: f32 = wide.iter().sum();
         assert_eq!(total, 1_200.0, "the columns fill the pane exactly");
         assert!(wide[0] > wide[1] + wide[2], "Name holds the largest share");
@@ -930,9 +1079,9 @@ mod tests {
 
         // The boundary: exactly the minima sum fits; one pixel less overflows.
         let minima_total: f32 = LIST_MIN_WIDTHS.iter().sum();
-        let boundary = distribute_widths(Some(minima_total), &no_drags);
+        let boundary = distribute_widths(&THREE, Some(minima_total), &no_drags);
         assert_eq!(boundary.iter().sum::<f32>(), minima_total);
-        let narrow = distribute_widths(Some(minima_total - 1.0), &no_drags);
+        let narrow = distribute_widths(&THREE, Some(minima_total - 1.0), &no_drags);
         assert_eq!(narrow[0], LIST_NAME_MIN_WIDTH, "Name never collapses");
         assert!(
             narrow.iter().sum::<f32>() > minima_total - 1.0,
@@ -940,7 +1089,7 @@ mod tests {
         );
 
         // Before the first measurement, the designed widths apply.
-        let first_frame = distribute_widths(None, &no_drags);
+        let first_frame = distribute_widths(&THREE, None, &no_drags);
         assert_eq!(first_frame, LIST_DEFAULT_WIDTHS);
     }
 
@@ -949,8 +1098,8 @@ mod tests {
     #[test]
     fn dragged_widths_are_respected_and_undragged_still_fill() {
         let mut drags = HashMap::new();
-        drags.insert(1, 300.0);
-        let wide = distribute_widths(Some(1_200.0), &drags);
+        drags.insert(ListColumn::Size, 300.0);
+        let wide = distribute_widths(&THREE, Some(1_200.0), &drags);
         assert_eq!(wide[1], 300.0, "a dragged width wins");
         let metadata: f32 = wide[1..].iter().sum();
         assert_eq!(
@@ -960,14 +1109,14 @@ mod tests {
         );
 
         let mut name_drag = HashMap::new();
-        name_drag.insert(0, 260.0);
-        let named = distribute_widths(Some(1_200.0), &name_drag);
+        name_drag.insert(ListColumn::Name, 260.0);
+        let named = distribute_widths(&THREE, Some(1_200.0), &name_drag);
         assert_eq!(named[0], 260.0, "a dragged Name width is respected");
         assert_eq!(named[1..].iter().sum::<f32>(), 280.0, "metadata stay put");
 
         let mut squeezed = HashMap::new();
-        squeezed.insert(0, 10.0);
-        let floored = distribute_widths(Some(1_200.0), &squeezed);
+        squeezed.insert(ListColumn::Name, 10.0);
+        let floored = distribute_widths(&THREE, Some(1_200.0), &squeezed);
         assert_eq!(floored[0], LIST_NAME_MIN_WIDTH, "Name keeps its minimum");
     }
 
@@ -1089,10 +1238,10 @@ mod tests {
         );
         assert_eq!(SortDir::Ascending.arrow(), "\u{2191}");
         assert_eq!(SortDir::Descending.arrow(), "\u{2193}");
-        assert_eq!(SortKey::of_column(0), Some(SortKey::Name));
-        assert_eq!(SortKey::of_column(1), Some(SortKey::Size));
-        assert_eq!(SortKey::of_column(2), Some(SortKey::Modified));
-        assert_eq!(SortKey::of_column(COLUMN_COUNT), None);
+        assert_eq!(
+            THREE.map(ListColumn::sorts_by),
+            [SortKey::Name, SortKey::Size, SortKey::Modified]
+        );
     }
 
     /// Recorded drag widths stay per-window session state.
@@ -1100,18 +1249,171 @@ mod tests {
     fn list_widths_record_drags_as_session_state() {
         let mut widths = ListWidths::default();
         assert!(widths.dragged().is_empty(), "no drags before any drag");
-        widths.record(1, 260.0);
-        assert_eq!(widths.dragged().get(&1), Some(&260.0));
-        widths.record(1, 240.0);
+        widths.record(ListColumn::Size, 260.0);
+        assert_eq!(widths.dragged().get(&ListColumn::Size), Some(&260.0));
+        widths.record(ListColumn::Size, 240.0);
         assert_eq!(
-            widths.dragged().get(&1),
+            widths.dragged().get(&ListColumn::Size),
             Some(&240.0),
             "the newest drag wins"
         );
         assert_eq!(
-            widths.dragged().get(&0),
+            widths.dragged().get(&ListColumn::Name),
             None,
             "undragged columns stay unrecorded"
+        );
+    }
+
+    use fileflux::core::UnixInfo;
+
+    fn owned(name: &str, mode: u32, owner: &str, group: &str) -> Entry {
+        let mut e = entry(name, EntryKind::File);
+        e.unix = Some(UnixInfo {
+            mode,
+            uid: 1000,
+            gid: 100,
+            owner: owner.into(),
+            group: group.into(),
+        });
+        e
+    }
+
+    /// The setting becomes the table's columns: Name first, each chosen
+    /// column once, in the canonical order; the default setting is today's
+    /// three columns.
+    #[test]
+    fn the_columns_given_to_the_table_follow_the_setting() {
+        use ColumnPref::{Group, Modified, Owner, Permissions, Size, Type};
+        assert_eq!(columns_for(&ColumnPref::defaults()), THREE.to_vec());
+        assert_eq!(columns_for(&[]), vec![ListColumn::Name], "Name alone");
+        assert_eq!(
+            columns_for(&[Group, Type, Owner, Permissions, Modified, Size, Type]),
+            vec![
+                ListColumn::Name,
+                ListColumn::Size,
+                ListColumn::Modified,
+                ListColumn::Type,
+                ListColumn::Permissions,
+                ListColumn::Owner,
+                ListColumn::Group,
+            ],
+            "canonical order, no repeats"
+        );
+    }
+
+    /// The optional columns read what the other views already show: the
+    /// details panel's kind label and permission string, and the owner and
+    /// group the scan resolved ("—" for an entry without them).
+    #[test]
+    fn type_permissions_owner_and_group_cells_read_the_entry() -> TestResult {
+        let entries = vec![
+            owned("photo.jpg", 0o640, "ana", "users"),
+            entry("trash.txt", EntryKind::File),
+        ];
+        let mut source = EntryTableDelegate::new(
+            WeakEntity::<Explorer>::new_invalid(),
+            Arc::new(entries),
+            Arc::new(vec![0, 1]),
+        );
+        source.set_columns(columns_for(&[
+            ColumnPref::Type,
+            ColumnPref::Permissions,
+            ColumnPref::Owner,
+            ColumnPref::Group,
+        ]));
+        assert_eq!(source.columns_count_for_tests(), 5);
+        let text = |row, column| source.cell(row, column).map(|cell| cell.text);
+        assert_eq!(text(0, 1).as_deref(), Some("Image \u{b7} JPG"));
+        assert_eq!(text(0, 2).as_deref(), Some("rw-r-----"));
+        assert_eq!(text(0, 3).as_deref(), Some("ana"));
+        assert_eq!(text(0, 4).as_deref(), Some("users"));
+        for column in 2..5 {
+            assert_eq!(text(1, column).as_deref(), Some("\u{2014}"), "{column}");
+        }
+        assert_eq!(text(1, 1).as_deref(), Some("Document \u{b7} TXT"));
+        let permissions = source.cell(0, 2).ok_or("exists")?;
+        assert!(permissions.muted);
+        assert_eq!(permissions.align, CellAlign::Left);
+        assert_eq!(source.cell(0, 5), None, "no column past the count");
+        Ok(())
+    }
+
+    /// Each header sorts by its own key, and the widths of the extra columns
+    /// join the layout: Name still takes the surplus and the table still
+    /// fills the pane.
+    #[test]
+    fn new_columns_sort_by_their_key_and_share_the_pane() {
+        assert_eq!(ListColumn::Type.sorts_by(), SortKey::Type);
+        assert_eq!(ListColumn::Permissions.sorts_by(), SortKey::Permissions);
+        assert_eq!(ListColumn::Owner.sorts_by(), SortKey::Owner);
+        assert_eq!(ListColumn::Group.sorts_by(), SortKey::Group);
+        let all = columns_for(&[
+            ColumnPref::Size,
+            ColumnPref::Modified,
+            ColumnPref::Type,
+            ColumnPref::Permissions,
+            ColumnPref::Owner,
+            ColumnPref::Group,
+        ]);
+        let wide = distribute_widths(&all, Some(1_600.0), &HashMap::new());
+        assert_eq!(wide.len(), 7);
+        assert_eq!(wide.iter().sum::<f32>(), 1_600.0);
+        let minima: f32 = all.iter().map(|column| column.min_width()).sum();
+        let narrow = distribute_widths(&all, Some(minima - 1.0), &HashMap::new());
+        assert_eq!(narrow[0], ListColumn::Name.min_width());
+        assert!(
+            narrow.iter().sum::<f32>() > minima - 1.0,
+            "overflows sideways"
+        );
+        // A drag is remembered by column, wherever the column sits.
+        let mut drags = HashMap::new();
+        drags.insert(ListColumn::Owner, 200.0);
+        assert_eq!(distribute_widths(&all, Some(1_600.0), &drags)[5], 200.0);
+        let without_type = columns_for(&[ColumnPref::Owner]);
+        assert_eq!(
+            distribute_widths(&without_type, Some(900.0), &drags)[1],
+            200.0
+        );
+    }
+
+    /// The comparators for the new keys, through the reference order the
+    /// index is proven equal to: permissions by number, owner and group by
+    /// name without case, no data lowest, folders first, name as tiebreak.
+    #[test]
+    fn sorting_by_permissions_owner_and_group_is_stable_with_name_tiebreak() {
+        let mut dir = owned("Zdir", 0o700, "zed", "wheel");
+        dir.kind = EntryKind::Directory;
+        let entries = vec![
+            owned("b.txt", 0o644, "Ana", "users"),
+            owned("a.txt", 0o644, "bob", "Users"),
+            owned("c.txt", 0o600, "ana", "adm"),
+            entry("none.txt", EntryKind::File),
+            dir,
+        ];
+        let all: Vec<usize> = (0..entries.len()).collect();
+        let order = |key, dir| names(&entries, &sorted_indices(&entries, &all, spec(key, dir)));
+        assert_eq!(
+            order(SortKey::Permissions, SortDir::Ascending),
+            ["Zdir", "none.txt", "c.txt", "a.txt", "b.txt"],
+            "folder first; no mode lowest; 600 < 644; equal modes by name"
+        );
+        assert_eq!(
+            order(SortKey::Permissions, SortDir::Descending),
+            ["Zdir", "a.txt", "b.txt", "c.txt", "none.txt"]
+        );
+        assert_eq!(
+            order(SortKey::Owner, SortDir::Ascending),
+            ["Zdir", "none.txt", "b.txt", "c.txt", "a.txt"],
+            "ana (any case) before bob; the tie by name"
+        );
+        assert_eq!(
+            order(SortKey::Group, SortDir::Ascending),
+            ["Zdir", "none.txt", "c.txt", "a.txt", "b.txt"],
+            "adm, then users/Users together (tie by name)"
+        );
+        assert_eq!(
+            order(SortKey::Group, SortDir::Descending),
+            ["Zdir", "a.txt", "b.txt", "c.txt", "none.txt"]
         );
     }
 }

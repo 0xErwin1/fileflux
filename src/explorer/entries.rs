@@ -1207,6 +1207,7 @@ mod tests {
             size: Some(1),
             modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
             origin: None,
+            unix: None,
         }
     }
 

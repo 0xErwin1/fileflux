@@ -14,6 +14,7 @@ pub mod du;
 pub mod fs;
 pub mod glob;
 pub mod icons;
+pub mod idnames;
 pub mod images;
 pub mod kinds;
 pub mod links;
@@ -78,6 +79,23 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     /// Original location from home Trash metadata; display-only, never opened.
     pub origin: Option<PathBuf>,
+    /// Mode, owner and group, read by the scan with the rest of the
+    /// metadata; `None` for entries that did not come from a scan with it
+    /// (Trash, Recent, search results) or whose metadata is out of reach.
+    pub unix: Option<UnixInfo>,
+}
+
+/// The unix facts of one entry, resolved once by the scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixInfo {
+    /// The permission bits (`st_mode & 0o7777`).
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// The user name, or the number when the uid has no name.
+    pub owner: std::sync::Arc<str>,
+    /// The group name, or the number when the gid has no name.
+    pub group: std::sync::Arc<str>,
 }
 
 impl Entry {

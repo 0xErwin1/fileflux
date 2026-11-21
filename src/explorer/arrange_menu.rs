@@ -5,6 +5,7 @@
 //! header can never disagree.
 
 use fileflux::core::kinds::FileCategory;
+use fileflux::core::settings::ColumnPref;
 
 use super::arrange::{ArrangeCommand, Arrangement, DateRange, SizeRange, SortDir, SortKey};
 use super::ops::{ArrangeMenu, MenuCommand, MenuItemSpec, MenuRow, SubmenuSpec};
@@ -123,30 +124,93 @@ pub(crate) fn select_rows() -> Vec<MenuRow> {
     ]
 }
 
-/// The rows of `menu` for `arrangement`.
-pub(crate) fn rows(menu: ArrangeMenu, arrangement: &Arrangement) -> Vec<MenuRow> {
+/// The rows of the Columns menu: one check row per optional column, checked
+/// when `columns` shows it. Name has no row: it is always shown.
+pub(crate) fn column_rows(columns: &[ColumnPref]) -> Vec<MenuRow> {
+    use ColumnPref::{Group, Modified, Owner, Permissions, Size, Type};
+    [
+        (Size, "Size"),
+        (Modified, "Modified"),
+        (Type, "Type"),
+        (Permissions, "Permissions"),
+        (Owner, "Owner"),
+        (Group, "Group"),
+    ]
+    .into_iter()
+    .map(|(column, label)| {
+        MenuRow::Item(MenuItemSpec {
+            checked: Some(columns.contains(&column)),
+            ..MenuItemSpec::new(MenuCommand::ToggleColumn(column), label)
+        })
+    })
+    .collect()
+}
+
+/// `columns` after a click on `column`'s row: shown when it was hidden,
+/// hidden when it was shown, in the canonical order.
+pub(crate) fn toggled_columns(columns: &[ColumnPref], column: ColumnPref) -> Vec<ColumnPref> {
+    let mut next: Vec<ColumnPref> = columns.iter().copied().filter(|c| *c != column).collect();
+    if !columns.contains(&column) {
+        next.push(column);
+    }
+    next.sort_unstable();
+    next.dedup();
+    next
+}
+
+/// The rows of `menu` for `arrangement` and the list's `columns`.
+pub(crate) fn rows(
+    menu: ArrangeMenu,
+    arrangement: &Arrangement,
+    columns: &[ColumnPref],
+) -> Vec<MenuRow> {
     match menu {
         ArrangeMenu::Sort => sort_rows(arrangement),
         ArrangeMenu::Filter => filter_rows(arrangement),
         ArrangeMenu::Select => select_rows(),
+        ArrangeMenu::Columns => column_rows(columns),
     }
 }
 
+/// `rows` of an empty-space menu with the Columns submenu after Filter.
+/// The list view offers it; the grid has no columns to choose.
+pub(crate) fn with_columns(
+    mut rows: Vec<MenuRow>,
+    arrangement: &Arrangement,
+    columns: &[ColumnPref],
+) -> Vec<MenuRow> {
+    let after_filter = rows
+        .iter()
+        .position(|row| matches!(row, MenuRow::Submenu(spec) if spec.menu == ArrangeMenu::Filter));
+    if let Some(at) = after_filter {
+        rows.insert(at + 1, submenu(ArrangeMenu::Columns, arrangement, columns));
+    }
+    rows
+}
+
 /// The row of a context menu that opens `menu` as a cascading submenu.
-pub(crate) fn submenu(menu: ArrangeMenu, arrangement: &Arrangement) -> MenuRow {
+pub(crate) fn submenu(
+    menu: ArrangeMenu,
+    arrangement: &Arrangement,
+    columns: &[ColumnPref],
+) -> MenuRow {
     MenuRow::Submenu(SubmenuSpec {
         menu,
         label: menu.label(),
-        rows: rows(menu, arrangement),
+        rows: rows(menu, arrangement, columns),
     })
 }
 
 /// Redraws the checks of every Sort/Filter submenu in `rows` from
 /// `arrangement`, after a choice changed it.
-pub(crate) fn refresh(rows_to_refresh: &mut [MenuRow], arrangement: &Arrangement) {
+pub(crate) fn refresh(
+    rows_to_refresh: &mut [MenuRow],
+    arrangement: &Arrangement,
+    columns: &[ColumnPref],
+) {
     for row in rows_to_refresh {
         if let MenuRow::Submenu(spec) = row {
-            spec.rows = rows(spec.menu, arrangement);
+            spec.rows = rows(spec.menu, arrangement, columns);
         }
     }
 }
@@ -216,6 +280,9 @@ mod tests {
                 "Size",
                 "Modified",
                 "Type",
+                "Permissions",
+                "Owner",
+                "Group",
                 "Ascending",
                 "Descending",
                 "Folders first",
@@ -325,7 +392,7 @@ mod tests {
             unexpected.is_empty(),
             "not sort/filter commands: {unexpected:?}"
         );
-        assert_eq!(commands.len(), 8 + 2 + 8 + 5 + 4);
+        assert_eq!(commands.len(), 11 + 2 + 8 + 5 + 4);
         for command in commands {
             let mut changed = Arrangement::default();
             changed.apply(command);
@@ -340,6 +407,102 @@ mod tests {
                 assert_ne!(changed, arrangement, "{command:?} changes nothing");
             }
         }
+    }
+
+    #[test]
+    fn the_columns_menu_checks_the_columns_that_are_shown() {
+        let defaults = ColumnPref::defaults();
+        let rows = column_rows(&defaults);
+        assert_eq!(
+            labels(&rows),
+            ["Size", "Modified", "Type", "Permissions", "Owner", "Group"],
+            "Name has no row: it is always shown"
+        );
+        assert_eq!(
+            checked_labels(&rows),
+            ["Size", "Modified"],
+            "today's columns"
+        );
+        let all = [
+            ColumnPref::Group,
+            ColumnPref::Type,
+            ColumnPref::Owner,
+            ColumnPref::Permissions,
+        ];
+        assert_eq!(
+            checked_labels(&column_rows(&all)),
+            ["Type", "Permissions", "Owner", "Group"]
+        );
+        assert!(checked_labels(&column_rows(&[])).is_empty());
+        for spec in items(&rows) {
+            assert!(spec.enabled && spec.shortcut.is_none() && !spec.danger);
+            assert!(matches!(spec.command, MenuCommand::ToggleColumn(_)));
+        }
+    }
+
+    #[test]
+    fn clicking_a_column_row_shows_or_hides_it_in_the_canonical_order() {
+        let defaults = ColumnPref::defaults();
+        assert_eq!(
+            toggled_columns(&defaults, ColumnPref::Owner),
+            [ColumnPref::Size, ColumnPref::Modified, ColumnPref::Owner]
+        );
+        assert_eq!(
+            toggled_columns(&defaults, ColumnPref::Size),
+            [ColumnPref::Modified]
+        );
+        assert_eq!(
+            toggled_columns(&[ColumnPref::Group], ColumnPref::Size),
+            [ColumnPref::Size, ColumnPref::Group],
+            "canonical order, not click order"
+        );
+        assert!(toggled_columns(&[ColumnPref::Type], ColumnPref::Type).is_empty());
+    }
+
+    #[test]
+    fn the_list_menu_nests_columns_after_filter_and_the_grid_menu_does_not() {
+        let arrangement = Arrangement::default();
+        let plain = menu_rows(&target(0, false), &arrangement);
+        assert!(
+            submenu_of(&plain, ArrangeMenu::Columns).is_none(),
+            "the grid: no columns"
+        );
+        let columns = [ColumnPref::Owner];
+        let rows = with_columns(plain.clone(), &arrangement, &columns);
+        let spec = submenu_of(&rows, ArrangeMenu::Columns);
+        assert_eq!(spec.map(|spec| spec.label), Some("Columns"));
+        assert_eq!(
+            spec.map(|spec| spec.rows.clone()),
+            Some(column_rows(&columns))
+        );
+        let at = |menu| {
+            rows.iter()
+                .position(|row| matches!(row, MenuRow::Submenu(spec) if spec.menu == menu))
+        };
+        assert_eq!(
+            at(ArrangeMenu::Columns),
+            at(ArrangeMenu::Filter).map(|filter| filter + 1)
+        );
+        assert_eq!(rows.len(), plain.len() + 1, "nothing else changes");
+        // A menu without the Filter group (a selection) is left alone.
+        let selection = menu_rows(&target(2, false), &arrangement);
+        assert_eq!(
+            with_columns(selection.clone(), &arrangement, &columns),
+            selection
+        );
+    }
+
+    #[test]
+    fn refreshing_a_menu_redraws_the_columns_checks() {
+        let arrangement = Arrangement::default();
+        let mut rows = with_columns(
+            menu_rows(&target(0, false), &arrangement),
+            &arrangement,
+            &ColumnPref::defaults(),
+        );
+        refresh(&mut rows, &arrangement, &[ColumnPref::Group]);
+        let columns = submenu_of(&rows, ArrangeMenu::Columns).map(|spec| spec.rows.clone());
+        assert_eq!(columns.as_deref().map(checked_labels), Some(vec!["Group"]));
     }
 
     #[test]
@@ -389,7 +552,7 @@ mod tests {
         arrangement.apply(ArrangeCommand::SortBy(SortKey::Name));
         arrangement.apply(ArrangeCommand::ToggleCategory(FileCategory::Images));
         arrangement.apply(ArrangeCommand::ToggleHidden);
-        refresh(&mut rows, &arrangement);
+        refresh(&mut rows, &arrangement, &[]);
         let sort = submenu_of(&rows, ArrangeMenu::Sort).map(|spec| checked_labels(&spec.rows));
         assert_eq!(
             sort,

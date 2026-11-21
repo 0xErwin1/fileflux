@@ -25,7 +25,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
     use gpui_kit_assets::IconName;
     Some(match command {
         // Sort and filter choices show their check mark instead.
-        MenuCommand::Arrange(_) => return None,
+        MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => return None,
         MenuCommand::AddFavorite => IconName::Star,
         MenuCommand::RemoveFavorite => IconName::StarFill,
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
@@ -61,6 +61,7 @@ fn submenu_icon(menu: ArrangeMenu) -> gpui_kit_assets::IconName {
         ArrangeMenu::Sort => gpui_kit_assets::IconName::ArrowUpDown,
         ArrangeMenu::Filter => gpui_kit_assets::IconName::ListFilter,
         ArrangeMenu::Select => gpui_kit_assets::IconName::SquareCheck,
+        ArrangeMenu::Columns => gpui_kit_assets::IconName::Table,
     }
 }
 
@@ -83,7 +84,10 @@ fn item_node(spec: &MenuItemSpec) -> MenuNode {
     }
     let node = MenuNode::new(item);
     // A sort or filter choice keeps the menu open and redraws its checks.
-    if matches!(spec.command, MenuCommand::Arrange(_)) {
+    if matches!(
+        spec.command,
+        MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_)
+    ) {
         node.keep_open(true)
     } else {
         node
@@ -384,7 +388,7 @@ mod tests {
         assert!(sort.is_some_and(MenuNode::opens_flyout));
         assert!(filter.is_some_and(MenuNode::opens_flyout));
         assert!(sort.is_some_and(|node| node.item.has_submenu));
-        assert_eq!(sort.map(|node| node.children.len()), Some(11));
+        assert_eq!(sort.map(|node| node.children.len()), Some(14));
         // Select nests too, and no other row does; no "Back" row exists.
         let nesting = root.iter().filter(|node| node.opens_flyout()).count();
         assert_eq!(nesting, 3);
@@ -420,7 +424,7 @@ mod tests {
 
         arrangement.apply(ArrangeCommand::SortBy(SortKey::Name));
         arrangement.apply(ArrangeCommand::ToggleCategory(FileCategory::Images));
-        arrange_menu::refresh(&mut menu.rows, &arrangement);
+        arrange_menu::refresh(&mut menu.rows, &arrangement, &[]);
         let root = menu.nodes();
         let sort = labelled(&root, "Sort by").and_then(|at| root.get(at));
         let filter = labelled(&root, "Filter").and_then(|at| root.get(at));
@@ -520,7 +524,7 @@ mod tests {
             MenuOn::Arrange(ArrangeMenu::Filter),
             None,
             point(px(0.0), px(0.0)),
-            arrange_menu::rows(ArrangeMenu::Filter, &arrangement),
+            arrange_menu::rows(ArrangeMenu::Filter, &arrangement, &[]),
         );
         let root = menu.nodes();
         assert!(root.iter().all(|node| !node.opens_flyout()));

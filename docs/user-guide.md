@@ -95,7 +95,9 @@ A segmented toggle in the toolbar switches between two presentations. The toggle
 | View | What you see |
 |---|---|
 | Grid | Fixed-size tiles with two-tone folders, file thumbnails and a size line (folders show "N items"). Rows are equal; the last partial row is left-aligned |
-| List | Columns Name, Size and Modified. Click a header to sort (folders stay first). Columns fill the pane; drag to resize. Folder item counts are filled in the background after the listing appears |
+| List | Columns Name, Size and Modified, plus the optional Type, Permissions, Owner and Group (see below). Click a header to sort (folders stay first). Columns fill the pane; drag to resize. Folder item counts are filled in the background after the listing appears |
+
+**List columns.** Name is always shown; Size and Modified are on by default. Right-click a column header, or open the empty-space menu's **Columns** submenu, to tick or untick Size, Modified, **Type** (the same label as the details panel: "Image · JPG", "Folder"), **Permissions** (`rw-r--r--`, as the details panel shows it), **Owner** (user name, the number when the id has no name) and **Group** (likewise). The menu stays open while you tick several. The choice is saved and applies to every tab and the next launch; a dragged width is remembered per column for the session. Clicking the Type, Permissions, Owner or Group header sorts by it (Permissions by the octal mode, Owner and Group by name without case; ties fall back to the name, folders stay first); the same keys are in the **Sort by** menu. Owner, Group and Permissions are read during the scan; entries that do not come from a folder scan (search results, Trash, Recent) show "—" in those three columns.
 
 Sizes use one SI formatter everywhere. Modified dates are shown in the system's local time zone (`TZ`, else `/etc/localtime`).
 
@@ -109,7 +111,7 @@ Use the subbar's **Sort** and **Filter** buttons, the same two pages in the empt
 
 | Control | Behavior |
 |---|---|
-| Sort | **Name, Size, Modified, Type**, ascending or descending; the default is **Modified, descending** (newest first). *Type* orders by category, then extension, then name. **Folders first** (default on) groups folders before files. **Natural number order** (default on) puts `IMG_2` before `IMG_10`. A missing size or time sorts lowest |
+| Sort | **Name, Size, Modified, Type, Permissions, Owner, Group**, ascending or descending; the default is **Modified, descending** (newest first). *Type* orders by category, then extension, then name. **Folders first** (default on) groups folders before files. **Natural number order** (default on) puts `IMG_2` before `IMG_10`. A missing size or time sorts lowest |
 | Type | Multi-select chips: Folders, Images, Videos, Audio, Documents, Archives, Code, Other, decided by extension. None selected means all |
 | Hidden files | Ctrl+H, or *Show hidden files* in the Filter menu. **Hidden by default**: names starting with a dot and the names listed one per line in the folder's `.hidden` file (Nautilus and Thunar's convention). No chip in the default state; showing them adds a **Hidden shown ×** chip. While some are hidden the counts read "5 of 8 items" |
 | Modified | Today, Last 7 days, Last 30 days, This year, Older (before the last 30 days). One choice or none. Files with an unknown time never match |

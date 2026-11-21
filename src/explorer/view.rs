@@ -30,7 +30,9 @@ use bolt::tokens::{IslandMetrics, Spacing};
 use fileflux::core::places::{Places, discover, startup_trash_root};
 use fileflux::core::recent;
 use fileflux::core::search::{SearchOptions, SearchSummary, search};
-use fileflux::core::settings::{self, Preferences, SETTINGS_VERSION, Session, Settings};
+use fileflux::core::settings::{
+    self, ColumnPref, Preferences, SETTINGS_VERSION, Session, Settings,
+};
 use fileflux::core::terminal::{self, Terminal, TerminalEnv};
 use fileflux::core::thumbnails::{Outcome, Skip};
 use fileflux::core::watch::{
@@ -572,13 +574,13 @@ impl Tab {
         // undragged column keeps re-filling when the pane changes.
         let table_events = cx.subscribe(&table, move |this, table, event: &TableEvent, cx| {
             if let TableEvent::ColumnWidthsChanged(widths) = event {
-                let applied = *table.read(cx).delegate().widths();
-                for (column, width) in widths.iter().enumerate() {
-                    let Some(applied) = applied.get(column) else {
-                        continue;
-                    };
+                let delegate = table.read(cx).delegate();
+                let applied = delegate.widths();
+                for ((column, applied), width) in
+                    delegate.columns().iter().zip(applied).zip(widths.iter())
+                {
                     if (width.as_f32() - applied).abs() > crate::explorer::table::DRAG_EPSILON {
-                        this.list_widths.record(column, width.as_f32());
+                        this.list_widths.record(*column, width.as_f32());
                     }
                 }
                 cx.notify();
@@ -758,6 +760,9 @@ pub(crate) struct Explorer {
     /// The column widths the user dragged on the details table, honored by
     /// [`crate::explorer::table::distribute_widths`] on every render.
     pub(crate) list_widths: ListWidths,
+    /// The optional columns of the list view, besides Name (the saved
+    /// preference).
+    pub(crate) list_columns: Vec<ColumnPref>,
     /// What each pane's entries area measured: the inner width recorded by
     /// the draw-nothing measuring canvas every frame (`None` until the first
     /// layout reached it, so the first frame draws with the estimate below)
@@ -1027,6 +1032,7 @@ impl Explorer {
             shell_focus: cx.focus_handle(),
             pane_focus: PerPane::new(cx.focus_handle(), cx.focus_handle()),
             list_widths: ListWidths::default(),
+            list_columns: preferences.list_columns.clone(),
             pane_geometry: PerPane::default(),
             sidebar_open: !preferences.sidebar_collapsed,
             sidebar_overlay_open: false,
@@ -1149,6 +1155,7 @@ impl Explorer {
                 arrangement: arrangement_to_prefs(active.state.arrangement()),
                 sidebar_width: self.sidebar_width.round() as u32,
                 details_width: self.details_width.round() as u32,
+                list_columns: self.list_columns.clone(),
                 sidebar_collapsed: !self.sidebar_open,
                 details_open: self.inspector_open,
                 window_width: f32::from(size.width).round() as u32,
