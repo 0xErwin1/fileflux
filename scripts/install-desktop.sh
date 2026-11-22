@@ -186,9 +186,9 @@ if [ "$mode" = uninstall ]; then
 else
   install_entry
   if [ "$images" -eq 1 ]; then
-    image_mimes | set_defaults
+    set_defaults < <(image_mimes)
   fi
   if [ "$folders" -eq 1 ]; then
-    folder_mimes | set_defaults
+    set_defaults < <(folder_mimes)
   fi
 fi
