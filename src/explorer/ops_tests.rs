@@ -4020,6 +4020,8 @@ fn a_desktop_file_never_opens_through_the_default_opener() {
     // Whatever a probe says, a .desktop decision is not changed into a
     // plain open.
     assert_eq!(OpenProbe::Desktop.settle(false), OpenProbe::Desktop);
+}
+
 #[test]
 fn the_admin_row_follows_the_terminal_row_and_is_absent_when_not_offered() {
     let folder = MenuTarget {
