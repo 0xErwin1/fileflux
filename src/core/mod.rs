@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+pub mod admin;
 pub mod apps;
 pub mod archive;
 pub mod bookmarks;

@@ -44,7 +44,7 @@ use super::ops::{
     rename_step, run_choice, run_launches, run_prompt, search_option_rows, start_failure_notice,
     stem_range, toolbar_menu_rows,
 };
-use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
+use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows, with_admin_row};
 use super::progress::{Sink, Unit};
 use super::sidebar::DevicePartition;
 use super::state::{FavoriteMove, Transition};
@@ -1229,6 +1229,14 @@ impl Explorer {
             ),
         };
         let mut rows = menu_rows(&target, self.tab().state.arrangement());
+        rows = with_admin_row(
+            rows,
+            fileflux::core::admin::row_offered(
+                fileflux::core::owner_helper::is_root(),
+                self.tab().state.current(),
+                &selected,
+            ),
+        );
         // Only the list view has columns to choose, from the folder's own
         // empty-space menu.
         if selected.is_empty()
@@ -1858,6 +1866,10 @@ impl Explorer {
             MenuCommand::OpenTerminal => {
                 let folder = self.single_selected_folder();
                 self.open_terminal(folder, cx);
+            }
+            MenuCommand::OpenAsAdmin => {
+                let folder = self.single_selected_folder();
+                self.open_as_admin(folder, cx);
             }
             MenuCommand::CopyFolderPath => self.copy_folder_path(window, cx),
             MenuCommand::Restore => self.restore_selected(window, cx),
@@ -2739,6 +2751,87 @@ impl Explorer {
             "Could not open a terminal".to_owned(),
             cx,
         );
+    }
+
+    /// "Open as Administrator": a separate Fileflux instance as root on
+    /// `folder`, else on the shown folder, through pkexec (see
+    /// [`fileflux::core::admin`]). Non-local places are refused with a
+    /// notice. Looking for the programs and starting pkexec happen off the
+    /// UI thread; the polkit dialog is pkexec's own. A dismissed dialog or a
+    /// missing pkexec only leaves a notice.
+    fn open_as_admin(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        use fileflux::core::admin;
+        let folder = match folder {
+            Some(folder) => Location::Directory(folder),
+            None => self.tab().state.current().clone(),
+        };
+        let places = self.places.as_ref().map(|places| places.fuse.clone());
+        let remote = |path: &Path| places.as_ref().is_some_and(|fuse| fuse.covers(path));
+        if let Some(refusal) = admin::refusal(&folder, remote) {
+            self.tab_mut().state.set_notice(refusal.to_string());
+            cx.notify();
+            return;
+        }
+        let Location::Directory(folder) = folder else {
+            return;
+        };
+        let started = cx.background_executor().spawn(async move {
+            let launch = admin::Launch::detect().map_err(|error| error.to_string())?;
+            let argv = launch.argv(&folder).map_err(|error| error.to_string())?;
+            admin::spawn(&argv).map_err(|error| format!("Could not start pkexec: {error}"))
+        });
+        cx.spawn(async move |this, cx| {
+            let mut child = match started.await {
+                Ok(child) => child,
+                Err(message) => {
+                    if let Err(closed) = this.update(cx, |this, cx| {
+                        this.tab_mut().state.set_notice(message);
+                        cx.notify();
+                    }) {
+                        log::debug!("the explorer closed before the launch result: {closed}");
+                    }
+                    return;
+                }
+            };
+            // pkexec lives as long as the root instance: look at it twice a
+            // second on a timer (no thread is held) and speak only if it
+            // ends badly.
+            loop {
+                match child.try_wait() {
+                    Ok(None) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(500))
+                            .await;
+                        if this.upgrade().is_none() {
+                            break;
+                        }
+                    }
+                    Ok(Some(status)) => {
+                        if let Some(notice) = admin::exit_notice(status.code())
+                            && let Err(closed) = this.update(cx, |this, cx| {
+                                this.tab_mut().state.set_notice(notice);
+                                cx.notify();
+                            })
+                        {
+                            log::debug!("the explorer closed before pkexec ended: {closed}");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        log::debug!("waiting for pkexec failed: {error}");
+                        return;
+                    }
+                }
+            }
+            // The window is gone: reap pkexec on a thread of its own.
+            if let Err(error) = std::thread::Builder::new()
+                .name("fileflux-reap".to_owned())
+                .spawn(move || drop(child.wait()))
+            {
+                log::debug!("cannot reap pkexec: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Starts a detached program off the UI thread and reports a failure to

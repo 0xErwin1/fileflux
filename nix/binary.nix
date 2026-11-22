@@ -146,6 +146,12 @@ stdenv.mkDerivation {
         --replace-fail /usr/bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
     fi
 
+    # The "Open as Administrator" polkit action names the installed launcher.
+    mkdir -p $out/share/polkit-1/actions
+    substitute ${../packaging/dev.fileflux.open-as-admin.policy} \
+      $out/share/polkit-1/actions/dev.fileflux.open-as-admin.policy \
+      --replace-fail /usr/bin/fileflux $out/bin/${appId}
+
     install -Dm644 LICENSE $out/share/licenses/${appId}/LICENSE
 
     runHook postInstall

@@ -36,6 +36,7 @@ One package, one library and one binary.
 | `watch` | inotify through `rustix`: the folder `WatchHub` and the device `DeviceWatcher` |
 | `settings` | `settings.toml` and `session.toml`: tolerant loading, version migration, atomic saving, merging |
 | `bookmarks` | The GTK bookmarks file as the favorites: parsing, labels, order-preserving atomic edits |
+| `admin` | "Open as Administrator": the `pkexec` command lines (policy installed or the `env DISPLAY=… XAUTHORITY=…` fallback), the environment allowlist, the refusals, the menu offer and the single-instance claim decision; pure, pkexec is never run by a test |
 | `terminal` | "Open in terminal": the xdg-terminal-exec lookup and the command per terminal (no shell) |
 | `apps` | "Open with…": `.desktop` discovery and `Exec=` parsing (no shell) |
 | `links` | Symbolic links: "Link to" naming, create-then-retry for a free name (never replaces), absolute targets |
@@ -95,6 +96,14 @@ These hold for every file operation. A change that breaks one needs a new design
 | **Safe settings** | A broken or newer file is backed up or left alone, never half-written |
 
 Names are bounded to 255 bytes: invented names ("name (2).ext") shorten the stem on a character boundary, and Trash names whose `.trashinfo` would not fit are stored under a shortened name with the exact original path recorded.
+
+## Elevation
+
+Two features use `pkexec` and neither ever asks for or stores a password: the owner change (`core::elevate`, the small `fileflux-owner-helper`) and **Open as Administrator** (`core::admin`).
+
+**Open as Administrator** starts a *separate* Fileflux process as root; the user's instance never gains privileges. It runs `pkexec <fileflux> --new-instance -- <folder>` when the polkit action `dev.fileflux.open-as-admin` is installed with `exec.path` equal to that launcher (the Nix `.fileflux-wrapped` name is mapped back to the `fileflux` wrapper) and `exec.allow_gui=true`, which lets pkexec keep `DISPLAY` and `XAUTHORITY`. Otherwise it runs `pkexec env DISPLAY=… XAUTHORITY=… <fileflux> --new-instance -- <folder>`, with only those two variables and only when set. No shell is involved, the folder is one argument after `--`, and `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` are never passed, so the root instance runs on X11/XWayland, keeps its settings under root's own home (pkexec sets `HOME=/root`) and cannot reach the user's session bus.
+
+The root instance never joins the single-instance protocol: `--new-instance` and any process whose effective uid is 0 skip `dbus::claim`, so it neither forwards its folder to the user's window nor takes the user's D-Bus name. While `geteuid()` is 0 every explorer window shows a fixed red banner (Bolt's `danger` colour) and every window title, explorer and image viewer, ends with " (root)". The menu row is hidden for root and refused for the Trash, Recent, search, disk usage and for FUSE and gvfs paths. A dismissed or missing pkexec leaves only a notice.
 
 ## Pinned stack
 

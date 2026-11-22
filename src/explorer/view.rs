@@ -2554,7 +2554,10 @@ impl Explorer {
     }
 
     fn sync_window_title(&self, window: &mut Window) {
-        window.set_window_title(&format!("{} — Fileflux", self.current_label()));
+        window.set_window_title(&fileflux::core::admin::window_title(
+            &format!("{} — Fileflux", self.current_label()),
+            fileflux::core::owner_helper::is_root(),
+        ));
     }
 
     /// Focuses the path field and selects its content.
@@ -4168,6 +4171,21 @@ impl Render for Explorer {
             .flex_col()
             .bg(colors.desk)
             .text_color(colors.foreground)
+            .children(fileflux::core::owner_helper::is_root().then(|| {
+                // Fixed, above everything: whatever this window does
+                // affects the whole system.
+                div()
+                    .id("explorer-root-banner")
+                    .flex_none()
+                    .w_full()
+                    .px(Spacing::SM)
+                    .py(Spacing::XS)
+                    .flex()
+                    .justify_center()
+                    .bg(colors.danger)
+                    .text_color(colors.on_semantic)
+                    .child(fileflux::core::admin::BANNER)
+            }))
             .child(self.render_header())
             // Ahead of every handler of a right press, so the menu it opens
             // knows it was opened by the mouse (Shift: new tab mode).

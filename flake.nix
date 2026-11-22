@@ -135,6 +135,12 @@
               substitute ${./packaging/dev.fileflux.owner-helper.policy} \
                 $out/share/polkit-1/actions/dev.fileflux.owner-helper.policy \
                 --replace-fail /usr/bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
+
+              # "Open as Administrator" runs `pkexec $out/bin/fileflux`; its
+              # action names that wrapper (not the wrapped binary).
+              substitute ${./packaging/dev.fileflux.open-as-admin.policy} \
+                $out/share/polkit-1/actions/dev.fileflux.open-as-admin.policy \
+                --replace-fail /usr/bin/fileflux $out/bin/fileflux
             '';
 
             postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

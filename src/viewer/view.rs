@@ -220,7 +220,10 @@ impl Viewer {
             })
             .detach();
         }
-        window.set_window_title(&format!("{} — Fileflux", self.current_name()));
+        window.set_window_title(&fileflux::core::admin::window_title(
+            &format!("{} — Fileflux", self.current_name()),
+            fileflux::core::owner_helper::is_root(),
+        ));
         cx.notify();
     }
 

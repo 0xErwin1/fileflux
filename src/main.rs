@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fileflux::cli::{self, CliError, Command, Target};
+use fileflux::core::{admin, owner_helper};
 use fileflux::dbus;
 
 /// Exit status for a command line that cannot be honored.
@@ -18,17 +19,27 @@ const USAGE_ERROR: u8 = 2;
 
 fn main() -> ExitCode {
     match launch() {
-        Ok(Launch::Window { target, forward }) => {
+        Ok(Launch::Window {
+            target,
+            forward,
+            new_instance,
+        }) => {
             gui::init_logging();
             // Only the explorer is a single instance; a viewer launch stays
             // its own process, as before.
+            // `--new-instance` and any root process stay out of it: the
+            // administrator instance never forwards to or claims the
+            // user's name.
+            let claims = admin::claims_session_name(new_instance, owner_helper::is_root());
             let desktop = match &target {
-                Target::Explorer(_) => match dbus::claim(&dbus::Endpoint::Session, &forward) {
-                    dbus::Role::Primary(primary) => Some(primary),
-                    dbus::Role::Forwarded => return ExitCode::SUCCESS,
-                    dbus::Role::Standalone => None,
-                },
-                Target::Viewer(_) => None,
+                Target::Explorer(_) if claims => {
+                    match dbus::claim(&dbus::Endpoint::Session, &forward) {
+                        dbus::Role::Primary(primary) => Some(primary),
+                        dbus::Role::Forwarded => return ExitCode::SUCCESS,
+                        dbus::Role::Standalone => None,
+                    }
+                }
+                Target::Explorer(_) | Target::Viewer(_) => None,
             };
             gui::open(target, desktop)
         }
@@ -51,13 +62,16 @@ enum Launch {
     Window {
         target: Target,
         forward: Vec<PathBuf>,
+        /// `--new-instance`: never forward to or claim the running one.
+        new_instance: bool,
     },
     /// Help or version was printed; no window opens.
     Done,
 }
 
 fn launch() -> Result<Launch, CliError> {
-    match cli::parse(std::env::args_os().skip(1))? {
+    let (command, new_instance) = cli::parse_with_flags(std::env::args_os().skip(1))?;
+    match command {
         Command::Help => {
             print!("{}", cli::USAGE);
             Ok(Launch::Done)
@@ -81,6 +95,7 @@ fn launch() -> Result<Launch, CliError> {
             Ok(Launch::Window {
                 target: resolved.target,
                 forward,
+                new_instance,
             })
         }
     }

@@ -26,7 +26,7 @@ All four must pass before a change is ready; CI runs the same ones.
 
 `cargo check --all-targets` is the quick type-check while iterating.
 
-The crate builds two binaries: `fileflux` (the app) and `fileflux-owner-helper` (`src/bin/fileflux-owner-helper.rs`), the small root program the details panel's owner change runs through `pkexec`. It uses only `std` and `rustix` (it includes `src/core/owner_helper.rs` by path and does not link the GUI), and `cargo run` starts `fileflux` (`default-run`). Install it in the same directory as `fileflux`: Fileflux looks for it only there (never in `PATH`) and otherwise falls back to `pkexec chown`. Ship `packaging/dev.fileflux.owner-helper.policy` into `share/polkit-1/actions`, with its `org.freedesktop.policykit.exec.path` set to the helper's installed path (the Nix package substitutes its store path). The tests never run the helper as root or through pkexec: they exercise its pure parts and run the binary as the current user to check that it refuses without root.
+The crate builds two binaries: `fileflux` (the app) and `fileflux-owner-helper` (`src/bin/fileflux-owner-helper.rs`), the small root program the details panel's owner change runs through `pkexec`. It uses only `std` and `rustix` (it includes `src/core/owner_helper.rs` by path and does not link the GUI), and `cargo run` starts `fileflux` (`default-run`). Install it in the same directory as `fileflux`: Fileflux looks for it only there (never in `PATH`) and otherwise falls back to `pkexec chown`. Ship `packaging/dev.fileflux.owner-helper.policy` into `share/polkit-1/actions`, with its `org.freedesktop.policykit.exec.path` set to the helper's installed path (the Nix package substitutes its store path). Ship `packaging/dev.fileflux.open-as-admin.policy` the same way, with `exec.path` set to the installed `fileflux` launcher (for the Nix source package that is the wrapper `$out/bin/fileflux`, for `nix/binary.nix` `$out/bin/<appId>`): it lets "Open as Administrator" run `pkexec <fileflux> --new-instance -- <folder>` with `DISPLAY` and `XAUTHORITY` kept (`exec.allow_gui`); without it Fileflux falls back to `pkexec env DISPLAY=… XAUTHORITY=…`. The tests never run pkexec, the helper as root or through pkexec: they exercise its pure parts and run the binary as the current user to check that it refuses without root.
 
 CI runs fmt, clippy `-D warnings`, tests and a release build; a nightly build publishes binaries. GUI checks are not part of CI.
 
@@ -102,7 +102,7 @@ To see what a folder with thousands of images and videos costs the UI thread, en
 
 | Output | What it is |
 |---|---|
-| `packages.fileflux` (also `default`, `fileflux-source`) | The source build with `rustPlatform.buildRustPackage`, the desktop entry, `bin/fileflux-owner-helper` and its polkit action in `share/polkit-1/actions` |
+| `packages.fileflux` (also `default`, `fileflux-source`) | The source build with `rustPlatform.buildRustPackage`, the desktop entry, `bin/fileflux-owner-helper` and the polkit actions for it and for Open as Administrator in `share/polkit-1/actions` |
 | `packages.fileflux-nightly` | The prebuilt binary of the rolling `nightly` release (`nix/binary.nix`, pinned by `nix/nightly-info.nix`), installed as `fileflux-nightly` |
 | `apps.fileflux`, `apps.fileflux-nightly` | `nix run` entry points for the two packages |
 | `overlays.default` | `pkgs.fileflux`, `pkgs.fileflux-source`, `pkgs.fileflux-nightly`, built from the consumer's package set |

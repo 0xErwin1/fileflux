@@ -97,6 +97,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::NewFolder => IconName::FolderPlus,
         MenuCommand::NewFile => IconName::FilePlus,
         MenuCommand::OpenTerminal => IconName::Terminal,
+        MenuCommand::OpenAsAdmin => IconName::ShieldAlert,
         MenuCommand::Restore => IconName::Undo2,
         MenuCommand::Cut => IconName::Scissors,
         MenuCommand::Copy => IconName::Copy,

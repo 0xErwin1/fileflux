@@ -1428,6 +1428,9 @@ pub(crate) enum MenuCommand {
     NewFolder,
     NewFile,
     OpenTerminal,
+    /// A separate Fileflux instance as root on the single selected folder
+    /// or the shown one (see [`fileflux::core::admin`]).
+    OpenAsAdmin,
     CopyFolderPath,
     Restore,
     EmptyTrash,
@@ -2043,6 +2046,32 @@ pub(crate) fn menu_rows(target: &MenuTarget, arrangement: &Arrangement) -> Vec<M
     rows
 }
 
+/// Adds "Open as Administrator" when `offered` (see
+/// [`fileflux::core::admin::row_offered`]): after "Open in terminal", else
+/// after "Open in split", else before "Copy folder path", else last.
+pub(crate) fn with_admin_row(mut rows: Vec<MenuRow>, offered: bool) -> Vec<MenuRow> {
+    if !offered {
+        return rows;
+    }
+    let position = |command| {
+        rows.iter()
+            .rposition(|row| matches!(row, MenuRow::Item(spec) if spec.command == command))
+    };
+    let at = position(MenuCommand::OpenTerminal)
+        .or_else(|| position(MenuCommand::OpenInSplit))
+        .map(|at| at + 1)
+        .or_else(|| position(MenuCommand::CopyFolderPath))
+        .unwrap_or(rows.len());
+    rows.insert(
+        at,
+        MenuRow::Item(MenuItemSpec::new(
+            MenuCommand::OpenAsAdmin,
+            "Open as Administrator",
+        )),
+    );
+    rows
+}
+
 /// The menu of the Recent view, from the folder view's `rows`: nothing is
 /// created or pasted into a list of files that live elsewhere, and one
 /// selected entry offers "Open containing folder".
@@ -2055,6 +2084,7 @@ pub(crate) fn recent_menu_rows(rows: Vec<MenuRow>, selected: usize) -> Vec<MenuR
                 | MenuCommand::Paste
                 | MenuCommand::PasteIntoFolder
                 | MenuCommand::OpenTerminal
+                | MenuCommand::OpenAsAdmin
                 | MenuCommand::CopyFolderPath
         ))
     };

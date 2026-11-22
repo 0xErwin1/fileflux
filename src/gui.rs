@@ -128,7 +128,13 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
     let options = WindowOptions {
         app_id: Some("fileflux".into()),
         titlebar: Some(TitlebarOptions {
-            title: Some(theme::brand().name),
+            title: Some(
+                fileflux::core::admin::window_title(
+                    &theme::brand().name,
+                    fileflux::core::owner_helper::is_root(),
+                )
+                .into(),
+            ),
             ..Default::default()
         }),
         window_bounds: Some(WindowBounds::Windowed(bounds)),

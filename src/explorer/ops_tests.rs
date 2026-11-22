@@ -4020,4 +4020,27 @@ fn a_desktop_file_never_opens_through_the_default_opener() {
     // Whatever a probe says, a .desktop decision is not changed into a
     // plain open.
     assert_eq!(OpenProbe::Desktop.settle(false), OpenProbe::Desktop);
+#[test]
+fn the_admin_row_follows_the_terminal_row_and_is_absent_when_not_offered() {
+    let folder = MenuTarget {
+        folder_selected: true,
+        ..target(false, 1, false, true)
+    };
+    let plain = menu_rows(&folder);
+    assert!(item(&plain, MenuCommand::OpenAsAdmin).is_none());
+    assert_eq!(with_admin_row(plain.clone(), false), plain);
+    let rows = with_admin_row(plain, true);
+    let labels = flat(&rows);
+    let at = labels.iter().position(|l| l == "Open as Administrator");
+    let terminal = labels.iter().position(|l| l == "Open in terminal");
+    assert_eq!(at, terminal.map(|t| t + 1), "{labels:?}");
+}
+
+#[test]
+fn the_admin_row_is_in_the_empty_space_menu_before_copy_folder_path() {
+    let rows = with_admin_row(menu_rows(&target(false, 0, false, false)), true);
+    let labels = flat(&rows);
+    let at = labels.iter().position(|l| l == "Open as Administrator");
+    let copy = labels.iter().position(|l| l == "Copy folder path");
+    assert_eq!(at.map(|a| a + 1), copy, "{labels:?}");
 }

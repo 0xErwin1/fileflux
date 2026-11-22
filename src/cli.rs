@@ -25,6 +25,9 @@ other files among them are ignored, with a note on stderr.
 Options:
   -h, --help       Print this help and exit
   -V, --version    Print the version and exit
+  --new-instance   Start a separate instance: never hand the paths to a
+                   running Fileflux nor take its single-instance name (what
+                   Open as Administrator starts as root)
 ";
 
 /// What the command line asks for.
@@ -84,13 +87,26 @@ pub fn parse<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
+    parse_with_flags(args).map(|(command, _)| command)
+}
+
+/// [`parse`], also telling whether `--new-instance` was given.
+pub fn parse_with_flags<I>(args: I) -> Result<(Command, bool), CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut new_instance = false;
     let mut paths = Vec::new();
     let mut options_done = false;
     for arg in args {
         if !options_done {
             match arg.to_str() {
-                Some("-h" | "--help") => return Ok(Command::Help),
-                Some("-V" | "--version") => return Ok(Command::Version),
+                Some("-h" | "--help") => return Ok((Command::Help, new_instance)),
+                Some("-V" | "--version") => return Ok((Command::Version, new_instance)),
+                Some("--new-instance") => {
+                    new_instance = true;
+                    continue;
+                }
                 Some("--") => {
                     options_done = true;
                     continue;
@@ -107,7 +123,7 @@ where
     if paths.len() > 1 && !paths.iter().any(|path| is_image_path(path)) {
         return Err(CliError::TooManyPaths);
     }
-    Ok(Command::Open(paths))
+    Ok((Command::Open(paths), new_instance))
 }
 
 /// What a resolved command line opens.
