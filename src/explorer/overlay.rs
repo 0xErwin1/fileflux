@@ -468,13 +468,14 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                 .focus_handle(&this.dialog_cancel_focus)
                 .on_click(press(DialogChoice::Cancel)),
         )
-        .children(text.extra.iter().map(|&(choice, label)| {
+        .children(dialog.footer_extra().into_iter().map(|(choice, label)| {
             let (id, focus) = match choice {
                 DialogChoice::KeepBoth => ("explorer-dialog-keep", &this.dialog_keep_focus),
                 _ => ("explorer-dialog-skip", &this.dialog_skip_focus),
             };
             Button::new(id, label)
                 .secondary()
+                .disabled(!armed && this.dialogs.needs_arming(choice))
                 .focus_handle(focus)
                 .on_click(press(choice))
         }))

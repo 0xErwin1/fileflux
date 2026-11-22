@@ -1704,6 +1704,123 @@ impl OpenProbe {
     }
 }
 
+/// What the explorer does for a decision (see [`OpenProbe::step`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenStep {
+    /// Open it as before ([`Explorer::open_file`]).
+    OpenNow,
+    /// Ask Run / Run in Terminal / Open / Cancel.
+    Prompt,
+    /// Open it in the text editor, never through the default opener.
+    AsText,
+    /// Read its first bytes off the UI thread first.
+    Probe,
+}
+
+impl OpenProbe {
+    /// The step this decision leads to.
+    pub(crate) fn step(&self) -> OpenStep {
+        match self {
+            OpenProbe::Plain => OpenStep::OpenNow,
+            OpenProbe::Prompt => OpenStep::Prompt,
+            OpenProbe::Desktop => OpenStep::AsText,
+            OpenProbe::MaybeRunnable => OpenStep::Probe,
+        }
+    }
+}
+
+/// How long an open waits for its probe before it opens the file plainly.
+pub(crate) const PROBE_DEADLINE: Duration = Duration::from_millis(1500);
+
+/// What [`ProbeTracker::begin`] decided for an open.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeStart {
+    /// Read the file; this token names the probe.
+    Begin(u64),
+    /// The same path is being probed: this open is dropped.
+    Drop,
+    /// An earlier probe of the path missed its deadline and is still
+    /// blocked: open plainly, queue no second read.
+    Plain,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeState {
+    Probing(u64),
+    /// The deadline passed; the read has not returned yet.
+    Expired,
+}
+
+/// The probes in flight, one per path: a hung mount blocks at most one task
+/// per file, never a queue of them.
+#[derive(Debug, Default)]
+pub(crate) struct ProbeTracker {
+    next: u64,
+    probes: std::collections::HashMap<PathBuf, ProbeState>,
+}
+
+impl ProbeTracker {
+    pub(crate) fn begin(&mut self, path: &Path) -> ProbeStart {
+        match self.probes.get(path) {
+            Some(ProbeState::Probing(_)) => ProbeStart::Drop,
+            Some(ProbeState::Expired) => ProbeStart::Plain,
+            None => {
+                self.next += 1;
+                self.probes
+                    .insert(path.to_path_buf(), ProbeState::Probing(self.next));
+                ProbeStart::Begin(self.next)
+            }
+        }
+    }
+
+    /// The probe `token` read the file. `true` when its result is still
+    /// wanted (in time); `false` for a late one or a stale token. The path
+    /// is free again either way once its own probe returned.
+    pub(crate) fn result(&mut self, path: &Path, token: u64) -> bool {
+        match self.probes.get(path) {
+            Some(ProbeState::Probing(current)) if *current == token => {
+                self.probes.remove(path);
+                true
+            }
+            Some(ProbeState::Expired) => {
+                self.probes.remove(path);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// The deadline of probe `token` passed. `true` once, when the open
+    /// must fall back to the plain one.
+    pub(crate) fn expire(&mut self, path: &Path, token: u64) -> bool {
+        match self.probes.get_mut(path) {
+            Some(state) if *state == ProbeState::Probing(token) => {
+                *state = ProbeState::Expired;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Where a press of Skip or Keep both on the open dialog goes: those two
+/// slots are shared by the conflict question and the run prompt, and each
+/// owns its own.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PressRoute {
+    RunPrompt(Option<RunChoice>),
+    Conflict,
+    Ignored,
+}
+
+pub(crate) fn press_route(action: &DialogAction, choice: DialogChoice) -> PressRoute {
+    match action {
+        DialogAction::Runnable(_) => PressRoute::RunPrompt(run_choice(choice)),
+        DialogAction::Conflict { .. } => PressRoute::Conflict,
+        _ => PressRoute::Ignored,
+    }
+}
+
 /// What opening `entry` (a file, not a folder) needs first. A file the scan
 /// saw without any execute bit, and an image, never start a probe; an entry
 /// that did not come from a scan with its mode (Recent, search results) is
@@ -2482,6 +2599,18 @@ impl DialogState {
         }
     }
 
+    /// The buttons between Cancel and the danger one. A conflict question
+    /// shows its Keep both / Skip only while it carries its conflict state
+    /// (the "apply to all" choice), as before the run prompt shared them.
+    pub(crate) fn footer_extra(&self) -> Vec<(DialogChoice, &'static str)> {
+        match (&self.kind, &self.action) {
+            (DialogKind::Conflict { .. }, DialogAction::Conflict { .. })
+            | (DialogKind::Runnable { .. }, _) => self.text.extra.clone(),
+            (DialogKind::Conflict { .. }, _) => Vec::new(),
+            _ => self.text.extra.clone(),
+        }
+    }
+
     /// The paste this dialog speaks for, when it is a conflict question.
     pub(crate) fn conflict_job(&self) -> Option<u64> {
         match self.action {
@@ -2589,7 +2718,19 @@ impl DialogQueue {
     /// Whether a press of `choice` is acted on at `now`: nothing is open,
     /// or the danger button is still too fresh, and the press is ignored.
     pub(crate) fn accepts(&self, choice: DialogChoice, now: Instant) -> bool {
-        self.is_open() && (!choice.is_danger() || self.armed_at(now))
+        self.is_open() && (!self.needs_arming(choice) || self.armed_at(now))
+    }
+
+    /// Whether a press of `choice` on the open dialog waits for it to arm:
+    /// the danger button, and on the run prompt every button that executes
+    /// (Run, Run in Terminal, Open), so a stray trailing click never runs
+    /// anything. Cancel is always live.
+    pub(crate) fn needs_arming(&self, choice: DialogChoice) -> bool {
+        choice.is_danger()
+            || (choice != DialogChoice::Cancel
+                && self
+                    .current()
+                    .is_some_and(|dialog| matches!(dialog.action, DialogAction::Runnable(_))))
     }
 
     /// The button the open dialog takes the keyboard on. This is the one

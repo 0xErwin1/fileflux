@@ -61,7 +61,7 @@ use crate::explorer::folder_memory::{self, FolderMemory};
 use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::menu_tree::RightPress;
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
-use crate::explorer::ops::{ArrangeMenu, DialogQueue};
+use crate::explorer::ops::{ArrangeMenu, DialogQueue, ProbeTracker};
 use crate::explorer::ops::{
     OpenAction, OpenSplit, Severity, UndoStack, open_action, open_probe, split_open,
 };
@@ -936,6 +936,8 @@ pub(crate) struct Explorer {
     /// by the drop and, for a drag that ended elsewhere, by the next pump
     /// tick.
     pub(crate) favorite_insert: Option<super::favorites::FavoriteInsert>,
+    /// The folder drag on screen began on a favorite row of the sidebar.
+    pub(crate) favorite_drag: bool,
     /// When and whether settings and session are written.
     persistence: Persistence,
     /// The view remembered for each folder, and when it is written.
@@ -985,6 +987,8 @@ pub(crate) struct Explorer {
     /// The open confirmation dialog and those waiting behind it: modal over
     /// the whole window, whichever tab is active.
     pub(crate) dialogs: DialogQueue,
+    /// The file probes in flight (see `Explorer::probe_then_open`).
+    pub(crate) probes: ProbeTracker,
     /// The focus of the dialog's backdrop (the focus trap).
     pub(crate) dialog_focus: FocusHandle,
     /// The dialog's default button: Cancel.
@@ -1233,6 +1237,7 @@ impl Explorer {
             split_drag: None,
             folder_drag: None,
             favorite_insert: None,
+            favorite_drag: false,
             persistence,
             folders,
             default_presentation,
@@ -1252,6 +1257,7 @@ impl Explorer {
             menu_focus: cx.focus_handle(),
             right_press: RightPress::default(),
             dialogs: DialogQueue::default(),
+            probes: ProbeTracker::default(),
             dialog_focus: cx.focus_handle(),
             dialog_cancel_focus: cx.focus_handle(),
             dialog_confirm_focus: cx.focus_handle(),
@@ -1409,6 +1415,9 @@ impl Explorer {
         if self.folder_drag.is_some() && !cx.has_active_drag() {
             self.folder_drag = None;
             cx.notify();
+        }
+        if self.favorite_drag && !cx.has_active_drag() {
+            self.favorite_drag = false;
         }
         if self.favorite_insert.is_some() && !cx.has_active_drag() {
             self.favorite_insert = None;

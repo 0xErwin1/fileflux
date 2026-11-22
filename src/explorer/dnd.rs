@@ -524,15 +524,24 @@ pub(crate) fn drag_source<E: StatefulInteractiveElement>(
     } else {
         Arc::new(vec![path.clone()])
     };
-    attach_drag(element, DraggedEntries { paths, folder }, path, glyph, weak)
+    attach_drag(
+        element,
+        DraggedEntries { paths, folder },
+        path,
+        glyph,
+        false,
+        weak,
+    )
 }
 
 /// Makes a sidebar row the drag source of the one folder it stands for. The
 /// payload is an entry drag's, so drops on folders, the split rail and the
 /// tab strip treat it the same; a click that does not move still navigates.
+/// `favorite` marks a row of the Favorites section, whose drag also reorders.
 pub(crate) fn place_drag_source<E: StatefulInteractiveElement>(
     element: E,
     path: PathBuf,
+    favorite: bool,
     weak: &WeakEntity<Explorer>,
 ) -> E {
     let dragged = DraggedEntries::one_folder(path.clone());
@@ -541,6 +550,7 @@ pub(crate) fn place_drag_source<E: StatefulInteractiveElement>(
         dragged,
         path,
         gpui_kit_assets::IconName::Folder,
+        favorite,
         weak,
     )
 }
@@ -552,6 +562,7 @@ fn attach_drag<E: StatefulInteractiveElement>(
     dragged: DraggedEntries,
     path: PathBuf,
     glyph: gpui_kit_assets::IconName,
+    favorite: bool,
     weak: &WeakEntity<Explorer>,
 ) -> E {
     let folder = dragged.folder;
@@ -564,6 +575,7 @@ fn attach_drag<E: StatefulInteractiveElement>(
                 && let Err(error) = drag_explorer.update(cx, |this, cx| {
                     // The press focused the pane the folder lives in.
                     this.folder_drag = Some(this.tabs.focus());
+                    this.favorite_drag = favorite;
                     cx.notify();
                 })
             {

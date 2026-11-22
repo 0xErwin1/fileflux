@@ -23,6 +23,9 @@ pub struct DesktopEntry {
     /// `X-TerminalArgDir`, the xdg-terminal-exec key naming the argument that
     /// sets a terminal's working directory (`--working-directory=`).
     pub terminal_arg_dir: Option<String>,
+    /// `X-TerminalArgExec`, the argument that makes a terminal run the
+    /// command that follows it (`-e`, `--`).
+    pub terminal_arg_exec: Option<String>,
 }
 
 /// An application that can open a file.
@@ -185,6 +188,9 @@ pub fn parse_desktop_entry(content: &str) -> Option<DesktopEntry> {
             }
             "X-TerminalArgDir" => {
                 entry.terminal_arg_dir = (!value.is_empty()).then(|| value.to_owned());
+            }
+            "X-TerminalArgExec" => {
+                entry.terminal_arg_exec = (!value.is_empty()).then(|| value.to_owned());
             }
             _ => {}
         }
@@ -1160,6 +1166,7 @@ mod tests {
                 terminal: false,
                 categories: Vec::new(),
                 terminal_arg_dir: None,
+                terminal_arg_exec: None,
             })
         );
     }
@@ -2064,5 +2071,74 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn read_desktop_file_returns_the_text_of_a_regular_file() -> TestResult {
+        let scratch = Scratch::new("read-ok")?;
+        scratch.write("a.desktop", "[Desktop Entry]\nName=A\n")?;
+        assert_eq!(
+            read_desktop_file(&scratch.0.join("a.desktop"))?,
+            "[Desktop Entry]\nName=A\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_desktop_file_refuses_a_fifo_without_blocking() -> TestResult {
+        let scratch = Scratch::new("read-fifo")?;
+        let fifo = scratch.0.join("pipe.desktop");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(read_desktop_file(&fifo)).ok());
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "read_desktop_file blocked on a FIFO")?;
+        let error = result.err().ok_or("a FIFO was read")?;
+        assert_eq!(error.to_string(), "it is not a regular file");
+        Ok(())
+    }
+
+    #[test]
+    fn read_desktop_file_refuses_a_directory() -> TestResult {
+        let scratch = Scratch::new("read-dir")?;
+        assert!(read_desktop_file(&scratch.0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn read_desktop_file_stops_at_one_mebibyte() -> TestResult {
+        let scratch = Scratch::new("read-big")?;
+        let limit = usize::try_from(DESKTOP_FILE_LIMIT)?;
+        scratch.write("big.desktop", &"x".repeat(limit + 4096))?;
+        assert_eq!(
+            read_desktop_file(&scratch.0.join("big.desktop"))?.len(),
+            limit
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expand_exec_bare_of_only_field_codes_is_empty() {
+        assert_eq!(expand_exec_bare("%f %U"), Err(ExecError::Empty));
+        assert_eq!(expand_exec_bare(""), Err(ExecError::Empty));
+        assert_eq!(
+            expand_exec_bare("tool %f x"),
+            Ok(vec![OsString::from("tool"), OsString::from("x")])
+        );
+    }
+
+    #[test]
+    fn x_terminal_arg_exec_is_the_trimmed_value_and_none_when_empty() {
+        let arg = |line: &str| entry_with(line).and_then(|entry| entry.terminal_arg_exec);
+        assert_eq!(arg("X-TerminalArgExec=  --  "), Some("--".to_owned()));
+        assert_eq!(arg("X-TerminalArgExec="), None);
+        assert_eq!(arg(""), None);
     }
 }

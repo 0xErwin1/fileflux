@@ -36,12 +36,13 @@ use super::menu_tree::{Shown, shown_for};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, AppLaunch, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job,
-    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenAction, OpenProbe, OpenTarget,
-    OpenWithPick, RenameCheck, RenameStep, Report, RunChoice, SearchOption, Severity, Unavailable,
-    UndoAction, UndoEntry, add_launch_row, add_viewer_row, check_rename, dismissed_notice,
-    launch_confirmation, menu_rows, no_trash_dialog, open_action, open_target, plan_launches,
-    rename_seed, rename_step, run_choice, run_launches, run_prompt, search_option_rows,
-    start_failure_notice, stem_range, toolbar_menu_rows,
+    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenAction, OpenProbe, OpenStep,
+    OpenTarget, OpenWithPick, PROBE_DEADLINE, PressRoute, ProbeStart, RenameCheck, RenameStep,
+    Report, RunChoice, SearchOption, Severity, Unavailable, UndoAction, UndoEntry, add_launch_row,
+    add_viewer_row, check_rename, dismissed_notice, launch_confirmation, menu_rows,
+    no_trash_dialog, open_action, open_target, plan_launches, press_route, rename_seed,
+    rename_step, run_choice, run_launches, run_prompt, search_option_rows, start_failure_notice,
+    stem_range, toolbar_menu_rows,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
@@ -922,10 +923,21 @@ impl Explorer {
             DialogChoice::Cancel => self.cancel_dialog(window, cx),
             DialogChoice::Confirm => self.confirm_dialog(window, cx),
             DialogChoice::Skip | DialogChoice::KeepBoth => {
-                if self.answer_run_prompt(choice, window, cx) {
+                // The run prompt arms every button that executes.
+                if !self.dialogs.accepts(choice, Instant::now()) {
                     return;
                 }
-                self.answer_open_conflict(choice, window, cx);
+                let Some(action) = self.dialogs.current().map(|dialog| dialog.action.clone())
+                else {
+                    return;
+                };
+                match press_route(&action, choice) {
+                    PressRoute::RunPrompt(_) => {
+                        self.answer_run_prompt(choice, window, cx);
+                    }
+                    PressRoute::Conflict => self.answer_open_conflict(choice, window, cx),
+                    PressRoute::Ignored => {}
+                }
             }
         }
     }
@@ -2317,29 +2329,55 @@ impl Explorer {
         if self.in_trash() {
             return self.open_file(&path, cx);
         }
-        match probe {
-            OpenProbe::Plain => self.open_file(&path, cx),
-            OpenProbe::Prompt => self.offer_run_prompt(&path, window, cx),
-            OpenProbe::Desktop => self.open_desktop_file_as_text(path, window, cx),
-            OpenProbe::MaybeRunnable => {
-                let looked = path.clone();
-                let probed = cx
-                    .background_executor()
-                    .spawn(async move { is_runnable(&looked) });
-                cx.spawn_in(window, async move |this, cx| {
-                    let runnable = probed.await;
-                    if let Err(error) = this.update_in(cx, |this, window, cx| {
-                        match OpenProbe::MaybeRunnable.settle(runnable) {
-                            OpenProbe::Prompt => this.offer_run_prompt(&path, window, cx),
-                            _ => this.open_file(&path, cx),
-                        }
-                    }) {
-                        log::debug!("the explorer closed before the file was probed: {error}");
-                    }
-                })
-                .detach();
-            }
+        match probe.step() {
+            OpenStep::OpenNow => self.open_file(&path, cx),
+            OpenStep::Prompt => self.offer_run_prompt(&path, window, cx),
+            OpenStep::AsText => self.open_desktop_file_as_text(path, window, cx),
+            OpenStep::Probe => self.probe_then_open(path, window, cx),
         }
+    }
+
+    /// Reads the first bytes of `path` off the UI thread to tell a program
+    /// from a file. One probe per path; one that has not answered within
+    /// [`PROBE_DEADLINE`] (a hung mount) gives up and the file opens as
+    /// before, and its late answer is ignored.
+    fn probe_then_open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let token = match self.probes.begin(&path) {
+            ProbeStart::Begin(token) => token,
+            ProbeStart::Drop => return,
+            ProbeStart::Plain => return self.open_file(&path, cx),
+        };
+        let looked = path.clone();
+        let probed = cx
+            .background_executor()
+            .spawn(async move { is_runnable(&looked) });
+        let waited = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(PROBE_DEADLINE).await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.probes.expire(&waited, token) {
+                    this.open_file(&waited, cx);
+                }
+            }) {
+                log::debug!("the explorer closed before the probe deadline: {error}");
+            }
+        })
+        .detach();
+        cx.spawn_in(window, async move |this, cx| {
+            let runnable = probed.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                if !this.probes.result(&path, token) {
+                    return;
+                }
+                match OpenProbe::MaybeRunnable.settle(runnable) {
+                    OpenProbe::Prompt => this.offer_run_prompt(&path, window, cx),
+                    _ => this.open_file(&path, cx),
+                }
+            }) {
+                log::debug!("the explorer closed before the file was probed: {error}");
+            }
+        })
+        .detach();
     }
 
     /// The "Run / Run in Terminal / Open" prompt for the program at `path`,

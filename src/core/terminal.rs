@@ -57,6 +57,8 @@ pub struct Terminal {
     /// Arguments that come before the working-directory one.
     args: Vec<OsString>,
     dir: DirArgOwned,
+    /// A desktop entry's `X-TerminalArgExec`, which replaces the default `-e`.
+    exec_arg: Option<String>,
 }
 
 /// [`DirArg`] where a desktop entry's `X-TerminalArgDir` may own its text.
@@ -96,6 +98,7 @@ impl Terminal {
             program,
             args: Vec::new(),
             dir,
+            exec_arg: None,
         }
     }
 
@@ -106,7 +109,11 @@ impl Terminal {
     #[must_use]
     pub fn command_running(&self, folder: &Path, argv: &[OsString]) -> TerminalCommand {
         let mut command = self.command(folder);
-        command.args.extend(exec_args(&self.program));
+        let (flags, wrap) = exec_args(&self.program, self.exec_arg.as_deref());
+        command.args.extend(flags);
+        if wrap {
+            command.args.extend(WRAPPER.iter().map(OsString::from));
+        }
         command.args.extend(argv.iter().cloned());
         command
     }
@@ -141,18 +148,34 @@ impl Terminal {
     }
 }
 
-/// The arguments that make the terminal at `program` run what follows them.
-/// The ones Fileflux knows by name take their own; `xdg-terminal-exec`,
-/// kitty and foot run the rest of the command line as it is, and any other
-/// terminal gets `-e`, the xdg-terminal-exec default (`X-ExecArg`).
-fn exec_args(program: &Path) -> Vec<OsString> {
+/// Starts the program the terminal was given without any parsing: the shell
+/// replaces itself with `"$@"`, the arguments after its own name.
+const WRAPPER: [&str; 4] = ["/bin/sh", "-c", "exec \"$@\"", "sh"];
+
+/// The arguments that make the terminal at `program` run what follows them,
+/// and whether the program must be wrapped in [`WRAPPER`].
+///
+/// `xdg-terminal-exec`, kitty and foot run the rest of the command line as
+/// it is; wezterm and gnome-terminal take it after `--`, xfce4-terminal after
+/// `-x`, alacritty after `-e` (all of them keep each argument intact).
+/// konsole, xterm and any other terminal re-split a lone `-e <arg>` as a
+/// command line, so the program goes through [`WRAPPER`]: with more than one
+/// argument after `-e` they run them as they are. A desktop entry's
+/// `X-TerminalArgExec` replaces the `-e` of an unknown terminal; only that
+/// `-e` form needs the wrapper.
+fn exec_args(program: &Path, entry_arg: Option<&str>) -> (Vec<OsString>, bool) {
     let flags: &[&str] = match program.file_name().and_then(OsStr::to_str) {
         Some("xdg-terminal-exec" | "kitty" | "foot") => &[],
         Some("wezterm" | "gnome-terminal") => &["--"],
         Some("xfce4-terminal") => &["-x"],
-        _ => &["-e"],
+        Some("alacritty") => &["-e"],
+        Some("konsole" | "xterm") => return (vec!["-e".into()], true),
+        _ => {
+            let flag = entry_arg.unwrap_or("-e");
+            return (vec![flag.into()], flag == "-e");
+        }
     };
-    flags.iter().map(OsString::from).collect()
+    (flags.iter().map(OsString::from).collect(), false)
 }
 
 fn known_dir_arg(program: &Path) -> Option<DirArg> {
@@ -294,6 +317,7 @@ fn from_entry(entry: &DesktopEntry, path_var: Option<&OsStr>) -> Option<Terminal
         return Some(terminal);
     }
     terminal.args = words.map(OsString::from).collect();
+    terminal.exec_arg.clone_from(&entry.terminal_arg_exec);
     if let Some(flag) = &entry.terminal_arg_dir {
         terminal.dir = if flag.ends_with('=') {
             DirArgOwned::Joined(flag.clone())
@@ -833,5 +857,71 @@ mod tests {
                 PathBuf::from("/etc/xdg")
             ]
         );
+    }
+
+    fn running(program: &str, entry: Option<&str>) -> Vec<String> {
+        let mut terminal = Terminal::at(PathBuf::from(program));
+        terminal.exec_arg = entry.map(str::to_owned);
+        let argv = vec![OsString::from("/opt/my tool")];
+        terminal
+            .command_running(Path::new("/w"), &argv)
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    const WRAPPED: [&str; 5] = ["/bin/sh", "-c", "exec \"$@\"", "sh", "/opt/my tool"];
+
+    #[test]
+    fn terminals_that_keep_argv_take_the_program_as_it_is() {
+        assert_eq!(running("/bin/xdg-terminal-exec", None), ["/opt/my tool"]);
+        assert_eq!(
+            running("/bin/foot", None),
+            ["--working-directory=/w", "/opt/my tool"]
+        );
+        assert_eq!(
+            running("/bin/xfce4-terminal", None),
+            ["--working-directory=/w", "-x", "/opt/my tool"]
+        );
+    }
+
+    #[test]
+    fn konsole_and_xterm_never_get_a_lone_re_split_argument() {
+        let mut konsole = vec!["--workdir", "/w", "-e"];
+        konsole.extend(WRAPPED);
+        assert_eq!(running("/bin/konsole", None), konsole);
+        let mut xterm = vec!["-e"];
+        xterm.extend(WRAPPED);
+        assert_eq!(running("/bin/xterm", None), xterm);
+    }
+
+    #[test]
+    fn a_desktop_entry_terminal_honours_x_terminal_arg_exec() {
+        assert_eq!(running("/bin/mytty", Some("--")), ["--", "/opt/my tool"]);
+        let mut default = vec!["-e"];
+        default.extend(WRAPPED);
+        assert_eq!(running("/bin/mytty", Some("-e")), default);
+        assert_eq!(running("/bin/mytty", None), default);
+
+        let scratch = Scratch::new("argexec");
+        scratch.terminal("mytty");
+        scratch.app(
+            "my.tty.desktop",
+            "Name=My tty\nExec=mytty\nX-TerminalArgExec=--run",
+        );
+        scratch.write("config/xdg-terminals.list", "my.tty.desktop\n");
+        let terminal = resolve(&scratch.env()).expect("resolves");
+        assert_eq!(terminal.exec_arg.as_deref(), Some("--run"));
+    }
+
+    #[test]
+    fn the_wrapper_runs_the_program_with_its_arguments_intact() {
+        let output = Command::new(WRAPPER[0])
+            .args(&WRAPPER[1..])
+            .args(["printf", "[%s]", "a b", "$HOME;x"])
+            .output()
+            .expect("wrapper runs");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "[a b][$HOME;x]");
     }
 }

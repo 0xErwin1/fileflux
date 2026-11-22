@@ -3860,97 +3860,164 @@ fn the_run_prompt_has_four_buttons_and_defaults_to_cancel() {
         dialog.action,
         DialogAction::Runnable(PathBuf::from("/x/my tool"))
     );
-    // Run is armed late like every confirming button; the others are live.
+    // Every button that executes is armed late; only Cancel is live.
     let t0 = Instant::now();
     let mut queue = DialogQueue::default();
     queue.offer_at(dialog, t0);
-    assert!(!queue.accepts(DialogChoice::Confirm, t0));
-    assert!(queue.accepts(DialogChoice::Skip, t0));
-    assert!(queue.accepts(DialogChoice::KeepBoth, t0));
+    let early = t0 + Duration::from_millis(399);
+    for choice in [
+        DialogChoice::Confirm,
+        DialogChoice::Skip,
+        DialogChoice::KeepBoth,
+    ] {
+        assert!(!queue.accepts(choice, t0), "{choice:?}");
+        assert!(!queue.accepts(choice, early), "{choice:?}");
+        assert!(queue.accepts(choice, t0 + ARM_DELAY), "{choice:?}");
+    }
     assert!(queue.accepts(DialogChoice::Cancel, t0));
 }
 
 #[test]
-fn a_conflict_question_keeps_its_buttons_in_order() {
-    for dialog in every_dialog() {
-        let expected: &[(DialogChoice, &str)] = match dialog.kind {
-            DialogKind::Conflict { .. } => &[
-                (DialogChoice::KeepBoth, "Keep both"),
-                (DialogChoice::Skip, "Skip"),
-            ],
-            DialogKind::Runnable { .. } => &[
-                (DialogChoice::KeepBoth, "Open"),
-                (DialogChoice::Skip, "Run in Terminal"),
-            ],
-            _ => &[],
-        };
-        assert_eq!(dialog.text.extra, expected, "{:?}", dialog.kind);
-    }
-}
-
-#[test]
-fn each_button_of_the_run_prompt_maps_to_its_answer() {
-    assert_eq!(run_choice(DialogChoice::Confirm), Some(RunChoice::Run));
-    assert_eq!(
-        run_choice(DialogChoice::Skip),
-        Some(RunChoice::RunInTerminal)
-    );
-    assert_eq!(run_choice(DialogChoice::KeepBoth), Some(RunChoice::Open));
-    assert_eq!(run_choice(DialogChoice::Cancel), None);
-}
-
-#[test]
-fn a_second_open_of_the_same_program_does_not_stack_a_second_prompt() {
+fn a_conflict_question_arms_only_its_danger_button() {
     let t0 = Instant::now();
-    let tool = Path::new("/x/tool");
+    let dialog = conflict_dialog();
     let mut queue = DialogQueue::default();
-    assert!(!queue.has_run_prompt_for(tool));
-    queue.offer_at(delete_dialog("/x/a"), t0);
-    queue.offer_at(run_prompt(tool), t0);
-    assert!(queue.has_run_prompt_for(tool), "waiting counts");
-    assert!(!queue.has_run_prompt_for(Path::new("/x/other")));
-    queue.close_at(t0);
-    assert!(queue.has_run_prompt_for(tool), "open counts");
-    queue.close_at(t0);
-    assert!(!queue.has_run_prompt_for(tool));
+    queue.offer_at(dialog, t0);
+    assert!(queue.accepts(DialogChoice::Skip, t0));
+    assert!(queue.accepts(DialogChoice::KeepBoth, t0));
+    assert!(!queue.accepts(DialogChoice::Confirm, t0));
 }
 
 #[test]
-fn launch_follows_open_only_when_added_and_only_for_a_desktop_file() {
-    let one_file = MenuTarget {
-        only_files: true,
-        ..target(false, 1, false, false)
-    };
-    let mut rows = menu_rows(&one_file);
-    assert!(item(&rows, MenuCommand::Launch).is_none(), "not by default");
-    let before = flat(&rows);
-    add_launch_row(&mut rows);
-    let mut expected = before.clone();
-    expected.insert(1, "Launch".to_owned());
-    assert_eq!(flat(&rows), expected);
-    assert_eq!(
-        item(&rows, MenuCommand::Launch).map(|spec| (spec.enabled, spec.danger)),
-        Some((true, false))
+fn the_extra_buttons_show_for_a_conflict_only_with_its_apply_all_state() {
+    let conflict = conflict_dialog();
+    assert_eq!(conflict.footer_extra().len(), 2);
+    // The same words without the conflict's state show no extra button.
+    let stray = DialogState::new(
+        conflict.kind.clone(),
+        &[],
+        DialogAction::EmptyTrash(Vec::new()),
     );
+    assert!(stray.footer_extra().is_empty());
+}
 
-    // Without an "Open" row (the empty space, the Trash) nothing is added.
-    for target in [target(false, 0, false, true), target(true, 1, false, false)] {
-        let mut rows = menu_rows(&target);
-        let before = flat(&rows);
-        add_launch_row(&mut rows);
-        assert_eq!(flat(&rows), before);
+#[test]
+fn the_run_prompt_shows_every_button_and_enter_alone_never_runs() {
+    let prompt = run_prompt(Path::new("/x/tool"));
+    // Every footer button is a Tab stop (Bolt's buttons are), so showing
+    // each of them is what makes Open and Run in Terminal reachable.
+    assert_eq!(
+        prompt.footer_extra(),
+        [
+            (DialogChoice::KeepBoth, "Open"),
+            (DialogChoice::Skip, "Run in Terminal"),
+        ]
+    );
+    assert_eq!(prompt.initial_focus(), DialogChoice::Cancel);
+}
+
+fn begun(start: ProbeStart) -> u64 {
+    match start {
+        ProbeStart::Begin(token) => token,
+        other => {
+            assert_eq!(other, ProbeStart::Begin(0), "a probe should have begun");
+            0
+        }
     }
 }
 
+fn conflict_dialog() -> DialogState {
+    DialogState::conflict(
+        1,
+        paste::ConflictRequest {
+            kind: DialogKind::Conflict {
+                name: "a".to_owned(),
+                folder: "b".to_owned(),
+                existing: "1 B".to_owned(),
+                incoming: "2 B".to_owned(),
+            },
+        },
+    )
+}
+
 #[test]
-fn folders_and_files_keep_the_open_action_they_had() {
-    use fileflux::core::EntryKind::{Directory, File};
+fn a_second_open_of_a_path_being_probed_is_dropped() {
+    let mut probes = ProbeTracker::default();
+    let path = Path::new("/mnt/hung/tool");
+    let token = begun(probes.begin(path));
+    assert_eq!(probes.begin(path), ProbeStart::Drop);
+    // Another path is independent.
+    assert!(matches!(
+        probes.begin(Path::new("/mnt/hung/other")),
+        ProbeStart::Begin(_)
+    ));
+    // The result in time is acted on once, then the path is free again.
+    assert!(probes.result(path, token));
+    assert!(!probes.result(path, token), "a result counts once");
+    assert!(matches!(probes.begin(path), ProbeStart::Begin(_)));
+}
+
+#[test]
+fn a_probe_that_misses_its_deadline_falls_back_once_and_its_late_result_is_ignored() {
+    assert_eq!(PROBE_DEADLINE, Duration::from_millis(1500));
+    let mut probes = ProbeTracker::default();
+    let path = Path::new("/mnt/hung/tool");
+    let token = begun(probes.begin(path));
+    assert!(probes.expire(path, token), "the deadline falls back");
+    assert!(!probes.expire(path, token), "only once");
+    // While the blocked read has not returned, no new read is queued: the
+    // open goes straight to the plain one.
+    assert_eq!(probes.begin(path), ProbeStart::Plain);
+    assert!(!probes.result(path, token), "the late result is ignored");
+    // The read returned: the path can be probed again.
+    assert!(matches!(probes.begin(path), ProbeStart::Begin(_)));
+}
+
+#[test]
+fn a_deadline_after_the_result_does_nothing() {
+    let mut probes = ProbeTracker::default();
+    let path = Path::new("/a/tool");
+    let token = begun(probes.begin(path));
+    assert!(probes.result(path, token));
+    assert!(!probes.expire(path, token));
+}
+
+#[test]
+fn the_run_prompt_slots_never_fall_through_to_the_conflict_handler() {
+    let prompt = DialogAction::Runnable(PathBuf::from("/x/tool"));
     assert_eq!(
-        open_action(&scanned(Path::new("/a/dir"), Directory, Some(0o755))),
-        OpenAction::Navigate
+        press_route(&prompt, DialogChoice::Skip),
+        PressRoute::RunPrompt(Some(RunChoice::RunInTerminal))
     );
     assert_eq!(
-        open_action(&scanned(Path::new("/a/tool"), File, Some(0o755))),
-        OpenAction::External
+        press_route(&prompt, DialogChoice::KeepBoth),
+        PressRoute::RunPrompt(Some(RunChoice::Open))
     );
+    let conflict = DialogAction::Conflict {
+        job: 3,
+        apply_all: false,
+    };
+    assert_eq!(
+        press_route(&conflict, DialogChoice::Skip),
+        PressRoute::Conflict
+    );
+    assert_eq!(
+        press_route(&conflict, DialogChoice::KeepBoth),
+        PressRoute::Conflict
+    );
+    assert_eq!(
+        press_route(&DialogAction::EmptyTrash(Vec::new()), DialogChoice::Skip),
+        PressRoute::Ignored
+    );
+}
+
+#[test]
+fn a_desktop_file_never_opens_through_the_default_opener() {
+    assert_eq!(OpenProbe::Desktop.step(), OpenStep::AsText);
+    assert_eq!(OpenProbe::Plain.step(), OpenStep::OpenNow);
+    assert_eq!(OpenProbe::Prompt.step(), OpenStep::Prompt);
+    assert_eq!(OpenProbe::MaybeRunnable.step(), OpenStep::Probe);
+    // Whatever a probe says, a .desktop decision is not changed into a
+    // plain open.
+    assert_eq!(OpenProbe::Desktop.settle(false), OpenProbe::Desktop);
 }

@@ -33,6 +33,14 @@ pub(crate) fn favorite_row_index(row: &str) -> Option<usize> {
     row.strip_prefix(FAVORITE_ROW_PREFIX)?.parse().ok()
 }
 
+/// Whether a drag of a folder reorders the favorites: only one that began on
+/// a favorite row of the sidebar, and only of a folder that is a favorite. A
+/// folder dragged from the entries area (or from another sidebar row) keeps
+/// the ordinary drop everywhere, the favorite rows' edges included.
+pub(crate) fn drag_reorders(began_on_favorite_row: bool, folder_is_favorite: bool) -> bool {
+    began_on_favorite_row && folder_is_favorite
+}
+
 /// The open "Rename…" dialog of a favorite: which folder and its one field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenameDialog {
@@ -327,6 +335,9 @@ impl Explorer {
     /// the band of the row the drag is over, and the move must change the
     /// list.
     pub(crate) fn favorite_drop_gap(&self, folder: &Path, pointer: Point<Pixels>) -> Option<usize> {
+        if !self.reorders_favorites_with(folder) {
+            return None;
+        }
         let over = self
             .favorite_insert
             .as_ref()
@@ -335,6 +346,14 @@ impl Explorer {
         self.favorites
             .move_anchor(folder, FavoriteMove::Gap(gap))
             .map(|_| gap)
+    }
+
+    fn reorders_favorites_with(&self, folder: &Path) -> bool {
+        drag_reorders(
+            self.favorite_drag,
+            self.favorites
+                .contains(&Location::Directory(folder.to_path_buf())),
+        )
     }
 
     /// A drag of the folder `folder` moved over the favorite row `row` (its
@@ -347,11 +366,7 @@ impl Explorer {
         pointer: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let next = if bounds.contains(&pointer)
-            && self
-                .favorites
-                .contains(&Location::Directory(folder.to_path_buf()))
-        {
+        let next = if bounds.contains(&pointer) && self.reorders_favorites_with(folder) {
             let mut insert = FavoriteInsert {
                 folder: folder.to_path_buf(),
                 row,
@@ -493,6 +508,14 @@ mod tests {
         assert_eq!(at(1.0), Some(0));
         assert_eq!(at(4.0), None);
         assert_eq!(at(7.0), Some(1));
+    }
+
+    #[test]
+    fn only_a_drag_that_began_on_a_favorite_row_reorders() {
+        assert!(drag_reorders(true, true));
+        assert!(!drag_reorders(false, true), "from the entries area");
+        assert!(!drag_reorders(true, false), "not a favorite");
+        assert!(!drag_reorders(false, false));
     }
 
     #[test]

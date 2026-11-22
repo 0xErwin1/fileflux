@@ -34,7 +34,7 @@ use super::actions::MenuOn;
 use super::devices::{actions_for, caption, unlisted_volumes};
 use super::dnd::{self, DropTarget};
 use super::entries;
-use super::favorites::favorite_row_id;
+use super::favorites::{favorite_row_id, favorite_row_index};
 use super::icon;
 use super::ops::{MenuCommand, MenuItemSpec, MenuRow};
 use super::state::Transition;
@@ -967,7 +967,12 @@ fn row_shell(
                             dnd::press_gate(event.position, cx);
                         }),
                     );
-                    dnd::place_drag_source(row, path.to_path_buf(), &cx.entity().downgrade())
+                    dnd::place_drag_source(
+                        row,
+                        path.to_path_buf(),
+                        favorite_row_index(&id).is_some(),
+                        &cx.entity().downgrade(),
+                    )
                 }
                 None => row,
             };

@@ -217,7 +217,18 @@ fn a_terminal_runs_a_program_with_its_own_exec_argument() -> TestResult {
             "wezterm",
             &["start", "--cwd", "/opt", "--", "/opt/tool", "arg one"],
         ),
-        ("someterm", &["-e", "/opt/tool", "arg one"]),
+        (
+            "someterm",
+            &[
+                "-e",
+                "/bin/sh",
+                "-c",
+                "exec \"$@\"",
+                "sh",
+                "/opt/tool",
+                "arg one",
+            ],
+        ),
     ];
     for (name, expected) in cases {
         let env = TerminalEnv {
