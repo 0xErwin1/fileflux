@@ -23,13 +23,14 @@ use fileflux::core::ops::{
     self as core_ops, Conflict, ItemOutcome, Mode, TransferError, TransferReport, rename_noreplace,
 };
 use fileflux::core::places::format_bytes;
+use fileflux::core::reason::plain_reason;
 use fileflux::core::trash::{self, TrashError};
 use gpui::{ClipboardItem, FileOperation};
 use rustix::io::Errno;
 
 use super::{
-    DialogChoice, DialogKind, Identity, JobCtx, Notice, Report, Severity, Sink, Step, UndoAction,
-    failure_line, items_label, lowercase_first, plural_items, presence, quote, quote_path,
+    DialogChoice, DialogKind, Failure, Identity, JobCtx, Notice, Report, Severity, Sink, Step,
+    UndoAction, could_not, lowercase_first, plural_items, presence, quote, quote_path, reasons_of,
     same_item,
 };
 use crate::explorer::util::format_modified;
@@ -174,7 +175,7 @@ pub(crate) fn paste_target(
 }
 
 /// How a folder reads in a message: its name, or the path for the root.
-fn folder_label(dir: &Path) -> String {
+pub(crate) fn folder_label(dir: &Path) -> String {
     dir.file_name().map_or_else(
         || dir.to_string_lossy().into_owned(),
         |name| name.to_string_lossy().into_owned(),
@@ -560,7 +561,7 @@ pub(crate) fn transfer_summary(
     let mut done: Vec<&Path> = Vec::new();
     let mut replaced_ok = 0usize;
     let mut skipped = 0usize;
-    let mut failures: Vec<(&Path, &TransferError)> = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     let mut details = Vec::new();
     for item in &report.items {
         match &item.outcome {
@@ -577,8 +578,9 @@ pub(crate) fn transfer_summary(
             // What the user cancelled is not a failure.
             ItemOutcome::Failed(TransferError::Cancelled) => {}
             ItemOutcome::Failed(error) => {
-                failures.push((&item.source, error));
-                details.push(failure_line(&item.source, error));
+                let failure = Failure::of_path(&item.source, error.plain());
+                details.push(failure.line());
+                failures.push(failure);
             }
         }
     }
@@ -601,7 +603,7 @@ pub(crate) fn transfer_summary(
         }
         text.push_str(&skipped_tail);
         if failed > 0 {
-            text.push_str(&format!("; {failed} failed"));
+            text.push_str(&format!("; {failed} failed: {}", reasons_of(&failures)));
         }
         if replaced_ok > 0 {
             text.push_str(&format!(
@@ -621,22 +623,12 @@ pub(crate) fn transfer_summary(
             Severity::Info,
             format!("Cancelled: nothing was {}", mode.past().to_lowercase()),
         )
-    } else if let [(source, error)] = failures.as_slice() {
-        (
-            Severity::Error,
-            format!(
-                "Could not {} {} \u{2014} {error}{skipped_tail}",
-                mode.bare(),
-                quote_path(source)
-            ),
-        )
     } else if failed > 0 {
         (
             Severity::Error,
             format!(
-                "Could not {} {}{skipped_tail}",
-                mode.bare(),
-                items_label(failed)
+                "{}{skipped_tail}",
+                could_not(mode.bare(), &format!(" to {place}"), &failures)
             ),
         )
     } else {
@@ -668,8 +660,9 @@ fn with_leftovers(
     ));
     for (path, error) in &report.leftovers {
         details.push(format!(
-            "{}: the replaced original is still there ({error})",
-            quote_path(path)
+            "{}: the replaced original is still there ({})",
+            quote_path(path),
+            plain_reason(error)
         ));
     }
     let severity = if severity == Severity::Error {
@@ -847,11 +840,11 @@ fn trash_copy(entry: &PlacedEntry, ctx: &JobCtx) -> Step {
         Err(TrashError::NoTrash(_)) => {
             return Step::Gone(format!("there is no Trash for {}", quote_path(&entry.to)));
         }
-        Err(error) => return Step::Failed(format!("{}: {error}", quote_path(&entry.to))),
+        Err(error) => return Step::Failed(format!("{}: {}", quote_path(&entry.to), error.plain())),
     };
     match trash::put(&entry.to, &target, chrono::Local::now().naive_local()) {
         Ok(_) => Step::Restored(entry.to.clone()),
-        Err(error) => Step::Failed(format!("{}: {error}", quote_path(&entry.to))),
+        Err(error) => Step::Failed(format!("{}: {}", quote_path(&entry.to), error.plain())),
     }
 }
 
@@ -895,7 +888,7 @@ fn return_one(entry: &PlacedEntry) -> Step {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Step::Blocked(format!("{name}: its original folder no longer exists"));
         }
-        Err(error) => return Step::Failed(format!("{name}: {error}")),
+        Err(error) => return Step::Failed(format!("{name}: {}", plain_reason(&error))),
     }
     match rename_noreplace(&entry.to, &entry.from) {
         Ok(()) => Step::Restored(entry.from.clone()),
@@ -903,7 +896,7 @@ fn return_one(entry: &PlacedEntry) -> Step {
         Err(error) if error.raw_os_error() == Some(Errno::XDEV.raw_os_error()) => {
             return_across_devices(entry, &name)
         }
-        Err(error) => Step::Failed(format!("{name}: {error}")),
+        Err(error) => Step::Failed(format!("{name}: {}", plain_reason(&error))),
     }
 }
 
@@ -930,15 +923,16 @@ fn return_across_devices(entry: &PlacedEntry, name: &str) -> Step {
         Some(ItemOutcome::Ok { dest, .. }) => match rename_noreplace(&dest, &entry.from) {
             Ok(()) => Step::Restored(entry.from.clone()),
             Err(error) => Step::Failed(format!(
-                "{name} came back as {} but could not be renamed: {error}",
-                quote(dest.file_name().unwrap_or_default())
+                "{name} came back as {} but could not be renamed: {}",
+                quote(dest.file_name().unwrap_or_default()),
+                plain_reason(&error)
             )),
         },
         Some(ItemOutcome::Skipped) => Step::Blocked(format!(
             "an item named {} is already in the folder it came from",
             quote(entry.to.file_name().unwrap_or_default())
         )),
-        Some(ItemOutcome::Failed(error)) => Step::Failed(format!("{name}: {error}")),
+        Some(ItemOutcome::Failed(error)) => Step::Failed(format!("{name}: {}", error.plain())),
         None => Step::Failed(format!("{name}: nothing was returned")),
     }
 }

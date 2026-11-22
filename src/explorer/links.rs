@@ -14,11 +14,13 @@ use std::path::{Path, PathBuf};
 
 use fileflux::core::Location;
 use fileflux::core::links::{self, Naming};
+use fileflux::core::reason::plain_reason;
 use gpui::{Context, Window};
 
 use super::ops::paste::{PasteInto, paste_target};
 use super::ops::{
-    Identity, MenuCommand, MenuItemSpec, MenuRow, Notice, Report, Severity, UndoAction,
+    Failure, Identity, MenuCommand, MenuItemSpec, MenuRow, Notice, Report, Severity, UndoAction,
+    failure_lines, reasons_of,
 };
 use super::progress::{Sink, Unit};
 use super::tabs::Affected;
@@ -120,6 +122,25 @@ fn links_label(count: usize) -> String {
     }
 }
 
+/// "Could not create a link to “a” in Docs: why" for one failure, "Could not
+/// create 3 links in Docs: why (2), why (1)" for several.
+fn could_not_link(into: Option<&Path>, failures: &[Failure]) -> String {
+    let place = into.map_or_else(String::new, |dir| {
+        format!(" in {}", super::ops::paste::folder_label(dir))
+    });
+    match failures {
+        [only] => format!(
+            "Could not create a link to {}{place}: {}",
+            only.item, only.reason
+        ),
+        many => format!(
+            "Could not create {}{place}: {}",
+            links_label(many.len()),
+            reasons_of(many)
+        ),
+    }
+}
+
 /// Runs a link job: a link to each of `sources`, beside it (`into` is
 /// `None`) or inside `into`. Blocking: call it on the background executor.
 pub(crate) fn run_links(
@@ -142,11 +163,12 @@ pub(crate) fn run_links(
         sink.cancel_flag(),
     );
     sink.advance(sources.len() as u64, "");
-    let details: Vec<String> = outcome
+    let failures: Vec<Failure> = outcome
         .failed
         .iter()
-        .map(|(source, error)| format!("{}: {error}", quoted(source)))
+        .map(|(source, error)| Failure::new(quoted(source), plain_reason(error)))
         .collect();
+    let details = failure_lines(&failures);
     let made = outcome.made.len();
     let failed = outcome.failed.len();
     let (severity, text) = if made == 0 {
@@ -155,13 +177,7 @@ pub(crate) fn run_links(
                 Severity::Info,
                 "Cancelled. No links were created.".to_owned(),
             ),
-            (false, Some((_, error))) if failed == 1 => {
-                (Severity::Error, format!("Could not create a link: {error}"))
-            }
-            (false, _) => (
-                Severity::Error,
-                format!("Could not create links ({failed} failed)"),
-            ),
+            (false, _) => (Severity::Error, could_not_link(into, &failures)),
         }
     } else {
         let mut text = match outcome.made.as_slice() {
@@ -169,7 +185,7 @@ pub(crate) fn run_links(
             _ => format!("Created {}", links_label(made)),
         };
         if failed > 0 {
-            text.push_str(&format!("; {failed} failed"));
+            text.push_str(&format!("; {failed} failed: {}", reasons_of(&failures)));
         }
         if outcome.cancelled {
             text.push_str("; cancelled");
@@ -223,7 +239,7 @@ pub(crate) fn undo(items: &[LinkedEntry], sink: &Sink) -> Report {
             }
             Err(error) => {
                 failed += 1;
-                problems.push(format!("{name}: {error}"));
+                problems.push(format!("{name}: {}", plain_reason(&error)));
                 remaining.push(item.clone());
             }
             Ok(meta)
@@ -237,7 +253,7 @@ pub(crate) fn undo(items: &[LinkedEntry], sink: &Sink) -> Report {
                 Ok(()) => done.push(&item.link),
                 Err(error) => {
                     failed += 1;
-                    problems.push(format!("{name}: {error}"));
+                    problems.push(format!("{name}: {}", plain_reason(&error)));
                     remaining.push(item.clone());
                 }
             },

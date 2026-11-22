@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fileflux::core::apps::{App, OpenWith};
+use fileflux::core::ops::{ItemOutcome, ItemReport, TransferError, TransferReport};
 use fileflux::core::places::startup_trash_root;
 use fileflux::core::trash::TrashKind;
 
 use super::super::progress::Unit;
+use super::paste::{self, ClipMode};
 use super::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2164,7 +2166,10 @@ fn restoring_without_usable_metadata_fails_and_keeps_the_item() -> TestResult {
 
     let report = run_job(Job::Restore(vec![os("a.txt"), os("b.txt")]), &ctx, &sink());
     assert_eq!(severity(&report), Some(Severity::Error));
-    assert_eq!(text(&report), "Could not restore 2 items");
+    assert_eq!(
+        text(&report),
+        "Could not restore 2 items: it no longer exists (1), the Trash entry is damaged (1)"
+    );
     assert_eq!(report.details.len(), 2);
     assert!(report.select.is_empty());
     assert_eq!(
@@ -2240,13 +2245,15 @@ fn emptying_the_trash_reports_the_item_that_could_not_be_removed() -> TestResult
         &sink(),
     );
     assert_eq!(severity(&report), Some(Severity::Warning));
-    assert_eq!(text(&report), "Emptied the Trash; 1 could not be removed");
+    assert_eq!(
+        text(&report),
+        "Emptied the Trash; 1 could not be removed: you don't have permission to do that"
+    );
     assert_eq!(report.details.len(), 1);
     assert!(
-        report
-            .details
-            .first()
-            .is_some_and(|line| line.contains("stuck")),
+        report.details.first().is_some_and(
+            |line| line == "\u{201c}stuck\u{201d}: you don't have permission to do that"
+        ),
         "{:?}",
         report.details
     );
@@ -3381,4 +3388,266 @@ fn ctrl_b_toggles_the_sidebar_from_anywhere_in_the_shell() {
         1,
         "Ctrl+B has exactly one binding"
     );
+}
+
+// --- failures say why, in plain words -------------------------------------------------
+
+const DENIED: &str = "you don't have permission to do that";
+
+/// A folder nobody can write to until the guard is dropped.
+fn read_only(scratch: &Scratch, name: &str) -> io::Result<(PathBuf, Unlock)> {
+    let dir = scratch.dir(name)?;
+    Ok((dir.clone(), Unlock(dir)))
+}
+
+fn lock(dir: &Path) -> io::Result<()> {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500))
+}
+
+fn failing_trash(raw: i32) -> JobCtx {
+    JobCtx {
+        trash_root: PathBuf::from("/nowhere"),
+        target_for: Box::new(move |_| Err(TrashError::Io(io::Error::from_raw_os_error(raw)))),
+    }
+}
+
+#[test]
+fn creating_in_a_read_only_folder_names_the_item_the_folder_and_the_reason() -> TestResult {
+    let scratch = Scratch::new("why-create")?;
+    let (dir, _unlock) = read_only(&scratch, "locked")?;
+    lock(&dir)?;
+    let ctx = scratch.ctx();
+    for (kind, noun, name) in [
+        (NewKind::Folder, "folder", "Untitled folder"),
+        (NewKind::File, "file", "Untitled file"),
+    ] {
+        let report = run_job(
+            Job::Create {
+                dir: dir.clone(),
+                kind,
+            },
+            &ctx,
+            &sink(),
+        );
+        assert_eq!(severity(&report), Some(Severity::Error));
+        assert_eq!(
+            text(&report),
+            format!("Could not create the {noun} \u{201c}{name}\u{201d} in locked: {DENIED}")
+        );
+        assert!(report.undo.is_none() && report.select.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn renaming_in_a_read_only_folder_names_both_names_and_the_reason() -> TestResult {
+    let scratch = Scratch::new("why-rename")?;
+    let a = scratch.file("locked/a.txt", "keep")?;
+    let (dir, _unlock) = (scratch.0.join("locked"), Unlock(scratch.0.join("locked")));
+    lock(&dir)?;
+    let report = run_job(
+        Job::Rename {
+            path: a.clone(),
+            new_name: os("b.txt"),
+        },
+        &scratch.ctx(),
+        &sink(),
+    );
+    assert_eq!(severity(&report), Some(Severity::Error));
+    assert_eq!(
+        text(&report),
+        format!("Could not rename \u{201c}a.txt\u{201d} to \u{201c}b.txt\u{201d}: {DENIED}")
+    );
+    assert_eq!(fs::read_to_string(&a)?, "keep");
+    Ok(())
+}
+
+#[test]
+fn deleting_what_cannot_be_deleted_says_which_item_and_why() -> TestResult {
+    let scratch = Scratch::new("why-delete")?;
+    let a = scratch.file("locked/a.txt", "a")?;
+    let b = scratch.file("locked/b.txt", "b")?;
+    let dir = scratch.0.join("locked");
+    let _unlock = Unlock(dir.clone());
+    lock(&dir)?;
+    let one = run_job(
+        Job::DeletePermanently(vec![a.clone()]),
+        &scratch.ctx(),
+        &sink(),
+    );
+    assert_eq!(severity(&one), Some(Severity::Error));
+    assert_eq!(
+        text(&one),
+        format!("Could not delete \u{201c}a.txt\u{201d}: {DENIED}")
+    );
+    assert_eq!(one.details, [format!("\u{201c}a.txt\u{201d}: {DENIED}")]);
+
+    let two = run_job(Job::DeletePermanently(vec![a, b]), &scratch.ctx(), &sink());
+    assert_eq!(text(&two), format!("Could not delete 2 items: {DENIED}"));
+    assert_eq!(
+        two.details,
+        [
+            format!("\u{201c}a.txt\u{201d}: {DENIED}"),
+            format!("\u{201c}b.txt\u{201d}: {DENIED}"),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_trash_that_fails_says_which_item_and_why_and_groups_several() -> TestResult {
+    let scratch = Scratch::new("why-trash")?;
+    let a = scratch.file("a.txt", "a")?;
+    let b = scratch.file("b.txt", "b")?;
+    let c = scratch.file("c.txt", "c")?;
+    let full = rustix::io::Errno::NOSPC.raw_os_error();
+    let one = run_job(Job::Trash(vec![a.clone()]), &failing_trash(full), &sink());
+    assert_eq!(severity(&one), Some(Severity::Error));
+    assert_eq!(
+        text(&one),
+        "Could not move \u{201c}a.txt\u{201d} to Trash: there is no space left on the device"
+    );
+
+    let denied = rustix::io::Errno::ACCESS.raw_os_error();
+    let flip = std::sync::atomic::AtomicUsize::new(0);
+    let ctx = JobCtx {
+        trash_root: PathBuf::from("/nowhere"),
+        target_for: Box::new(move |_| {
+            let n = flip.fetch_add(1, Ordering::Relaxed);
+            Err(TrashError::Io(io::Error::from_raw_os_error(if n == 2 {
+                full
+            } else {
+                denied
+            })))
+        }),
+    };
+    let many = run_job(Job::Trash(vec![a, b, c]), &ctx, &sink());
+    assert_eq!(
+        text(&many),
+        format!(
+            "Could not move 3 items to Trash: {DENIED} (2), there is no space left on the device (1)"
+        )
+    );
+    assert_eq!(
+        many.details,
+        [
+            format!("\u{201c}a.txt\u{201d}: {DENIED}"),
+            format!("\u{201c}b.txt\u{201d}: {DENIED}"),
+            "\u{201c}c.txt\u{201d}: there is no space left on the device".to_owned(),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_partial_trash_failure_still_says_why_in_the_summary() -> TestResult {
+    let scratch = Scratch::new("why-trash-partial")?;
+    let a = scratch.file("a.txt", "a")?;
+    let b = scratch.file("b.txt", "b")?;
+    let real = scratch.ctx();
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let ctx = JobCtx {
+        trash_root: real.trash_root.clone(),
+        target_for: Box::new(move |path| {
+            if first.swap(false, Ordering::Relaxed) {
+                (real.target_for)(path)
+            } else {
+                Err(TrashError::Io(io::Error::from(
+                    io::ErrorKind::PermissionDenied,
+                )))
+            }
+        }),
+    };
+    let report = run_job(Job::Trash(vec![a, b]), &ctx, &sink());
+    assert_eq!(severity(&report), Some(Severity::Warning));
+    assert_eq!(
+        text(&report),
+        format!("Moved \u{201c}a.txt\u{201d} to Trash; 1 could not be moved: {DENIED}")
+    );
+    Ok(())
+}
+
+#[test]
+fn an_undo_that_fails_says_why_in_plain_words() -> TestResult {
+    let scratch = Scratch::new("why-undo")?;
+    let a = scratch.file("a.txt", "a")?;
+    let ctx = scratch.ctx();
+    let trashed = run_job(Job::Trash(vec![a.clone()]), &ctx, &sink());
+    let action = trashed.undo.ok_or("an undo")?;
+    let info = scratch.trash().join("info/a.txt.trashinfo");
+    fs::set_permissions(&info, fs::Permissions::from_mode(0o000))?;
+    let _unlock = Unlock(info.clone());
+    let report = run_job(Job::Undo(action), &ctx, &sink());
+    assert_eq!(severity(&report), Some(Severity::Error));
+    assert_eq!(
+        text(&report),
+        format!("Can't undo: \u{201c}a.txt\u{201d}: {DENIED}")
+    );
+    Ok(())
+}
+
+#[test]
+fn no_operation_notice_or_detail_shows_an_os_error_code() -> TestResult {
+    let scratch = Scratch::new("no-os-error")?;
+    let (locked, _unlock) = read_only(&scratch, "locked")?;
+    let a = scratch.file("locked/a.txt", "a")?;
+    lock(&locked)?;
+    let ctx = scratch.ctx();
+    let mut reports = vec![
+        run_job(
+            Job::Create {
+                dir: locked.clone(),
+                kind: NewKind::File,
+            },
+            &ctx,
+            &sink(),
+        ),
+        run_job(
+            Job::Rename {
+                path: a.clone(),
+                new_name: os("b"),
+            },
+            &ctx,
+            &sink(),
+        ),
+        run_job(Job::DeletePermanently(vec![a.clone()]), &ctx, &sink()),
+        run_job(Job::Restore(vec![os("missing")]), &ctx, &sink()),
+        run_job(Job::DeleteFromTrash(vec![os("missing")]), &ctx, &sink()),
+        run_job(Job::Trash(vec![a.clone()]), &ctx, &sink()),
+    ];
+    for code in 1..=133 {
+        reports.push(run_job(
+            Job::Trash(vec![a.clone(), a.clone()]),
+            &failing_trash(code),
+            &sink(),
+        ));
+        let items = [a.clone(), locked.clone()]
+            .into_iter()
+            .map(|source| ItemReport {
+                source,
+                outcome: ItemOutcome::Failed(TransferError::Io(io::Error::from_raw_os_error(code))),
+            })
+            .collect();
+        let transfer = TransferReport {
+            items,
+            ..TransferReport::default()
+        };
+        let (notice, details) = paste::transfer_summary(ClipMode::Cut, &locked, &transfer, &[]);
+        reports.push(Report {
+            notice: Some(notice),
+            details,
+            ..Report::default()
+        });
+    }
+    for report in reports {
+        let lines = report
+            .notice
+            .iter()
+            .map(|n| n.text.clone())
+            .chain(report.details);
+        for line in lines {
+            assert!(!line.contains("os error"), "{line}");
+        }
+    }
+    Ok(())
 }

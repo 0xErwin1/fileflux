@@ -194,7 +194,15 @@ pub(crate) fn run_compress(
             )
         }
         Err(ArchiveError::Cancelled) => cancelled("Compressing"),
-        Err(error) => Report::error(format!("Could not compress: {error}")),
+        Err(error) => Report::error(format!(
+            "Could not compress {} in {}: {}",
+            match members {
+                [only] => quoted(only),
+                many => items(many.len()),
+            },
+            super::ops::paste::folder_label(folder),
+            error.plain()
+        )),
     }
 }
 
@@ -238,8 +246,10 @@ pub(crate) fn run_extract(
         }
         Err(ArchiveError::Cancelled) => cancelled("Extracting"),
         Err(error) => Report::error(format!(
-            "Could not extract {}: {error}",
-            name_of(archive_path)
+            "Could not extract {} to {}: {}",
+            name_of(archive_path),
+            super::ops::paste::folder_label(dest_dir),
+            error.plain()
         )),
     }
 }

@@ -233,14 +233,11 @@ fn a_failed_item_is_reported_and_the_rest_still_linked() -> TestResult {
     assert_eq!(notice.severity, Severity::Warning);
     assert_eq!(
         notice.text,
-        "Created link \u{201c}Link to a\u{201d}; 1 failed"
+        "Created link \u{201c}Link to a\u{201d}; 1 failed: it no longer exists"
     );
-    assert_eq!(report.details.len(), 1);
-    assert!(
-        report
-            .details
-            .iter()
-            .all(|d| d.starts_with("\u{201c}gone\u{201d}: "))
+    assert_eq!(
+        report.details,
+        ["\u{201c}gone\u{201d}: it no longer exists"]
     );
     assert!(report.undo.is_some());
     Ok(())
@@ -252,7 +249,16 @@ fn when_nothing_could_be_linked_it_is_an_error_without_undo() -> TestResult {
     let report = run(&[s.path("gone")], None, Naming::LinkTo);
     let notice = report.notice.as_ref().ok_or("a notice")?;
     assert_eq!(notice.severity, Severity::Error);
-    assert!(notice.text.starts_with("Could not create a link: "));
+    assert_eq!(
+        notice.text,
+        "Could not create a link to \u{201c}gone\u{201d}: it no longer exists"
+    );
+    let many = run(&[s.path("gone"), s.path("lost")], None, Naming::LinkTo);
+    assert_eq!(
+        many.notice.map(|n| n.text),
+        Some("Could not create 2 links: it no longer exists".to_owned())
+    );
+    assert_eq!(many.details.len(), 2);
     assert!(report.undo.is_none() && report.select.is_empty());
     Ok(())
 }

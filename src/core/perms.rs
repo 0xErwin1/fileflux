@@ -16,6 +16,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::reason::plain_reason;
+
 /// One of the three permission classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
@@ -557,10 +559,10 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    fn failure(&mut self, path: &Path, error: &dyn std::fmt::Display) {
+    fn failure(&mut self, path: &Path, error: &io::Error) {
         self.out.failures.push(Failure {
             path: path.to_path_buf(),
-            message: error.to_string(),
+            message: plain_reason(error),
         });
     }
 
@@ -627,7 +629,7 @@ impl Walk<'_> {
     /// never blocks its contents.
     fn tree(&mut self, dir: &File, path: &Path, device: u64, depth: usize) {
         if depth > MAX_DEPTH {
-            self.failure(path, &"too deeply nested");
+            self.failure(path, &io::Error::other("too deeply nested"));
             return;
         }
         let reader = match fs::read_dir(through(dir)) {
@@ -776,7 +778,7 @@ pub fn restore(
             Ok(false) => out.unchanged += 1,
             Err(error) => out.failures.push(Failure {
                 path: item.path.clone(),
-                message: error.to_string(),
+                message: plain_reason(&error),
             }),
         }
         on_item(&item.path, index as u64 + 1);
@@ -1409,6 +1411,11 @@ mod tests {
             applied.failures.first().map(|f| f.path.clone()),
             Some(locked.clone())
         );
+        assert_eq!(
+            applied.failures.first().map(|f| f.message.as_str()),
+            Some("you don't have permission to do that"),
+            "the reason is in plain words"
+        );
         assert_eq!(mode_of(&ok)?, 0o604, "a sibling still changed");
         assert_eq!(mode_of(&top)?, 0o705, "and so did the folder itself");
         Ok(())
@@ -1423,6 +1430,10 @@ mod tests {
         };
         let applied = run(&[dir.root.join("gone")], &change, false);
         assert_eq!(applied.failures.len(), 1);
+        assert_eq!(
+            applied.failures.first().map(|f| f.message.as_str()),
+            Some("it no longer exists")
+        );
         assert_eq!(applied.changed, 0);
         Ok(())
     }

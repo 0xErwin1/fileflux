@@ -31,6 +31,7 @@ use fileflux::core::devices::DevicePlan;
 use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::places::{FuseRoots, Places};
+use fileflux::core::reason::{group_reasons, plain_reason};
 use fileflux::core::search_match::QueryOptions;
 use fileflux::core::settings::ColumnPref;
 use fileflux::core::trash::{
@@ -532,7 +533,12 @@ fn create(dir: &Path, kind: NewKind) -> Report {
         let name = match core_ops::unique_name(dir, OsStr::new(kind.base_name())) {
             Ok(name) => name,
             Err(error) => {
-                return Report::error(format!("Could not create the {}: {error}", kind.noun()));
+                return Report::error(format!(
+                    "Could not create the {} in {}: {}",
+                    kind.noun(),
+                    paste::folder_label(dir),
+                    plain_reason(&error)
+                ));
             }
         };
         let made = match kind {
@@ -556,7 +562,13 @@ fn create(dir: &Path, kind: NewKind) -> Report {
             }
             Err(error) if error.is_already_exists() => {}
             Err(error) => {
-                return Report::error(format!("Could not create the {}: {error}", kind.noun()));
+                return Report::error(format!(
+                    "Could not create the {} {} in {}: {}",
+                    kind.noun(),
+                    quote(&name),
+                    paste::folder_label(dir),
+                    error.plain()
+                ));
             }
         }
     }
@@ -588,7 +600,12 @@ fn rename(path: &Path, new_name: &OsStr) -> Report {
         Err(error) if error.is_already_exists() => {
             Report::error(format!("{} already exists here", quote(new_name)))
         }
-        Err(error) => Report::error(format!("Could not rename {}: {error}", quote_path(path))),
+        Err(error) => Report::error(format!(
+            "Could not rename {} to {}: {}",
+            quote_path(path),
+            quote(new_name),
+            error.plain()
+        )),
     }
 }
 
@@ -602,12 +619,60 @@ fn failure_line(path: &Path, error: impl std::fmt::Display) -> String {
     format!("{}: {error}", quote_path(path))
 }
 
+/// One item that failed: its quoted name and why, in plain words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub(crate) item: String,
+    pub(crate) reason: String,
+}
+
+impl Failure {
+    pub(crate) fn new(item: impl Into<String>, reason: impl Into<String>) -> Failure {
+        Failure {
+            item: item.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn of_path(path: &Path, reason: impl Into<String>) -> Failure {
+        Failure::new(quote_path(path), reason)
+    }
+
+    /// The line of the toast's Details: one item and its reason.
+    pub(crate) fn line(&self) -> String {
+        format!("{}: {}", self.item, self.reason)
+    }
+}
+
+pub(crate) fn failure_lines(failures: &[Failure]) -> Vec<String> {
+    failures.iter().map(Failure::line).collect()
+}
+
+/// The reasons of `failures`, each once with its count when they differ.
+pub(crate) fn reasons_of(failures: &[Failure]) -> String {
+    group_reasons(failures.iter().map(|failure| failure.reason.as_str()))
+}
+
+/// "Could not move “a” to Docs: <reason>" for one failure; "Could not move 3
+/// items to Docs: <reason> (2), <reason> (1)" for several. `place` is what
+/// follows the item(s), with its preposition (" to Docs"), or empty.
+pub(crate) fn could_not(verb: &str, place: &str, failures: &[Failure]) -> String {
+    match failures {
+        [only] => format!("Could not {verb} {}{place}: {}", only.item, only.reason),
+        many => format!(
+            "Could not {verb} {}{place}: {}",
+            plural_items(many.len()),
+            reasons_of(many)
+        ),
+    }
+}
+
 fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
     sink.set_total(paths.len() as u64);
     let now = chrono::Local::now().naive_local();
     let mut items: Vec<TrashedEntry> = Vec::new();
     let mut needs_permanent = Vec::new();
-    let mut details = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     let mut removed: Vec<PathBuf> = Vec::new();
     let mut cancelled = false;
     for (index, path) in paths.iter().enumerate() {
@@ -639,7 +704,7 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
                 items.push(entry);
             }
             Err(TrashError::NoTrash(_)) => needs_permanent.push(path.clone()),
-            Err(error) => details.push(failure_line(path, error)),
+            Err(error) => failures.push(Failure::of_path(path, error.plain())),
         }
     }
     sink.advance(paths.len() as u64, "");
@@ -659,14 +724,18 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
         if cancelled {
             text = format!("Cancelled: {}", lowercase_first(&text));
         }
-        let severity = if details.is_empty() {
+        let severity = if failures.is_empty() {
             if cancelled {
                 Severity::Info
             } else {
                 Severity::Success
             }
         } else {
-            text.push_str(&format!("; {} could not be moved", details.len()));
+            text.push_str(&format!(
+                "; {} could not be moved: {}",
+                failures.len(),
+                reasons_of(&failures)
+            ));
             Severity::Warning
         };
         Some(Notice { severity, text })
@@ -675,19 +744,15 @@ fn trash_items(paths: &[PathBuf], ctx: &JobCtx, sink: &Sink) -> Report {
             severity: Severity::Info,
             text: "Cancelled: nothing was moved to the Trash".to_owned(),
         })
-    } else if let [only] = details.as_slice() {
+    } else if !failures.is_empty() {
         Some(Notice {
             severity: Severity::Error,
-            text: format!("Could not move to Trash \u{2014} {only}"),
-        })
-    } else if !details.is_empty() {
-        Some(Notice {
-            severity: Severity::Error,
-            text: format!("Could not move {} to Trash", plural_items(details.len())),
+            text: could_not("move", " to Trash", &failures),
         })
     } else {
         None
     };
+    let mut details = failure_lines(&failures);
     // A cancelled job never asks about permanent deletion: what needed it
     // is said in the summary instead of silently dropped.
     let mut notice = notice;
@@ -746,7 +811,7 @@ fn lowercase_first(text: &str) -> String {
 fn delete_items(paths: &[PathBuf], sink: &Sink) -> Report {
     sink.set_total(paths.len() as u64);
     let mut deleted: Vec<&PathBuf> = Vec::new();
-    let mut details = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     let mut cancelled = false;
     for (index, path) in paths.iter().enumerate() {
         if sink.cancelled() {
@@ -756,7 +821,7 @@ fn delete_items(paths: &[PathBuf], sink: &Sink) -> Report {
         sink.advance(index as u64, &quote_path(path));
         match core_ops::remove_permanently(path) {
             Ok(()) => deleted.push(path),
-            Err(error) => details.push(failure_line(path, error)),
+            Err(error) => failures.push(Failure::of_path(path, plain_reason(&error))),
         }
     }
     sink.advance(paths.len() as u64, "");
@@ -773,7 +838,7 @@ fn delete_items(paths: &[PathBuf], sink: &Sink) -> Report {
     let removed = deleted.iter().map(|path| (*path).clone()).collect();
     Report {
         removed,
-        ..summarize(count, done, "delete", cancelled, details)
+        ..summarize(count, done, "delete", "", cancelled, failures)
     }
 }
 
@@ -783,8 +848,9 @@ fn summarize(
     count: usize,
     done: String,
     verb: &str,
+    place: &str,
     cancelled: bool,
-    details: Vec<String>,
+    failures: Vec<Failure>,
 ) -> Report {
     let notice = if count > 0 {
         let mut text = if cancelled {
@@ -792,14 +858,18 @@ fn summarize(
         } else {
             done
         };
-        let severity = if details.is_empty() {
+        let severity = if failures.is_empty() {
             if cancelled {
                 Severity::Info
             } else {
                 Severity::Success
             }
         } else {
-            text.push_str(&format!("; {} could not be {verb}d", details.len()));
+            text.push_str(&format!(
+                "; {} could not be {verb}d: {}",
+                failures.len(),
+                reasons_of(&failures)
+            ));
             Severity::Warning
         };
         Notice { severity, text }
@@ -808,20 +878,15 @@ fn summarize(
             severity: Severity::Info,
             text: format!("Cancelled: nothing was {verb}d"),
         }
-    } else if let [only] = details.as_slice() {
-        Notice {
-            severity: Severity::Error,
-            text: format!("Could not {verb} \u{2014} {only}"),
-        }
     } else {
         Notice {
             severity: Severity::Error,
-            text: format!("Could not {verb} {}", plural_items(details.len())),
+            text: could_not(verb, place, &failures),
         }
     };
     Report {
         notice: Some(notice),
-        details,
+        details: failure_lines(&failures),
         cancelled,
         ..Report::default()
     }
@@ -836,7 +901,7 @@ fn load_item(ctx: &JobCtx, name: &OsStr) -> Result<TrashedItem, TrashError> {
 fn restore_items(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
     sink.set_total(names.len() as u64);
     let mut restored: Vec<(TrashedItem, PathBuf)> = Vec::new();
-    let mut details = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     let mut cancelled = false;
     for (index, name) in names.iter().enumerate() {
         if sink.cancelled() {
@@ -849,7 +914,7 @@ fn restore_items(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
         });
         match result {
             Ok(pair) => restored.push(pair),
-            Err(error) => details.push(format!("{}: {error}", quote(name))),
+            Err(error) => failures.push(Failure::new(quote(name), error.plain())),
         }
     }
     sink.advance(names.len() as u64, "");
@@ -875,7 +940,7 @@ fn restore_items(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
             text
         }
     };
-    let mut report = summarize(restored.len(), done, "restore", cancelled, details);
+    let mut report = summarize(restored.len(), done, "restore", "", cancelled, failures);
     report.select = restored.into_iter().map(|(_, dest)| dest).collect();
     report
 }
@@ -883,7 +948,7 @@ fn restore_items(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
 fn delete_from_trash(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
     sink.set_total(names.len() as u64);
     let mut deleted: Vec<String> = Vec::new();
-    let mut details = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     let mut cancelled = false;
     for (index, name) in names.iter().enumerate() {
         if sink.cancelled() {
@@ -899,7 +964,7 @@ fn delete_from_trash(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
         let shown = item.original.file_name().map_or_else(|| quote(name), quote);
         match trash::delete_permanently(&item) {
             Ok(()) => deleted.push(shown),
-            Err(error) => details.push(format!("{shown}: {error}")),
+            Err(error) => failures.push(Failure::new(shown, error.plain())),
         }
     }
     sink.advance(names.len() as u64, "");
@@ -907,7 +972,14 @@ fn delete_from_trash(names: &[OsString], ctx: &JobCtx, sink: &Sink) -> Report {
         [only] => format!("Deleted {only} from the Trash"),
         many => format!("Deleted {} from the Trash", plural_items(many.len())),
     };
-    summarize(deleted.len(), done, "delete", cancelled, details)
+    summarize(
+        deleted.len(),
+        done,
+        "delete",
+        " from the Trash",
+        cancelled,
+        failures,
+    )
 }
 
 /// Deletes exactly the confirmed `names`. There is deliberately no
@@ -919,7 +991,7 @@ fn empty_trash(ctx: &JobCtx, names: Vec<OsString>, sink: &Sink) -> Report {
     }
     sink.set_total(names.len() as u64);
     let mut removed = 0usize;
-    let mut details = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     let mut cancelled = false;
     for (index, name) in names.iter().enumerate() {
         if sink.cancelled() {
@@ -934,10 +1006,11 @@ fn empty_trash(ctx: &JobCtx, names: Vec<OsString>, sink: &Sink) -> Report {
         };
         match trash::delete_permanently(&item) {
             Ok(()) => removed += 1,
-            Err(error) => details.push(format!("{}: {error}", quote(name))),
+            Err(error) => failures.push(Failure::new(quote(name), error.plain())),
         }
     }
     sink.advance(names.len() as u64, "");
+    let details = failure_lines(&failures);
     if cancelled {
         let text = if removed == 0 {
             "Cancelled: the Trash was not emptied".to_owned()
@@ -957,12 +1030,16 @@ fn empty_trash(ctx: &JobCtx, names: Vec<OsString>, sink: &Sink) -> Report {
             ..Report::default()
         };
     }
-    let (severity, text) = if details.is_empty() {
+    let (severity, text) = if failures.is_empty() {
         (Severity::Success, "Emptied the Trash".to_owned())
     } else {
         (
             Severity::Warning,
-            format!("Emptied the Trash; {} could not be removed", details.len()),
+            format!(
+                "Emptied the Trash; {} could not be removed: {}",
+                failures.len(),
+                reasons_of(&failures)
+            ),
         )
     };
     Report {
@@ -998,7 +1075,7 @@ fn presence(path: &Path) -> Result<Option<fs::Metadata>, String> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("{}: {error}", quote_path(path))),
+        Err(error) => Err(format!("{}: {}", quote_path(path), plain_reason(&error))),
     }
 }
 
@@ -1029,7 +1106,7 @@ fn undo_rename(old: &Path, new: &Path, identity: Identity) -> Result<Report, Str
         Err(error) if error.is_already_exists() => {
             Err(format!("{} already exists", quote(old_name)))
         }
-        Err(error) => Err(format!("{}: {error}", quote_path(new))),
+        Err(error) => Err(format!("{}: {}", quote_path(new), error.plain())),
     }
 }
 
@@ -1066,7 +1143,7 @@ fn restore_one(entry: &TrashedEntry) -> Step {
     match TrashedItem::load(&entry.target, &entry.item.name) {
         Ok(current) if current.original == entry.item.original => {}
         Err(TrashError::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
-            return Step::Failed(format!("{original}: {error}"));
+            return Step::Failed(format!("{original}: {}", plain_reason(&error)));
         }
         Ok(_) | Err(_) => return changed(),
     }
@@ -1077,7 +1154,7 @@ fn restore_one(entry: &TrashedEntry) -> Step {
         Err(error) if error.is_already_exists() => {
             Step::Blocked(format!("{original} already exists"))
         }
-        Err(error) => Step::Failed(format!("{original}: {error}")),
+        Err(error) => Step::Failed(format!("{original}: {}", error.plain())),
     }
 }
 
@@ -1188,7 +1265,7 @@ fn undo_create(
         NewKind::Folder => {
             meta.is_dir()
                 && fs::read_dir(path)
-                    .map_err(|error| format!("{}: {error}", quote_path(path)))?
+                    .map_err(|error| format!("{}: {}", quote_path(path), plain_reason(&error)))?
                     .next()
                     .is_none()
         }
@@ -1211,10 +1288,10 @@ fn trash_created(path: &Path, ctx: &JobCtx) -> Result<Report, String> {
     // To the Trash, never a permanent delete; without a Trash it stays.
     let target = (ctx.target_for)(path).map_err(|error| match error {
         TrashError::NoTrash(_) => format!("there is no Trash for {}", quote_path(path)),
-        other => format!("{}: {other}", quote_path(path)),
+        other => format!("{}: {}", quote_path(path), other.plain()),
     })?;
     trash::put(path, &target, chrono::Local::now().naive_local())
-        .map_err(|error| format!("{}: {error}", quote_path(path)))?;
+        .map_err(|error| format!("{}: {}", quote_path(path), error.plain()))?;
     Ok(Report::say(
         Severity::Success,
         format!("Moved {} to Trash", quote_path(path)),

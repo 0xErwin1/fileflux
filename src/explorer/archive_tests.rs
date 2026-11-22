@@ -211,6 +211,52 @@ fn compress_report_selects_the_archive_and_can_be_undone() -> Result<(), Box<dyn
 }
 
 #[test]
+fn a_failed_compress_names_the_items_and_the_folder_and_never_shows_an_os_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tool) = tool() else {
+        return Ok(());
+    };
+    let scratch = Scratch::new()?;
+    let locked = scratch.0.join("locked");
+    fs::create_dir(&locked)?;
+    fs::write(locked.join("a.txt"), b"a")?;
+    fs::write(locked.join("b.txt"), b"b")?;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))?;
+    let run = |members: &[&str]| {
+        let members: Vec<OsString> = members.iter().map(OsString::from).collect();
+        run_compress(
+            &tool,
+            &locked,
+            &members,
+            OsStr::new("out"),
+            Format::Zip,
+            &Sink::new(Unit::Items),
+        )
+    };
+    let one = run(&["a.txt"]);
+    let many = run(&["a.txt", "b.txt"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
+    let one = one.notice.ok_or("a notice")?;
+    let many = many.notice.ok_or("a notice")?;
+    assert_eq!(one.severity, Severity::Error);
+    assert!(
+        one.text
+            .starts_with("Could not compress \u{201c}a.txt\u{201d} in locked: "),
+        "{}",
+        one.text
+    );
+    assert!(
+        many.text
+            .starts_with("Could not compress 2 items in locked: "),
+        "{}",
+        many.text
+    );
+    assert!(!one.text.contains("os error"), "{}", one.text);
+    Ok(())
+}
+
+#[test]
 fn cancelled_jobs_leave_nothing_and_say_so() -> Result<(), Box<dyn std::error::Error>> {
     let Some(tool) = tool() else {
         return Ok(());
@@ -270,7 +316,7 @@ fn an_unsafe_archive_is_a_clear_error_and_writes_nothing() -> Result<(), Box<dyn
     assert_eq!(notice.severity, Severity::Error);
     assert_eq!(
         notice.text,
-        "Could not extract \u{201c}evil.tar\u{201d}: The archive is unsafe: \u{201c}../outside.txt\u{201d} points outside the destination. Nothing was extracted."
+        "Could not extract \u{201c}evil.tar\u{201d} to dest: The archive is unsafe: \u{201c}../outside.txt\u{201d} points outside the destination. Nothing was extracted."
     );
     assert!(report.undo.is_none());
     assert!(report.select.is_empty());

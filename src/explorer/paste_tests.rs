@@ -675,7 +675,8 @@ fn a_replace_that_could_not_clean_up_is_not_reported_as_clean() {
     assert!(
         details
             .iter()
-            .any(|line| line.contains(".fileflux-aside-1-1") && line.contains("denied")),
+            .any(|line| line.contains(".fileflux-aside-1-1")
+                && line.contains("you don't have permission")),
         "{details:?}"
     );
 }
@@ -693,7 +694,7 @@ fn skipped_and_failed_items_are_counted_with_details() {
     let (notice, details) = summary(ClipMode::Copy, items, false);
     assert_eq!(
         notice.text,
-        "Copied \u{201c}a\u{201d} to Pictures; 1 skipped; 1 failed"
+        "Copied \u{201c}a\u{201d} to Pictures; 1 skipped; 1 failed: you don't have permission to do that"
     );
     assert_eq!(notice.severity, Severity::Warning);
     assert_eq!(details.len(), 2);
@@ -705,8 +706,79 @@ fn skipped_and_failed_items_are_counted_with_details() {
     assert!(
         details
             .iter()
-            .any(|line| line.starts_with("\u{201c}c\u{201d}: ") && line.contains("permission"))
+            .any(|line| line == "\u{201c}c\u{201d}: you don't have permission to do that")
     );
+}
+
+fn io_failed(source: &str, errno: rustix::io::Errno) -> ItemReport {
+    failed(
+        source,
+        TransferError::Io(io::Error::from_raw_os_error(errno.raw_os_error())),
+    )
+}
+
+#[test]
+fn a_single_failed_move_names_the_item_the_destination_and_the_reason() {
+    let (notice, details) = summary(
+        ClipMode::Cut,
+        vec![io_failed("/x/a.txt", rustix::io::Errno::ACCESS)],
+        false,
+    );
+    assert_eq!(notice.severity, Severity::Error);
+    assert_eq!(
+        notice.text,
+        "Could not move \u{201c}a.txt\u{201d} to Pictures: you don't have permission to do that"
+    );
+    assert_eq!(
+        details,
+        ["\u{201c}a.txt\u{201d}: you don't have permission to do that"]
+    );
+}
+
+#[test]
+fn several_failed_items_are_summarized_by_reason_and_listed_in_the_details() {
+    let (notice, details) = summary(
+        ClipMode::Cut,
+        vec![
+            io_failed("/x/a", rustix::io::Errno::ACCESS),
+            io_failed("/x/b", rustix::io::Errno::NOSPC),
+            io_failed("/x/c", rustix::io::Errno::ACCESS),
+        ],
+        false,
+    );
+    assert_eq!(
+        notice.text,
+        "Could not move 3 items to Pictures: you don't have permission to do that (2), there is no space left on the device (1)"
+    );
+    assert_eq!(
+        details,
+        [
+            "\u{201c}a\u{201d}: you don't have permission to do that",
+            "\u{201c}b\u{201d}: there is no space left on the device",
+            "\u{201c}c\u{201d}: you don't have permission to do that",
+        ]
+    );
+}
+
+#[test]
+fn a_move_whose_source_could_not_be_removed_says_so_in_plain_words() {
+    let (notice, details) = summary(
+        ClipMode::Cut,
+        vec![failed(
+            "/x/a",
+            TransferError::SourceNotRemoved(io::Error::from_raw_os_error(
+                rustix::io::Errno::ACCESS.raw_os_error(),
+            )),
+        )],
+        false,
+    );
+    let expected =
+        "copied, but the original could not be removed: you don't have permission to do that";
+    assert_eq!(
+        notice.text,
+        format!("Could not move \u{201c}a\u{201d} to Pictures: {expected}")
+    );
+    assert_eq!(details, [format!("\u{201c}a\u{201d}: {expected}")]);
 }
 
 #[test]
@@ -730,9 +802,12 @@ fn a_folder_into_itself_is_an_error_toast() {
     assert_eq!(notice.severity, Severity::Error);
     assert_eq!(
         notice.text,
-        "Could not copy \u{201c}Docs\u{201d} \u{2014} cannot place a folder inside itself"
+        "Could not copy \u{201c}Docs\u{201d} to Pictures: a folder can't be placed inside itself"
     );
-    assert_eq!(details.len(), 1);
+    assert_eq!(
+        details,
+        ["\u{201c}Docs\u{201d}: a folder can't be placed inside itself"]
+    );
     let (several, _) = summary(
         ClipMode::Cut,
         vec![
@@ -741,7 +816,10 @@ fn a_folder_into_itself_is_an_error_toast() {
         ],
         false,
     );
-    assert_eq!(several.text, "Could not move 2 items");
+    assert_eq!(
+        several.text,
+        "Could not move 2 items to Pictures: a folder can't be placed inside itself"
+    );
 }
 
 #[test]
@@ -1415,7 +1493,7 @@ fn a_folder_pasted_into_itself_is_an_error_and_nothing_changes() -> TestResult {
         assert_eq!(
             text_of(&ran.report),
             format!(
-                "Could not {verb} \u{201c}Docs\u{201d} \u{2014} cannot place a folder inside itself"
+                "Could not {verb} \u{201c}Docs\u{201d} to Docs: a folder can't be placed inside itself"
             )
         );
         assert!(ran.report.undo.is_none());

@@ -24,6 +24,7 @@ use fileflux::core::idnames::owner_choices;
 use fileflux::core::perms::{
     self, Access, Applied, Change, Class, Edit, Exec, Group, Merged, Summary,
 };
+use fileflux::core::reason::group_reasons;
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Styled, Window, div,
     prelude::*, px,
@@ -331,8 +332,37 @@ pub(crate) fn report_from(applied: Applied, what: &str, verb: &str) -> Report {
     } else if applied.failures.is_empty() {
         parts.push(format!("Nothing to change in {what}"));
     }
-    if !applied.failures.is_empty() {
-        parts.push(format!("{} failed", applied.failures.len()));
+    // One failure and nothing changed: say which item, like any other
+    // single failure; otherwise the count and the reasons.
+    if let [only] = applied.failures.as_slice()
+        && applied.changed == 0
+        && !applied.cancelled
+    {
+        let name = only
+            .path
+            .file_name()
+            .unwrap_or(only.path.as_os_str())
+            .to_string_lossy();
+        let bare = if verb == "Restored" {
+            "restore"
+        } else {
+            "change"
+        };
+        parts.push(format!(
+            "Could not {bare} {what} of \u{201c}{name}\u{201d}: {}",
+            only.message
+        ));
+    } else if !applied.failures.is_empty() {
+        parts.push(format!(
+            "{} failed: {}",
+            applied.failures.len(),
+            group_reasons(
+                applied
+                    .failures
+                    .iter()
+                    .map(|failure| failure.message.as_str())
+            )
+        ));
     }
     if applied.cancelled {
         parts.push("cancelled".to_owned());
@@ -1292,7 +1322,7 @@ mod tests {
         let mut result = applied(2);
         result.failures = vec![Failure {
             path: p("/x/locked"),
-            message: "Permission denied (os error 13)".to_owned(),
+            message: "you don't have permission to do that".to_owned(),
         }];
         result.symlinks = 1;
         let report = report_from(result, "permissions", "Changed");
@@ -1301,12 +1331,12 @@ mod tests {
         assert_eq!(
             notice.map(|n| n.text.as_str()),
             Some(
-                "Changed permissions of 2 items; 1 failed. Skipped 1 symbolic link: their own permissions cannot be changed"
+                "Changed permissions of 2 items; 1 failed: you don't have permission to do that. Skipped 1 symbolic link: their own permissions cannot be changed"
             )
         );
         assert_eq!(
             report.details,
-            ["/x/locked: Permission denied (os error 13)"]
+            ["/x/locked: you don't have permission to do that"]
         );
         assert!(
             matches!(report.undo, Some(UndoAction::Permissions { ref items }) if items.len() == 2)
@@ -1351,7 +1381,41 @@ mod tests {
         );
         assert_eq!(
             failed.notice.as_ref().map(|n| n.text.as_str()),
-            Some("1 failed")
+            Some("Could not change permissions of \u{201c}x\u{201d}: boom")
+        );
+        let undone = Applied {
+            failures: vec![Failure {
+                path: p("/x"),
+                message: "boom".to_owned(),
+            }],
+            ..Applied::default()
+        };
+        assert_eq!(
+            report_from(undone, "permissions", "Restored")
+                .notice
+                .as_ref()
+                .map(|n| n.text.as_str()),
+            Some("Could not restore permissions of \u{201c}x\u{201d}: boom")
+        );
+        let two = Applied {
+            failures: vec![
+                Failure {
+                    path: p("/x"),
+                    message: "boom".to_owned(),
+                },
+                Failure {
+                    path: p("/y"),
+                    message: "boom".to_owned(),
+                },
+            ],
+            ..Applied::default()
+        };
+        assert_eq!(
+            report_from(two, "permissions", "Changed")
+                .notice
+                .as_ref()
+                .map(|n| n.text.as_str()),
+            Some("2 failed: boom")
         );
 
         let cancelled = Applied {

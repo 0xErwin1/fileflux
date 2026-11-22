@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use fileflux::core::Location;
+use fileflux::core::reason::plain_reason;
 use fileflux::core::templates::{self, Template};
 
 use super::ops::{Identity, MenuCommand, MenuRow, Report, UndoAction};
@@ -86,7 +87,15 @@ pub(crate) fn run_create(dir: &Path, template: &Path) -> Report {
             }
         }
         Err(error) => Report::error(format!(
-            "Could not create the file from the template: {error}"
+            "Could not create the file from the template {} in {}: {}",
+            template
+                .file_name()
+                .map_or_else(String::new, |name| format!(
+                    "\u{201c}{}\u{201d}",
+                    name.to_string_lossy()
+                )),
+            super::ops::paste::folder_label(dir),
+            plain_reason(&error)
         )),
     }
 }
@@ -262,7 +271,13 @@ mod tests {
         fs::create_dir(&dest)?;
         let report = run_create(&dest, &scratch.0.join("gone.odt"));
         assert!(report.select.is_empty() && report.undo.is_none() && !report.begin_rename);
-        assert!(report.notice.is_some());
+        assert_eq!(
+            report.notice.map(|notice| notice.text),
+            Some(
+                "Could not create the file from the template \u{201c}gone.odt\u{201d} in dest: it no longer exists"
+                    .to_owned()
+            )
+        );
         assert_eq!(fs::read_dir(&dest)?.count(), 0);
         Ok(())
     }
