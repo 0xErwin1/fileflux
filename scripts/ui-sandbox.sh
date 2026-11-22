@@ -155,8 +155,10 @@ start() {
 
     # The pid is that of the launching shell until it execs dbus-run-session;
     # sleep before the first identity check so that gap is not read as a stale
-    # pid (which would drop the pid file).
-    for _ in $(seq 1 40); do
+    # pid (which would drop the pid file). The bridge can take over 20 s to
+    # listen while the private session bus retries desktop portals that cannot
+    # reach a compositor, so wait up to 60 s.
+    for _ in $(seq 1 120); do
         sleep 0.5
         if grep -q "UI automation bridge listening" "$root/app.log" 2>/dev/null; then
             echo "Fileflux running on $display, sandbox $root"
