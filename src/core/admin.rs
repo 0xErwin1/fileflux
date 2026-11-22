@@ -88,27 +88,30 @@ pub fn policy_allows(policy: &str, launcher: &Path) -> bool {
     let annotation = |key: &str| {
         let (_, rest) = policy.split_once(key)?;
         let (text, _) = rest.split_once("</annotate>")?;
-        Some(text.trim())
+        Some(text)
     };
-    annotation(EXEC_PATH_KEY).is_some_and(|path| Path::new(path) == launcher)
+    // polkit compares the annotation with the program path as plain text.
+    annotation(EXEC_PATH_KEY).is_some_and(|path| launcher.to_str() == Some(path))
         && annotation(ALLOW_GUI_KEY) == Some("true")
 }
 
-/// Where the policy may be installed: beside the launcher's prefix, then the
-/// system directories.
+/// Where the policy may be installed: only the directories `polkitd` reads
+/// actions from. A copy inside the package (`nix run`, a profile, a
+/// home-manager link) is never seen by polkit, so it must not count: the
+/// generic action would apply and strip `DISPLAY` and `XAUTHORITY`. The
+/// launcher is not consulted; it is the policy's `exec.path` that has to
+/// match it.
 #[must_use]
-pub fn policy_candidates(launcher: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    if let Some(bin) = launcher.parent() {
-        found.push(bin.join("../share/polkit-1/actions").join(POLICY_FILE));
-    }
-    for dir in [
+pub fn policy_candidates(_launcher: &Path) -> Vec<PathBuf> {
+    [
+        "/etc/polkit-1/actions",
+        "/usr/local/share/polkit-1/actions",
         "/usr/share/polkit-1/actions",
         "/run/current-system/sw/share/polkit-1/actions",
-    ] {
-        found.push(Path::new(dir).join(POLICY_FILE));
-    }
-    found
+    ]
+    .iter()
+    .map(|dir| Path::new(dir).join(POLICY_FILE))
+    .collect()
 }
 
 /// Why a launch could not be built.
@@ -120,6 +123,8 @@ pub enum LaunchError {
     Launcher,
     /// The folder is not absolute: pkexec does not run in our folder.
     RelativeFolder,
+    /// `env` would read a launcher path holding `=` as `NAME=VALUE`.
+    LauncherHasEquals,
 }
 
 impl fmt::Display for LaunchError {
@@ -131,6 +136,9 @@ impl fmt::Display for LaunchError {
             Self::Env => "Open as Administrator needs the env program, which was not found",
             Self::Launcher => "Open as Administrator could not find the Fileflux executable",
             Self::RelativeFolder => "Open as Administrator needs an absolute folder path",
+            Self::LauncherHasEquals => {
+                "Open as Administrator cannot start Fileflux from a path containing '=' without the polkit policy installed"
+            }
         })
     }
 }
@@ -183,6 +191,9 @@ impl Launch {
     pub fn argv(&self, folder: &Path) -> Result<Vec<OsString>, LaunchError> {
         if !folder.is_absolute() {
             return Err(LaunchError::RelativeFolder);
+        }
+        if !self.policy_installed && self.launcher.as_os_str().as_encoded_bytes().contains(&b'=') {
+            return Err(LaunchError::LauncherHasEquals);
         }
         let mut argv = vec![self.pkexec.clone().into_os_string()];
         if !self.policy_installed {
@@ -240,21 +251,70 @@ pub fn row_offered(root: bool, location: &Location, selected: &[(PathBuf, bool)]
     !root && matches!(location, Location::Directory(_)) && matches!(selected, [] | [(_, true)])
 }
 
-/// The notice for how `pkexec` ended; `None` when nothing is worth saying
-/// (a clean end, or a signal).
+/// The notice for how the launch ended; `None` when nothing is worth saying
+/// (a clean end, or a signal). Exit codes 126 and 127 are pkexec's (dialog
+/// dismissed, not authorized) but also `env`'s and Fileflux's own, so the
+/// words stay neutral.
 #[must_use]
 pub fn exit_notice(code: Option<i32>) -> Option<String> {
     match code? {
         0 => None,
-        126 => Some(
-            "Authentication was cancelled; Fileflux was not opened as administrator".to_owned(),
-        ),
-        127 => Some(
-            "Authorization was not granted (no polkit agent, or not allowed); Fileflux was not opened as administrator"
-                .to_owned(),
-        ),
-        code => Some(format!("The administrator instance ended (exit {code})")),
+        code => Some(format!(
+            "The administrator instance could not start (exit {code}): authentication was cancelled or refused, or the program could not run"
+        )),
     }
+}
+
+/// Whether `path` (already canonical) is on a remote or FUSE mount, from the
+/// mount table's bytes: the deepest mount holding it decides. Types `fuse`
+/// and `fuse.*` (sshfs, gvfs, rclone…) are remote; `fuseblk`, which is how
+/// ntfs-3g and exfat mount a local disk, is not.
+#[must_use]
+pub fn remote_in(table: &[u8], path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut best: Option<(usize, bool)> = None;
+    for line in table.split(|&byte| byte == b'\n') {
+        let mut fields = line
+            .split(|&byte| byte == b' ' || byte == b'\t')
+            .filter(|field| !field.is_empty());
+        let (_, Some(mount), Some(fs_type)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        let mount = PathBuf::from(OsStr::from_bytes(&unescape_mount(mount)));
+        if !path.starts_with(&mount) {
+            continue;
+        }
+        let depth = mount.components().count();
+        let remote = fs_type == b"fuse" || fs_type.starts_with(b"fuse.");
+        if best.is_none_or(|(deepest, _)| depth >= deepest) {
+            best = Some((depth, remote));
+        }
+    }
+    best.is_some_and(|(_, remote)| remote)
+}
+
+/// `\040`-style octal escapes of a mount table field.
+fn unescape_mount(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
+    let mut rest = field;
+    while let Some((&byte, tail)) = rest.split_first() {
+        let octal = (byte == b'\\')
+            .then(|| tail.get(..3))
+            .flatten()
+            .filter(|digits| digits.iter().all(|d| (b'0'..=b'7').contains(d)))
+            .map(|digits| digits.iter().fold(0u32, |n, d| n * 8 + u32::from(d - b'0')));
+        match octal {
+            Some(value) => {
+                out.push(u8::try_from(value & 0xff).unwrap_or(b'?'));
+                rest = tail.get(3..).unwrap_or_default();
+            }
+            None => {
+                out.push(byte);
+                rest = tail;
+            }
+        }
+    }
+    out
 }
 
 /// Starts `argv` (program first) detached, with no stdin, stdout or stderr,

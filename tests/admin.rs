@@ -174,17 +174,27 @@ fn the_policy_counts_only_when_it_names_this_launcher_and_allows_the_gui() {
 }
 
 #[test]
-fn the_policy_is_looked_for_beside_the_install_and_in_the_system_dirs() {
-    let found = policy_candidates(Path::new("/opt/ff/bin/fileflux"));
-    assert_eq!(
-        found.first(),
-        Some(&PathBuf::from(
-            "/opt/ff/bin/../share/polkit-1/actions/dev.fileflux.open-as-admin.policy"
-        ))
+fn the_policy_is_looked_for_only_where_polkitd_reads_actions() {
+    let found = policy_candidates(Path::new("/nix/store/x/bin/fileflux"));
+    assert!(
+        found.contains(&PathBuf::from(
+            "/usr/share/polkit-1/actions/dev.fileflux.open-as-admin.policy"
+        )),
+        "{found:?}"
     );
-    assert!(found.contains(&PathBuf::from(
-        "/usr/share/polkit-1/actions/dev.fileflux.open-as-admin.policy"
-    )));
+    assert!(
+        found.contains(&PathBuf::from(
+            "/run/current-system/sw/share/polkit-1/actions/dev.fileflux.open-as-admin.policy"
+        )),
+        "{found:?}"
+    );
+    for candidate in &found {
+        let text = candidate.to_string_lossy();
+        assert!(!text.starts_with("/nix/store"), "{text}");
+        assert!(!text.contains(".."), "{text}");
+        assert!(!text.contains("/bin/"), "{text}");
+        assert!(text.contains("polkit-1/actions"), "{text}");
+    }
 }
 
 #[test]
@@ -279,12 +289,60 @@ fn non_local_places_are_refused_with_a_reason() {
 }
 
 #[test]
-fn the_pkexec_exit_becomes_a_notice_only_when_something_went_wrong() {
+fn an_exit_notice_is_neutral_about_who_ended() {
     assert_eq!(exit_notice(Some(0)), None);
     assert_eq!(exit_notice(None), None);
-    assert!(exit_notice(Some(126)).is_some_and(|n| n.contains("cancelled")));
-    assert!(exit_notice(Some(127)).is_some_and(|n| n.contains("not granted")));
-    assert!(exit_notice(Some(3)).is_some_and(|n| n.contains("exit 3")));
+    for code in [126, 127, 3] {
+        let notice = exit_notice(Some(code)).unwrap_or_default();
+        assert!(
+            notice.starts_with("The administrator instance could not start"),
+            "{notice}"
+        );
+        assert!(notice.contains(&format!("exit {code}")), "{notice}");
+    }
+}
+
+#[test]
+fn a_launcher_with_an_equals_sign_is_refused_for_the_env_fallback_only() {
+    let mut odd = launch(false, Some(":0"), None);
+    odd.launcher = PathBuf::from("/opt/a=b/bin/fileflux");
+    assert_eq!(
+        odd.argv(Path::new("/srv")),
+        Err(LaunchError::LauncherHasEquals)
+    );
+    assert!(LaunchError::LauncherHasEquals.to_string().contains('='));
+    odd.policy_installed = true;
+    assert!(odd.argv(Path::new("/srv")).is_ok());
+}
+
+#[test]
+fn a_policy_path_is_compared_as_the_exact_string() {
+    let policy = |path: &str| {
+        format!(
+            "<annotate key=\"org.freedesktop.policykit.exec.path\">{path}</annotate>\
+             <annotate key=\"org.freedesktop.policykit.exec.allow_gui\">true</annotate>"
+        )
+    };
+    let launcher = Path::new("/opt/ff/bin/fileflux");
+    assert!(!policy_allows(&policy("/opt/ff/bin/./fileflux"), launcher));
+    assert!(!policy_allows(&policy("/opt/ff/bin//fileflux"), launcher));
+    assert!(!policy_allows(&policy(" /opt/ff/bin/fileflux"), launcher));
+    assert!(policy_allows(&policy("/opt/ff/bin/fileflux"), launcher));
+}
+
+#[test]
+fn only_real_remote_mounts_are_remote_and_local_fuseblk_is_not() {
+    let table = b"/dev/sda1 / ext4 rw 0 0\n\
+/dev/sdb1 /mnt/ntfs fuseblk rw 0 0\n\
+me@host:/ /mnt/remote fuse.sshfs rw 0 0\n\
+x /mnt/my\\040share fuse rw 0 0\n\
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n";
+    let remote = |path: &str| admin::remote_in(table, Path::new(path));
+    assert!(!remote("/home/me"));
+    assert!(!remote("/mnt/ntfs/dir"));
+    assert!(remote("/mnt/remote/dir"));
+    assert!(remote("/mnt/my share/x"));
+    assert!(remote("/run/user/1000/gvfs/mtp:host=x/DCIM"));
 }
 
 #[test]

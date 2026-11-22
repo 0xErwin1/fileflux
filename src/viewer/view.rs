@@ -771,6 +771,18 @@ fn rotated_image(image: &RenderImage, rotation: Rotation) -> Option<(Arc<RenderI
     Some((render_image(turned), turned_width, turned_height))
 }
 
+/// The height of the fixed banner a root viewer shows.
+const ROOT_BANNER_HEIGHT: f32 = 24.0;
+
+/// What the banner takes off the stage: nothing unless running as root.
+fn root_banner_height() -> f32 {
+    if fileflux::core::owner_helper::is_root() {
+        ROOT_BANNER_HEIGHT
+    } else {
+        0.0
+    }
+}
+
 impl Focusable for Viewer {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -783,7 +795,7 @@ impl Render for Viewer {
         let viewport = window.viewport_size();
         self.area = Pt::new(
             f32::from(viewport.width),
-            (f32::from(viewport.height) - BAR_HEIGHT).max(1.0),
+            (f32::from(viewport.height) - BAR_HEIGHT - root_banner_height()).max(1.0),
         );
         self.refresh_shown(window, cx);
 
@@ -854,6 +866,19 @@ impl Render for Viewer {
             .flex_col()
             .bg(colors.desk)
             .text_color(colors.foreground)
+            .children(fileflux::core::owner_helper::is_root().then(|| {
+                div()
+                    .id("viewer-root-banner")
+                    .flex_none()
+                    .w_full()
+                    .h(px(ROOT_BANNER_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(colors.danger)
+                    .text_color(colors.on_semantic)
+                    .child(fileflux::core::admin::BANNER)
+            }))
             .on_action(cx.listener(|_, _: &Close, window, _| window.remove_window()))
             .on_action(cx.listener(|this, _: &Previous, window, cx| {
                 this.go(Step::Previous, window, cx);

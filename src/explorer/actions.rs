@@ -2765,9 +2765,7 @@ impl Explorer {
             Some(folder) => Location::Directory(folder),
             None => self.tab().state.current().clone(),
         };
-        let places = self.places.as_ref().map(|places| places.fuse.clone());
-        let remote = |path: &Path| places.as_ref().is_some_and(|fuse| fuse.covers(path));
-        if let Some(refusal) = admin::refusal(&folder, remote) {
+        if let Some(refusal) = admin::refusal(&folder, |_| false) {
             self.tab_mut().state.set_notice(refusal.to_string());
             cx.notify();
             return;
@@ -2776,6 +2774,14 @@ impl Explorer {
             return;
         };
         let started = cx.background_executor().spawn(async move {
+            // The mount table is read here, not from the places (which may
+            // not be known yet), and the folder is resolved first so a
+            // symbolic link into a FUSE or gvfs mount is caught.
+            let real = std::fs::canonicalize(&folder).unwrap_or_else(|_| folder.clone());
+            let table = std::fs::read("/proc/self/mounts").unwrap_or_default();
+            if admin::remote_in(&table, &real) {
+                return Err(admin::Refusal::Remote.to_string());
+            }
             let launch = admin::Launch::detect().map_err(|error| error.to_string())?;
             let argv = launch.argv(&folder).map_err(|error| error.to_string())?;
             admin::spawn(&argv).map_err(|error| format!("Could not start pkexec: {error}"))
