@@ -84,6 +84,50 @@ fn unescape(value: &str) -> String {
     out
 }
 
+/// The most of a `.desktop` file that is read: a few lines, never large.
+const DESKTOP_FILE_LIMIT: u64 = 1 << 20;
+
+/// The text of the `.desktop` file at `path` (a link is followed, as opening
+/// it would). Opened non-blocking and checked on the descriptor, so a FIFO
+/// swapped in cannot stall it; blocking on a slow mount, so call it off the
+/// UI thread.
+pub fn read_desktop_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("it is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(DESKTOP_FILE_LIMIT).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// What "Launch" runs for a Desktop Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopLaunch {
+    /// The program and its arguments (see [`expand_exec_bare`]).
+    pub argv: Vec<OsString>,
+    /// `Terminal=true`: the entry wants a terminal around it.
+    pub terminal: bool,
+}
+
+/// The command "Launch" runs for the `.desktop` file `content`: its `Exec`
+/// expanded with no files. The error is a plain sentence for a notice.
+pub fn desktop_launch(content: &str) -> Result<DesktopLaunch, String> {
+    let entry = parse_desktop_entry(content)
+        .ok_or_else(|| "it is not a launcher of an application".to_owned())?;
+    let argv = expand_exec_bare(&entry.exec).map_err(|error| error.to_string())?;
+    Ok(DesktopLaunch {
+        argv,
+        terminal: entry.terminal,
+    })
+}
+
 /// Reads the `[Desktop Entry]` group of a `.desktop` file. `None` when the
 /// group, its `Name` or its `Exec` is missing, or when it is not an
 /// application (`Type=Link`, `Type=Directory`).
@@ -249,9 +293,10 @@ struct ExecArg {
     list: bool,
 }
 
-/// `token` for one file: the codes replaced as in [`expand_exec`]; `None`
-/// when the argument held only dropped codes.
-fn render_arg(token: &str, path: &Path, uri: &[u8]) -> Option<Vec<u8>> {
+/// `token` for one file (`None`: no file, so its codes are dropped too): the
+/// codes replaced as in [`expand_exec`]; `None` when the argument held only
+/// dropped codes.
+fn render_arg(token: &str, file: Option<(&Path, &[u8])>) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut had_code = false;
     let mut chars = token.chars();
@@ -263,13 +308,52 @@ fn render_arg(token: &str, path: &Path, uri: &[u8]) -> Option<Vec<u8>> {
         }
         had_code = true;
         match chars.next() {
-            Some('f' | 'F') => out.extend_from_slice(path.as_os_str().as_bytes()),
-            Some('u' | 'U') => out.extend_from_slice(uri),
+            Some('f' | 'F') => {
+                if let Some((path, _)) = file {
+                    out.extend_from_slice(path.as_os_str().as_bytes());
+                }
+            }
+            Some('u' | 'U') => {
+                if let Some((_, uri)) = file {
+                    out.extend_from_slice(uri);
+                }
+            }
             Some('%') => out.push(b'%'),
             _ => {}
         }
     }
     (!(out.is_empty() && had_code)).then_some(out)
+}
+
+/// The arguments of `exec` with their field codes found; a field code inside
+/// quotes is refused (see [`ExecError::QuotedFieldCode`]).
+fn exec_args(exec: &str) -> Result<Vec<ExecArg>, ExecError> {
+    let mut tokens = Vec::new();
+    for ExecToken { text, quoted } in split_exec_tokens(exec)? {
+        if quoted && has_field_code(&text) {
+            return Err(ExecError::QuotedFieldCode);
+        }
+        tokens.push(ExecArg {
+            list: has_list_code(&text),
+            text,
+        });
+    }
+    Ok(tokens)
+}
+
+/// The argument list to run `exec` with **no files**, as "Launch" does: the
+/// file codes (`%f %F %u %U`) and the other codes are dropped, `%%` is a
+/// percent sign, and an argument that held only dropped codes disappears. No
+/// shell is involved.
+pub fn expand_exec_bare(exec: &str) -> Result<Vec<OsString>, ExecError> {
+    let args: Vec<OsString> = exec_args(exec)?
+        .iter()
+        .filter_map(|token| render_arg(&token.text, None).map(OsString::from_vec))
+        .collect();
+    if args.first().is_none_or(|program| program.is_empty()) {
+        return Err(ExecError::Empty);
+    }
+    Ok(args)
 }
 
 /// The processes to start to run `exec` on `paths`, as argument lists (the
@@ -281,16 +365,7 @@ fn render_arg(token: &str, path: &Path, uri: &[u8]) -> Option<Vec<u8>> {
 /// to a list code takes the first file. No shell is involved. No paths, no
 /// processes.
 pub fn expand_exec_many(exec: &str, paths: &[&Path]) -> Result<Vec<Vec<OsString>>, ExecError> {
-    let mut tokens = Vec::new();
-    for ExecToken { text, quoted } in split_exec_tokens(exec)? {
-        if quoted && has_field_code(&text) {
-            return Err(ExecError::QuotedFieldCode);
-        }
-        tokens.push(ExecArg {
-            list: has_list_code(&text),
-            text,
-        });
-    }
+    let tokens = exec_args(exec)?;
     let Some(first) = paths.first() else {
         return Ok(Vec::new());
     };
@@ -306,11 +381,14 @@ pub fn expand_exec_many(exec: &str, paths: &[&Path]) -> Result<Vec<Vec<OsString>
             if token.list {
                 for each in paths {
                     args.extend(
-                        render_arg(&token.text, each, &uri_of(each)).map(OsString::from_vec),
+                        render_arg(&token.text, Some((each, &uri_of(each))))
+                            .map(OsString::from_vec),
                     );
                 }
             } else {
-                args.extend(render_arg(&token.text, path, &uri_of(path)).map(OsString::from_vec));
+                args.extend(
+                    render_arg(&token.text, Some((path, &uri_of(path)))).map(OsString::from_vec),
+                );
             }
         }
         if args.first().is_none_or(|program| program.is_empty()) {
@@ -909,6 +987,29 @@ fn open_with_for_type(mime: &str) -> OpenWith {
         all_apps: all_apps(&found),
         mime: mime.to_owned(),
     }
+}
+
+/// The default application for `text/plain` among the ones installed under
+/// `dirs`, as `default_of` names it (see [`default_apps`]). `None` when none
+/// is set or the one set is not installed or cannot take a file.
+pub fn default_text_app_in(
+    dirs: &[PathBuf],
+    default_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<App> {
+    default_apps(
+        dirs,
+        &[(PathBuf::new(), "text/plain".to_owned())],
+        default_of,
+    )
+    .into_iter()
+    .find_map(|(_, app)| app)
+}
+
+/// The default application for `text/plain`, from the process environment
+/// (the user's `mimeapps.list`, else `xdg-mime query default`). Blocking:
+/// off the UI thread.
+pub fn default_text_app() -> Option<App> {
+    default_text_app_in(&application_dirs_from_env(), &|mime| default_id_for(mime))
 }
 
 /// Files with the application that opens them.

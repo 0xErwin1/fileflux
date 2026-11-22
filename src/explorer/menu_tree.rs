@@ -78,6 +78,7 @@ fn command_icon(command: MenuCommand) -> Option<gpui_kit_assets::IconName> {
         MenuCommand::RemoveFavorite => IconName::StarFill,
         MenuCommand::Open | MenuCommand::OpenWith => IconName::FolderOpen,
         MenuCommand::OpenInViewer => IconName::Image,
+        MenuCommand::Launch => IconName::Play,
         MenuCommand::OpenInNewTab => IconName::ExternalLink,
         MenuCommand::OpenInSplit => IconName::Columns2,
         MenuCommand::OpenContainingFolder => IconName::FolderOpen,

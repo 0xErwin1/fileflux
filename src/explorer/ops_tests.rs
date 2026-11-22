@@ -2865,6 +2865,7 @@ fn every_dialog() -> Vec<DialogState> {
             },
         },
     ));
+    dialogs.push(run_prompt(Path::new("/x/tool")));
     dialogs
 }
 
@@ -3650,4 +3651,199 @@ fn no_operation_notice_or_detail_shows_an_os_error_code() -> TestResult {
         }
     }
     Ok(())
+}
+
+// --- Run / Run in Terminal / Open ------------------------------------------------
+
+fn scanned(path: &Path, kind: fileflux::core::EntryKind, mode: Option<u32>) -> Entry {
+    Entry {
+        name: path
+            .file_name()
+            .map(OsStr::to_os_string)
+            .unwrap_or_default(),
+        path: path.to_path_buf(),
+        kind,
+        is_symlink: false,
+        size: None,
+        modified: None,
+        origin: None,
+        unix: mode.map(|mode| fileflux::core::UnixInfo {
+            mode,
+            uid: 0,
+            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
+        }),
+    }
+}
+
+fn probe_of(path: &str, mode: Option<u32>) -> OpenProbe {
+    open_probe(&scanned(
+        Path::new(path),
+        fileflux::core::EntryKind::File,
+        mode,
+    ))
+}
+
+#[test]
+fn only_a_file_with_an_execute_bit_is_probed() {
+    assert_eq!(probe_of("/a/tool", Some(0o755)), OpenProbe::MaybeRunnable);
+    assert_eq!(probe_of("/a/tool", Some(0o100)), OpenProbe::MaybeRunnable);
+    assert_eq!(probe_of("/a/tool", Some(0o010)), OpenProbe::MaybeRunnable);
+    assert_eq!(probe_of("/a/tool", Some(0o001)), OpenProbe::MaybeRunnable);
+    // No execute bit: the old path, with no read of the file.
+    assert_eq!(probe_of("/a/notes.txt", Some(0o644)), OpenProbe::Plain);
+    // Recent and search results come without a mode: the read decides.
+    assert_eq!(probe_of("/a/tool", None), OpenProbe::MaybeRunnable);
+    // An image never prompts.
+    assert_eq!(probe_of("/a/pic.png", Some(0o755)), OpenProbe::Plain);
+}
+
+#[test]
+fn a_desktop_file_opens_as_text_whatever_its_mode() {
+    assert_eq!(probe_of("/a/App.desktop", Some(0o755)), OpenProbe::Desktop);
+    assert_eq!(probe_of("/a/App.desktop", Some(0o644)), OpenProbe::Desktop);
+    assert_eq!(probe_of("/a/App.desktop", None), OpenProbe::Desktop);
+}
+
+#[test]
+fn a_probed_program_asks_and_anything_else_opens_as_before() -> TestResult {
+    use fileflux::core::runnable::is_runnable;
+
+    let scratch = Scratch::new("run-prompt")?;
+    let elf = scratch.file("tool", "\u{7f}ELF....")?;
+    let script = scratch.file("run.sh", "#!/bin/sh\n")?;
+    // vfat, ntfs and MTP mark every file executable.
+    let text = scratch.file("notes.txt", "just text\n")?;
+    for path in [&elf, &script, &text] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    let decide = |path: &Path| {
+        let entry = scanned(path, fileflux::core::EntryKind::File, Some(0o755));
+        open_probe(&entry).settle(is_runnable(path))
+    };
+    assert_eq!(decide(&elf), OpenProbe::Prompt);
+    assert_eq!(decide(&script), OpenProbe::Prompt);
+    assert_eq!(
+        decide(&text),
+        OpenProbe::Plain,
+        "an exec-bit file that is no program takes the old path"
+    );
+
+    // A decision that needed no probe is not changed by one.
+    assert_eq!(OpenProbe::Desktop.settle(true), OpenProbe::Desktop);
+    assert_eq!(OpenProbe::Plain.settle(true), OpenProbe::Plain);
+    Ok(())
+}
+
+#[test]
+fn the_run_prompt_has_four_buttons_and_defaults_to_cancel() {
+    let dialog = run_prompt(Path::new("/x/my tool"));
+    assert_eq!(dialog.text.title, "Run \u{201c}my tool\u{201d}?");
+    assert_eq!(dialog.text.confirm, "Run");
+    assert_eq!(
+        dialog.text.extra,
+        [
+            (DialogChoice::KeepBoth, "Open"),
+            (DialogChoice::Skip, "Run in Terminal"),
+        ]
+    );
+    assert_eq!(dialog.initial_focus(), DialogChoice::Cancel);
+    assert_eq!(
+        dialog.action,
+        DialogAction::Runnable(PathBuf::from("/x/my tool"))
+    );
+    // Run is armed late like every confirming button; the others are live.
+    let t0 = Instant::now();
+    let mut queue = DialogQueue::default();
+    queue.offer_at(dialog, t0);
+    assert!(!queue.accepts(DialogChoice::Confirm, t0));
+    assert!(queue.accepts(DialogChoice::Skip, t0));
+    assert!(queue.accepts(DialogChoice::KeepBoth, t0));
+    assert!(queue.accepts(DialogChoice::Cancel, t0));
+}
+
+#[test]
+fn a_conflict_question_keeps_its_buttons_in_order() {
+    for dialog in every_dialog() {
+        let expected: &[(DialogChoice, &str)] = match dialog.kind {
+            DialogKind::Conflict { .. } => &[
+                (DialogChoice::KeepBoth, "Keep both"),
+                (DialogChoice::Skip, "Skip"),
+            ],
+            DialogKind::Runnable { .. } => &[
+                (DialogChoice::KeepBoth, "Open"),
+                (DialogChoice::Skip, "Run in Terminal"),
+            ],
+            _ => &[],
+        };
+        assert_eq!(dialog.text.extra, expected, "{:?}", dialog.kind);
+    }
+}
+
+#[test]
+fn each_button_of_the_run_prompt_maps_to_its_answer() {
+    assert_eq!(run_choice(DialogChoice::Confirm), Some(RunChoice::Run));
+    assert_eq!(
+        run_choice(DialogChoice::Skip),
+        Some(RunChoice::RunInTerminal)
+    );
+    assert_eq!(run_choice(DialogChoice::KeepBoth), Some(RunChoice::Open));
+    assert_eq!(run_choice(DialogChoice::Cancel), None);
+}
+
+#[test]
+fn a_second_open_of_the_same_program_does_not_stack_a_second_prompt() {
+    let t0 = Instant::now();
+    let tool = Path::new("/x/tool");
+    let mut queue = DialogQueue::default();
+    assert!(!queue.has_run_prompt_for(tool));
+    queue.offer_at(delete_dialog("/x/a"), t0);
+    queue.offer_at(run_prompt(tool), t0);
+    assert!(queue.has_run_prompt_for(tool), "waiting counts");
+    assert!(!queue.has_run_prompt_for(Path::new("/x/other")));
+    queue.close_at(t0);
+    assert!(queue.has_run_prompt_for(tool), "open counts");
+    queue.close_at(t0);
+    assert!(!queue.has_run_prompt_for(tool));
+}
+
+#[test]
+fn launch_follows_open_only_when_added_and_only_for_a_desktop_file() {
+    let one_file = MenuTarget {
+        only_files: true,
+        ..target(false, 1, false, false)
+    };
+    let mut rows = menu_rows(&one_file);
+    assert!(item(&rows, MenuCommand::Launch).is_none(), "not by default");
+    let before = flat(&rows);
+    add_launch_row(&mut rows);
+    let mut expected = before.clone();
+    expected.insert(1, "Launch".to_owned());
+    assert_eq!(flat(&rows), expected);
+    assert_eq!(
+        item(&rows, MenuCommand::Launch).map(|spec| (spec.enabled, spec.danger)),
+        Some((true, false))
+    );
+
+    // Without an "Open" row (the empty space, the Trash) nothing is added.
+    for target in [target(false, 0, false, true), target(true, 1, false, false)] {
+        let mut rows = menu_rows(&target);
+        let before = flat(&rows);
+        add_launch_row(&mut rows);
+        assert_eq!(flat(&rows), before);
+    }
+}
+
+#[test]
+fn folders_and_files_keep_the_open_action_they_had() {
+    use fileflux::core::EntryKind::{Directory, File};
+    assert_eq!(
+        open_action(&scanned(Path::new("/a/dir"), Directory, Some(0o755))),
+        OpenAction::Navigate
+    );
+    assert_eq!(
+        open_action(&scanned(Path::new("/a/tool"), File, Some(0o755))),
+        OpenAction::External
+    );
 }

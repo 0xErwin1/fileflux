@@ -62,7 +62,9 @@ use crate::explorer::inspector::{self, PermissionProbe};
 use crate::explorer::menu_tree::RightPress;
 use crate::explorer::ops::paste::{ClipMode, ClipboardState, PasteInto};
 use crate::explorer::ops::{ArrangeMenu, DialogQueue};
-use crate::explorer::ops::{OpenAction, OpenSplit, Severity, UndoStack, open_action, split_open};
+use crate::explorer::ops::{
+    OpenAction, OpenSplit, Severity, UndoStack, open_action, open_probe, split_open,
+};
 use crate::explorer::panes::{self, OtherPane, PaneLayout, Panes, PerPane, Side, SplitDrag};
 use crate::explorer::persist::{
     Persistence, Startup, arrangement_from_prefs, arrangement_to_prefs, restore_fallback_notice,
@@ -3282,8 +3284,8 @@ impl Explorer {
             );
             return;
         }
-        let entry_path = entry.path.clone();
-        self.open_file(&entry_path, cx);
+        let (entry_path, probe) = (entry.path.clone(), open_probe(entry));
+        self.open_chosen_file(entry_path, probe, window, cx);
     }
 
     /// Toggles the favorites membership of the current directory.

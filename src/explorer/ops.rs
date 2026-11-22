@@ -32,6 +32,7 @@ use fileflux::core::images::is_image_path;
 use fileflux::core::ops::{self as core_ops, validate_name};
 use fileflux::core::places::{FuseRoots, Places};
 use fileflux::core::reason::{group_reasons, plain_reason};
+use fileflux::core::runnable::is_desktop_file;
 use fileflux::core::search_match::QueryOptions;
 use fileflux::core::settings::ColumnPref;
 use fileflux::core::trash::{
@@ -1416,6 +1417,8 @@ pub(crate) enum MenuCommand {
     OpenContainingFolder,
     /// Choose the application to open the selected files with.
     OpenWith,
+    /// Run the selected `.desktop` file's `Exec` (with no files).
+    Launch,
     Rename,
     CopyPath,
     Properties,
@@ -1662,6 +1665,95 @@ pub(crate) fn open_target(path: &Path, displayed: &[&Entry]) -> OpenTarget {
             list: vec![path.to_path_buf()],
             index: 0,
         },
+    }
+}
+
+/// How opening one file starts, decided from what the scan already knows
+/// (no disk access, so the UI thread can ask it).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenProbe {
+    /// Open it as before (the viewer or the default application).
+    Plain,
+    /// A `.desktop` file: it opens in the text editor, never launches.
+    Desktop,
+    /// It may be a program: look at its first bytes (off the UI thread)
+    /// before choosing between the prompt and [`OpenProbe::Plain`].
+    MaybeRunnable,
+    /// A probed program: ask Run / Run in Terminal / Open / Cancel.
+    Prompt,
+}
+
+impl OpenProbe {
+    /// The decision once the first bytes of a [`OpenProbe::MaybeRunnable`]
+    /// file are known: a program asks, anything else (an exec-bit text file
+    /// on vfat, ntfs or MTP) opens as it always did. The other decisions
+    /// need no probe and stay as they are.
+    pub(crate) fn settle(self, runnable: bool) -> OpenProbe {
+        match (self, runnable) {
+            (OpenProbe::MaybeRunnable, true) => OpenProbe::Prompt,
+            (OpenProbe::MaybeRunnable, false) => OpenProbe::Plain,
+            (decided, _) => decided,
+        }
+    }
+}
+
+/// What opening `entry` (a file, not a folder) needs first. A file the scan
+/// saw without any execute bit, and an image, never start a probe; an entry
+/// that did not come from a scan with its mode (Recent, search results) is
+/// probed, because the read is the only way to know.
+pub(crate) fn open_probe(entry: &Entry) -> OpenProbe {
+    if is_desktop_file(&entry.path) {
+        return OpenProbe::Desktop;
+    }
+    if is_image_path(&entry.path) {
+        return OpenProbe::Plain;
+    }
+    match &entry.unix {
+        Some(info) if info.mode & 0o111 == 0 => OpenProbe::Plain,
+        _ => OpenProbe::MaybeRunnable,
+    }
+}
+
+/// What the "Run / Run in Terminal / Open" prompt answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunChoice {
+    Run,
+    RunInTerminal,
+    Open,
+}
+
+/// What a press of `choice` on the prompt does; Cancel does nothing.
+pub(crate) fn run_choice(choice: DialogChoice) -> Option<RunChoice> {
+    match choice {
+        DialogChoice::Confirm => Some(RunChoice::Run),
+        DialogChoice::Skip => Some(RunChoice::RunInTerminal),
+        DialogChoice::KeepBoth => Some(RunChoice::Open),
+        DialogChoice::Cancel => None,
+    }
+}
+
+/// The prompt for the program at `path`.
+pub(crate) fn run_prompt(path: &Path) -> DialogState {
+    DialogState::new(
+        DialogKind::Runnable {
+            file: display_name(path),
+        },
+        &[],
+        DialogAction::Runnable(path.to_path_buf()),
+    )
+}
+
+/// Adds "Launch" right after "Open" in the menu of one selected `.desktop`
+/// file. A menu without an "Open" row is left alone.
+pub(crate) fn add_launch_row(rows: &mut Vec<MenuRow>) {
+    let after_open = rows
+        .iter()
+        .position(|row| matches!(row, MenuRow::Item(spec) if spec.command == MenuCommand::Open));
+    if let Some(at) = after_open {
+        rows.insert(
+            at + 1,
+            MenuRow::Item(MenuItemSpec::new(MenuCommand::Launch, "Launch")),
+        );
     }
 }
 
@@ -2044,6 +2136,9 @@ pub(crate) enum DialogKind {
         /// The list of every application shows instead of the ones for `mime`.
         other: bool,
     },
+    /// Opening `file` would run a program (ELF or `#!` with the execute
+    /// permission): Run, Run in Terminal, Open or Cancel.
+    Runnable { file: String },
     /// Opening would start `count` processes (more than
     /// [`CONFIRM_LAUNCHES_ABOVE`]); `app` names the application when it is
     /// one for all of them.
@@ -2090,6 +2185,8 @@ pub(crate) enum DialogAction {
     DeleteFromTrash(Vec<OsString>),
     /// The Trash names the dialog counted; nothing else is deleted.
     EmptyTrash(Vec<OsString>),
+    /// The program at this path: run it, run it in a terminal or open it.
+    Runnable(PathBuf),
     /// Run the selected application on the files.
     OpenWith(OpenWithState),
     /// Start these launches, which the dialog counted and named.
@@ -2445,6 +2542,14 @@ impl DialogQueue {
         self.open.is_some()
     }
 
+    /// Whether a prompt for the program at `path` is open or waiting: a
+    /// second double-click while the first is still being probed must not
+    /// stack a second prompt.
+    pub(crate) fn has_run_prompt_for(&self, path: &Path) -> bool {
+        let is_it = |dialog: &DialogState| matches!(&dialog.action, DialogAction::Runnable(prompted) if prompted == path);
+        self.current().is_some_and(is_it) || self.waiting.iter().any(is_it)
+    }
+
     /// Whether the open dialog accepts its danger button at `now`; false
     /// while it is still too fresh, and when none is open.
     pub(crate) fn armed_at(&self, now: Instant) -> bool {
@@ -2550,6 +2655,9 @@ pub(crate) struct DialogText {
     pub(crate) names: Vec<String>,
     /// The danger button's label.
     pub(crate) confirm: &'static str,
+    /// The buttons between Cancel and the danger one, left to right, each
+    /// pressed as the choice it names.
+    pub(crate) extra: Vec<(DialogChoice, &'static str)>,
 }
 
 /// How many names a dialog lists before "…and N more".
@@ -2641,6 +2749,14 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
                 format!("Applications for {mime} files. Up and Down choose, Enter opens.")
             },
             "Open",
+        ),
+        DialogKind::Runnable { file } => (
+            format!("Run \u{201c}{file}\u{201d}?"),
+            format!(
+                "\u{201c}{file}\u{201d} is a program. Run it, run it in a terminal, \
+                 or open it as a file?"
+            ),
+            "Run",
         ),
         DialogKind::OpenMany { app, count } => (
             match app {
@@ -2751,18 +2867,30 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         ],
         // Every application is a row of its own: none is folded away.
         DialogKind::OpenWith { .. } => names.to_vec(),
-        DialogKind::OpenMany { .. } => Vec::new(),
+        DialogKind::OpenMany { .. } | DialogKind::Runnable { .. } => Vec::new(),
         // The field says what the dialog is about.
         DialogKind::Archive { .. } | DialogKind::SelectPattern | DialogKind::Connect => Vec::new(),
         // The lines gio printed before asking, as they are.
         DialogKind::MountPrompt { .. } => names.to_vec(),
         _ => listed(names),
     };
+    let extra = match kind {
+        DialogKind::Conflict { .. } => vec![
+            (DialogChoice::KeepBoth, "Keep both"),
+            (DialogChoice::Skip, "Skip"),
+        ],
+        DialogKind::Runnable { .. } => vec![
+            (DialogChoice::KeepBoth, "Open"),
+            (DialogChoice::Skip, "Run in Terminal"),
+        ],
+        _ => Vec::new(),
+    };
     DialogText {
         title,
         body,
         names,
         confirm,
+        extra,
     }
 }
 

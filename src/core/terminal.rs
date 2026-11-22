@@ -99,6 +99,18 @@ impl Terminal {
         }
     }
 
+    /// The command that runs `argv` in this terminal, in `folder`: the
+    /// terminal's own way to take a program (see [`exec_args`]) follows the
+    /// working-directory argument, then the program and its arguments. The
+    /// terminal closes when the program ends.
+    #[must_use]
+    pub fn command_running(&self, folder: &Path, argv: &[OsString]) -> TerminalCommand {
+        let mut command = self.command(folder);
+        command.args.extend(exec_args(&self.program));
+        command.args.extend(argv.iter().cloned());
+        command
+    }
+
     /// The program that starts the terminal.
     #[must_use]
     pub fn program(&self) -> &Path {
@@ -127,6 +139,20 @@ impl Terminal {
             cwd: folder.to_path_buf(),
         }
     }
+}
+
+/// The arguments that make the terminal at `program` run what follows them.
+/// The ones Fileflux knows by name take their own; `xdg-terminal-exec`,
+/// kitty and foot run the rest of the command line as it is, and any other
+/// terminal gets `-e`, the xdg-terminal-exec default (`X-ExecArg`).
+fn exec_args(program: &Path) -> Vec<OsString> {
+    let flags: &[&str] = match program.file_name().and_then(OsStr::to_str) {
+        Some("xdg-terminal-exec" | "kitty" | "foot") => &[],
+        Some("wezterm" | "gnome-terminal") => &["--"],
+        Some("xfce4-terminal") => &["-x"],
+        _ => &["-e"],
+    };
+    flags.iter().map(OsString::from).collect()
 }
 
 fn known_dir_arg(program: &Path) -> Option<DirArg> {

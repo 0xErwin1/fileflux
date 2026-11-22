@@ -26,6 +26,7 @@ use gpui::{
 use fileflux::core::apps::{self, AppGroup, OpenWith};
 use fileflux::core::images::is_image_path;
 use fileflux::core::places::Volume;
+use fileflux::core::runnable::{is_desktop_file, is_runnable};
 
 use super::arrange::ArrangeCommand;
 use super::arrange_menu;
@@ -35,11 +36,12 @@ use super::menu_tree::{Shown, shown_for};
 use super::ops::paste::{ClipMode, PasteInto, answer_for};
 use super::ops::{
     ARM_DELAY, AppLaunch, ArrangeMenu, DialogAction, DialogChoice, DialogKind, DialogState, Job,
-    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenAction, OpenTarget,
-    OpenWithPick, RenameCheck, RenameStep, Report, SearchOption, Severity, Unavailable, UndoAction,
-    UndoEntry, add_viewer_row, check_rename, dismissed_notice, launch_confirmation, menu_rows,
-    no_trash_dialog, open_action, open_target, plan_launches, rename_seed, rename_step,
-    run_launches, search_option_rows, start_failure_notice, stem_range, toolbar_menu_rows,
+    JobCtx, MenuCommand, MenuRow, MenuTarget, NewKind, Notice, OpenAction, OpenProbe, OpenTarget,
+    OpenWithPick, RenameCheck, RenameStep, Report, RunChoice, SearchOption, Severity, Unavailable,
+    UndoAction, UndoEntry, add_launch_row, add_viewer_row, check_rename, dismissed_notice,
+    launch_confirmation, menu_rows, no_trash_dialog, open_action, open_target, plan_launches,
+    rename_seed, rename_step, run_choice, run_launches, run_prompt, search_option_rows,
+    start_failure_notice, stem_range, toolbar_menu_rows,
 };
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
@@ -920,9 +922,37 @@ impl Explorer {
             DialogChoice::Cancel => self.cancel_dialog(window, cx),
             DialogChoice::Confirm => self.confirm_dialog(window, cx),
             DialogChoice::Skip | DialogChoice::KeepBoth => {
+                if self.answer_run_prompt(choice, window, cx) {
+                    return;
+                }
                 self.answer_open_conflict(choice, window, cx);
             }
         }
+    }
+
+    /// A press on the "Run / Run in Terminal / Open" prompt: closes it and
+    /// does what the button says. `false` when the open dialog is not that
+    /// prompt (nothing changes then).
+    fn answer_run_prompt(
+        &mut self,
+        choice: DialogChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(DialogAction::Runnable(path)) =
+            self.dialogs.current().map(|dialog| dialog.action.clone())
+        else {
+            return false;
+        };
+        self.dialogs.close();
+        self.dialog_closed(window, cx);
+        match run_choice(choice) {
+            Some(RunChoice::Run) => self.run_program(&path, cx),
+            Some(RunChoice::RunInTerminal) => self.run_program_in_terminal(&path, cx),
+            Some(RunChoice::Open) => self.open_file(&path, cx),
+            None => {}
+        }
+        true
     }
 
     /// The checkbox "Apply to all remaining conflicts" of the open question.
@@ -962,6 +992,9 @@ impl Explorer {
         // trailing click of a double-click on the dialog before it must not
         // confirm this one.
         if !self.dialogs.accepts(DialogChoice::Confirm, Instant::now()) {
+            return;
+        }
+        if self.answer_run_prompt(DialogChoice::Confirm, window, cx) {
             return;
         }
         if self
@@ -1016,7 +1049,8 @@ impl Explorer {
                 self.start_launches(launches, cx);
                 return;
             }
-            DialogAction::OpenWith(_)
+            DialogAction::Runnable(_)
+            | DialogAction::OpenWith(_)
             | DialogAction::Archive(_)
             | DialogAction::SelectPattern(_)
             | DialogAction::Connect(_)
@@ -1212,6 +1246,13 @@ impl Explorer {
             matches!(self.selected_visible_paths().as_slice(), [path] if is_image_path(path));
         if target.only_files && one_image && !target.in_trash {
             add_viewer_row(&mut rows);
+        }
+        let one_launcher = matches!(
+            self.selected_visible_paths().as_slice(),
+            [path] if is_desktop_file(path)
+        );
+        if target.only_files && one_launcher && !target.in_trash {
+            add_launch_row(&mut rows);
         }
         if target.selected > 0 {
             let in_folder = matches!(self.tab().state.current(), Location::Directory(_));
@@ -1773,6 +1814,7 @@ impl Explorer {
                 }
             }
             MenuCommand::OpenWith => self.open_with(window, cx),
+            MenuCommand::Launch => self.launch_selected_desktop_file(window, cx),
             MenuCommand::Rename => self.start_rename(window, cx),
             MenuCommand::CopyPath => self.copy_selected_paths(cx),
             MenuCommand::Properties => {
@@ -1989,6 +2031,17 @@ impl Explorer {
         if paths.is_empty() || !all_files {
             return;
         }
+        self.look_up_open_with(paths, window, cx);
+    }
+
+    /// Looks up the applications for `paths` off the UI thread, then offers
+    /// the "Open with…" chooser.
+    fn look_up_open_with(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let lookup = {
             let paths = paths.clone();
             cx.background_executor().spawn(async move {
@@ -2215,6 +2268,198 @@ impl Explorer {
             .state
             .set_notice("Copied the folder path".to_owned());
         cx.notify();
+    }
+
+    /// Opens one file the user chose (double click, Enter, Open): a program
+    /// asks first (see [`Explorer::offer_run_prompt`]), a `.desktop` file
+    /// opens in the text editor, everything else as [`Explorer::open_file`].
+    /// What needs the file's content is read off the UI thread.
+    pub(crate) fn open_chosen_file(
+        &mut self,
+        path: PathBuf,
+        probe: OpenProbe,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.in_trash() {
+            return self.open_file(&path, cx);
+        }
+        match probe {
+            OpenProbe::Plain => self.open_file(&path, cx),
+            OpenProbe::Prompt => self.offer_run_prompt(&path, window, cx),
+            OpenProbe::Desktop => self.open_desktop_file_as_text(path, window, cx),
+            OpenProbe::MaybeRunnable => {
+                let looked = path.clone();
+                let probed = cx
+                    .background_executor()
+                    .spawn(async move { is_runnable(&looked) });
+                cx.spawn_in(window, async move |this, cx| {
+                    let runnable = probed.await;
+                    if let Err(error) = this.update_in(cx, |this, window, cx| {
+                        match OpenProbe::MaybeRunnable.settle(runnable) {
+                            OpenProbe::Prompt => this.offer_run_prompt(&path, window, cx),
+                            _ => this.open_file(&path, cx),
+                        }
+                    }) {
+                        log::debug!("the explorer closed before the file was probed: {error}");
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// The "Run / Run in Terminal / Open" prompt for the program at `path`,
+    /// through the confirmation queue; Cancel is the default button, so
+    /// Enter alone never runs it.
+    fn offer_run_prompt(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialogs.has_run_prompt_for(path) {
+            return;
+        }
+        self.offer_dialog(run_prompt(path), window, cx);
+    }
+
+    /// "Run": the program, detached, in its folder, no shell.
+    fn run_program(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let folder = path.parent().map(Path::to_path_buf);
+        self.launch(
+            path.to_path_buf(),
+            Vec::new(),
+            folder,
+            format!("Could not run {}", quoted(path)),
+            cx,
+        );
+    }
+
+    /// "Run in Terminal": the program as the terminal's command, in its folder.
+    fn run_program_in_terminal(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let folder = path.parent().map(Path::to_path_buf);
+        self.run_in_terminal(vec![path.as_os_str().to_owned()], folder, &quoted(path), cx);
+    }
+
+    /// Runs `argv` in the terminal (see [`Terminal::command_running`]);
+    /// `name` is how a notice calls it.
+    fn run_in_terminal(
+        &mut self,
+        argv: Vec<OsString>,
+        folder: Option<PathBuf>,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminal.clone() else {
+            self.tab_mut()
+                .state
+                .set_notice(format!("Could not run {name}: no terminal found"));
+            cx.notify();
+            return;
+        };
+        let folder = folder.unwrap_or_else(|| PathBuf::from("."));
+        let command = terminal.command_running(&folder, &argv);
+        self.launch(
+            command.program,
+            command.args,
+            Some(command.cwd),
+            format!("Could not run {name} in a terminal"),
+            cx,
+        );
+    }
+
+    /// Opening a `.desktop` file: with the default application for
+    /// `text/plain` (never `xdg-open` on the file, which may launch it), else
+    /// the "Open with…" chooser. The lookup runs off the UI thread.
+    fn open_desktop_file_as_text(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lookup = cx
+            .background_executor()
+            .spawn(async move { apps::default_text_app() });
+        cx.spawn_in(window, async move |this, cx| {
+            let editor = lookup.await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| match editor {
+                Some(app) => this.start_groups(
+                    vec![AppGroup {
+                        app: Some(app),
+                        paths: vec![path],
+                    }],
+                    window,
+                    cx,
+                ),
+                None => this.look_up_open_with(vec![path], window, cx),
+            }) {
+                log::debug!("the explorer closed before the editor was found: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// "Launch" on the selected `.desktop` file: its `Exec` with no files,
+    /// in a terminal when it says `Terminal=true`.
+    fn launch_selected_desktop_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_trash() {
+            return;
+        }
+        let selected = self.selected_visible_paths();
+        let [path] = selected.as_slice() else {
+            return;
+        };
+        if !is_desktop_file(path) {
+            return;
+        }
+        let path = path.clone();
+        let read = {
+            let path = path.clone();
+            cx.background_executor().spawn(async move {
+                apps::read_desktop_file(&path).map_err(|error| error.to_string())
+            })
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let plan = read
+                .await
+                .and_then(|content| apps::desktop_launch(&content));
+            if let Err(error) =
+                this.update(cx, |this, cx| this.start_desktop_launch(&path, plan, cx))
+            {
+                log::debug!("the explorer closed before the launcher was read: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn start_desktop_launch(
+        &mut self,
+        path: &Path,
+        plan: Result<apps::DesktopLaunch, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.tab_mut()
+                    .state
+                    .set_notice(format!("Could not launch {}: {error}", quoted(path)));
+                cx.notify();
+                return;
+            }
+        };
+        let folder = path.parent().map(Path::to_path_buf);
+        if plan.terminal {
+            self.run_in_terminal(plan.argv, folder, &quoted(path), cx);
+            return;
+        }
+        let mut argv = plan.argv.into_iter();
+        let Some(program) = argv.next() else {
+            return;
+        };
+        self.launch(
+            PathBuf::from(program),
+            argv.collect(),
+            folder,
+            format!("Could not launch {}", quoted(path)),
+            cx,
+        );
     }
 
     /// Opens a file: an image in the viewer window (walking the images of

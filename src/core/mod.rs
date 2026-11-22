@@ -31,6 +31,7 @@ pub mod perms;
 pub mod places;
 pub mod reason;
 pub mod recent;
+pub mod runnable;
 pub mod search;
 pub mod search_match;
 pub mod settings;

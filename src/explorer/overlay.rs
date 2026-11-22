@@ -210,7 +210,9 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         || prompt.is_some()
         || matches!(
             dialog.kind,
-            DialogKind::DeviceBusy { .. } | DialogKind::OpenMany { .. }
+            DialogKind::DeviceBusy { .. }
+                | DialogKind::OpenMany { .. }
+                | DialogKind::Runnable { .. }
         );
     let body = div()
         .flex()
@@ -443,7 +445,6 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
             }
         }
     };
-    let conflict = apply_all.is_some();
     let footer = div()
         .flex()
         .items_center()
@@ -454,21 +455,16 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
                 .focus_handle(&this.dialog_cancel_focus)
                 .on_click(press(DialogChoice::Cancel)),
         )
-        .when(conflict, |footer| {
-            footer
-                .child(
-                    Button::new("explorer-dialog-keep", "Keep both")
-                        .secondary()
-                        .focus_handle(&this.dialog_keep_focus)
-                        .on_click(press(DialogChoice::KeepBoth)),
-                )
-                .child(
-                    Button::new("explorer-dialog-skip", "Skip")
-                        .secondary()
-                        .focus_handle(&this.dialog_skip_focus)
-                        .on_click(press(DialogChoice::Skip)),
-                )
-        })
+        .children(text.extra.iter().map(|&(choice, label)| {
+            let (id, focus) = match choice {
+                DialogChoice::KeepBoth => ("explorer-dialog-keep", &this.dialog_keep_focus),
+                _ => ("explorer-dialog-skip", &this.dialog_skip_focus),
+            };
+            Button::new(id, label)
+                .secondary()
+                .focus_handle(focus)
+                .on_click(press(choice))
+        }))
         .child(
             {
                 let confirm = Button::new("explorer-dialog-confirm", text.confirm);
@@ -494,6 +490,8 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         modal.icon(icon(gpui_kit_assets::IconName::Archive))
     } else if open_with.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::FolderOpen))
+    } else if matches!(dialog.kind, DialogKind::Runnable { .. }) {
+        modal.icon(icon(gpui_kit_assets::IconName::Play))
     } else if calm {
         modal.icon(icon(gpui_kit_assets::IconName::Usb))
     } else {
