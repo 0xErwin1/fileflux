@@ -104,7 +104,7 @@ Use it to check what a screenshot cannot: which element a click actually lands o
 | `overlays.default` | `pkgs.fileflux`, `pkgs.fileflux-source`, `pkgs.fileflux-nightly`, built from the consumer's package set |
 | `devShells.default` | The shell described above |
 
-The hashes in `nix/nightly-info.nix` are placeholders on `main`; the nightly workflow rewrites them on the `nightly` ref, so consume the prebuilt package as `github:0xErwin1/fileflux/nightly#fileflux-nightly`. The source build currently fails while vendoring the `gpui-component` git dependency (the same failure as ReqFlux's); CI is unaffected because it builds with Cargo.
+The hashes in `nix/nightly-info.nix` are placeholders on `main`; the nightly workflow rewrites them on the `nightly` ref, so consume the prebuilt package as `github:0xErwin1/fileflux/nightly#fileflux-nightly`.
 
 ## Scripts and assets
 

@@ -9,6 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use chrono::{TimeZone, Utc};
 use fileflux::core::clipboard::ClipboardAction;
 use fileflux::core::ops::{ItemOutcome, ItemReport, TransferError};
+use gpui::{ClipboardItem, FileOperation};
 
 use super::super::{DialogState, Job, MenuCommand, MenuItemSpec, MenuRow, MenuTarget, run_job};
 use super::*;
@@ -150,41 +151,137 @@ fn the_system_clipboard_gets_the_paths_one_per_line() {
     assert_eq!(clipboard_text(&[]), "");
 }
 
+fn text_item(text: &str) -> ClipboardItem {
+    ClipboardItem::new_string(text.to_owned())
+}
+
+fn files_item(operation: FileOperation, list: &[&str]) -> ClipboardItem {
+    ClipboardItem::new_files(paths(list), operation)
+}
+
+fn adopted_files(action: ClipboardAction, list: &[&str]) -> SystemClipboard {
+    SystemClipboard::Adopt(ClipboardFiles {
+        action,
+        paths: paths(list),
+    })
+}
+
+#[test]
+fn copy_and_cut_map_to_the_gpui_file_operations_and_back() {
+    assert_eq!(file_operation(ClipMode::Copy), FileOperation::Copy);
+    assert_eq!(file_operation(ClipMode::Cut), FileOperation::Cut);
+    assert_eq!(clip_mode(FileOperation::Copy), ClipMode::Copy);
+    assert_eq!(clip_mode(FileOperation::Cut), ClipMode::Cut);
+}
+
+#[test]
+fn copy_and_cut_write_files_with_their_operation_and_the_paths_as_text() {
+    let list = paths(&["/x/a b.txt", "/x/c"]);
+    for (mode, operation) in [
+        (ClipMode::Copy, FileOperation::Copy),
+        (ClipMode::Cut, FileOperation::Cut),
+    ] {
+        let item = clipboard_item(mode, &list);
+        assert_eq!(item.file_paths(), Some(list.clone()));
+        assert_eq!(item.file_operation(), Some(operation));
+        assert_eq!(item.text().as_deref(), Some("/x/a b.txt\n/x/c"));
+    }
+}
+
 #[test]
 fn files_another_application_copied_replace_our_clipboard() {
     let exists = |_: &Path| true;
-    let adopted = |written, system| system_clipboard_action(written, system, exists);
-    let files = |action, list: &[&str]| {
-        SystemClipboard::Adopt(ClipboardFiles {
-            action,
-            paths: paths(list),
-        })
+    let adopted = |written, mode, system: ClipboardItem| {
+        system_clipboard_action(written, mode, Some(&system), exists)
     };
-    // Nothing of ours: a file list on the system clipboard is pasted.
+    // Nothing of ours: files on the system clipboard are pasted, cut or copied.
     assert_eq!(
-        adopted(None, Some("copy\nfile:///x/a%20b")),
-        files(ClipboardAction::Copy, &["/x/a b"])
+        adopted(None, None, files_item(FileOperation::Cut, &["/x/a b"])),
+        adopted_files(ClipboardAction::Cut, &["/x/a b"])
     );
     assert_eq!(
-        adopted(None, Some("cut\r\nfile:///x/a\r\n")),
-        files(ClipboardAction::Cut, &["/x/a"])
+        adopted(
+            None,
+            None,
+            files_item(FileOperation::Copy, &["/x/a", "/x/b"])
+        ),
+        adopted_files(ClipboardAction::Copy, &["/x/a", "/x/b"])
     );
-    // It changed since we wrote ours: the system clipboard wins.
+    // It changed since we wrote ours: the system clipboard wins, as files or as text.
     assert_eq!(
-        adopted(Some("/x/old"), Some("file:///x/new")),
-        files(ClipboardAction::Copy, &["/x/new"])
+        adopted(
+            Some("/x/old"),
+            Some(ClipMode::Copy),
+            files_item(FileOperation::Cut, &["/x/new"])
+        ),
+        adopted_files(ClipboardAction::Cut, &["/x/new"])
+    );
+    assert_eq!(
+        adopted(
+            Some("/x/old"),
+            Some(ClipMode::Copy),
+            text_item("file:///x/new")
+        ),
+        adopted_files(ClipboardAction::Copy, &["/x/new"])
+    );
+    // The same files, but another application cut them: that is a new clipboard.
+    assert_eq!(
+        adopted(
+            Some("/x/a"),
+            Some(ClipMode::Copy),
+            files_item(FileOperation::Cut, &["/x/a"])
+        ),
+        adopted_files(ClipboardAction::Cut, &["/x/a"])
+    );
+}
+
+#[test]
+fn files_that_are_gone_are_dropped_from_what_another_application_copied() {
+    let only_a = |path: &Path| path == Path::new("/x/a");
+    assert_eq!(
+        system_clipboard_action(
+            None,
+            None,
+            Some(&files_item(FileOperation::Copy, &["/x/a", "/x/gone"])),
+            only_a
+        ),
+        adopted_files(ClipboardAction::Copy, &["/x/a"])
+    );
+    assert_eq!(
+        system_clipboard_action(
+            None,
+            None,
+            Some(&files_item(FileOperation::Cut, &["/x/gone"])),
+            only_a
+        ),
+        SystemClipboard::Keep
     );
 }
 
 #[test]
 fn our_clipboard_stands_while_the_system_one_is_what_we_wrote() {
     let exists = |_: &Path| true;
+    // Exactly what Copy/Cut write now: files, with the operation we hold.
+    for mode in [ClipMode::Copy, ClipMode::Cut] {
+        let item = clipboard_item(mode, &paths(&["/x/a", "/x/b"]));
+        assert_eq!(
+            system_clipboard_action(Some("/x/a\n/x/b"), Some(mode), Some(&item), exists),
+            SystemClipboard::Keep,
+            "{mode:?}"
+        );
+    }
+    // Text only, with a trailing newline, as a clipboard without file support gives it.
     assert_eq!(
-        system_clipboard_action(Some("/x/a\n/x/b"), Some("/x/a\n/x/b\n"), exists),
+        system_clipboard_action(
+            Some("/x/a\n/x/b"),
+            Some(ClipMode::Cut),
+            Some(&text_item("/x/a\n/x/b\n")),
+            exists
+        ),
         SystemClipboard::Keep
     );
     assert_eq!(
-        system_clipboard_action(Some("/x/a"), None, exists),
+        system_clipboard_action(Some("/x/a"), Some(ClipMode::Cut), None, exists),
         SystemClipboard::Keep
     );
 }
@@ -193,17 +290,45 @@ fn our_clipboard_stands_while_the_system_one_is_what_we_wrote() {
 fn a_system_clipboard_that_is_not_files_drops_ours_and_is_otherwise_ignored() {
     let exists = |_: &Path| true;
     assert_eq!(
-        system_clipboard_action(Some("/x/a"), Some("hello world"), exists),
+        system_clipboard_action(
+            Some("/x/a"),
+            Some(ClipMode::Copy),
+            Some(&text_item("hello world")),
+            exists
+        ),
         SystemClipboard::Forget
     );
     assert_eq!(
-        system_clipboard_action(None, Some("hello world"), exists),
+        system_clipboard_action(None, None, Some(&text_item("hello world")), exists),
         SystemClipboard::Keep
     );
     // Files that are gone are not a clipboard.
     assert_eq!(
-        system_clipboard_action(None, Some("file:///x/gone"), |_: &Path| false),
+        system_clipboard_action(
+            None,
+            None,
+            Some(&text_item("file:///x/gone")),
+            |_: &Path| false
+        ),
         SystemClipboard::Keep
+    );
+}
+
+#[test]
+fn the_text_fallback_still_reads_the_cut_line_and_uris() {
+    let exists = |_: &Path| true;
+    let read = |text: &str| system_clipboard_action(None, None, Some(&text_item(text)), exists);
+    assert_eq!(
+        read("copy\nfile:///x/a%20b"),
+        adopted_files(ClipboardAction::Copy, &["/x/a b"])
+    );
+    assert_eq!(
+        read("cut\r\nfile:///x/a\r\n"),
+        adopted_files(ClipboardAction::Cut, &["/x/a"])
+    );
+    assert_eq!(
+        read("/x/a"),
+        adopted_files(ClipboardAction::Copy, &["/x/a"])
     );
 }
 

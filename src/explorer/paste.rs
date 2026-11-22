@@ -16,12 +16,15 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, TimeZone};
-use fileflux::core::clipboard::{ClipboardFiles, format_plain_paths, parse_clipboard_files};
+use fileflux::core::clipboard::{
+    ClipboardAction, ClipboardFiles, format_plain_paths, parse_clipboard_files,
+};
 use fileflux::core::ops::{
     self as core_ops, Conflict, ItemOutcome, Mode, TransferError, TransferReport, rename_noreplace,
 };
 use fileflux::core::places::format_bytes;
 use fileflux::core::trash::{self, TrashError};
+use gpui::{ClipboardItem, FileOperation};
 use rustix::io::Errno;
 
 use super::{
@@ -216,12 +219,33 @@ pub(crate) fn paste_title(mode: ClipMode, sources: &[PathBuf], dest: &Path) -> S
     format!("{} {what} to {}", mode.progressive(), folder_label(dest))
 }
 
-/// The text the system clipboard gets: the paths, one per line. The gpui
-/// clipboard carries plain text only (see [`system_clipboard_action`]), so
-/// this is `text/plain`, not a `text/uri-list` of `file://` URIs: pasting
-/// into a terminal gives paths.
+/// The text that goes next to the files on the system clipboard: the paths,
+/// one per line, so pasting into a terminal gives paths.
 pub(crate) fn clipboard_text(paths: &[PathBuf]) -> String {
     format_plain_paths(paths)
+}
+
+/// The gpui file operation a [`ClipMode`] is offered as.
+pub(crate) fn file_operation(mode: ClipMode) -> FileOperation {
+    match mode {
+        ClipMode::Copy => FileOperation::Copy,
+        ClipMode::Cut => FileOperation::Cut,
+    }
+}
+
+/// The [`ClipMode`] a gpui file operation asks for.
+pub(crate) fn clip_mode(operation: FileOperation) -> ClipMode {
+    match operation {
+        FileOperation::Copy => ClipMode::Copy,
+        FileOperation::Cut => ClipMode::Cut,
+    }
+}
+
+/// What Copy and Cut put on the system clipboard: the files with their
+/// operation, which gpui offers as `x-special/gnome-copied-files`,
+/// `text/uri-list` and plain text (see [`clipboard_text`]).
+pub(crate) fn clipboard_item(mode: ClipMode, paths: &[PathBuf]) -> ClipboardItem {
+    ClipboardItem::new_files(paths.iter().cloned(), file_operation(mode))
 }
 
 /// Whether the system clipboard no longer holds what Copy/Cut wrote. An
@@ -249,20 +273,50 @@ pub(crate) enum SystemClipboard {
 }
 
 /// Decides what the system clipboard `system` means given the text `written`
-/// that Copy/Cut last put there (`None` when the internal clipboard is
-/// empty). The system clipboard wins when it changed since Fileflux wrote it.
+/// and the `mode` that Copy/Cut last put there (`None` when the internal
+/// clipboard is empty). The system clipboard wins when it changed since
+/// Fileflux wrote it. Files the clipboard carries (what a file manager
+/// offers) come first, with their copy or cut operation; otherwise its text
+/// is read as a file list.
 pub(crate) fn system_clipboard_action(
     written: Option<&str>,
-    system: Option<&str>,
+    mode: Option<ClipMode>,
+    system: Option<&ClipboardItem>,
     exists: impl Fn(&Path) -> bool,
 ) -> SystemClipboard {
     let Some(system) = system else {
         return SystemClipboard::Keep;
     };
-    if written.is_some_and(|written| !clipboard_is_stale(written, Some(system))) {
+    let text = system.text();
+    let operation = system.file_operation().map(clip_mode);
+    // Our own files, with the operation we wrote, are not a change; the same
+    // paths cut by someone else are.
+    let ours = operation.is_none() || operation == mode;
+    if ours
+        && let (Some(written), Some(text)) = (written, text.as_deref())
+        && !clipboard_is_stale(written, Some(text))
+    {
         return SystemClipboard::Keep;
     }
-    match parse_clipboard_files(system, exists) {
+    if text.is_none() {
+        return SystemClipboard::Keep;
+    }
+    let files = match (system.file_paths(), operation) {
+        (Some(paths), Some(mode)) => {
+            let paths: Vec<PathBuf> = paths.into_iter().filter(|path| exists(path)).collect();
+            (!paths.is_empty()).then_some(ClipboardFiles {
+                action: match mode {
+                    ClipMode::Copy => ClipboardAction::Copy,
+                    ClipMode::Cut => ClipboardAction::Cut,
+                },
+                paths,
+            })
+        }
+        _ => text
+            .as_deref()
+            .and_then(|text| parse_clipboard_files(text, exists)),
+    };
+    match files {
         Some(files) => SystemClipboard::Adopt(files),
         None if written.is_some() => SystemClipboard::Forget,
         None => SystemClipboard::Keep,

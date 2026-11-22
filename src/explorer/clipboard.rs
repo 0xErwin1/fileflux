@@ -1,13 +1,13 @@
 //! Copy, Cut and Paste on the UI side.
 //!
 //! Copy and Cut keep the paths in the app (see [`ClipboardState`]) and also
-//! write them, one per line, to the system clipboard, so pasting into a
-//! terminal gives paths. Paste first looks at the system clipboard: files
-//! another application copied or cut there (`file://` URIs or absolute
-//! paths, one per line, optionally after a `copy`/`cut` line) replace the
-//! internal clipboard. The gpui clipboard carries text only, so the
-//! `x-special/gnome-copied-files` and `text/uri-list` targets cannot be
-//! offered or read. Paste runs `core::ops::transfer` off the UI thread
+//! write them to the system clipboard as files with a copy or cut operation
+//! (`ClipboardItem::new_files`: `x-special/gnome-copied-files`,
+//! `text/uri-list` and the paths as text), so other file managers paste them
+//! and a terminal gets paths. Paste first looks at the system clipboard:
+//! files another application copied or cut there, or text of `file://` URIs
+//! or absolute paths, one per line, optionally after a `copy`/`cut` line,
+//! replace the internal clipboard. Paste runs `core::ops::transfer` off the UI thread
 //! as a byte-based operation behind the progress card. When the worker meets
 //! an existing target it blocks and sends a question over a channel; the
 //! pump below turns it into a modal that waits its turn in the dialog queue
@@ -19,13 +19,13 @@ use std::time::{Duration, Instant};
 use fileflux::core::Location;
 use fileflux::core::clipboard::ClipboardAction;
 use fileflux::core::ops::Conflict;
-use gpui::{ClipboardItem, Context, Task, Window};
+use gpui::{Context, Task, Window};
 
 use super::devices::job_paths;
 use super::ops::paste::{
     ClipMode, ConflictAnswer, ConflictLink, ConflictRequest, PasteInto, PasteJob, PastePlan,
-    SystemClipboard, clip_notice, clipboard_text, paste_target, paste_title, plan_paste,
-    system_clipboard_action,
+    SystemClipboard, clip_notice, clipboard_item, clipboard_text, paste_target, paste_title,
+    plan_paste, system_clipboard_action,
 };
 use super::ops::{DialogState, Job, Report, Severity};
 use super::progress::Unit;
@@ -64,8 +64,8 @@ impl Explorer {
             .collect()
     }
 
-    /// Ctrl+C / Ctrl+X: remembers the selection, and writes its paths to
-    /// the system clipboard as text.
+    /// Ctrl+C / Ctrl+X: remembers the selection, and writes it to the system
+    /// clipboard as files to copy or cut.
     pub(crate) fn copy_selection(&mut self, mode: ClipMode, cx: &mut Context<Self>) {
         if self.in_trash() {
             return;
@@ -75,7 +75,7 @@ impl Explorer {
             return;
         }
         let text = clipboard_text(&paths);
-        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        cx.write_to_clipboard(clipboard_item(mode, &paths));
         self.tab_mut().state.set_notice(clip_notice(mode, &paths));
         self.clipboard.set(mode, paths);
         self.clipboard_text = Some(text);
@@ -87,11 +87,14 @@ impl Explorer {
     /// and replaced when what was put there is files another application
     /// copied or cut (see [`system_clipboard_action`]).
     pub(crate) fn reconcile_clipboard(&mut self, cx: &mut Context<Self>) {
-        let system = cx.read_from_clipboard().and_then(|item| item.text());
-        let action =
-            system_clipboard_action(self.clipboard_text.as_deref(), system.as_deref(), |path| {
-                path.symlink_metadata().is_ok()
-            });
+        let system = cx.read_from_clipboard();
+        let held = self.clipboard.get().map(|held| held.mode);
+        let action = system_clipboard_action(
+            self.clipboard_text.as_deref(),
+            held,
+            system.as_ref(),
+            |path| path.symlink_metadata().is_ok(),
+        );
         match action {
             SystemClipboard::Keep => {}
             SystemClipboard::Forget => {
@@ -104,8 +107,8 @@ impl Explorer {
                     ClipboardAction::Copy => ClipMode::Copy,
                     ClipboardAction::Cut => ClipMode::Cut,
                 };
+                self.clipboard_text = system.as_ref().and_then(|item| item.text());
                 self.clipboard.set(mode, files.paths);
-                self.clipboard_text = system;
                 cx.notify();
             }
         }
