@@ -22,38 +22,139 @@
 //! those icons out, and the answer is memoized per MIME type, so even a
 //! folder of thousands of files costs one probe set per file type, never
 //! per tile or per frame.
+//! The probe, like rasterizing a found icon, runs on a background thread
+//! ([`background`]): a view asks, draws its bundled glyph until the answer
+//! is in, and redraws when [`take_announced`] says one arrived.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 
 use super::mimes;
 use super::thumbnailers::data_directories;
 
 /// The icon file for the type of a file named `name`, from the installed
 /// freedesktop icon theme, or `None` when the theme names nothing for it
-/// (the caller keeps its bundled glyph). Decided from the name's extension
-/// alone; the filesystem is probed only for a type's first question, once
-/// per process.
+/// (the caller keeps its bundled glyph) **or has not been asked yet**:
+/// finding it probes the filesystem, which the UI thread never does. The
+/// first question about a type starts the probe on a background thread and
+/// answers `None`; [`announce`] tells the view when an answer arrived, and
+/// asking again then returns it. Decided from the name's extension alone.
 #[must_use]
 pub fn for_file(name: &OsStr) -> Option<PathBuf> {
     let mime = mimes::of_name(name)?;
-    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(found) = cache.get(mime) {
-        return found.clone();
+    match MEMO.ask(mime) {
+        Ask::Known(found) => found,
+        Ask::Resolving => None,
+        Ask::Start => {
+            let mime = mime.to_owned();
+            background(move || {
+                let environment = environment();
+                let found = resolve_in(&environment.roots, &environment.themes, &mime);
+                MEMO.settle(&mime, found);
+                announce();
+            });
+            None
+        }
     }
-    let environment = environment();
-    let found = resolve_in(&environment.roots, &environment.themes, mime);
-    cache.insert(mime.to_owned(), found.clone());
-    found
 }
 
 /// The memoized answers, keyed by MIME type (which fixes the candidate
-/// names): a `None` answer is kept too, so a type the theme does not cover
-/// is probed once, not per file.
-static CACHE: LazyLock<Mutex<HashMap<String, Option<PathBuf>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// names).
+static MEMO: LazyLock<Memo> = LazyLock::new(Memo::default);
+
+/// What is known about one type's icon.
+#[derive(Debug)]
+enum Slot {
+    /// The probe is running.
+    Resolving,
+    /// The probe is over; `None` when the theme has no icon for the type.
+    Known(Option<PathBuf>),
+}
+
+/// What asking the [`Memo`] about a type came to.
+#[derive(Debug)]
+enum Ask {
+    /// The answer: a type the theme does not cover is `Known(None)` too, so
+    /// it is probed once, not per file.
+    Known(Option<PathBuf>),
+    /// Someone else's probe is running.
+    Resolving,
+    /// Nobody asked yet: the caller probes and [`Memo::settle`]s.
+    Start,
+}
+
+/// The memo of [`for_file`]: one probe per type, however many tiles ask.
+#[derive(Debug, Default)]
+struct Memo {
+    slots: Mutex<HashMap<String, Slot>>,
+}
+
+impl Memo {
+    fn ask(&self, mime: &str) -> Ask {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        match slots.get(mime) {
+            Some(Slot::Known(found)) => Ask::Known(found.clone()),
+            Some(Slot::Resolving) => Ask::Resolving,
+            None => {
+                slots.insert(mime.to_owned(), Slot::Resolving);
+                Ask::Start
+            }
+        }
+    }
+
+    fn settle(&self, mime: &str, found: Option<PathBuf>) {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(mime.to_owned(), Slot::Known(found));
+    }
+}
+
+/// Runs `job` on the one background thread the icon work shares, in the order
+/// jobs were handed in: probing a theme and rasterizing an icon touch the
+/// disk and burn CPU, so neither happens while a frame is being built.
+pub fn background(job: impl FnOnce() + Send + 'static) {
+    type Job = Box<dyn FnOnce() + Send>;
+    static WORKER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (sender, jobs) = std::sync::mpsc::channel::<Job>();
+        let started = std::thread::Builder::new()
+            .name("icons".to_owned())
+            .spawn(move || {
+                for job in jobs {
+                    job();
+                }
+            });
+        match started {
+            Ok(_) => Some(sender),
+            Err(error) => {
+                log::debug!("could not start the icon thread: {error}");
+                None
+            }
+        }
+    });
+    if let Some(worker) = worker {
+        drop(worker.send(Box::new(job)));
+    }
+}
+
+/// Set when background icon work finished something a view may now draw.
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// Says that an icon is ready: the view redraws when it next [`take_announced`]
+/// (a burst of icons costs one redraw).
+pub fn announce() {
+    ANNOUNCED.store(true, Ordering::Release);
+}
+
+/// Whether an icon became ready since the last call.
+pub fn take_announced() -> bool {
+    ANNOUNCED.swap(false, Ordering::AcqRel)
+}
 
 /// A themed icon rasterized in full colour, at the size a view draws it:
 /// GPUI's own SVG element paints an alpha mask, so every themed icon
@@ -720,6 +821,56 @@ mod tests {
             "a cycle is cut, not followed forever"
         );
         drop(std::fs::remove_dir_all(&root));
+        Ok(())
+    }
+
+    #[test]
+    fn a_type_is_resolved_once_and_asking_meanwhile_starts_nothing() {
+        let memo = Memo::default();
+        assert!(matches!(memo.ask("image/png"), Ask::Start));
+        assert!(
+            matches!(memo.ask("image/png"), Ask::Resolving),
+            "a second tile of the type waits for the first one's probe"
+        );
+        assert!(matches!(memo.ask("video/mp4"), Ask::Start), "another type");
+    }
+
+    #[test]
+    fn a_settled_answer_is_kept_and_a_type_without_an_icon_is_never_probed_again() {
+        let memo = Memo::default();
+        assert!(matches!(memo.ask("image/png"), Ask::Start));
+        memo.settle("image/png", Some(PathBuf::from("/t/png.svg")));
+        assert!(matches!(
+            memo.ask("image/png"),
+            Ask::Known(Some(found)) if found == Path::new("/t/png.svg")
+        ));
+        assert!(matches!(memo.ask("application/x-nothing"), Ask::Start));
+        memo.settle("application/x-nothing", None);
+        for _ in 0..3 {
+            assert!(
+                matches!(memo.ask("application/x-nothing"), Ask::Known(None)),
+                "the miss is remembered: the bundled glyph stays without a new probe"
+            );
+        }
+    }
+
+    #[test]
+    fn background_work_runs_off_the_calling_thread_and_announces_itself() -> TestResult {
+        // Whatever an earlier test announced is not this one's concern.
+        take_announced();
+        let (done, received) = std::sync::mpsc::channel();
+        let caller = std::thread::current().id();
+        background(move || {
+            done.send(std::thread::current().id()).ok();
+            announce();
+        });
+        let worker = received.recv_timeout(std::time::Duration::from_secs(5))?;
+        assert_ne!(worker, caller, "the job did not run on the UI thread");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !take_announced() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!take_announced(), "the announcement is taken once");
         Ok(())
     }
 }

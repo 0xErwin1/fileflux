@@ -195,33 +195,63 @@ pub(crate) fn file_icon(name: &OsStr, color: Hsla, size: f32) -> gpui::AnyElemen
 /// Every theme icon drawn so far, rasterized once: keyed by the icon's
 /// file and its box in whole pixels, so each (icon, size) is rasterized on
 /// its first frame only — never again per frame per tile — and a raster
-/// that failed once (`None`) is not retried either.
+/// that failed once (`Done(None)`) is not retried either.
 static RASTERS: LazyLock<Mutex<Rasters>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The rasterized theme icons: the icon file and its box in whole pixels
-/// to the drawn image (`None` when rasterizing that icon failed).
-type Rasters = HashMap<(PathBuf, u32), Option<Arc<RenderImage>>>;
+/// to what is known of its image.
+type Rasters = HashMap<(PathBuf, u32), Raster>;
+
+/// What is known of one rasterized theme icon.
+enum Raster {
+    /// The background thread is making it.
+    Rendering,
+    /// Made: the image, or `None` when rasterizing that icon failed.
+    Done(Option<Arc<RenderImage>>),
+}
 
 /// The theme icon at `path` rasterized in colour into `size`-pixel square
 /// pixels, memoized per (path, size) for the whole process (see
-/// [`RASTERS`]). GPUI's image pipeline draws BGRA, so the raster's straight
-/// RGBA is channel-swapped on the way in — the same swap GPUI's own image
-/// loader applies to decoded files. `None` when the icon cannot be
-/// rasterized.
+/// [`RASTERS`]). Reading and rasterizing an icon is work for the background
+/// (see [`fileflux::core::icons::background`]), not for a frame: the first ask
+/// starts it and answers `None`, so the caller draws its glyph meanwhile, and
+/// the view is told when the image is ready
+/// ([`fileflux::core::icons::announce`]). GPUI's image pipeline draws BGRA, so
+/// the raster's straight RGBA is channel-swapped on the way in — the same swap
+/// GPUI's own image loader applies to decoded files. `None` when the icon
+/// cannot be rasterized.
 fn rasterized(path: &Path, size: u32) -> Option<Arc<RenderImage>> {
-    let mut rasters = RASTERS.lock().unwrap_or_else(PoisonError::into_inner);
-    rasters
-        .entry((path.to_owned(), size))
-        .or_insert_with(|| {
-            let rendered = fileflux::core::icons::render(path, size)?;
-            let mut pixels = RgbaImage::from_raw(rendered.width, rendered.height, rendered.rgba)?;
-            for pixel in pixels.as_chunks_mut::<4>().0 {
-                // Straight RGBA to straight BGRA, the byte order GPUI draws.
-                pixel.swap(0, 2);
+    let key = (path.to_owned(), size);
+    {
+        let mut rasters = RASTERS.lock().unwrap_or_else(PoisonError::into_inner);
+        match rasters.get(&key) {
+            Some(Raster::Done(image)) => return image.clone(),
+            Some(Raster::Rendering) => return None,
+            None => {
+                rasters.insert(key.clone(), Raster::Rendering);
             }
-            Some(Arc::new(RenderImage::new([Frame::new(pixels)])))
-        })
-        .clone()
+        }
+    }
+    fileflux::core::icons::background(move || {
+        let image = rasterize(&key.0, key.1);
+        RASTERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, Raster::Done(image));
+        fileflux::core::icons::announce();
+    });
+    None
+}
+
+/// The image of the icon at `path`, `size` pixels square (see [`rasterized`]).
+fn rasterize(path: &Path, size: u32) -> Option<Arc<RenderImage>> {
+    let rendered = fileflux::core::icons::render(path, size)?;
+    let mut pixels = RgbaImage::from_raw(rendered.width, rendered.height, rendered.rgba)?;
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        // Straight RGBA to straight BGRA, the byte order GPUI draws.
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new([Frame::new(pixels)])))
 }
 
 /// A theme icon file drawn `size` pixels square: rasterized in the theme's
@@ -1599,9 +1629,39 @@ mod tests {
     /// The theme-icon memo: two asks for the same (icon file, size) get
     /// the same rasterized image, so an icon is rasterized once per
     /// process — never again per frame per tile.
+    /// Polls [`rasterized`] until the background raster of (`path`, `size`)
+    /// is over (the memo holds its answer), then returns that answer.
+    fn rasterized_when_settled(path: &Path, size: u32) -> Option<Arc<RenderImage>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let answer = rasterized(path, size);
+            let settled = RASTERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&(path.to_owned(), size))
+                .is_some_and(|slot| matches!(slot, Raster::Done(_)));
+            if settled || std::time::Instant::now() > deadline {
+                return answer;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn rasters_of(icon: &Path) -> usize {
+        RASTERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .filter(|(path, _)| path == icon)
+            .count()
+    }
+
+    /// A raster is made off the calling thread: the first ask answers `None`
+    /// (the caller keeps its glyph meanwhile) and the one after the work is
+    /// over gets the image, the same one every time.
     #[test]
     #[allow(clippy::expect_used)]
-    fn the_same_icon_and_size_rasterize_once() {
+    fn an_icon_rasterizes_in_the_background_once_per_size() {
         let root = scratch("memo");
         let icon = root.join("red.svg");
         std::fs::write(
@@ -1609,14 +1669,41 @@ mod tests {
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><rect width=\"64\" height=\"64\" fill=\"#ff0000\"/></svg>",
         )
         .expect("icon SVG");
-        let first = rasterized(&icon, 32).expect("the icon rasterizes");
+        fileflux::core::icons::take_announced();
+        assert!(
+            rasterized(&icon, 32).is_none(),
+            "the first ask does not wait for the raster"
+        );
+        let first = rasterized_when_settled(&icon, 32).expect("the icon rasterizes");
         let second = rasterized(&icon, 32).expect("the memo answers");
         assert!(
             Arc::ptr_eq(&first, &second),
             "the second ask reuses the first raster instead of rasterizing again"
         );
-        let rasters = RASTERS.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(rasters.len(), 1, "exactly one (icon, size) was rasterized");
+        assert_eq!(
+            rasters_of(&icon),
+            1,
+            "exactly one (icon, size) was rasterized"
+        );
+        assert!(
+            fileflux::core::icons::take_announced(),
+            "the view is told an icon is ready"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// An icon that cannot be rasterized is not retried on every frame.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn an_icon_that_fails_to_rasterize_is_remembered() {
+        let root = scratch("broken");
+        let icon = root.join("broken.svg");
+        std::fs::write(&icon, "not an svg").expect("broken icon");
+        assert!(rasterized_when_settled(&icon, 16).is_none());
+        for _ in 0..3 {
+            assert!(rasterized(&icon, 16).is_none());
+        }
+        assert_eq!(rasters_of(&icon), 1);
         drop(std::fs::remove_dir_all(&root));
     }
 

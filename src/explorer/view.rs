@@ -1265,6 +1265,10 @@ impl Explorer {
                             tab.prioritize_thumbnails();
                         }
                         this.ensure_preview_thumbnail(cx);
+                        // A theme icon was found or rasterized in the background.
+                        if fileflux::core::icons::take_announced() {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
