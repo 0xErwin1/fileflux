@@ -92,6 +92,10 @@ The script runs Xvfb with openbox (native capture finds no window without a wind
 
 Use it to check what a screenshot cannot: which element a click actually lands on, where a drag preview sits relative to the pointer, what the status bar renders for a given selection. The bridge reads frames in-process, so it works on Wayland; the server's native **screenshots** are X11-only, so on Wayland capture the window another way. Prefer this over XTest-driven checks above when the question is about the element tree rather than pixels, and keep both when the question is visual.
 
+### Measuring a big folder
+
+To see what a folder with thousands of images and videos costs the UI thread, enter it in the sandbox and read the frames: `mark_frames`, enter the folder through the path field (Ctrl+L, the path, Enter), wait, then `get_frame_report` (`app_draw_ms`, `prepaint_ms`, `views_reused`). Use a fresh `XDG_CACHE_HOME` for a cold thumbnail cache and keep it for a warm one, and measure a `--release` build as well as the debug one: a debug GPUI frame costs about ten times more, and that is what a developer running `cargo run` feels. The bridge's `ping` is answered off the UI thread, so it says nothing about a busy window; time a foreground timer against its deadline instead. Frame cost does not depend on the folder (a 3-entry folder draws as slowly as a 1100-entry one, the grid being virtualized), so what matters is how many frames the folder causes: thumbnails are published together every 150 ms and redraw the window only when one on screen changed.
+
 ## Nix packages
 
 `flake.nix` outputs, for `x86_64-linux` and `aarch64-linux` (the prebuilt nightly only for `x86_64-linux`):
