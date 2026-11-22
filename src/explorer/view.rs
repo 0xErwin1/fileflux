@@ -44,8 +44,9 @@ use fileflux::core::{Listing, Location};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Div, Entity, FocusHandle, Focusable,
     InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, ScrollStrategy, Stateful, Styled, Subscription,
-    Task, UniformListScrollHandle, WeakEntity, Window, actions, deferred, div, prelude::*, px,
+    MouseUpEvent, NavigationDirection, ParentElement, Pixels, Render, ScrollStrategy, Stateful,
+    Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, deferred,
+    div, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::table::{TableEvent, TableState};
@@ -3884,6 +3885,22 @@ impl Explorer {
         self.focus_pane(side, window, cx);
     }
 
+    /// A mouse back or forward button pressed inside `side`: the pane's own
+    /// history moves, like Alt+Left/Alt+Right. In a split the capture-phase
+    /// press already gave `side` the focus. Ignored while a dialog or the
+    /// context menu is open, like any other press over their overlays.
+    fn mouse_navigation(
+        &mut self,
+        direction: NavigationDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dialogs.is_open() || self.menu.is_some() {
+            return;
+        }
+        self.navigate(history_transition(direction), window, cx);
+    }
+
     /// A release inside `side` while entries are being dragged: the pane the
     /// drop lands in takes the focus (see [`panes::drop_focus`]).
     fn drop_in_pane(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
@@ -4499,6 +4516,14 @@ impl Explorer {
             .flex_col();
         // The panes share the free width in the divider's proportion.
         pane.style().flex_grow = Some(weight);
+        for direction in [NavigationDirection::Back, NavigationDirection::Forward] {
+            pane = pane.on_mouse_down(
+                MouseButton::Navigate(direction),
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.mouse_navigation(direction, window, cx);
+                }),
+            );
+        }
         if !split {
             return pane.child(island);
         }
@@ -5090,9 +5115,29 @@ pub(crate) fn path_argument_message(argument: &PathArgument) -> String {
     }
 }
 
+/// The history step a mouse back or forward button stands for.
+fn history_transition(direction: NavigationDirection) -> Transition {
+    match direction {
+        NavigationDirection::Back => Transition::Back,
+        NavigationDirection::Forward => Transition::Forward,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_back_and_forward_buttons_walk_the_history() {
+        assert!(matches!(
+            history_transition(NavigationDirection::Back),
+            Transition::Back
+        ));
+        assert!(matches!(
+            history_transition(NavigationDirection::Forward),
+            Transition::Forward
+        ));
+    }
 
     /// The finding: a successful edited-path submission reseeds the path
     /// field — even while it stays focused — so a second Enter reloads the

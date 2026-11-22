@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- The mouse's back and forward side buttons walk a pane's history (also in a disk usage analysis), like Alt+← and Alt+→; in a split they act on the pane under the pointer. Only the image viewer handled them before.
 - `scripts/install-desktop.sh --default-folders` makes Fileflux the default application for folders (`inode/directory`); `--uninstall` restores the previous default. The desktop entry already declared folders, but the script only ever set the image types.
 - Video thumbnails out of the box with Nix: the `fileflux-source` and nightly packages and the dev shell bring `ffmpegthumbnailer` and append its thumbnailers to `XDG_DATA_DIRS` (after the system's, which keep priority), so videos get a preview without installing anything else.
 - Copy and paste files with other file managers: Copy and Cut put the files on the system clipboard as `x-special/gnome-copied-files` and `text/uri-list` (plus KDE's cut flag for a cut), so Nautilus, Thunar or Dolphin paste them; Paste takes files those applications copied or cut, and a cut moves them through the usual conflict dialog, progress and Undo. Pasting `file://` URIs or absolute paths as text still works, and a clipboard Fileflux owns behaves as before. Needs DBFlux `85ce001` (dbflux#1384).

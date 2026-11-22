@@ -20,7 +20,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Ctrl+L | Edit the path | Enter navigates; Escape restores |
 | Ctrl+F | Search file names | Current folder only; Escape clears |
 | Ctrl+Shift+F | Search in subfolders | Turns on *Search in subfolders* and focuses the search field; see [Search in subfolders](user-guide.md#search-in-subfolders) |
-| Alt+← / Alt+→ | Back / Forward | |
+| Alt+← / Alt+→ | Back / Forward | The mouse's back and forward buttons do the same over a pane |
 | Alt+↑ | Up one folder | |
 | Ctrl+R | Refresh (also in the toolbar `⋯` menu) | |
 | Ctrl+I | Toggle the details panel | Same as Properties, also in the toolbar `⋯` menu |
