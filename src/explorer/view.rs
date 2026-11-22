@@ -79,11 +79,16 @@ use crate::explorer::typeahead::{self, TypeAhead};
 use crate::explorer::zoom::{self, GridZoomExt as _, WheelTravel};
 use crate::explorer::{dnd, entries, overlay, progress, rubber, sidebar, tabstrip, toolbar, util};
 
-/// How many images one background thumbnail lookup covers before the tiles
-/// it found are shown.
-const THUMBNAIL_BATCH: usize = 32;
-/// How many images are decoded at once to make missing thumbnails.
-const THUMBNAIL_JOBS: usize = 2;
+/// How often the thumbnails that arrived are shown: a burst of them costs one
+/// redraw, not one each.
+const THUMBNAIL_PUBLISH: Duration = Duration::from_millis(150);
+/// The most images looked up or decoded at once for their thumbnails: half
+/// the cores, so the window keeps the rest, between two and four.
+fn thumbnail_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, |cores| cores.get() / 2)
+        .clamp(2, 4)
+}
 
 /// Key context of the whole explorer window.
 pub(crate) const EXPLORER_CONTEXT: &str = "FilefluxExplorer";
@@ -521,8 +526,18 @@ pub(crate) struct Tab {
     counts_task: Option<Task<()>>,
     /// The thumbnail lookups of the listing, filled by `thumbs_task`.
     pub(crate) thumbs: Arc<entries::Thumbs>,
-    /// The retained thumbnail lookup, replaced by the next commit.
+    /// The retained thumbnail publisher, replaced by the next commit.
     thumbs_task: Option<Task<()>>,
+    /// The thumbnail work still to do for this listing; closed when the
+    /// listing is replaced or the tab goes away.
+    thumb_queue: Option<Arc<fileflux::core::thumbnails::Queue<entries::Thumb>>>,
+    /// The tiles on screen last time the thumbnail queue was ordered, as
+    /// positions in the displayed order.
+    thumb_viewport: Option<(usize, usize)>,
+    /// The tiles the grid drew last, as positions in the displayed order:
+    /// the rows built for the viewport times the columns. Written by the
+    /// grid while it draws; `(0, 0)` until it has drawn.
+    pub(crate) visible_tiles: Rc<Cell<(usize, usize)>>,
     /// The retained arrangement job loop (see [`Explorer::arrange_tab`]).
     arrange_task: Option<Task<()>>,
     /// When the current stretch of arrangement jobs began.
@@ -542,6 +557,51 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
+    /// Puts the thumbnails of the tiles on screen first in the queue, when
+    /// the screen moved since the queue was last ordered.
+    fn prioritize_thumbnails(&mut self) {
+        let Some(queue) = &self.thumb_queue else {
+            return;
+        };
+        let screen = self.visible_tiles.get();
+        if self.thumb_viewport == Some(screen) {
+            return;
+        }
+        self.thumb_viewport = Some(screen);
+        let displayed = self.state.visible_shared();
+        let places: HashMap<&Path, usize> = displayed
+            .iter()
+            .enumerate()
+            .filter_map(|(place, &index)| Some((self.snapshot.get(index)?.path.as_path(), place)))
+            .collect();
+        queue.reprioritize(|path| places.get(path).copied(), screen.0..screen.1);
+    }
+
+    /// The images whose thumbnail the window draws right now: the tiles on
+    /// screen and the selection (the details panel previews it). `None`
+    /// before the grid has drawn, when everything counts.
+    fn thumbnails_on_screen(&self) -> Option<std::collections::HashSet<PathBuf>> {
+        let mut shown: std::collections::HashSet<PathBuf> =
+            self.state.selection().iter().cloned().collect();
+        if self.state.view() == View::List {
+            return Some(shown);
+        }
+        let (start, end) = self.visible_tiles.get();
+        if start >= end {
+            return None;
+        }
+        let displayed = self.state.visible_shared();
+        shown.extend(
+            displayed
+                .iter()
+                .skip(start)
+                .take(end - start)
+                .filter_map(|&index| self.snapshot.get(index))
+                .map(|entry| entry.path.clone()),
+        );
+        Some(shown)
+    }
+
     /// An arrangement job has been running long enough to say so.
     pub(crate) fn arrange_is_slow(&self) -> bool {
         self.state.is_arranging()
@@ -657,6 +717,9 @@ impl Tab {
             counts_task: None,
             thumbs: Arc::new(entries::Thumbs::new()),
             thumbs_task: None,
+            thumb_queue: None,
+            thumb_viewport: None,
+            visible_tiles: Rc::new(Cell::new((0, 0))),
             arrange_task: None,
             arranging_since: None,
             arrange_hint_task: None,
@@ -1194,6 +1257,9 @@ impl Explorer {
                         this.pump_network(window, cx);
                         this.pump_desktop(window, cx);
                         this.persist_tick(window, cx);
+                        for tab in this.tabs.iter_mut() {
+                            tab.prioritize_thumbnails();
+                        }
                     })
                     .is_err()
                 {
@@ -2047,10 +2113,14 @@ impl Explorer {
         }
     }
 
-    /// Looks up the cached thumbnails of tab `id`'s images on the background
-    /// executor, then generates the missing ones (freedesktop `large`), a batch at a time so the first tiles do not wait for a long
-    /// folder. `bucket` is the smallest cache size the grid's zoom needs. The answers that still apply stay on screen meanwhile; a newer
-    /// commit replaces the task (dropping it).
+    /// Finds or makes the thumbnails of tab `id`'s images (freedesktop
+    /// `large` or `normal`, whichever `bucket` the grid's zoom needs) on the
+    /// background executor: a few workers take the images in the order the
+    /// view shows them — the tiles on screen first, then the ones a scroll
+    /// reaches next — and the thumbnails that arrived are shown together, at
+    /// most every [`THUMBNAIL_PUBLISH`]. The answers that still apply stay on
+    /// screen meanwhile. A newer commit replaces the work (dropping it stops
+    /// the workers after the images they are on).
     fn start_thumbnails(&mut self, id: TabId, cx: &mut Context<Self>) {
         let bucket = self.grid_zoom.thumbnail_bucket();
         let Some(tab) = self.tabs.by_id_mut(id) else {
@@ -2062,82 +2132,50 @@ impl Explorer {
             entries::plan_thumbnails(&tab.snapshot, &displayed, &tab.thumbs, trust_known, bucket);
         tab.thumbs = Arc::new(keep);
         tab.thumbs_task = None;
+        if let Some(stale) = tab.thumb_queue.take() {
+            stale.close();
+        }
+        tab.thumb_viewport = None;
         if todo.is_empty() {
             return;
         }
-        let task = cx.spawn(async move |this, cx| {
-            // Cache lookups first, so every cached thumbnail shows before any
-            // image is decoded.
-            let mut missing = Vec::new();
-            for batch in todo.chunks(THUMBNAIL_BATCH) {
-                let batch = batch.to_vec();
-                let answers = cx
-                    .background_executor()
-                    .spawn(async move {
-                        batch
-                            .into_iter()
-                            .map(|(path, modified)| {
-                                let found = fileflux::core::thumbnails::lookup_at(&path, bucket);
-                                (path, modified, found)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
-                let mut hits = Vec::new();
-                for (path, modified, found) in answers {
-                    if found.is_some() {
-                        hits.push((
-                            path,
-                            entries::Thumb {
-                                modified,
-                                found,
-                                misses: 0,
-                            },
-                        ));
-                    } else {
-                        missing.push((path, modified));
+        let queue = Arc::new(fileflux::core::thumbnails::Queue::new(todo));
+        tab.thumb_queue = Some(Arc::clone(&queue));
+        tab.prioritize_thumbnails();
+        let workers: Vec<Task<()>> = (0..thumbnail_workers())
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                cx.background_executor().spawn(async move {
+                    while let Some((path, modified)) = queue.next() {
+                        let found = thumbnail_for(&path, bucket);
+                        let misses = u32::from(found.is_none());
+                        let thumb = entries::Thumb {
+                            modified,
+                            found,
+                            misses,
+                        };
+                        queue.finish((path, modified), thumb);
                     }
-                }
-                if hits.is_empty() {
-                    continue;
-                }
-                if !Self::publish_thumbnails(&this, id, hits, cx) {
+                })
+            })
+            .collect();
+        let task = cx.spawn(async move |this, cx| {
+            // Dropping the task (a newer commit, a closed tab) closes the
+            // queue and cancels the workers.
+            let work = ThumbnailWork { queue, workers };
+            loop {
+                cx.background_executor().timer(THUMBNAIL_PUBLISH).await;
+                let answers: Vec<_> = work
+                    .queue
+                    .drain()
+                    .into_iter()
+                    .map(|((path, _), thumb)| (path, thumb))
+                    .collect();
+                // A miss is published too: it is what bounds the retries.
+                if !answers.is_empty() && !Self::publish_thumbnails(&this, id, answers, cx) {
                     return;
                 }
-            }
-            // Then generate the missing ones, a few decodes at a time.
-            for jobs in missing.chunks(THUMBNAIL_JOBS) {
-                let running = jobs
-                    .iter()
-                    .map(|(path, modified)| {
-                        let (path, modified) = (path.clone(), *modified);
-                        cx.background_executor().spawn(async move {
-                            let found = match fileflux::core::thumbnails::generate_at(&path, bucket)
-                            {
-                                Outcome::Ready(thumbnail) => Some(thumbnail),
-                                // A file of the cache is a thumbnail already.
-                                Outcome::Skipped(Skip::InsideCache) => Some(path.clone()),
-                                Outcome::Failed | Outcome::Skipped(_) => None,
-                            };
-                            let misses = u32::from(found.is_none());
-                            (
-                                path,
-                                entries::Thumb {
-                                    modified,
-                                    found,
-                                    misses,
-                                },
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let mut made = Vec::new();
-                for job in running {
-                    let (path, thumb) = job.await;
-                    // A miss is published too: it is what bounds the retries.
-                    made.push((path, thumb));
-                }
-                if !made.is_empty() && !Self::publish_thumbnails(&this, id, made, cx) {
+                if work.queue.is_idle() {
                     return;
                 }
             }
@@ -2214,8 +2252,9 @@ impl Explorer {
         control
     }
 
-    /// Shows `answers` on tab `id`. `false` when the explorer is gone and the
-    /// thumbnail task should stop.
+    /// Shows `answers` on tab `id`, redrawing only when a tile on screen (or
+    /// the preview of the selection) got a thumbnail it did not have. `false`
+    /// when the explorer is gone and the thumbnail task should stop.
     fn publish_thumbnails(
         this: &WeakEntity<Self>,
         id: TabId,
@@ -2223,7 +2262,14 @@ impl Explorer {
         cx: &mut AsyncApp,
     ) -> bool {
         let published = this.update(cx, |this, cx| {
+            let mut redraw = false;
             if let Some(tab) = this.tabs.by_id_mut(id) {
+                redraw = match tab.thumbnails_on_screen() {
+                    Some(shown) => {
+                        entries::redraws(&tab.thumbs, &answers, |path| shown.contains(path))
+                    }
+                    None => true,
+                };
                 let thumbs = Arc::make_mut(&mut tab.thumbs);
                 for (path, mut thumb) in answers {
                     if thumb.found.is_none() {
@@ -2239,7 +2285,9 @@ impl Explorer {
                     thumbs.insert(path, thumb);
                 }
             }
-            cx.notify();
+            if redraw {
+                cx.notify();
+            }
         });
         if let Err(error) = &published {
             log::debug!("the explorer closed before its thumbnails settled: {error}");
@@ -3877,6 +3925,36 @@ fn committed_path_text(location: &Location) -> String {
 /// it already shows the committed query and no programmatic set is needed.
 fn search_field_resync<'a>(committed_query: &'a str, field_value: &str) -> Option<&'a str> {
     (field_value != committed_query).then_some(committed_query)
+}
+
+/// The thumbnail of `path` for a tile that needs `bucket`: the cache's, or
+/// one made now (blocking: only ever called on the background executor).
+/// `None` when there is none and the glyph stays.
+fn thumbnail_for(path: &Path, bucket: fileflux::core::thumbnails::Bucket) -> Option<PathBuf> {
+    if let Some(cached) = fileflux::core::thumbnails::lookup_at(path, bucket) {
+        return Some(cached);
+    }
+    match fileflux::core::thumbnails::generate_at(path, bucket) {
+        Outcome::Ready(thumbnail) => Some(thumbnail),
+        // A file of the cache is a thumbnail already.
+        Outcome::Skipped(Skip::InsideCache) => Some(path.to_path_buf()),
+        Outcome::Failed | Outcome::Skipped(_) => None,
+    }
+}
+
+/// The thumbnail work of one listing, held by the task that publishes it:
+/// dropping it closes the queue (the workers stop after their current image)
+/// and cancels the workers.
+struct ThumbnailWork {
+    queue: Arc<fileflux::core::thumbnails::Queue<entries::Thumb>>,
+    #[allow(dead_code)]
+    workers: Vec<Task<()>>,
+}
+
+impl Drop for ThumbnailWork {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 impl Render for Explorer {

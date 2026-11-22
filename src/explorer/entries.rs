@@ -15,6 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -264,6 +265,22 @@ pub(crate) fn misses_after(previous: Option<&Thumb>, modified: Option<SystemTime
         }
         _ => 1,
     }
+}
+
+/// Whether showing `answers` changes what the view draws: some answer is for
+/// a path `shown` says is on screen and carries a different thumbnail than
+/// the one `known` has (none, to a first one). A miss leaves the glyph where
+/// it is and an answer for a tile off screen is only picked up when it
+/// scrolls in, so neither is worth a redraw.
+pub(crate) fn redraws(
+    known: &Thumbs,
+    answers: &[(PathBuf, Thumb)],
+    shown: impl Fn(&Path) -> bool,
+) -> bool {
+    answers.iter().any(|(path, thumb)| {
+        let drawn = known.get(path).and_then(|known| known.found.as_ref());
+        shown(path) && drawn != thumb.found.as_ref()
+    })
 }
 
 /// The lookups of one listing, by image path. A tile with no answer yet
@@ -615,6 +632,7 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
     let counts_for_rows = Arc::clone(this.tab().state.child_counts());
     let thumbs_for_rows = Arc::clone(&this.tab().thumbs);
     let weak_for_rows = weak.clone();
+    let tiles_on_screen = Rc::clone(&this.tab().visible_tiles);
     let visible_for_rows = Arc::clone(&visible);
     let selected_for_rows = Arc::clone(&selected);
     let cut: Arc<BTreeSet<PathBuf>> = Arc::new(this.clipboard.cut_paths());
@@ -649,6 +667,8 @@ pub(crate) fn render(this: &Explorer, cx: &mut Context<Explorer>) -> Stateful<Di
             "explorer-grid-rows",
             item_count,
             move |row_range, _window, cx: &mut App| {
+                // Where the view is, for the thumbnail work to follow it.
+                tiles_on_screen.set((row_range.start * columns, row_range.end * columns));
                 row_range
                     .map(|row| {
                         let data = GridData {
@@ -1598,5 +1618,59 @@ mod tests {
         let rasters = RASTERS.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(rasters.len(), 1, "exactly one (icon, size) was rasterized");
         drop(std::fs::remove_dir_all(&root));
+    }
+
+    fn found(path: &str) -> Thumb {
+        Thumb {
+            modified: None,
+            found: Some(PathBuf::from(path)),
+            misses: 0,
+        }
+    }
+
+    fn miss() -> Thumb {
+        Thumb {
+            modified: None,
+            found: None,
+            misses: 1,
+        }
+    }
+
+    fn on_screen(shown: &'static [&'static str]) -> impl Fn(&Path) -> bool {
+        move |path| shown.iter().any(|name| path == Path::new(name))
+    }
+
+    #[test]
+    fn a_thumbnail_for_a_tile_on_screen_redraws() {
+        let answers = [(PathBuf::from("/p/a.jpg"), found("/t/a.png"))];
+        assert!(redraws(&Thumbs::new(), &answers, on_screen(&["/p/a.jpg"])));
+    }
+
+    #[test]
+    fn thumbnails_for_tiles_off_screen_do_not_redraw() {
+        let answers = [
+            (PathBuf::from("/p/b.jpg"), found("/t/b.png")),
+            (PathBuf::from("/p/c.jpg"), found("/t/c.png")),
+        ];
+        assert!(!redraws(&Thumbs::new(), &answers, on_screen(&["/p/a.jpg"])));
+    }
+
+    #[test]
+    fn a_miss_or_an_unchanged_thumbnail_on_screen_does_not_redraw() {
+        let mut known = Thumbs::new();
+        known.insert(PathBuf::from("/p/a.jpg"), found("/t/a.png"));
+        let shown = on_screen(&["/p/a.jpg", "/p/m.jpg"]);
+        let same = [(PathBuf::from("/p/a.jpg"), found("/t/a.png"))];
+        assert!(!redraws(&known, &same, &shown), "same thumbnail again");
+        let miss = [(PathBuf::from("/p/m.jpg"), miss())];
+        assert!(!redraws(&known, &miss, &shown), "the glyph stays");
+    }
+
+    #[test]
+    fn a_different_thumbnail_on_screen_redraws() {
+        let mut known = Thumbs::new();
+        known.insert(PathBuf::from("/p/a.jpg"), found("/t/normal/a.png"));
+        let bigger = [(PathBuf::from("/p/a.jpg"), found("/t/large/a.png"))];
+        assert!(redraws(&known, &bigger, on_screen(&["/p/a.jpg"])));
     }
 }

@@ -686,6 +686,122 @@ pub fn generate_at(image: &Path, bucket: Bucket) -> Outcome {
         })
 }
 
+// --- Scheduling ---------------------------------------------------------------
+
+/// One image to find or make a thumbnail for: its path and the modification
+/// time it had when it was listed.
+pub type Job = (PathBuf, Option<SystemTime>);
+
+/// The thumbnail work of one listing, shared between the worker threads that
+/// do it and the view that shows it: the workers take the next job, finish it
+/// into a result, and the view collects every result that arrived since it
+/// last looked, so a burst of thumbnails costs one redraw, not one each.
+/// What the view is showing decides what comes next ([`Queue::reprioritize`]),
+/// and closing the queue — leaving the folder — stops the workers after the
+/// jobs they are running.
+pub struct Queue<R> {
+    state: Mutex<QueueState<R>>,
+}
+
+impl<R> std::fmt::Debug for Queue<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.lock();
+        formatter
+            .debug_struct("Queue")
+            .field("pending", &state.pending.len())
+            .field("running", &state.running)
+            .field("done", &state.done.len())
+            .field("closed", &state.closed)
+            .finish()
+    }
+}
+
+struct QueueState<R> {
+    pending: std::collections::VecDeque<Job>,
+    running: usize,
+    done: Vec<(Job, R)>,
+    closed: bool,
+}
+
+impl<R> Queue<R> {
+    /// A queue that serves `jobs` in the order given.
+    #[must_use]
+    pub fn new(jobs: Vec<Job>) -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                pending: jobs.into(),
+                running: 0,
+                done: Vec::new(),
+                closed: false,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState<R>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The next job to work on, or `None` when none is left or the queue was
+    /// closed. The job counts as running until [`Queue::finish`].
+    pub fn next(&self) -> Option<Job> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        let job = state.pending.pop_front()?;
+        state.running += 1;
+        Some(job)
+    }
+
+    /// Records `result` as the outcome of `job`, a job [`Queue::next`] served.
+    pub fn finish(&self, job: Job, result: R) {
+        let mut state = self.lock();
+        state.running = state.running.saturating_sub(1);
+        state.done.push((job, result));
+    }
+
+    /// Every result finished since the last call, in the order they finished.
+    pub fn drain(&self) -> Vec<(Job, R)> {
+        std::mem::take(&mut self.lock().done)
+    }
+
+    /// Stops serving: the pending jobs are dropped.
+    pub fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.pending.clear();
+    }
+
+    /// Whether nothing is pending, nothing is running and every result was
+    /// collected.
+    pub fn is_idle(&self) -> bool {
+        let state = self.lock();
+        state.pending.is_empty() && state.running == 0 && state.done.is_empty()
+    }
+
+    /// Puts the jobs the view shows first. `position` is a job's place in the
+    /// view (`None` for one the view hides) and `viewport` the places on
+    /// screen: those are served first in view order, then the ones after the
+    /// screen (the way a reader scrolls), then the ones before it, and last
+    /// the ones the view does not show. Jobs of equal rank keep their order.
+    pub fn reprioritize(
+        &self,
+        position: impl Fn(&Path) -> Option<usize>,
+        viewport: std::ops::Range<usize>,
+    ) {
+        let mut state = self.lock();
+        state
+            .pending
+            .make_contiguous()
+            .sort_by_cached_key(|(path, _)| match position(path) {
+                Some(place) if viewport.contains(&place) => (0_u8, place),
+                Some(place) if place >= viewport.end => (1, place),
+                Some(place) => (2, place),
+                None => (3, 0),
+            });
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -806,5 +922,73 @@ mod tests {
             "the second request reuses it"
         );
         drop(fs::remove_dir_all(&dir));
+    }
+
+    fn job(index: usize) -> Job {
+        (PathBuf::from(format!("/p/{index}.jpg")), None)
+    }
+
+    fn position(path: &Path) -> Option<usize> {
+        path.file_stem()?.to_str()?.parse().ok()
+    }
+
+    fn served(queue: &Queue<u8>) -> Vec<usize> {
+        std::iter::from_fn(|| queue.next())
+            .filter_map(|(path, _)| position(&path))
+            .collect()
+    }
+
+    #[test]
+    fn a_queue_serves_its_jobs_in_the_given_order() {
+        let queue = Queue::<u8>::new((0..5).map(job).collect());
+        assert_eq!(served(&queue), [0, 1, 2, 3, 4]);
+        assert_eq!(queue.next(), None, "an empty queue serves nothing");
+    }
+
+    #[test]
+    fn the_viewport_is_served_first_then_what_follows_then_what_precedes() {
+        let queue = Queue::<u8>::new((0..10).map(job).collect());
+        queue.reprioritize(position, 6..8);
+        assert_eq!(served(&queue), [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_job_the_view_does_not_show_waits_behind_every_shown_one() {
+        let mut jobs: Vec<Job> = (0..3).map(job).collect();
+        jobs.insert(0, (PathBuf::from("/p/hidden.jpg"), None));
+        let queue = Queue::<u8>::new(jobs);
+        queue.reprioritize(position, 1..2);
+        let order: Vec<Option<usize>> = std::iter::from_fn(|| queue.next())
+            .map(|(path, _)| position(&path))
+            .collect();
+        assert_eq!(order, [Some(1), Some(2), Some(0), None]);
+    }
+
+    #[test]
+    fn a_closed_queue_serves_nothing_more() {
+        let queue = Queue::<u8>::new((0..3).map(job).collect());
+        assert!(queue.next().is_some());
+        queue.close();
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn results_come_out_in_one_batch_and_the_queue_is_idle_once_all_are_in() {
+        let queue = Queue::new((0..2).map(job).collect());
+        assert!(!queue.is_idle());
+        let first = queue.next().expect("a job");
+        let second = queue.next().expect("a second job");
+        assert!(!queue.is_idle(), "two jobs are running");
+        queue.finish(first, 1u8);
+        assert!(!queue.is_idle(), "one job is still running");
+        queue.finish(second, 2u8);
+        assert!(!queue.is_idle(), "the results were not collected yet");
+        let batch = queue.drain();
+        assert_eq!(
+            batch.iter().map(|(_, result)| *result).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(queue.drain().is_empty(), "a result is handed out once");
+        assert!(queue.is_idle());
     }
 }
