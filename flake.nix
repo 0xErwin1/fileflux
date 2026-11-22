@@ -141,7 +141,9 @@
               wrapProgram $out/bin/fileflux \
                 --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}" \
                 --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib" \
-                --suffix PATH : "${lib.makeBinPath [ pkgs.libarchive ]}"
+                --suffix PATH : "${lib.makeBinPath [ pkgs.libarchive ]}" \
+                --run 'export XDG_DATA_DIRS="''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"' \
+                --suffix XDG_DATA_DIRS : "${pkgs.ffmpegthumbnailer}/share"
             '';
 
             meta = with lib; {
@@ -208,11 +210,18 @@
           devShells.default = pkgs.mkShell {
             inherit buildInputs;
             # libarchive provides bsdtar, which Compress/Extract run and the
-            # archive tests exercise.
+            # archive tests exercise; ffmpegthumbnailer thumbnails videos.
             nativeBuildInputs = nativeBuildInputs ++ [
               rustToolchain
               pkgs.libarchive
+              pkgs.ffmpegthumbnailer
             ];
+            # Video thumbnails: ffmpegthumbnailer's .thumbnailer files, after
+            # whatever the system already provides (the freedesktop default
+            # when XDG_DATA_DIRS is unset).
+            shellHook = ''
+              export XDG_DATA_DIRS="''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:${pkgs.ffmpegthumbnailer}/share"
+            '';
             LD_LIBRARY_PATH = runtimeLibraryPath;
             # Fontconfig is dlopened at runtime (see .cargo/config.toml); keep
             # it resolvable for direct binary runs outside cargo too.

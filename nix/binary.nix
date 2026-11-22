@@ -32,6 +32,7 @@
   vulkan-loader,
   alsa-lib,
   libarchive,
+  ffmpegthumbnailer,
   stdenv_cc_libs ? stdenv.cc.cc.lib,
   # Which info file to read. Fileflux has no stable release channel yet, so
   # this is the rolling nightly.
@@ -170,7 +171,9 @@ stdenv.mkDerivation {
         ]
       }" \
       --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib" \
-      --suffix PATH : "${lib.makeBinPath [ libarchive ]}"
+      --suffix PATH : "${lib.makeBinPath [ libarchive ]}" \
+      --run 'export XDG_DATA_DIRS="''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"' \
+      --suffix XDG_DATA_DIRS : "${ffmpegthumbnailer}/share"
   '';
 
   meta = with lib; {
