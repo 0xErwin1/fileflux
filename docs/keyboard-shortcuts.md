@@ -41,7 +41,7 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 | Del | Move to Trash | Offers Undo |
 | Shift+Del | Delete permanently | Asks first; Cancel is the default |
 | Ctrl+Shift+N | New folder | Starts an inline rename |
-| Ctrl+C / Ctrl+X / Ctrl+V | Copy / Cut / Paste | Paste also takes files another application put on the system clipboard as text (`file://` URIs or absolute paths); see the user guide's Clipboard section |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / Cut / Paste | Copy and Cut put the files on the system clipboard for other file managers too (Nautilus, Thunar, Dolphin), and Paste takes files they copied or cut (a cut moves), or `file://` URIs and absolute paths as text; see the user guide's Clipboard section |
 | Ctrl+Z | Undo the last operation | |
 | Ctrl+Shift+C | Copy path | |
 | Menu / Shift+F10 | Open the context menu | |
