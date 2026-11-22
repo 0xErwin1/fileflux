@@ -895,6 +895,41 @@ pub(crate) fn wants_large_preview(
         && thumb.is_none_or(|thumb| thumb.found.is_some())
 }
 
+/// The file version a preview request was made for: its path and the
+/// modification time it had.
+pub(crate) type PreviewKey = (PathBuf, Option<std::time::SystemTime>);
+
+/// Whether the details panel asks for a `large` thumbnail now: the file's
+/// preview waits for one ([`wants_large_preview`]) and this version of the
+/// file was not asked for yet (`asked` is the last request). A request is
+/// per version, so an edited file is asked again, while an answer that found
+/// nothing is not retried in a loop.
+pub(crate) fn preview_request_due(
+    asked: Option<&PreviewKey>,
+    path: &Path,
+    modified: Option<std::time::SystemTime>,
+    size: Option<u64>,
+    thumb: Option<&entries::Thumb>,
+) -> bool {
+    asked.is_none_or(|(asked_path, asked_modified)| {
+        asked_path.as_path() != path || *asked_modified != modified
+    }) && wants_large_preview(path, size, thumb)
+}
+
+/// Whether a selected file whose tile has `thumb` may still need a `large`
+/// preview thumbnail: it has none yet, or only one from a smaller size
+/// directory. A quick check that lets the caller skip looking the selected
+/// entry up when the answer is final (a large thumbnail, or no possible one).
+pub(crate) fn may_need_large_preview(thumb: Option<&entries::Thumb>) -> bool {
+    thumb.is_none_or(|thumb| {
+        thumb
+            .found
+            .as_deref()
+            .and_then(Bucket::of_thumbnail)
+            .is_some_and(|bucket| bucket < Bucket::Large)
+    })
+}
+
 /// The file the preview box draws for `entry`, `None` to keep the icon.
 fn preview_source(this: &Explorer, entry: &Entry) -> Option<PathBuf> {
     match preview_plan(&entry.path, entry.size, this.tab().thumbs.get(&entry.path)) {
@@ -1446,6 +1481,59 @@ mod tests {
         assert!(
             !wants_large_preview(Path::new("/p/v.mp4"), Some(BIG), None),
             "only images the app decodes are asked for a large thumbnail"
+        );
+    }
+
+    #[test]
+    fn the_preview_is_asked_once_per_file_version_and_again_when_it_changes() {
+        let path = Path::new("/p/a.jpg");
+        let at =
+            |secs| Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        let normal = thumb(Some("/c/thumbnails/normal/a.png"));
+        assert!(preview_request_due(
+            None,
+            path,
+            at(1),
+            Some(BIG),
+            Some(&normal)
+        ));
+        let asked = (path.to_path_buf(), at(1));
+        assert!(
+            !preview_request_due(Some(&asked), path, at(1), Some(BIG), Some(&normal)),
+            "the same version is not asked twice"
+        );
+        assert!(
+            preview_request_due(Some(&asked), path, at(2), Some(BIG), Some(&normal)),
+            "a changed file is asked again though its path was"
+        );
+        let other = (PathBuf::from("/p/b.jpg"), at(1));
+        assert!(preview_request_due(
+            Some(&other),
+            path,
+            at(1),
+            Some(BIG),
+            Some(&normal)
+        ));
+        let large = thumb(Some("/c/thumbnails/large/a.png"));
+        assert!(
+            !preview_request_due(None, path, at(1), Some(BIG), Some(&large)),
+            "a large thumbnail needs no request"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_or_smaller_thumbnail_can_need_a_large_preview() {
+        assert!(may_need_large_preview(None));
+        assert!(may_need_large_preview(Some(&thumb(Some(
+            "/c/thumbnails/normal/a.png"
+        )))));
+        assert!(!may_need_large_preview(Some(&thumb(Some(
+            "/c/thumbnails/large/a.png"
+        )))));
+        assert!(!may_need_large_preview(Some(&thumb(Some("/c/own/a.png")))));
+        assert!(
+            !may_need_large_preview(Some(&thumb(None))),
+            "a miss is final"
         );
     }
 }

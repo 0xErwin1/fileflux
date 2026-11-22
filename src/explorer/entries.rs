@@ -297,6 +297,50 @@ pub(crate) fn misses_after(previous: Option<&Thumb>, modified: Option<SystemTime
     }
 }
 
+/// What the thumbnail of a file becomes when `answer` arrives and `known` is
+/// what the listing has: the thumbnail to store, or `None` to keep `known`.
+/// For the same unchanged file a miss never replaces a thumbnail already
+/// found, and neither does a thumbnail from a smaller size directory than the
+/// one shown (the details panel's `large` one must not fall back to a
+/// `normal` one the listing finds later); a new modification time replaces
+/// anything. A miss that is stored counts the misses of the unchanged file.
+pub(crate) fn merge_answer(known: Option<&Thumb>, mut answer: Thumb) -> Option<Thumb> {
+    let unchanged = known.filter(|known| known.modified == answer.modified);
+    match (
+        &answer.found,
+        unchanged.and_then(|known| known.found.as_ref()),
+    ) {
+        (None, Some(_)) => return None,
+        (Some(new), Some(shown)) if size_of(new) < size_of(shown) => return None,
+        _ => {}
+    }
+    if answer.found.is_none() {
+        answer.misses = misses_after(known, answer.modified);
+    }
+    Some(answer)
+}
+
+/// The size directory a found thumbnail belongs to; a file of the cache
+/// outside the size directories is its own thumbnail, as large as it gets.
+fn size_of(found: &Path) -> Bucket {
+    Bucket::of_thumbnail(found).unwrap_or(Bucket::Large)
+}
+
+/// The screen and displayed order a thumbnail queue was last ordered for.
+pub(crate) type QueueOrder = ((usize, usize), Arc<Vec<usize>>);
+
+/// Whether the thumbnail queue is already ordered for what the view shows:
+/// the screen is the one it was ordered for and so is the displayed order
+/// (the same shared list, which a new filter, sort or hidden-files setting
+/// replaces).
+pub(crate) fn queue_order_is_current(
+    ordered_for: Option<&QueueOrder>,
+    screen: (usize, usize),
+    order: &Arc<Vec<usize>>,
+) -> bool {
+    ordered_for.is_some_and(|(seen, seen_order)| *seen == screen && Arc::ptr_eq(seen_order, order))
+}
+
 /// Whether showing `answers` changes what the view draws: some answer is for
 /// a path `shown` says is on screen and carries a different thumbnail than
 /// the one `known` has (none, to a first one). A miss leaves the glyph where
@@ -321,7 +365,7 @@ pub(crate) type Thumbs = HashMap<PathBuf, Thumb>;
 /// A file outside the cache's size directories (an image that is itself in
 /// the cache) is its own thumbnail and always does.
 fn large_enough(found: &Path, wanted: Bucket) -> bool {
-    Bucket::of_thumbnail(found).is_none_or(|bucket| bucket >= wanted)
+    size_of(found) >= wanted
 }
 
 /// An image whose thumbnail is looked up: a regular file (a symlink shows
@@ -1289,6 +1333,88 @@ fn entry_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_queue_is_reordered_when_the_screen_or_the_arrangement_changes() {
+        let order = Arc::new(vec![0, 1, 2]);
+        let ordered = Some(((0, 4), Arc::clone(&order)));
+        assert!(queue_order_is_current(ordered.as_ref(), (0, 4), &order));
+        assert!(
+            !queue_order_is_current(ordered.as_ref(), (4, 8), &order),
+            "the screen moved"
+        );
+        let resorted = Arc::new(vec![2, 1, 0]);
+        assert!(
+            !queue_order_is_current(ordered.as_ref(), (0, 4), &resorted),
+            "a filter, sort or hidden-files change made a new order"
+        );
+        assert!(
+            !queue_order_is_current(None, (0, 4), &order),
+            "never ordered"
+        );
+    }
+
+    fn answer(found: Option<&str>, secs: u64) -> Thumb {
+        Thumb {
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+            found: found.map(PathBuf::from),
+            misses: u32::from(found.is_none()),
+        }
+    }
+
+    #[test]
+    fn a_normal_answer_never_replaces_a_large_one_for_an_unchanged_file() {
+        let known = answer(Some("/c/thumbnails/large/a.png"), 1);
+        let merged = merge_answer(Some(&known), answer(Some("/c/thumbnails/normal/a.png"), 1));
+        assert_eq!(merged, None, "the larger thumbnail stays");
+    }
+
+    #[test]
+    fn a_new_modification_time_replaces_a_large_answer_with_a_normal_one() {
+        let known = answer(Some("/c/thumbnails/large/a.png"), 1);
+        let fresh = answer(Some("/c/thumbnails/normal/a.png"), 2);
+        assert_eq!(merge_answer(Some(&known), fresh.clone()), Some(fresh));
+    }
+
+    #[test]
+    fn answers_of_equal_or_bigger_size_and_first_answers_are_taken() {
+        let normal = answer(Some("/c/thumbnails/normal/a.png"), 1);
+        let large = answer(Some("/c/thumbnails/large/a.png"), 1);
+        assert_eq!(
+            merge_answer(Some(&normal), large.clone()),
+            Some(large.clone())
+        );
+        assert_eq!(
+            merge_answer(Some(&large), large.clone()),
+            Some(large.clone())
+        );
+        assert_eq!(merge_answer(None, normal.clone()), Some(normal));
+        let own = answer(Some("/c/other/a.png"), 1);
+        assert_eq!(
+            merge_answer(Some(&large), own.clone()),
+            Some(own),
+            "a file of the cache is its own thumbnail, as large as it gets"
+        );
+    }
+
+    #[test]
+    fn a_miss_keeps_a_found_thumbnail_but_counts_against_a_missing_one() {
+        let found = answer(Some("/c/thumbnails/large/a.png"), 1);
+        assert_eq!(merge_answer(Some(&found), answer(None, 1)), None);
+        let missed = answer(None, 1);
+        let merged = merge_answer(Some(&missed), answer(None, 1));
+        assert_eq!(
+            merged.map(|thumb| thumb.misses),
+            Some(2),
+            "the misses add up while unchanged"
+        );
+        let changed = merge_answer(Some(&found), answer(None, 2));
+        assert_eq!(
+            changed.map(|thumb| (thumb.found, thumb.misses)),
+            Some((None, 1)),
+            "a changed file starts over"
+        );
+    }
 
     /// Every grid row, the last partial one included, addresses the same
     /// fixed tile geometry: a full row holds exactly `columns` tiles, the

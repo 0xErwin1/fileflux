@@ -89,6 +89,17 @@ fn thumbnail_workers() -> usize {
         .map_or(2, |cores| cores.get() / 2)
         .clamp(2, 4)
 }
+/// How long a worker that found the app-wide limit reached waits to ask again.
+const THUMBNAIL_WAIT: Duration = Duration::from_millis(25);
+
+/// The app-wide limit of thumbnail jobs running at once: every tab and pane
+/// shares it, so many media tabs cannot take every background thread. One
+/// permit stays for the tab on screen.
+fn thumbnail_limiter() -> &'static fileflux::core::thumbnails::Limiter {
+    static LIMITER: std::sync::OnceLock<fileflux::core::thumbnails::Limiter> =
+        std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| fileflux::core::thumbnails::Limiter::new(thumbnail_workers(), 1))
+}
 
 /// Key context of the whole explorer window.
 pub(crate) const EXPLORER_CONTEXT: &str = "FilefluxExplorer";
@@ -531,12 +542,15 @@ pub(crate) struct Tab {
     /// The thumbnail work still to do for this listing; closed when the
     /// listing is replaced or the tab goes away.
     thumb_queue: Option<Arc<fileflux::core::thumbnails::Queue<entries::Thumb>>>,
-    /// The file whose `large` preview thumbnail was last asked for, so the
-    /// selection is asked for once.
-    preview_requested: Option<PathBuf>,
-    /// The tiles on screen last time the thumbnail queue was ordered, as
-    /// positions in the displayed order.
-    thumb_viewport: Option<(usize, usize)>,
+    /// The file version (path and modification time) whose `large` preview
+    /// thumbnail was last asked for, so each version is asked for once.
+    preview_requested: Option<inspector::PreviewKey>,
+    /// The displayed order the queue was last ordered for (see
+    /// [`entries::queue_order_is_current`]), with the screen it had.
+    thumb_ordered_for: Option<entries::QueueOrder>,
+    /// Whether this tab is on screen: its thumbnail workers may use the
+    /// permits the app keeps for the foreground.
+    thumb_foreground: Arc<AtomicBool>,
     /// The tiles the grid drew last, as positions in the displayed order:
     /// the rows built for the viewport times the columns. Written by the
     /// grid while it draws; `(0, 0)` until it has drawn.
@@ -561,17 +575,22 @@ pub(crate) struct Tab {
 
 impl Tab {
     /// Puts the thumbnails of the tiles on screen first in the queue, when
-    /// the screen moved since the queue was last ordered.
+    /// the screen moved or the arrangement (filter, hidden files, sort)
+    /// changed since the queue was last ordered; nothing is done once no job
+    /// is waiting.
     fn prioritize_thumbnails(&mut self) {
         let Some(queue) = &self.thumb_queue else {
             return;
         };
-        let screen = self.visible_tiles.get();
-        if self.thumb_viewport == Some(screen) {
+        if !queue.has_work() {
             return;
         }
-        self.thumb_viewport = Some(screen);
+        let screen = self.visible_tiles.get();
         let displayed = self.state.visible_shared();
+        if entries::queue_order_is_current(self.thumb_ordered_for.as_ref(), screen, &displayed) {
+            return;
+        }
+        self.thumb_ordered_for = Some((screen, Arc::clone(&displayed)));
         let places: HashMap<&Path, usize> = displayed
             .iter()
             .enumerate()
@@ -721,7 +740,8 @@ impl Tab {
             thumbs: Arc::new(entries::Thumbs::new()),
             thumbs_task: None,
             thumb_queue: None,
-            thumb_viewport: None,
+            thumb_ordered_for: None,
+            thumb_foreground: Arc::new(AtomicBool::new(true)),
             preview_requested: None,
             visible_tiles: Rc::new(Cell::new((0, 0))),
             arrange_task: None,
@@ -1261,7 +1281,12 @@ impl Explorer {
                         this.pump_network(window, cx);
                         this.pump_desktop(window, cx);
                         this.persist_tick(window, cx);
+                        let shown: Vec<TabId> = std::iter::once(this.tabs.focused().active().id)
+                            .chain(this.tabs.other().map(|pane| pane.active().id))
+                            .collect();
                         for tab in this.tabs.iter_mut() {
+                            tab.thumb_foreground
+                                .store(shown.contains(&tab.id), Ordering::Relaxed);
                             tab.prioritize_thumbnails();
                         }
                         this.ensure_preview_thumbnail(cx);
@@ -1773,6 +1798,11 @@ impl Explorer {
                 // reader at the place they were reading.
                 if !scan.refresh {
                     self.scroll_to_top(id, cx);
+                    // The grid has not drawn this folder: the old screen's
+                    // tiles mean nothing to its queue.
+                    if let Some(tab) = self.tabs.by_id_mut(id) {
+                        tab.visible_tiles.set((0, 0));
+                    }
                 }
                 self.start_child_counts(id, cx);
                 self.start_thumbnails(id, cx);
@@ -2144,26 +2174,41 @@ impl Explorer {
         if let Some(stale) = tab.thumb_queue.take() {
             stale.close();
         }
-        tab.thumb_viewport = None;
+        tab.thumb_ordered_for = None;
         if todo.is_empty() {
             return;
         }
         let queue = Arc::new(fileflux::core::thumbnails::Queue::new(todo));
         tab.thumb_queue = Some(Arc::clone(&queue));
         tab.prioritize_thumbnails();
+        let foreground = Arc::clone(&tab.thumb_foreground);
         let workers: Vec<Task<()>> = (0..thumbnail_workers())
             .map(|_| {
                 let queue = Arc::clone(&queue);
+                let foreground = Arc::clone(&foreground);
+                let executor = cx.background_executor().clone();
                 cx.background_executor().spawn(async move {
-                    while let Some((path, modified)) = queue.next() {
-                        let found = thumbnail_for(&path, bucket);
-                        let misses = u32::from(found.is_none());
-                        let thumb = entries::Thumb {
-                            modified,
-                            found,
-                            misses,
+                    // A permit of the app-wide limit is held while a job
+                    // runs; without one the worker waits without a thread.
+                    while queue.has_work() {
+                        let Some(_permit) =
+                            thumbnail_limiter().try_acquire(foreground.load(Ordering::Relaxed))
+                        else {
+                            executor.timer(THUMBNAIL_WAIT).await;
+                            continue;
                         };
-                        queue.finish((path, modified), thumb);
+                        let served = queue.work_next(|(path, modified)| {
+                            let found = thumbnail_for(path, bucket);
+                            let misses = u32::from(found.is_none());
+                            entries::Thumb {
+                                modified: *modified,
+                                found,
+                                misses,
+                            }
+                        });
+                        if !served {
+                            return;
+                        }
                     }
                 })
             })
@@ -2206,14 +2251,25 @@ impl Explorer {
         let Some(tab) = self.tabs.by_id_mut(id) else {
             return;
         };
+        // Nothing to look up unless exactly one file is selected and its
+        // thumbnail is missing or too small.
+        let selected = tab.state.selection();
+        if selected.len() != 1
+            || selected
+                .first()
+                .is_none_or(|path| !inspector::may_need_large_preview(tab.thumbs.get(path)))
+        {
+            return;
+        }
         let request = match tab.state.selected_entries().as_slice() {
             [entry]
-                if tab.preview_requested.as_ref() != Some(&entry.path)
-                    && inspector::wants_large_preview(
-                        &entry.path,
-                        entry.size,
-                        tab.thumbs.get(&entry.path),
-                    ) =>
+                if inspector::preview_request_due(
+                    tab.preview_requested.as_ref(),
+                    &entry.path,
+                    entry.modified,
+                    entry.size,
+                    tab.thumbs.get(&entry.path),
+                ) =>
             {
                 Some((entry.path.clone(), entry.modified))
             }
@@ -2222,7 +2278,7 @@ impl Explorer {
         let Some((path, modified)) = request else {
             return;
         };
-        tab.preview_requested = Some(path.clone());
+        tab.preview_requested = Some((path.clone(), modified));
         let made = {
             let path = path.clone();
             cx.background_executor().spawn(async move {
@@ -2328,18 +2384,10 @@ impl Explorer {
                     None => true,
                 };
                 let thumbs = Arc::make_mut(&mut tab.thumbs);
-                for (path, mut thumb) in answers {
-                    if thumb.found.is_none() {
-                        let known = thumbs.get(&path);
-                        // A miss never replaces a preview already found for
-                        // the same unchanged file.
-                        if known.is_some_and(|k| k.found.is_some() && k.modified == thumb.modified)
-                        {
-                            continue;
-                        }
-                        thumb.misses = entries::misses_after(known, thumb.modified);
+                for (path, thumb) in answers {
+                    if let Some(merged) = entries::merge_answer(thumbs.get(&path), thumb) {
+                        thumbs.insert(path, merged);
                     }
-                    thumbs.insert(path, thumb);
                 }
             }
             if redraw {

@@ -753,6 +753,34 @@ impl<R> Queue<R> {
         Some(job)
     }
 
+    /// Whether a job is waiting to be served (the queue is open).
+    pub fn has_work(&self) -> bool {
+        let state = self.lock();
+        !state.closed && !state.pending.is_empty()
+    }
+
+    /// Serves the next job: runs `work` on it and records its result;
+    /// `false` when there was no job to serve. A job whose `work` panics
+    /// counts as finished without a result (its tile keeps the glyph), so a
+    /// decoder that panics can never leave the queue counted as running.
+    pub fn work_next(&self, work: impl FnOnce(&Job) -> R) -> bool {
+        let Some(job) = self.next() else {
+            return false;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&job))) {
+            Ok(result) => self.finish(job, result),
+            Err(_) => {
+                log::warn!(
+                    "thumbnail of {} panicked; it keeps its icon",
+                    job.0.display()
+                );
+                let mut state = self.lock();
+                state.running = state.running.saturating_sub(1);
+            }
+        }
+        true
+    }
+
     /// Records `result` as the outcome of `job`, a job [`Queue::next`] served.
     pub fn finish(&self, job: Job, result: R) {
         let mut state = self.lock();
@@ -799,6 +827,60 @@ impl<R> Queue<R> {
                 Some(place) => (2, place),
                 None => (3, 0),
             });
+    }
+}
+
+/// The most thumbnail jobs running at once across the whole app, however many
+/// tabs and panes list images: each worker holds a [`Permit`] while it works
+/// on a job. `reserve` permits are kept for the foreground (the tab the user
+/// looks at), so tabs behind it cannot take every one.
+#[derive(Debug)]
+pub struct Limiter {
+    cap: usize,
+    reserve: usize,
+    in_use: std::sync::atomic::AtomicUsize,
+}
+
+/// One running job of a [`Limiter`]; released on drop.
+#[derive(Debug)]
+pub struct Permit<'a>(&'a Limiter);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl Limiter {
+    /// A limiter of `cap` permits (at least one) that keeps `reserve` of them
+    /// for the foreground; a background holder always has at least one.
+    #[must_use]
+    pub const fn new(cap: usize, reserve: usize) -> Self {
+        Self {
+            cap: if cap == 0 { 1 } else { cap },
+            reserve,
+            in_use: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// A permit, or `None` when the limit is reached: the foreground may use
+    /// all of them, the background all but the reserve.
+    pub fn try_acquire(&self, foreground: bool) -> Option<Permit<'_>> {
+        let limit = if foreground {
+            self.cap
+        } else {
+            self.cap.saturating_sub(self.reserve).max(1)
+        };
+        self.in_use
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |in_use| (in_use < limit).then_some(in_use + 1),
+            )
+            .ok()
+            .map(|_| Permit(self))
     }
 }
 
@@ -990,5 +1072,154 @@ mod tests {
         );
         assert!(queue.drain().is_empty(), "a result is handed out once");
         assert!(queue.is_idle());
+    }
+
+    // --- Queue and limiter ------------------------------------------------
+
+    fn jobs(n: usize) -> Vec<Job> {
+        (0..n)
+            .map(|i| (PathBuf::from(format!("/p/{i}.jpg")), None))
+            .collect()
+    }
+
+    fn place(path: &Path) -> Option<usize> {
+        path.file_stem()?.to_str()?.parse().ok()
+    }
+
+    /// Many folders opened and left while workers run and the view scrolls:
+    /// every worker exits, no result is lost or duplicated for a queue that
+    /// ran to the end, and a closed queue stops serving.
+    #[test]
+    fn open_close_cycles_never_hang_or_duplicate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for cycle in 0..300 {
+            let n = 50 + cycle % 200;
+            let queue = std::sync::Arc::new(Queue::<usize>::new(jobs(n)));
+            let served = std::sync::Arc::new(AtomicUsize::new(0));
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let (queue, served) = (queue.clone(), served.clone());
+                    std::thread::spawn(move || {
+                        while let Some(job) = queue.next() {
+                            served.fetch_add(1, Ordering::Relaxed);
+                            let value = place(&job.0).unwrap_or(usize::MAX);
+                            queue.finish(job, value);
+                        }
+                    })
+                })
+                .collect();
+            let mut drained = Vec::new();
+            for step in 0..5 {
+                queue.reprioritize(place, (step * 10)..(step * 10 + 20));
+                drained.extend(queue.drain());
+            }
+            let leave = cycle % 3 == 0;
+            if leave {
+                queue.close();
+                assert!(queue.next().is_none(), "a closed queue serves nothing");
+            }
+            for worker in workers {
+                worker.join().expect("worker did not panic");
+            }
+            drained.extend(queue.drain());
+            assert!(queue.is_idle(), "cycle {cycle}: idle once the workers exit");
+            let mut seen: Vec<usize> = drained.iter().map(|(_, value)| *value).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(before, seen.len(), "cycle {cycle}: published twice");
+            assert_eq!(
+                seen.len(),
+                served.load(Ordering::Relaxed),
+                "cycle {cycle}: a result was lost"
+            );
+            if !leave {
+                assert_eq!(
+                    seen,
+                    (0..n).collect::<Vec<_>>(),
+                    "cycle {cycle}: all done once"
+                );
+            }
+        }
+    }
+
+    /// Re-prioritizing never grows the queue nor duplicates a job.
+    #[test]
+    fn reprioritize_neither_grows_nor_duplicates() {
+        let queue = Queue::<u8>::new(jobs(1000));
+        for start in (0..1000).step_by(7) {
+            queue.reprioritize(place, start..start + 40);
+        }
+        let mut served: Vec<usize> = std::iter::from_fn(|| queue.next())
+            .filter_map(|(path, _)| place(&path))
+            .collect();
+        assert_eq!(served.len(), 1000);
+        served.sort_unstable();
+        served.dedup();
+        assert_eq!(served.len(), 1000);
+    }
+
+    /// A job that panics counts as finished (no result, so its tile keeps the
+    /// glyph): the queue still goes idle and the other jobs are served.
+    #[test]
+    fn a_panicking_job_still_counts_as_finished() {
+        let queue = Queue::<usize>::new(jobs(3));
+        let mut served = 0;
+        while queue.work_next(|job| {
+            served += 1;
+            assert!(place(&job.0) != Some(1), "decoder panic");
+            served
+        }) {}
+        assert_eq!(served, 3, "the jobs after the panic are served");
+        let answers = queue.drain();
+        assert_eq!(answers.len(), 2, "the panicked job has no result");
+        assert!(queue.is_idle(), "nothing stays counted as running");
+    }
+
+    #[test]
+    fn has_work_follows_pending_and_close() {
+        let queue = Queue::<u8>::new(jobs(1));
+        assert!(queue.has_work());
+        assert!(queue.next().is_some());
+        assert!(!queue.has_work(), "nothing pending");
+        let queue = Queue::<u8>::new(jobs(2));
+        queue.close();
+        assert!(!queue.has_work(), "closed");
+    }
+
+    /// The cap is shared by every holder, and a background tab leaves the
+    /// reserved permits to the foreground one.
+    #[test]
+    fn the_limiter_caps_all_holders_and_reserves_for_the_foreground() {
+        let limiter = Limiter::new(3, 1);
+        let first = limiter
+            .try_acquire(false)
+            .expect("background gets a permit");
+        let second = limiter
+            .try_acquire(false)
+            .expect("background gets a second");
+        assert!(
+            limiter.try_acquire(false).is_none(),
+            "the last permit is reserved for the foreground"
+        );
+        let third = limiter
+            .try_acquire(true)
+            .expect("foreground takes the reserve");
+        assert!(limiter.try_acquire(true).is_none(), "the cap is absolute");
+        drop(second);
+        let again = limiter
+            .try_acquire(true)
+            .expect("a released permit is reusable");
+        drop((first, third, again));
+        assert!(limiter.try_acquire(false).is_some());
+    }
+
+    #[test]
+    fn the_limiter_never_lets_a_background_holder_starve_at_a_cap_of_one() {
+        let limiter = Limiter::new(1, 1);
+        assert!(
+            limiter.try_acquire(false).is_some(),
+            "a reserve never takes the only permit from everyone"
+        );
     }
 }
