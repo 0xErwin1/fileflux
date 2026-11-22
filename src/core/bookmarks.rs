@@ -8,7 +8,8 @@
 //! network bookmarks (see [`super::network`]); one that carries a password is
 //! not listed. Every other line (comments, blanks, anything unknown) is kept
 //! byte for byte: this module only ever appends a line or
-//! drops the lines of the folder being removed, so another program's
+//! drops the lines of the folder being removed, rewrites the label of one
+//! line or moves one line, so another program's
 //! bookmarks, order and labels survive a change made here.
 //!
 //! Every change reads the file again, edits those bytes and writes them
@@ -283,6 +284,89 @@ impl BookmarkFile {
         self.lines.len() != before
     }
 
+    /// Sets the label of the first line of `folder` (cleared when `label` is
+    /// empty); whether the line changed. The address stays as written and so
+    /// does the line's ending; no other line is touched.
+    fn relabel(&mut self, folder: &Path, label: &str) -> bool {
+        let label = (!label.is_empty()).then(|| label.to_owned());
+        let Some(line) = self
+            .lines
+            .iter_mut()
+            .find(|line| line.bookmark.as_ref().is_some_and(|b| b.path == folder))
+        else {
+            return false;
+        };
+        let Some(bookmark) = line.bookmark.as_mut() else {
+            return false;
+        };
+        if bookmark.label == label {
+            return false;
+        }
+        let text = content(&line.raw);
+        let uri = text.split(|&byte| byte == b' ').next().unwrap_or_default();
+        let ending = line.raw.get(text.len()..).unwrap_or_default().to_vec();
+        let mut raw = uri.to_vec();
+        if let Some(label) = &label {
+            raw.push(b' ');
+            raw.extend_from_slice(label.as_bytes());
+        }
+        raw.extend_from_slice(&ending);
+        line.raw = raw;
+        bookmark.label = label;
+        true
+    }
+
+    /// Moves the first line of `folder` just before the first line of
+    /// `before`, or after the last favorite's line when `before` is `None`;
+    /// whether the order of the favorites changed. Every line keeps its bytes, except that the
+    /// one that was last and no longer is gets its line ending.
+    fn move_folder(&mut self, folder: &Path, before: Option<&Path>) -> bool {
+        let position = |wanted: &Path| {
+            self.lines
+                .iter()
+                .position(|line| line.bookmark.as_ref().is_some_and(|b| b.path == wanted))
+        };
+        let Some(from) = position(folder) else {
+            return false;
+        };
+        let to = match before {
+            Some(anchor) if anchor == folder => return false,
+            Some(anchor) => match position(anchor) {
+                Some(index) => index,
+                None => return false,
+            },
+            None => match self.lines.iter().rposition(|line| line.bookmark.is_some()) {
+                Some(last) => last + 1,
+                None => return false,
+            },
+        };
+        // Only favorites count: stepping over a comment or a network line
+        // would change the file, not the order of the favorites.
+        let (low, high) = if to > from {
+            (from + 1, to)
+        } else {
+            (to, from)
+        };
+        let crosses_favorite = self
+            .lines
+            .get(low..high)
+            .is_some_and(|lines| lines.iter().any(|line| line.bookmark.is_some()));
+        if !crosses_favorite {
+            return false;
+        }
+        let eol = self.eol();
+        let moved = self.lines.remove(from);
+        self.lines
+            .insert(if to > from { to - 1 } else { to }, moved);
+        let last = self.lines.len().saturating_sub(1);
+        for line in self.lines.iter_mut().take(last) {
+            if !line.raw.ends_with(b"\n") {
+                line.raw.extend_from_slice(eol);
+            }
+        }
+        true
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         self.lines
             .iter()
@@ -461,4 +545,37 @@ pub fn merge(path: &Path, folders: &[PathBuf]) -> io::Result<usize> {
         added > 0
     })?;
     Ok(added)
+}
+
+/// Sets the label of `folder`'s bookmark (its first line when repeated), or
+/// clears it when `label` is empty, which shows the folder's name again;
+/// `false` when `folder` is no bookmark or already has that label (nothing
+/// is written, nothing created). The label is trimmed. Other lines stay byte
+/// for byte.
+///
+/// # Errors
+///
+/// A label with a control character (it would break the line), or any I/O
+/// failure; the file is left as it was.
+pub fn rename(path: &Path, folder: &Path, label: &str) -> io::Result<bool> {
+    let label = label.trim();
+    if label.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a bookmark label cannot hold line breaks or control characters",
+        ));
+    }
+    update(path, &mut || {}, |file| file.relabel(folder, label))
+}
+
+/// Moves `folder`'s bookmark (its first line when repeated) just before the
+/// bookmark of `before`, or after the last favorite when `before` is `None`;
+/// `false` when either is no bookmark or the order would not change (nothing
+/// is written). Lines that are not favorites keep their places and bytes.
+///
+/// # Errors
+///
+/// Any I/O failure; the file is left as it was.
+pub fn reorder(path: &Path, folder: &Path, before: Option<&Path>) -> io::Result<bool> {
+    update(path, &mut || {}, |file| file.move_folder(folder, before))
 }

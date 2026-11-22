@@ -12,7 +12,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use fileflux::core::bookmarks::{
-    Bookmark, add, add_observed, bookmarks_path, file_uri, merge, parse, read, remove,
+    Bookmark, add, add_observed, bookmarks_path, file_uri, merge, parse, read, remove, rename,
+    reorder,
 };
 
 /// A scratch directory removed when the test ends.
@@ -442,4 +443,165 @@ fn relative_folders_are_rejected_by_add_and_merge_and_nothing_is_written() {
         "control: creates"
     );
     assert!(nested.exists());
+}
+
+// --- rename and reorder ---------------------------------------------------------
+
+fn read_text(file: &Path) -> String {
+    String::from_utf8(std::fs::read(file).expect("file reads")).expect("file is UTF-8")
+}
+
+#[test]
+fn rename_sets_the_label_and_touches_no_other_line() {
+    let scratch = Scratch::new("rename-set");
+    let text = "# mine\nfile:///a\r\nsftp://h/p Server\nfile:///b Old\nfile:///c\n";
+    let file = scratch.write(text.as_bytes());
+    assert!(rename(&file, Path::new("/b"), "New name").expect("renames"));
+    assert_eq!(
+        read_text(&file),
+        "# mine\nfile:///a\r\nsftp://h/p Server\nfile:///b New name\nfile:///c\n"
+    );
+    assert!(rename(&file, Path::new("/a"), "  Home  ").expect("renames"));
+    assert_eq!(
+        read_text(&file),
+        "# mine\nfile:///a Home\r\nsftp://h/p Server\nfile:///b New name\nfile:///c\n",
+        "the label is trimmed and the line keeps its own ending"
+    );
+}
+
+#[test]
+fn an_empty_label_restores_the_folder_name() {
+    let scratch = Scratch::new("rename-clear");
+    let file = scratch.write(b"file:///a Alpha\nfile:///b Beta");
+    assert!(rename(&file, Path::new("/b"), "").expect("clears"));
+    assert_eq!(read_text(&file), "file:///a Alpha\nfile:///b");
+    assert_eq!(
+        read(&file).expect("reads")[1],
+        Bookmark {
+            path: PathBuf::from("/b"),
+            label: None
+        }
+    );
+}
+
+#[test]
+fn rename_keeps_the_uri_as_written_and_the_missing_final_newline() {
+    let scratch = Scratch::new("rename-uri");
+    let file = scratch.write(b"file:///My%20Docs\nfile://localhost/x");
+    assert!(rename(&file, Path::new("/My Docs"), "Docs").expect("renames"));
+    assert!(rename(&file, Path::new("/x"), "X").expect("renames"));
+    assert_eq!(
+        read_text(&file),
+        "file:///My%20Docs Docs\nfile://localhost/x X"
+    );
+}
+
+#[test]
+fn rename_that_changes_nothing_or_finds_nothing_leaves_the_file_alone() {
+    let scratch = Scratch::new("rename-noop");
+    let file = scratch.write(b"file:///a Alpha\nfile:///b\n");
+    let before = std::fs::metadata(&file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    assert!(!rename(&file, Path::new("/a"), "Alpha").expect("same label"));
+    assert!(!rename(&file, Path::new("/b"), "").expect("already no label"));
+    assert!(!rename(&file, Path::new("/missing"), "X").expect("unknown folder"));
+    assert_eq!(read_text(&file), "file:///a Alpha\nfile:///b\n");
+    assert_eq!(
+        std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        before,
+        "nothing was written"
+    );
+    let missing = scratch.0.join("none/bookmarks");
+    assert!(!rename(&missing, Path::new("/a"), "X").expect("no file"));
+    assert!(!missing.exists(), "nothing is created");
+}
+
+#[test]
+fn rename_refuses_a_label_that_would_break_the_line_and_changes_nothing() {
+    let scratch = Scratch::new("rename-bad");
+    let file = scratch.write(b"file:///a\n");
+    for label in ["two\nlines", "cr\rhere", "nul\0"] {
+        let error = rename(&file, Path::new("/a"), label).expect_err("refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{label:?}");
+    }
+    assert_eq!(read_text(&file), "file:///a\n");
+}
+
+#[test]
+fn rename_changes_only_the_first_line_of_a_repeated_folder() {
+    let scratch = Scratch::new("rename-dup");
+    let file = scratch.write(b"file:///a\nfile:///b\nfile:///a Second\n");
+    assert!(rename(&file, Path::new("/a"), "First").expect("renames"));
+    assert_eq!(
+        read_text(&file),
+        "file:///a First\nfile:///b\nfile:///a Second\n"
+    );
+}
+
+const FIVE: &[u8] = b"file:///a\n# note\nfile:///b B\nsftp://h/p Srv\nfile:///c\n";
+
+#[test]
+fn reorder_moves_a_favorite_before_another_and_keeps_every_other_line_in_place() {
+    let scratch = Scratch::new("reorder-before");
+    let file = scratch.write(FIVE);
+    assert!(reorder(&file, Path::new("/c"), Some(Path::new("/b"))).expect("moves"));
+    assert_eq!(
+        read_text(&file),
+        "file:///a\n# note\nfile:///c\nfile:///b B\nsftp://h/p Srv\n"
+    );
+    assert!(reorder(&file, Path::new("/a"), Some(Path::new("/b"))).expect("moves"));
+    assert_eq!(
+        read_text(&file),
+        "# note\nfile:///c\nfile:///a\nfile:///b B\nsftp://h/p Srv\n"
+    );
+}
+
+#[test]
+fn reorder_to_the_end_goes_after_the_last_favorite() {
+    let scratch = Scratch::new("reorder-end");
+    let file = scratch.write(FIVE);
+    assert!(reorder(&file, Path::new("/a"), None).expect("moves"));
+    assert_eq!(
+        read_text(&file),
+        "# note\nfile:///b B\nsftp://h/p Srv\nfile:///c\nfile:///a\n"
+    );
+}
+
+#[test]
+fn reorder_keeps_the_label_and_terminates_a_line_that_stops_being_last() {
+    let scratch = Scratch::new("reorder-eol");
+    let file = scratch.write(b"file:///a\r\nfile:///b Bee");
+    assert!(reorder(&file, Path::new("/b"), Some(Path::new("/a"))).expect("moves"));
+    assert_eq!(read_text(&file), "file:///b Bee\r\nfile:///a\r\n");
+    assert!(reorder(&file, Path::new("/b"), None).expect("moves"));
+    assert_eq!(read_text(&file), "file:///a\r\nfile:///b Bee\r\n");
+}
+
+#[test]
+fn reorder_that_changes_nothing_leaves_the_file_alone() {
+    let scratch = Scratch::new("reorder-noop");
+    let file = scratch.write(FIVE);
+    let before = std::fs::metadata(&file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    assert!(!reorder(&file, Path::new("/a"), Some(Path::new("/a"))).expect("onto itself"));
+    assert!(!reorder(&file, Path::new("/a"), Some(Path::new("/b"))).expect("already before"));
+    assert!(!reorder(&file, Path::new("/c"), None).expect("already last"));
+    assert!(!reorder(&file, Path::new("/zzz"), None).expect("unknown folder"));
+    assert!(!reorder(&file, Path::new("/a"), Some(Path::new("/zzz"))).expect("unknown anchor"));
+    assert_eq!(read_text(&file).as_bytes(), FIVE);
+    assert_eq!(
+        std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        before,
+        "nothing was written"
+    );
 }

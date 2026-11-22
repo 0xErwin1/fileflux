@@ -536,6 +536,7 @@ fn a_sidebar_row_menu_offers_open_tab_favorite_copy_and_properties() {
         favorite: false,
         terminal: false,
         recent: false,
+        slot: None,
     });
     assert_eq!(
         flat(&rows),
@@ -567,6 +568,7 @@ fn a_favorite_row_offers_remove_instead_of_add() {
         favorite: true,
         terminal: false,
         recent: false,
+        slot: None,
     });
     assert_eq!(
         flat(&rows),
@@ -586,6 +588,108 @@ fn a_favorite_row_offers_remove_instead_of_add() {
     assert!(item(&rows, MenuCommand::AddFavorite).is_none());
 }
 
+/// The menu of a row of the Favorites section at `slot`.
+fn favorite_row_rows(slot: FavoriteSlot) -> Vec<MenuRow> {
+    sidebar_menu_rows(&SidebarTarget {
+        trash: false,
+        favorite: true,
+        terminal: false,
+        recent: false,
+        slot: Some(slot),
+    })
+}
+
+#[test]
+fn a_favorites_section_row_offers_rename_move_and_remove() {
+    let rows = favorite_row_rows(FavoriteSlot {
+        first: false,
+        last: false,
+    });
+    assert_eq!(
+        flat(&rows),
+        [
+            "Open",
+            "Open in new tab",
+            "Open in split",
+            "Analyze Disk Usage",
+            "-",
+            "Rename\u{2026}",
+            "Move up",
+            "Move down",
+            "Remove from favorites",
+            "Copy path",
+            "-",
+            "Properties"
+        ]
+    );
+    for command in [
+        MenuCommand::RenameFavorite,
+        MenuCommand::MoveFavoriteUp,
+        MenuCommand::MoveFavoriteDown,
+        MenuCommand::RemoveFavorite,
+    ] {
+        assert!(
+            item(&rows, command).is_some_and(|item| item.enabled && !item.danger),
+            "{command:?} works"
+        );
+    }
+    assert!(item(&rows, MenuCommand::AddFavorite).is_none());
+}
+
+#[test]
+fn the_first_and_last_favorites_cannot_move_past_the_ends() {
+    let enabled = |slot, command| item(&favorite_row_rows(slot), command).map(|item| item.enabled);
+    let first = FavoriteSlot {
+        first: true,
+        last: false,
+    };
+    assert_eq!(enabled(first, MenuCommand::MoveFavoriteUp), Some(false));
+    assert_eq!(enabled(first, MenuCommand::MoveFavoriteDown), Some(true));
+    let last = FavoriteSlot {
+        first: false,
+        last: true,
+    };
+    assert_eq!(enabled(last, MenuCommand::MoveFavoriteUp), Some(true));
+    assert_eq!(enabled(last, MenuCommand::MoveFavoriteDown), Some(false));
+    let only = FavoriteSlot {
+        first: true,
+        last: true,
+    };
+    assert_eq!(enabled(only, MenuCommand::MoveFavoriteUp), Some(false));
+    assert_eq!(enabled(only, MenuCommand::MoveFavoriteDown), Some(false));
+    assert_eq!(enabled(only, MenuCommand::RenameFavorite), Some(true));
+    assert_eq!(enabled(only, MenuCommand::RemoveFavorite), Some(true));
+}
+
+#[test]
+fn a_row_outside_the_favorites_section_never_offers_rename_or_move() {
+    for favorite in [false, true] {
+        let rows = sidebar_menu_rows(&SidebarTarget {
+            trash: false,
+            favorite,
+            terminal: true,
+            recent: false,
+            slot: None,
+        });
+        for command in [
+            MenuCommand::RenameFavorite,
+            MenuCommand::MoveFavoriteUp,
+            MenuCommand::MoveFavoriteDown,
+        ] {
+            assert!(item(&rows, command).is_none(), "{command:?} on a place row");
+        }
+    }
+}
+
+#[test]
+fn the_rename_favorite_dialog_says_the_folder_itself_is_not_renamed() {
+    let text = dialog_text(&DialogKind::RenameFavorite, &[]);
+    assert_eq!(text.title, "Rename favorite");
+    assert_eq!(text.confirm, "Rename");
+    assert!(text.body.contains("empty"), "{}", text.body);
+    assert!(text.body.contains("folder itself"), "{}", text.body);
+}
+
 #[test]
 fn a_sidebar_row_offers_open_in_terminal_only_when_a_terminal_exists() {
     let rows = sidebar_menu_rows(&SidebarTarget {
@@ -593,6 +697,7 @@ fn a_sidebar_row_offers_open_in_terminal_only_when_a_terminal_exists() {
         favorite: false,
         terminal: true,
         recent: false,
+        slot: None,
     });
     assert_eq!(
         flat(&rows),
@@ -717,6 +822,7 @@ fn the_sidebar_trash_row_offers_open_new_tab_and_empty_trash_only() {
             favorite,
             terminal: true,
             recent: false,
+            slot: None,
         });
         assert_eq!(
             flat(&rows),
@@ -736,6 +842,7 @@ fn the_sidebar_recent_row_offers_open_and_new_tab_only() {
             favorite,
             terminal,
             recent: true,
+            slot: None,
         });
         assert_eq!(flat(&rows), ["Open", "Open in new tab"]);
     }

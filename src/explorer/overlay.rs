@@ -190,6 +190,10 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         DialogAction::SelectPattern(state) => Some(state),
         _ => None,
     };
+    let rename_favorite = match &dialog.action {
+        DialogAction::RenameFavorite(state) => Some(state),
+        _ => None,
+    };
     let connect = match &dialog.action {
         DialogAction::Connect(state) => Some(state),
         _ => None,
@@ -206,6 +210,7 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     let calm = open_with.is_some()
         || archive.is_some()
         || pattern.is_some()
+        || rename_favorite.is_some()
         || connect.is_some()
         || prompt.is_some()
         || matches!(
@@ -238,6 +243,14 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
             Input::new(&state.input)
                 .id("explorer-select-pattern-input")
                 .aria_label("Name pattern")
+                .w_full()
+                .small()
+        }))
+        // "Rename…" of a favorite: the name the sidebar shows.
+        .children(rename_favorite.map(|state| {
+            Input::new(&state.input)
+                .id("explorer-rename-favorite-input")
+                .aria_label("Favorite name")
                 .w_full()
                 .small()
         }))
@@ -486,6 +499,8 @@ fn render_dialog(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
         modal.icon(icon(gpui_kit_assets::IconName::Network))
     } else if pattern.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::SquareCheck))
+    } else if rename_favorite.is_some() {
+        modal.icon(icon(gpui_kit_assets::IconName::Pencil))
     } else if archive.is_some() {
         modal.icon(icon(gpui_kit_assets::IconName::Archive))
     } else if open_with.is_some() {

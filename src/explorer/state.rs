@@ -182,6 +182,81 @@ impl Favorites {
             self.0.retain(|known| known.path != *path);
         }
     }
+
+    /// Sets the label of `folder`'s favorite, or clears it with `None`.
+    pub(crate) fn relabel(&mut self, folder: &Path, label: Option<String>) {
+        if let Some(favorite) = self.0.iter_mut().find(|known| known.path == folder) {
+            favorite.label = label;
+        }
+    }
+
+    /// Where `folder` is in the list, as far as the menu needs to know.
+    pub(crate) fn slot_of(&self, folder: &Path) -> Option<FavoriteSlot> {
+        let index = self.0.iter().position(|known| known.path == folder)?;
+        Some(FavoriteSlot {
+            first: index == 0,
+            last: index + 1 == self.0.len(),
+        })
+    }
+
+    /// What a move of `folder` asks of the bookmarks file: the favorite it
+    /// goes just before (`None` for the end of the list); the outer `None`
+    /// when the list would not change (`folder` is not a favorite, is
+    /// already there, or the step leaves the list).
+    pub(crate) fn move_anchor(&self, folder: &Path, step: FavoriteMove) -> Option<Option<PathBuf>> {
+        let index = self.0.iter().position(|known| known.path == folder)?;
+        let gap = match step {
+            FavoriteMove::Up => index.checked_sub(1)?,
+            FavoriteMove::Down => index + 2,
+            FavoriteMove::Gap(gap) => gap,
+        }
+        .min(self.0.len());
+        // The gaps just above and just below `folder` leave the list as is.
+        if gap == index || gap == index + 1 {
+            return None;
+        }
+        Some(self.0.get(gap).map(|before| before.path.clone()))
+    }
+
+    /// Moves `folder` just before `before` (the end when `None`); whether
+    /// the list changed.
+    pub(crate) fn move_before(&mut self, folder: &Path, before: Option<&Path>) -> bool {
+        let Some(from) = self.0.iter().position(|known| known.path == folder) else {
+            return false;
+        };
+        let to = match before {
+            Some(anchor) => match self.0.iter().position(|known| known.path == anchor) {
+                Some(index) => index,
+                None => return false,
+            },
+            None => self.0.len(),
+        };
+        if to == from || to == from + 1 {
+            return false;
+        }
+        let moved = self.0.remove(from);
+        self.0.insert(if to > from { to - 1 } else { to }, moved);
+        true
+    }
+}
+
+/// How a favorite moves in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FavoriteMove {
+    /// One place up.
+    Up,
+    /// One place down.
+    Down,
+    /// Into the gap `n` of the list: 0 is above the first favorite, the
+    /// list's length is below the last.
+    Gap(usize),
+}
+
+/// Whether a favorite has a neighbour above and below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FavoriteSlot {
+    pub(crate) first: bool,
+    pub(crate) last: bool,
 }
 
 /// The folders up to this many entries are arranged on the calling thread:
@@ -2510,6 +2585,106 @@ mod tests {
         flip(&mut favorites, &Location::Recent);
         assert_eq!(paths(&favorites), [PathBuf::from("/fixture/b")]);
         assert!(!favorites.contains(&Location::Recent));
+    }
+
+    #[test]
+    fn favorites_move_one_step_or_into_a_gap_and_stay_unique() {
+        let list = |names: &[&str]| {
+            Favorites::from_bookmarks(
+                names
+                    .iter()
+                    .map(|name| Bookmark {
+                        path: PathBuf::from(format!("/f/{name}")),
+                        label: None,
+                    })
+                    .collect(),
+            )
+        };
+        let order = |favorites: &Favorites| -> String {
+            favorites
+                .bookmarks()
+                .iter()
+                .filter_map(|bookmark| bookmark.path.file_name()?.to_str())
+                .collect()
+        };
+        let apply = |favorites: &mut Favorites, name: &str, step| {
+            let folder = PathBuf::from(format!("/f/{name}"));
+            let anchor = favorites.move_anchor(&folder, step)?;
+            Some(favorites.move_before(&folder, anchor.as_deref()))
+        };
+        let mut favorites = list(&["a", "b", "c", "d"]);
+        assert_eq!(apply(&mut favorites, "c", FavoriteMove::Up), Some(true));
+        assert_eq!(order(&favorites), "acbd");
+        assert_eq!(apply(&mut favorites, "c", FavoriteMove::Down), Some(true));
+        assert_eq!(order(&favorites), "abcd");
+        assert_eq!(apply(&mut favorites, "c", FavoriteMove::Down), Some(true));
+        assert_eq!(
+            order(&favorites),
+            "abdc",
+            "one step down onto the last place"
+        );
+        assert_eq!(apply(&mut favorites, "a", FavoriteMove::Gap(4)), Some(true));
+        assert_eq!(order(&favorites), "bdca", "the gap below the last row");
+        assert_eq!(apply(&mut favorites, "a", FavoriteMove::Gap(0)), Some(true));
+        assert_eq!(order(&favorites), "abdc", "the gap above the first row");
+        assert_eq!(apply(&mut favorites, "d", FavoriteMove::Gap(1)), Some(true));
+        assert_eq!(order(&favorites), "adbc");
+    }
+
+    #[test]
+    fn a_move_that_changes_nothing_has_no_plan() {
+        let favorites = Favorites::from_bookmarks(
+            ["a", "b", "c"]
+                .iter()
+                .map(|name| Bookmark {
+                    path: PathBuf::from(format!("/f/{name}")),
+                    label: None,
+                })
+                .collect(),
+        );
+        let plan = |name: &str, step| favorites.move_anchor(Path::new(&format!("/f/{name}")), step);
+        assert_eq!(plan("a", FavoriteMove::Up), None, "the first cannot go up");
+        assert_eq!(
+            plan("c", FavoriteMove::Down),
+            None,
+            "the last cannot go down"
+        );
+        assert_eq!(
+            plan("b", FavoriteMove::Gap(1)),
+            None,
+            "the gap above itself"
+        );
+        assert_eq!(
+            plan("b", FavoriteMove::Gap(2)),
+            None,
+            "the gap below itself"
+        );
+        assert_eq!(plan("x", FavoriteMove::Up), None, "not a favorite");
+        assert_eq!(
+            plan("a", FavoriteMove::Down),
+            Some(Some(PathBuf::from("/f/c"))),
+            "the file move names the favorite it goes before"
+        );
+        assert_eq!(
+            plan("a", FavoriteMove::Gap(3)),
+            Some(None),
+            "the end of the list"
+        );
+        assert_eq!(
+            favorites.slot_of(Path::new("/f/a")),
+            Some(FavoriteSlot {
+                first: true,
+                last: false
+            })
+        );
+        assert_eq!(
+            favorites.slot_of(Path::new("/f/c")),
+            Some(FavoriteSlot {
+                first: false,
+                last: true
+            })
+        );
+        assert_eq!(favorites.slot_of(Path::new("/f/x")), None);
     }
 
     #[test]

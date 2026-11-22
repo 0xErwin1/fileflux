@@ -46,7 +46,7 @@ use super::ops::{
 use super::ops::{SidebarTarget, menu_title, recent_menu_rows, sidebar_menu_rows};
 use super::progress::{Sink, Unit};
 use super::sidebar::DevicePartition;
-use super::state::Transition;
+use super::state::{FavoriteMove, Transition};
 use super::tabs::{Affected, Placement, tabs_to_refresh};
 use super::toasts::{make_room, toast_timeout};
 use super::view::{Explorer, OpContext, TabId};
@@ -1021,6 +1021,14 @@ impl Explorer {
             self.confirm_select_pattern(window, cx);
             return;
         }
+        if self
+            .dialogs
+            .current()
+            .is_some_and(|dialog| matches!(dialog.action, DialogAction::RenameFavorite(_)))
+        {
+            self.confirm_rename_favorite(window, cx);
+            return;
+        }
         match self.dialogs.current().map(|dialog| &dialog.action) {
             Some(DialogAction::Connect(_)) => return self.confirm_connect(window, cx),
             Some(DialogAction::MountPrompt(_)) => return self.confirm_mount_prompt(window, cx),
@@ -1053,6 +1061,7 @@ impl Explorer {
             | DialogAction::OpenWith(_)
             | DialogAction::Archive(_)
             | DialogAction::SelectPattern(_)
+            | DialogAction::RenameFavorite(_)
             | DialogAction::Connect(_)
             | DialogAction::MountPrompt(_) => return,
             DialogAction::DeviceWhenIdle(plan) => {
@@ -1320,11 +1329,17 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         self.cancel_rename(window, cx);
+        // Only a row of the Favorites section renames and reorders.
+        let slot = match (&location, super::favorites::favorite_row_index(&row)) {
+            (Location::Directory(folder), Some(_)) => self.favorites.slot_of(folder),
+            _ => None,
+        };
         let mut rows = sidebar_menu_rows(&SidebarTarget {
             trash: location == Location::Trash,
             recent: location == Location::Recent,
             favorite: self.favorites.contains(&location),
             terminal: self.terminal.is_some(),
+            slot,
         });
         if let Some(actions) = device
             .as_deref()
@@ -1798,6 +1813,9 @@ impl Explorer {
             }
             MenuCommand::ConnectToServer => self.connect_to_server(window, cx),
             MenuCommand::ConnectBookmark | MenuCommand::RemoveBookmark => {}
+            MenuCommand::RenameFavorite
+            | MenuCommand::MoveFavoriteUp
+            | MenuCommand::MoveFavoriteDown => {}
             MenuCommand::Arrange(_) | MenuCommand::ToggleColumn(_) => {}
             MenuCommand::Zoom(zoom) => self.zoom(zoom, cx),
             MenuCommand::ResetFolderView => self.reset_folder_view(cx),
@@ -1943,6 +1961,21 @@ impl Explorer {
             }
             MenuCommand::AddFavorite => self.set_favorite(&location, true, cx),
             MenuCommand::RemoveFavorite => self.set_favorite(&location, false, cx),
+            MenuCommand::RenameFavorite => {
+                if let Location::Directory(folder) = location {
+                    self.rename_favorite(folder, window, cx);
+                }
+            }
+            MenuCommand::MoveFavoriteUp | MenuCommand::MoveFavoriteDown => {
+                if let Location::Directory(folder) = location {
+                    let step = if command == MenuCommand::MoveFavoriteUp {
+                        FavoriteMove::Up
+                    } else {
+                        FavoriteMove::Down
+                    };
+                    self.move_favorite(&folder, step, cx);
+                }
+            }
             MenuCommand::CopyPath => {
                 if let Location::Directory(path) = &location {
                     cx.write_to_clipboard(ClipboardItem::new_string(

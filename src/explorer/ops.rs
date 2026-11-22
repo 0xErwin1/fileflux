@@ -46,6 +46,7 @@ use gpui::Entity;
 use super::arrange::{ArrangeCommand, Arrangement};
 use super::arrange_menu;
 use super::progress::Sink;
+use super::state::FavoriteSlot;
 
 #[path = "paste.rs"]
 pub(crate) mod paste;
@@ -1455,6 +1456,12 @@ pub(crate) enum MenuCommand {
     AddFavorite,
     /// Sidebar rows: unpin the row's folder from the Favorites.
     RemoveFavorite,
+    /// Favorites section rows: ask for the name the sidebar shows.
+    RenameFavorite,
+    /// Favorites section rows: one place up in the list.
+    MoveFavoriteUp,
+    /// Favorites section rows: one place down in the list.
+    MoveFavoriteDown,
     /// Devices: mount the unmounted filesystem.
     Mount,
     /// Devices: unlock the encrypted volume (asks for its passphrase) and
@@ -1976,6 +1983,9 @@ pub(crate) struct SidebarTarget {
     pub(crate) favorite: bool,
     /// Whether a terminal can be opened.
     pub(crate) terminal: bool,
+    /// Set for a row of the Favorites section: where it stands in the list.
+    /// Only those rows rename and reorder the favorite.
+    pub(crate) slot: Option<FavoriteSlot>,
 }
 
 /// The menu of a sidebar row. Every row opens in place or in a new tab; a
@@ -2015,6 +2025,19 @@ pub(crate) fn sidebar_menu_rows(target: &SidebarTarget) -> Vec<MenuRow> {
         false,
     ));
     rows.push(MenuRow::Separator);
+    if let Some(slot) = target.slot {
+        rows.extend([
+            item(MenuCommand::RenameFavorite, "Rename\u{2026}", false),
+            MenuRow::Item(MenuItemSpec {
+                enabled: !slot.first,
+                ..MenuItemSpec::new(MenuCommand::MoveFavoriteUp, "Move up")
+            }),
+            MenuRow::Item(MenuItemSpec {
+                enabled: !slot.last,
+                ..MenuItemSpec::new(MenuCommand::MoveFavoriteDown, "Move down")
+            }),
+        ]);
+    }
     rows.push(if target.favorite {
         item(MenuCommand::RemoveFavorite, "Remove from favorites", false)
     } else {
@@ -2155,6 +2178,8 @@ pub(crate) enum DialogKind {
     Archive { extract: bool },
     /// "Select items matching…": a glob pattern.
     SelectPattern,
+    /// "Rename…" of a favorite: the name the sidebar shows.
+    RenameFavorite,
     /// "Connect to Server…": a server address.
     Connect,
     /// A prompt of `gio mount` for the server (or, with `unlock`, the
@@ -2203,6 +2228,8 @@ pub(crate) enum DialogAction {
     Archive(super::archive::ArchiveDialog),
     /// The "Select items matching…" dialog: its field.
     SelectPattern(super::selection::SelectDialog),
+    /// The "Rename…" dialog of a favorite: its folder and field.
+    RenameFavorite(super::favorites::RenameDialog),
     /// The "Connect to Server…" dialog: its field.
     Connect(super::network::ConnectDialog),
     /// A prompt of `gio mount`: what it asks and the field for the answer.
@@ -2447,6 +2474,7 @@ impl DialogState {
             DialogKind::OpenWith { .. }
             | DialogKind::Archive { .. }
             | DialogKind::SelectPattern
+            | DialogKind::RenameFavorite
             | DialogKind::Connect
             | DialogKind::MountPrompt { .. } => DialogChoice::Confirm,
             DialogKind::Conflict { .. } => CONFLICT_DEFAULT,
@@ -2794,6 +2822,13 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
                 .to_owned(),
             "Select",
         ),
+        DialogKind::RenameFavorite => (
+            "Rename favorite".to_owned(),
+            "Type the name the sidebar shows for this favorite. Leave it empty to show the \
+             folder\u{2019}s own name. The folder itself is not renamed."
+                .to_owned(),
+            "Rename",
+        ),
         DialogKind::Connect => (
             "Connect to Server".to_owned(),
             "Type the address: sftp://, smb://, ftp://, ftps://, dav:// or davs://. \
@@ -2869,7 +2904,10 @@ pub(crate) fn dialog_text(kind: &DialogKind, names: &[String]) -> DialogText {
         DialogKind::OpenWith { .. } => names.to_vec(),
         DialogKind::OpenMany { .. } | DialogKind::Runnable { .. } => Vec::new(),
         // The field says what the dialog is about.
-        DialogKind::Archive { .. } | DialogKind::SelectPattern | DialogKind::Connect => Vec::new(),
+        DialogKind::Archive { .. }
+        | DialogKind::SelectPattern
+        | DialogKind::RenameFavorite
+        | DialogKind::Connect => Vec::new(),
         // The lines gio printed before asking, as they are.
         DialogKind::MountPrompt { .. } => names.to_vec(),
         _ => listed(names),

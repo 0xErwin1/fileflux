@@ -34,6 +34,7 @@ use super::actions::MenuOn;
 use super::devices::{actions_for, caption, unlisted_volumes};
 use super::dnd::{self, DropTarget};
 use super::entries;
+use super::favorites::favorite_row_id;
 use super::icon;
 use super::ops::{MenuCommand, MenuItemSpec, MenuRow};
 use super::state::Transition;
@@ -324,10 +325,28 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
                 .child("Star a folder to pin it here."),
         );
     }
+    let tint = ChromeColors::tint(cx.theme());
+    // The insertion line of a favorite dragged between rows.
+    let gap = this
+        .favorite_insert
+        .as_ref()
+        .filter(|_| cx.has_active_drag())
+        .and_then(|over| over.gap);
+    let count = this.favorites.bookmarks().len();
     for (index, bookmark) in this.favorites.bookmarks().iter().enumerate() {
         let path = &bookmark.path;
-        section = section.child(nav_row(
-            format!("favorite-{index}"),
+        let line = |top: bool| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .h(px(2.0))
+                .when(top, Div::top_0)
+                .when(!top, Div::bottom_0)
+                .bg(tint)
+        };
+        let row = nav_row(
+            favorite_row_id(index),
             &bookmark.display_name(),
             path.to_string_lossy().into_owned(),
             gpui_kit_assets::IconName::Star,
@@ -335,7 +354,13 @@ fn favorites_section(this: &Explorer, cx: &mut Context<Explorer>) -> Div {
             None,
             this,
             cx,
-        ));
+        )
+        .relative()
+        .when(gap == Some(index), |row| row.child(line(true)))
+        .when(gap == Some(index + 1) && index + 1 == count, |row| {
+            row.child(line(false))
+        });
+        section = section.child(dnd::favorite_row(row, index, &cx.entity().downgrade()));
     }
     section
 }

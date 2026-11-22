@@ -931,6 +931,11 @@ pub(crate) struct Explorer {
     /// and "the other pane" is counted from there. Cleared by the drop and,
     /// for a drag that ended elsewhere, by the next pump tick.
     pub(crate) folder_drag: Option<Side>,
+    /// The Favorites row a drag of a favorite is over, and the gap between
+    /// rows it points at: the insertion line and the reorder drop. Cleared
+    /// by the drop and, for a drag that ended elsewhere, by the next pump
+    /// tick.
+    pub(crate) favorite_insert: Option<super::favorites::FavoriteInsert>,
     /// When and whether settings and session are written.
     persistence: Persistence,
     /// The view remembered for each folder, and when it is written.
@@ -1227,6 +1232,7 @@ impl Explorer {
             split_ratio: panes::ratio_of(preferences.split_permille),
             split_drag: None,
             folder_drag: None,
+            favorite_insert: None,
             persistence,
             folders,
             default_presentation,
@@ -1402,6 +1408,10 @@ impl Explorer {
         }
         if self.folder_drag.is_some() && !cx.has_active_drag() {
             self.folder_drag = None;
+            cx.notify();
+        }
+        if self.favorite_insert.is_some() && !cx.has_active_drag() {
+            self.favorite_insert = None;
             cx.notify();
         }
         self.remember_changed_views();

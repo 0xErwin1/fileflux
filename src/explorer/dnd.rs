@@ -720,6 +720,48 @@ fn dragged_paths(value: &dyn Any) -> Option<(DragOrigin, &[PathBuf])> {
         .map(|external| (DragOrigin::External, external.paths()))
 }
 
+/// Makes the Favorites row number `row` watch a drag of one folder move over
+/// it, so [`Explorer::favorite_drag_over`] can show the insertion line and the
+/// drop can reorder. The row stays a drop target of its own folder.
+pub(crate) fn favorite_row<E: InteractiveElement>(
+    element: E,
+    row: usize,
+    weak: &WeakEntity<Explorer>,
+) -> E {
+    let weak = weak.clone();
+    element.on_drag_move::<DraggedEntries>(move |event, window, cx| {
+        let Some(folder) = event.drag(cx).sole_folder().map(Path::to_path_buf) else {
+            return;
+        };
+        // Inside the click slop the drag has not begun.
+        if !drag_armed(window, cx) {
+            return;
+        }
+        let (bounds, pointer) = (event.bounds, event.event.position);
+        if let Err(error) = weak.update(cx, |this, cx| {
+            this.favorite_drag_over((row, bounds), &folder, pointer, cx);
+        }) {
+            log::debug!("a drag moved over a closed explorer: {error}");
+        }
+    })
+}
+
+/// Whether `dragged`, dropped where the pointer is now, lands between two
+/// favorite rows and reorders them.
+fn reorders_favorites(
+    weak: &WeakEntity<Explorer>,
+    dragged: &dyn Any,
+    window: &Window,
+    cx: &App,
+) -> bool {
+    let Some(folder) = dragged_folder(dragged) else {
+        return false;
+    };
+    let pointer = window.mouse_position();
+    weak.upgrade()
+        .is_some_and(|this| this.read(cx).favorite_drop_gap(folder, pointer).is_some())
+}
+
 /// Makes `element` a drop target: tint-washed and bordered while a drag that
 /// would do something hovers it, refusing every other drag.
 pub(crate) fn drop_target<E>(
@@ -735,19 +777,32 @@ where
     let tint = ChromeColors::tint(theme);
     let wash = theme.list_active;
     let accepts = {
-        let target = target.clone();
+        let (weak, target) = (weak.clone(), target.clone());
         move |value: &dyn Any, window: &mut Window, cx: &mut App| {
-            dragged_paths(value).is_some_and(|(origin, paths)| {
-                (origin == DragOrigin::External || drag_armed(window, cx))
-                    && check_drop(origin, paths, &target) == DropCheck::Accept
-            })
+            // Between two favorite rows the drop reorders them, whatever the
+            // row's own folder would make of it.
+            (drag_armed(window, cx) && reorders_favorites(&weak, value, window, cx))
+                || dragged_paths(value).is_some_and(|(origin, paths)| {
+                    (origin == DragOrigin::External || drag_armed(window, cx))
+                        && check_drop(origin, paths, &target) == DropCheck::Accept
+                })
         }
     };
+    let washes = weak.clone();
     let on_internal = {
         let (weak, target) = (weak.clone(), target.clone());
         move |dragged: &DraggedEntries, window: &mut Window, cx: &mut App| {
             if !drag_armed(window, cx) {
                 return;
+            }
+            if let Some(folder) = dragged.sole_folder() {
+                let pointer = window.mouse_position();
+                let moved = weak
+                    .update(cx, |this, cx| this.drop_favorite(folder, pointer, cx))
+                    .unwrap_or(false);
+                if moved {
+                    return;
+                }
             }
             let paths = dragged.paths.to_vec();
             drop_on(
@@ -776,8 +831,9 @@ where
     };
     element
         .can_drop(accepts)
-        .drag_over::<DraggedEntries>(move |style, _, window, cx| {
-            if drag_armed(window, cx) {
+        .drag_over::<DraggedEntries>(move |style, dragged, window, cx| {
+            // The insertion line speaks for a drop between favorite rows.
+            if drag_armed(window, cx) && !reorders_favorites(&washes, dragged, window, cx) {
                 style.bg(wash).border_1().border_color(tint)
             } else {
                 style
