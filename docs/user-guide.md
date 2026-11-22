@@ -455,10 +455,13 @@ Animated GIF and WebP play. Images beyond 16384 px on a side or 100 megapixels, 
 ### Making Fileflux your default image viewer
 
 ```sh
-scripts/install-desktop.sh                  # install the desktop entry (needs `fileflux` on PATH)
-scripts/install-desktop.sh --default-images # also make it the default for image types
-scripts/install-desktop.sh --uninstall      # undo exactly what was installed
+scripts/install-desktop.sh                   # install the desktop entry (needs `fileflux` on PATH)
+scripts/install-desktop.sh --default-images  # also make it the default for image types
+scripts/install-desktop.sh --default-folders # also make it the default file manager (inode/directory)
+scripts/install-desktop.sh --uninstall       # undo exactly what was installed
 ```
+
+The two `--default-*` options can be combined.
 
 The script writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list`, and `--uninstall` restores the defaults it replaced.
 

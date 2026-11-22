@@ -114,7 +114,7 @@ The hashes in `nix/nightly-info.nix` are placeholders on `main`; the nightly wor
 
 | Path | Purpose |
 |---|---|
-| `scripts/install-desktop.sh` | Install or remove the desktop entry, optionally as default image viewer (`--default-images`, `--uninstall`). Writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list` |
+| `scripts/install-desktop.sh` | Install or remove the desktop entry, optionally as default image viewer and file manager (`--default-images`, `--default-folders`, `--uninstall`). Writes only to `$XDG_DATA_HOME/applications` and `$XDG_CONFIG_HOME/mimeapps.list` |
 | `scripts/native-smoke.py` | Native smoke check described above |
 | `scripts/ui-sandbox.sh` | Isolated `ui-automation` session for the gpui-mcp server (`start [folder]`, `stop`, `status`), described above |
 | `packaging/fileflux.desktop` | The desktop entry the install script uses |

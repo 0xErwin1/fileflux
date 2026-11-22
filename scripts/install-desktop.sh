@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Installs (or removes) Fileflux's desktop entry for the current user, so it
-# shows up in "Open With" menus and can be the default image viewer.
+# shows up in "Open With" menus and can be the default image viewer and
+# file manager.
 #
 #   scripts/install-desktop.sh                    install the desktop entry
 #   scripts/install-desktop.sh --default-images   ...and make Fileflux the default
 #                                                 app for the image types it opens
+#   scripts/install-desktop.sh --default-folders  ...and make Fileflux the default
+#                                                 app for folders (inode/directory)
 #   scripts/install-desktop.sh --uninstall        undo exactly what was installed
 #
 # The entry goes to ${XDG_DATA_HOME:-$HOME/.local/share}/applications and the
@@ -37,10 +40,16 @@ usage() {
 say() { printf 'fileflux: %s\n' "$*"; }
 die() { printf 'fileflux: %s\n' "$*" >&2; exit 1; }
 
-# The image MIME types the desktop entry claims (everything but directories).
-image_mimes() {
-  sed -n 's/^MimeType=//p' "$SOURCE" | tr ';' '\n' | grep -v '^$' | grep -v '^inode/'
+# The MIME types the desktop entry claims, one per line.
+claimed_mimes() {
+  sed -n 's/^MimeType=//p' "$SOURCE" | tr ';' '\n' | grep -v '^$'
 }
+
+# The image types (everything but directories).
+image_mimes() { claimed_mimes | grep -v '^inode/'; }
+
+# The folder types (inode/directory).
+folder_mimes() { claimed_mimes | grep '^inode/'; }
 
 # The explicit default of $1 in mimeapps.list ([Default Applications]), if any.
 explicit_default() {
@@ -90,6 +99,7 @@ install_entry() {
     say "note: 'fileflux' is not on PATH; the entry will not launch until it is"
 }
 
+# Makes Fileflux the default for every type read on stdin.
 set_defaults() {
   command -v xdg-mime >/dev/null 2>&1 || die "xdg-mime not found; cannot set defaults"
   # A desktop-specific list beats mimeapps.list when queries are answered.
@@ -117,7 +127,7 @@ set_defaults() {
     fi
     xdg-mime default "$APP_ID" "$mime"
     say "default for $mime: $APP_ID${current:+ (was $current)}"
-  done < <(image_mimes)
+  done
 }
 
 uninstall() {
@@ -157,10 +167,12 @@ uninstall() {
 }
 
 mode=install
-defaults=0
+images=0
+folders=0
 for arg in "$@"; do
   case "$arg" in
-    --default-images) defaults=1 ;;
+    --default-images) images=1 ;;
+    --default-folders) folders=1 ;;
     --uninstall) mode=uninstall ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die "unknown option '$arg'" ;;
@@ -168,11 +180,15 @@ for arg in "$@"; do
 done
 
 if [ "$mode" = uninstall ]; then
-  [ "$defaults" -eq 0 ] || die "--default-images cannot be combined with --uninstall"
+  [ "$images" -eq 0 ] || die "--default-images cannot be combined with --uninstall"
+  [ "$folders" -eq 0 ] || die "--default-folders cannot be combined with --uninstall"
   uninstall
 else
   install_entry
-  if [ "$defaults" -eq 1 ]; then
-    set_defaults
+  if [ "$images" -eq 1 ]; then
+    image_mimes | set_defaults
+  fi
+  if [ "$folders" -eq 1 ]; then
+    folder_mimes | set_defaults
   fi
 fi
