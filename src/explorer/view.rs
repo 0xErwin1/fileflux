@@ -531,6 +531,9 @@ pub(crate) struct Tab {
     /// The thumbnail work still to do for this listing; closed when the
     /// listing is replaced or the tab goes away.
     thumb_queue: Option<Arc<fileflux::core::thumbnails::Queue<entries::Thumb>>>,
+    /// The file whose `large` preview thumbnail was last asked for, so the
+    /// selection is asked for once.
+    preview_requested: Option<PathBuf>,
     /// The tiles on screen last time the thumbnail queue was ordered, as
     /// positions in the displayed order.
     thumb_viewport: Option<(usize, usize)>,
@@ -719,6 +722,7 @@ impl Tab {
             thumbs_task: None,
             thumb_queue: None,
             thumb_viewport: None,
+            preview_requested: None,
             visible_tiles: Rc::new(Cell::new((0, 0))),
             arrange_task: None,
             arranging_since: None,
@@ -1260,6 +1264,7 @@ impl Explorer {
                         for tab in this.tabs.iter_mut() {
                             tab.prioritize_thumbnails();
                         }
+                        this.ensure_preview_thumbnail(cx);
                     })
                     .is_err()
                 {
@@ -2183,6 +2188,54 @@ impl Explorer {
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.thumbs_task = Some(task);
         }
+    }
+
+    /// Asks for the `large` thumbnail the details panel previews the selected
+    /// big image with, once, on the background executor: the panel never
+    /// decodes a photograph whole. The answer joins the listing's thumbnails
+    /// (a `large` one fills a tile as well as a `normal` one).
+    fn ensure_preview_thumbnail(&mut self, cx: &mut Context<Self>) {
+        if !self.inspector_open {
+            return;
+        }
+        let id = self.active_id();
+        let Some(tab) = self.tabs.by_id_mut(id) else {
+            return;
+        };
+        let request = match tab.state.selected_entries().as_slice() {
+            [entry]
+                if tab.preview_requested.as_ref() != Some(&entry.path)
+                    && inspector::wants_large_preview(
+                        &entry.path,
+                        entry.size,
+                        tab.thumbs.get(&entry.path),
+                    ) =>
+            {
+                Some((entry.path.clone(), entry.modified))
+            }
+            _ => None,
+        };
+        let Some((path, modified)) = request else {
+            return;
+        };
+        tab.preview_requested = Some(path.clone());
+        let made = {
+            let path = path.clone();
+            cx.background_executor().spawn(async move {
+                thumbnail_for(&path, fileflux::core::thumbnails::Bucket::Large)
+            })
+        };
+        cx.spawn(async move |this, cx| {
+            let found = made.await;
+            let misses = u32::from(found.is_none());
+            let thumb = entries::Thumb {
+                modified,
+                found,
+                misses,
+            };
+            Self::publish_thumbnails(&this, id, vec![(path, thumb)], cx);
+        })
+        .detach();
     }
 
     /// Applies a zoom command to the view the focused pane shows (the

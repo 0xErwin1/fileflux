@@ -18,6 +18,7 @@ use fileflux::core::places::format_bytes;
 #[cfg(test)]
 use fileflux::core::settings::DEFAULT_DETAILS_WIDTH;
 use fileflux::core::settings::DETAILS_WIDTH_RANGE;
+use fileflux::core::thumbnails::Bucket;
 use fileflux::core::{Entry, EntryKind, Location};
 use gpui::{
     AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Stateful,
@@ -841,19 +842,66 @@ fn none_selected(this: &Explorer, cx: &mut Context<Explorer>) -> Vec<AnyElement>
     body
 }
 
-/// What the preview box shows for a file: the image itself when the app
-/// decodes it, else the thumbnail an installed freedesktop thumbnailer made
-/// (a video's frame, a PDF's page, an office document's first page) once the
-/// background job has it. `None` keeps the type's icon — the installed
-/// theme's when it has one, else the type glyph.
-fn preview_source(this: &Explorer, entry: &Entry) -> Option<PathBuf> {
-    if fileflux::core::thumbnails::is_decodable_image(&entry.path) {
-        return Some(entry.path.clone());
+/// Images up to this size are previewed whole: decoding one is cheap. A bigger
+/// one — a photograph is tens of megabytes of pixels once decoded, and every
+/// image the selection passes over stays decoded in memory — is previewed by
+/// its thumbnail.
+const PREVIEW_WHOLE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// What the preview box draws for a file.
+#[derive(Debug, PartialEq, Eq)]
+enum Preview {
+    /// The file itself.
+    Whole,
+    /// This thumbnail.
+    Thumbnail(PathBuf),
+    /// Nothing yet: the type's icon shows until a thumbnail exists.
+    Wait,
+}
+
+/// What the preview box shows for the file at `path`, `size` bytes, whose
+/// tile's lookup answered `thumb`: a small image the app decodes itself; a
+/// big one its `large` thumbnail (a `normal` one would draw blurred in the
+/// box); anything else (a video's frame, a PDF's page, an office document's
+/// first page) the thumbnail an installed freedesktop thumbnailer made. A
+/// file of the cache is its own thumbnail.
+fn preview_plan(path: &Path, size: Option<u64>, thumb: Option<&entries::Thumb>) -> Preview {
+    let found = thumb.and_then(|thumb| thumb.found.as_ref());
+    if !fileflux::core::thumbnails::is_decodable_image(path) {
+        return found.map_or(Preview::Wait, |found| Preview::Thumbnail(found.clone()));
     }
-    this.tab()
-        .thumbs
-        .get(&entry.path)
-        .and_then(|thumb| thumb.found.clone())
+    if size.is_some_and(|size| size <= PREVIEW_WHOLE_MAX_BYTES) {
+        return Preview::Whole;
+    }
+    match found {
+        Some(found) if Bucket::of_thumbnail(found).is_none_or(|bucket| bucket >= Bucket::Large) => {
+            Preview::Thumbnail(found.clone())
+        }
+        _ => Preview::Wait,
+    }
+}
+
+/// Whether the file's preview waits for a `large` thumbnail that nobody has
+/// asked for yet: a big image the app decodes whose tile has no thumbnail or
+/// only a `normal` one. A lookup that found nothing is final until the file
+/// changes, so it is not asked again.
+pub(crate) fn wants_large_preview(
+    path: &Path,
+    size: Option<u64>,
+    thumb: Option<&entries::Thumb>,
+) -> bool {
+    fileflux::core::thumbnails::is_decodable_image(path)
+        && preview_plan(path, size, thumb) == Preview::Wait
+        && thumb.is_none_or(|thumb| thumb.found.is_some())
+}
+
+/// The file the preview box draws for `entry`, `None` to keep the icon.
+fn preview_source(this: &Explorer, entry: &Entry) -> Option<PathBuf> {
+    match preview_plan(&entry.path, entry.size, this.tab().thumbs.get(&entry.path)) {
+        Preview::Whole => Some(entry.path.clone()),
+        Preview::Thumbnail(thumbnail) => Some(thumbnail),
+        Preview::Wait => None,
+    }
 }
 
 /// The theme icon of a plain file entry: symlinks and broken links keep
@@ -1311,5 +1359,93 @@ mod tests {
             "Broken link"
         );
         assert_eq!(kind_label(&entry("sock", EntryKind::Other)), "Special file");
+    }
+
+    fn thumb(found: Option<&str>) -> entries::Thumb {
+        entries::Thumb {
+            modified: None,
+            found: found.map(PathBuf::from),
+            misses: u32::from(found.is_none()),
+        }
+    }
+
+    const BIG: u64 = 24 * 1024 * 1024;
+
+    #[test]
+    fn a_small_image_is_previewed_whole() {
+        let plan = preview_plan(Path::new("/p/a.png"), Some(40 * 1024), None);
+        assert_eq!(plan, Preview::Whole);
+        let plan = preview_plan(Path::new("/p/a.png"), Some(PREVIEW_WHOLE_MAX_BYTES), None);
+        assert_eq!(plan, Preview::Whole, "the limit itself is still small");
+    }
+
+    #[test]
+    fn a_big_image_is_previewed_by_its_large_thumbnail_never_whole() {
+        let large = thumb(Some("/c/thumbnails/large/a.png"));
+        let plan = preview_plan(Path::new("/p/a.jpg"), Some(BIG), Some(&large));
+        assert_eq!(
+            plan,
+            Preview::Thumbnail(PathBuf::from("/c/thumbnails/large/a.png"))
+        );
+        let plan = preview_plan(Path::new("/p/a.jpg"), Some(BIG), None);
+        assert_eq!(
+            plan,
+            Preview::Wait,
+            "no thumbnail yet: the icon waits for it"
+        );
+        assert!(wants_large_preview(Path::new("/p/a.jpg"), Some(BIG), None));
+    }
+
+    #[test]
+    fn a_big_image_with_only_a_normal_thumbnail_waits_for_a_large_one() {
+        let normal = thumb(Some("/c/thumbnails/normal/a.png"));
+        let plan = preview_plan(Path::new("/p/a.jpg"), Some(BIG), Some(&normal));
+        assert_eq!(
+            plan,
+            Preview::Wait,
+            "128 px would draw blurred in a 180 px box"
+        );
+        assert!(wants_large_preview(
+            Path::new("/p/a.jpg"),
+            Some(BIG),
+            Some(&normal)
+        ));
+    }
+
+    #[test]
+    fn an_image_of_the_cache_is_previewed_as_its_own_thumbnail() {
+        let own = thumb(Some("/c/not-a-size-dir/a.png"));
+        let plan = preview_plan(Path::new("/c/not-a-size-dir/a.png"), Some(BIG), Some(&own));
+        assert_eq!(
+            plan,
+            Preview::Thumbnail(PathBuf::from("/c/not-a-size-dir/a.png"))
+        );
+    }
+
+    #[test]
+    fn a_big_image_without_a_possible_thumbnail_keeps_its_icon_and_is_not_asked_again() {
+        let failed = thumb(None);
+        let plan = preview_plan(Path::new("/p/a.jpg"), Some(BIG), Some(&failed));
+        assert_eq!(plan, Preview::Wait);
+        assert!(
+            !wants_large_preview(Path::new("/p/a.jpg"), Some(BIG), Some(&failed)),
+            "an answer that found nothing is final until the file changes"
+        );
+    }
+
+    #[test]
+    fn a_video_is_previewed_by_whatever_thumbnail_its_tile_has() {
+        let normal = thumb(Some("/c/thumbnails/normal/v.png"));
+        let plan = preview_plan(Path::new("/p/v.mp4"), Some(BIG), Some(&normal));
+        assert_eq!(
+            plan,
+            Preview::Thumbnail(PathBuf::from("/c/thumbnails/normal/v.png"))
+        );
+        let plan = preview_plan(Path::new("/p/v.mp4"), Some(BIG), None);
+        assert_eq!(plan, Preview::Wait);
+        assert!(
+            !wants_large_preview(Path::new("/p/v.mp4"), Some(BIG), None),
+            "only images the app decodes are asked for a large thumbnail"
+        );
     }
 }
