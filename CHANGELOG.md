@@ -79,6 +79,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The mouse back and forward buttons now give the pane they were pressed in the focus before moving its history, instead of relying on an earlier press handler; a sidebar press that nothing released (for example in a disk usage view) no longer stays pending for a later click.
 - Failed or stale submits in the path field no longer change the committed folder, and the fields stay in sync after navigation.
 - Command-line paths containing `..` are folded, and the current directory is needed only for relative paths.
 - File operation dialogs and undo hardened against stale or background results.

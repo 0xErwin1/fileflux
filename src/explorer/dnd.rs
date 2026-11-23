@@ -335,6 +335,43 @@ pub(crate) fn press_owns_release(
     release_is_plain_click(gate, drag_active) && gate == DragGate::Pressed(pressed_at)
 }
 
+/// The sidebar press waiting for its release. Only one press is ever
+/// pending: a later press anywhere forgets it, and every release consumes
+/// it, so it cannot outlive its gesture when no entries area listens for
+/// the release (the usage views have none): every press, wherever it lands,
+/// first forgets it (see the window root's capture-phase press handler).
+#[derive(Debug)]
+pub(crate) struct PlacePress<T>(Option<((f32, f32), T)>);
+
+impl<T> Default for PlacePress<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> PlacePress<T> {
+    /// A left press on a sidebar row at `at`.
+    pub(crate) fn press(&mut self, at: (f32, f32), target: T) {
+        self.0 = Some((at, target));
+    }
+
+    /// A press that is not on a sidebar row: the pending one is stale.
+    pub(crate) fn forget(&mut self) {
+        self.0 = None;
+    }
+
+    /// The release takes the press, whoever it belongs to; the caller
+    /// clicks it only when [`press_owns_release`].
+    pub(crate) fn take(&mut self) -> Option<((f32, f32), T)> {
+        self.0.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// The window's one drag gate, shared by every drag source and target
 /// (they run inside GPUI callbacks that cannot reach the explorer).
 #[derive(Clone, Default)]
@@ -1060,6 +1097,61 @@ mod tests {
         // Past the threshold it is a drag, and with no press it is nothing.
         assert!(!press_owns_release(DragGate::Armed, at, true));
         assert!(!press_owns_release(DragGate::Idle, at, true));
+    }
+
+    #[test]
+    fn one_press_is_one_activation() {
+        // GPUI's own click on the row fires exactly when no drag started;
+        // the release path fires only when one did. Never both.
+        let at = (10.0, 20.0);
+        for gate in [
+            DragGate::Idle,
+            DragGate::Pressed(at),
+            DragGate::Pressed((1.0, 1.0)),
+            DragGate::Armed,
+        ] {
+            for drag_active in [false, true] {
+                let gpui_clicks = !drag_active;
+                let release_clicks = press_owns_release(gate, at, drag_active);
+                assert!(
+                    !(gpui_clicks && release_clicks),
+                    "{gate:?} drag_active={drag_active}"
+                );
+            }
+        }
+        let release = |pending: &mut PlacePress<&'static str>, gate, drag_active| {
+            let (pressed_at, target) = pending.take()?;
+            press_owns_release(gate, pressed_at, drag_active).then_some(target)
+        };
+        let mut pending = PlacePress::default();
+        pending.press(at, "home");
+        assert_eq!(release(&mut pending, DragGate::Pressed(at), false), None);
+        pending.press(at, "home");
+        assert_eq!(
+            release(&mut pending, DragGate::Pressed(at), true),
+            Some("home")
+        );
+    }
+
+    #[test]
+    fn a_sidebar_press_never_outlives_its_gesture() {
+        let at = (10.0, 20.0);
+        let mut pending = PlacePress::default();
+        // A still click nobody listened to; the next press anywhere
+        // forgets it.
+        pending.press(at, "home");
+        assert!(pending.is_pending());
+        pending.forget();
+        assert!(!pending.is_pending());
+        assert_eq!(pending.take(), None);
+        // A release always consumes the press.
+        pending.press(at, "home");
+        assert_eq!(pending.take(), Some((at, "home")));
+        assert!(!pending.is_pending());
+        // A newer press replaces an older one.
+        pending.press(at, "old");
+        pending.press((5.0, 5.0), "new");
+        assert_eq!(pending.take(), Some(((5.0, 5.0), "new")));
     }
 
     fn p(path: &str) -> PathBuf {

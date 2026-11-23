@@ -33,6 +33,19 @@ pub(crate) fn favorite_row_index(row: &str) -> Option<usize> {
     row.strip_prefix(FAVORITE_ROW_PREFIX)?.parse().ok()
 }
 
+/// Whether a drag that starts on the sidebar row `row` begins on a favorite.
+/// Set when the drag starts, so a stale `true` never carries over to a drag
+/// from another row.
+pub(crate) fn favorite_flag_at_start(row: &str) -> bool {
+    favorite_row_index(row).is_some()
+}
+
+/// The favorite-drag flag while the window reports `drag_active`: it lasts
+/// no longer than the drag.
+pub(crate) fn favorite_flag_while(flag: bool, drag_active: bool) -> bool {
+    flag && drag_active
+}
+
 /// Whether a drag of a folder reorders the favorites: only one that began on
 /// a favorite row of the sidebar, and only of a folder that is a favorite. A
 /// folder dragged from the entries area (or from another sidebar row) keeps
@@ -473,6 +486,21 @@ impl Explorer {
 mod tests {
     use super::*;
     use gpui::{point, px, size};
+
+    #[test]
+    fn the_favorite_flag_comes_from_the_row_id_and_lasts_the_drag() {
+        // Set at drag start, from the row the drag began on.
+        assert!(favorite_flag_at_start(&favorite_row_id(0)));
+        assert!(favorite_flag_at_start(&favorite_row_id(7)));
+        for row in ["home", "favorite-", "favorite-x", "device-1", ""] {
+            assert!(!favorite_flag_at_start(row), "{row:?}");
+        }
+        // Held while a drag is active, cleared when none is.
+        assert!(favorite_flag_while(true, true));
+        assert!(!favorite_flag_while(true, false));
+        assert!(!favorite_flag_while(false, true));
+        assert!(!favorite_flag_while(false, false));
+    }
 
     /// A 26 px row at y = 100.
     fn row() -> Bounds<Pixels> {

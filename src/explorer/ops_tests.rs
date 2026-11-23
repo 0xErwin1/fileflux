@@ -4046,3 +4046,119 @@ fn the_admin_row_is_in_the_empty_space_menu_before_copy_folder_path() {
     let copy = labels.iter().position(|l| l == "Copy folder path");
     assert_eq!(at.map(|a| a + 1), copy, "{labels:?}");
 }
+
+// --- Run prompt tests restored after 058eb3b removed them ----------------------
+
+#[test]
+fn a_conflict_question_keeps_its_buttons_in_order() {
+    for dialog in every_dialog() {
+        let expected: &[(DialogChoice, &str)] = match dialog.kind {
+            DialogKind::Conflict { .. } => &[
+                (DialogChoice::KeepBoth, "Keep both"),
+                (DialogChoice::Skip, "Skip"),
+            ],
+            DialogKind::Runnable { .. } => &[
+                (DialogChoice::KeepBoth, "Open"),
+                (DialogChoice::Skip, "Run in Terminal"),
+            ],
+            _ => &[],
+        };
+        assert_eq!(dialog.text.extra, expected, "{:?}", dialog.kind);
+        // What the footer shows follows the same order (a conflict only with
+        // its apply-all state, which `DialogState::conflict` carries).
+        assert_eq!(dialog.footer_extra(), expected, "{:?}", dialog.kind);
+    }
+}
+
+#[test]
+fn each_button_of_the_run_prompt_maps_to_its_answer() {
+    assert_eq!(run_choice(DialogChoice::Confirm), Some(RunChoice::Run));
+    assert_eq!(
+        run_choice(DialogChoice::Skip),
+        Some(RunChoice::RunInTerminal)
+    );
+    assert_eq!(run_choice(DialogChoice::KeepBoth), Some(RunChoice::Open));
+    assert_eq!(run_choice(DialogChoice::Cancel), None);
+    // The press route hands the same answers to the run prompt only.
+    let prompt = DialogAction::Runnable(PathBuf::from("/x/tool"));
+    for choice in [
+        DialogChoice::Confirm,
+        DialogChoice::Skip,
+        DialogChoice::KeepBoth,
+        DialogChoice::Cancel,
+    ] {
+        assert_eq!(
+            press_route(&prompt, choice),
+            PressRoute::RunPrompt(run_choice(choice)),
+            "{choice:?}"
+        );
+    }
+}
+
+#[test]
+fn a_second_open_of_the_same_program_does_not_stack_a_second_prompt() {
+    let t0 = Instant::now();
+    let tool = Path::new("/x/tool");
+    let mut queue = DialogQueue::default();
+    assert!(!queue.has_run_prompt_for(tool));
+    queue.offer_at(delete_dialog("/x/a"), t0);
+    queue.offer_at(run_prompt(tool), t0);
+    assert!(queue.has_run_prompt_for(tool), "waiting counts");
+    assert!(!queue.has_run_prompt_for(Path::new("/x/other")));
+    queue.close_at(t0);
+    assert!(queue.has_run_prompt_for(tool), "open counts");
+    queue.close_at(t0);
+    assert!(!queue.has_run_prompt_for(tool));
+    // Every button that executes waits for arming on the prompt, so a stray
+    // trailing second click cannot run anything.
+    let mut queue = DialogQueue::default();
+    queue.offer_at(run_prompt(tool), t0);
+    for choice in [
+        DialogChoice::Confirm,
+        DialogChoice::Skip,
+        DialogChoice::KeepBoth,
+    ] {
+        assert!(queue.needs_arming(choice), "{choice:?}");
+    }
+    assert!(!queue.needs_arming(DialogChoice::Cancel));
+}
+
+#[test]
+fn launch_follows_open_only_when_added_and_only_for_a_desktop_file() {
+    let one_file = MenuTarget {
+        only_files: true,
+        ..target(false, 1, false, false)
+    };
+    let mut rows = menu_rows(&one_file);
+    assert!(item(&rows, MenuCommand::Launch).is_none(), "not by default");
+    let before = flat(&rows);
+    add_launch_row(&mut rows);
+    let mut expected = before.clone();
+    expected.insert(1, "Launch".to_owned());
+    assert_eq!(flat(&rows), expected);
+    assert_eq!(
+        item(&rows, MenuCommand::Launch).map(|spec| (spec.enabled, spec.danger)),
+        Some((true, false))
+    );
+
+    // Without an "Open" row (the empty space, the Trash) nothing is added.
+    for target in [target(false, 0, false, true), target(true, 1, false, false)] {
+        let mut rows = menu_rows(&target);
+        let before = flat(&rows);
+        add_launch_row(&mut rows);
+        assert_eq!(flat(&rows), before);
+    }
+}
+
+#[test]
+fn folders_and_files_keep_the_open_action_they_had() {
+    use fileflux::core::EntryKind::{Directory, File};
+    assert_eq!(
+        open_action(&scanned(Path::new("/a/dir"), Directory, Some(0o755))),
+        OpenAction::Navigate
+    );
+    assert_eq!(
+        open_action(&scanned(Path::new("/a/tool"), File, Some(0o755))),
+        OpenAction::External
+    );
+}

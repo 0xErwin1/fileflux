@@ -1044,7 +1044,7 @@ pub(crate) struct Explorer {
     /// The draggable sidebar row the left button went down on and where: a
     /// release before the drag threshold is the click it was, and only its
     /// own release (see `dnd::press_owns_release`).
-    pub(crate) place_press: Option<((f32, f32), super::sidebar::PlaceTarget)>,
+    pub(crate) place_press: dnd::PlacePress<super::sidebar::PlaceTarget>,
 }
 
 impl Focusable for Explorer {
@@ -1284,7 +1284,7 @@ impl Explorer {
             network: super::network::NetworkHub::default(),
             rubber_band: None,
             entry_press: None,
-            place_press: None,
+            place_press: dnd::PlacePress::default(),
         };
         this._watch_pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -1416,9 +1416,8 @@ impl Explorer {
             self.folder_drag = None;
             cx.notify();
         }
-        if self.favorite_drag && !cx.has_active_drag() {
-            self.favorite_drag = false;
-        }
+        self.favorite_drag =
+            super::favorites::favorite_flag_while(self.favorite_drag, cx.has_active_drag());
         if self.favorite_insert.is_some() && !cx.has_active_drag() {
             self.favorite_insert = None;
             cx.notify();
@@ -3909,20 +3908,28 @@ impl Explorer {
         self.focus_pane(side, window, cx);
     }
 
-    /// A mouse back or forward button pressed inside `side`: the pane's own
-    /// history moves, like Alt+Left/Alt+Right. In a split the capture-phase
-    /// press already gave `side` the focus. Ignored while a dialog or the
-    /// context menu is open, like any other press over their overlays.
+    /// A mouse back or forward button pressed inside `side`: `side` takes
+    /// the focus first (it does not rely on the capture-phase press having
+    /// done it), then its own history moves, like Alt+Left/Alt+Right.
+    /// Ignored while a dialog or the context menu is open, like any other
+    /// press over their overlays.
     fn mouse_navigation(
         &mut self,
+        side: Side,
         direction: NavigationDirection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.dialogs.is_open() || self.menu.is_some() {
-            return;
+        let blocked = self.dialogs.is_open() || self.menu.is_some();
+        match mouse_navigation_plan(blocked, self.tabs.is_split(), self.tabs.focus(), side) {
+            MouseNavigation::Ignore => {}
+            MouseNavigation::Navigate { focus } => {
+                if let Some(side) = focus {
+                    self.focus_pane(side, window, cx);
+                }
+                self.navigate(history_transition(direction), window, cx);
+            }
         }
-        self.navigate(history_transition(direction), window, cx);
     }
 
     /// A release inside `side` while entries are being dragged: the pane the
@@ -4190,6 +4197,10 @@ impl Render for Explorer {
             // Ahead of every handler of a right press, so the menu it opens
             // knows it was opened by the mouse (Shift: new tab mode).
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                // Capture runs ahead of a sidebar row's own press, which
+                // records its press after this: a press still pending from
+                // an earlier gesture nobody released is stale.
+                this.place_press.forget();
                 if this.right_press.press(event.button) {
                     cx.defer_in(window, |this, _window, _cx| this.right_press.settle());
                 }
@@ -4559,7 +4570,7 @@ impl Explorer {
             pane = pane.on_mouse_down(
                 MouseButton::Navigate(direction),
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    this.mouse_navigation(direction, window, cx);
+                    this.mouse_navigation(side, direction, window, cx);
                 }),
             );
         }
@@ -5162,9 +5173,70 @@ fn history_transition(direction: NavigationDirection) -> Transition {
     }
 }
 
+/// What a mouse back or forward press inside a pane does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseNavigation {
+    /// A dialog or the context menu is open: the press belongs to them.
+    Ignore,
+    /// Move the pressed pane's history, after giving it the focus when
+    /// `focus` is `Some`.
+    Navigate { focus: Option<Side> },
+}
+
+/// The plan for a mouse back/forward press in pane `pressed`. The pane is
+/// named by the press, never inferred from whichever pane had the focus.
+fn mouse_navigation_plan(
+    blocked: bool,
+    split: bool,
+    focus: Side,
+    pressed: Side,
+) -> MouseNavigation {
+    if blocked {
+        return MouseNavigation::Ignore;
+    }
+    MouseNavigation::Navigate {
+        focus: panes::drop_focus(split, focus, pressed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mouse_navigation_names_the_pane_it_was_pressed_in() {
+        use MouseNavigation::{Ignore, Navigate};
+        // Pressed in the pane that is not focused: it takes the focus first.
+        assert_eq!(
+            mouse_navigation_plan(false, true, Side::Left, Side::Right),
+            Navigate {
+                focus: Some(Side::Right)
+            }
+        );
+        assert_eq!(
+            mouse_navigation_plan(false, true, Side::Right, Side::Left),
+            Navigate {
+                focus: Some(Side::Left)
+            }
+        );
+        // Already focused, or a single pane: nothing to focus, still navigates.
+        assert_eq!(
+            mouse_navigation_plan(false, true, Side::Left, Side::Left),
+            Navigate { focus: None }
+        );
+        assert_eq!(
+            mouse_navigation_plan(false, false, Side::Left, Side::Right),
+            Navigate { focus: None }
+        );
+        // A dialog or menu keeps the press, whatever the panes.
+        for (split, focus, pressed) in [
+            (true, Side::Left, Side::Right),
+            (true, Side::Left, Side::Left),
+            (false, Side::Left, Side::Left),
+        ] {
+            assert_eq!(mouse_navigation_plan(true, split, focus, pressed), Ignore);
+        }
+    }
 
     #[test]
     fn mouse_back_and_forward_buttons_walk_the_history() {

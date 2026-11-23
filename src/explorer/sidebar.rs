@@ -34,7 +34,7 @@ use super::actions::MenuOn;
 use super::devices::{actions_for, caption, unlisted_volumes};
 use super::dnd::{self, DropTarget};
 use super::entries;
-use super::favorites::{favorite_row_id, favorite_row_index};
+use super::favorites::{favorite_flag_at_start, favorite_row_id};
 use super::icon;
 use super::ops::{MenuCommand, MenuItemSpec, MenuRow};
 use super::state::Transition;
@@ -963,14 +963,15 @@ fn row_shell(
                     let row = row.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                            this.place_press = Some((dnd::point_of(event.position), press.clone()));
+                            this.place_press
+                                .press(dnd::point_of(event.position), press.clone());
                             dnd::press_gate(event.position, cx);
                         }),
                     );
                     dnd::place_drag_source(
                         row,
                         path.to_path_buf(),
-                        favorite_row_index(&id).is_some(),
+                        favorite_flag_at_start(&id),
                         &cx.entity().downgrade(),
                     )
                 }
