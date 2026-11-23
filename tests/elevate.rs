@@ -710,3 +710,45 @@ fn with_the_helper_change_owner_runs_the_helper_and_still_re_reads_afterwards() 
     );
     Ok(())
 }
+
+#[test]
+fn a_channel_build_finds_its_own_helper_under_libexec_of_its_channel() {
+    let canon = |dir: &Path| Ok(dir.to_path_buf());
+    let own = PathBuf::from("/store/ff-nightly/libexec/nightly").join(HELPER_NAME);
+    // The launcher and the Nix wrapped executable both name the channel.
+    for exe in [
+        "/store/ff-nightly/bin/fileflux-nightly",
+        "/store/ff-nightly/bin/.fileflux-nightly-wrapped",
+    ] {
+        let asked = RefCell::new(Vec::new());
+        let found = helper_beside(Path::new(exe), canon, |path| {
+            asked.borrow_mut().push(path.to_path_buf());
+            path == own
+        });
+        assert_eq!(found, Some(own.clone()), "{exe}");
+        // Never the helper of the source package next to it.
+        assert_eq!(*asked.borrow(), vec![own.clone()], "{exe}");
+    }
+    // Missing there: none, even with a helper in bin/.
+    let found = helper_beside(
+        Path::new("/store/ff-nightly/bin/fileflux-nightly"),
+        canon,
+        |p| p == Path::new("/store/ff-nightly/bin").join(HELPER_NAME),
+    );
+    assert_eq!(found, None);
+}
+
+#[test]
+fn a_channel_that_could_climb_out_of_libexec_is_not_a_channel() {
+    let canon = |dir: &Path| Ok(dir.to_path_buf());
+    let asked = RefCell::new(Vec::new());
+    let found = helper_beside(Path::new("/x/bin/fileflux-.."), canon, |path| {
+        asked.borrow_mut().push(path.to_path_buf());
+        false
+    });
+    assert_eq!(found, None);
+    assert_eq!(
+        *asked.borrow(),
+        vec![PathBuf::from("/x/bin").join(HELPER_NAME)]
+    );
+}

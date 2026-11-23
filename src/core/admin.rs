@@ -81,6 +81,34 @@ pub fn launcher_of(exe: &Path) -> PathBuf {
     }
 }
 
+/// The release channel a launcher belongs to, from its file name: `fileflux`
+/// is the source package (no channel) and `fileflux-<channel>` (for example
+/// `fileflux-nightly`, also as the Nix `.fileflux-nightly-wrapped`) is that
+/// channel's binary package. A channel is letters and digits only, so it can
+/// never name another directory.
+#[must_use]
+pub fn channel_of(exe: &Path) -> Option<String> {
+    let launcher = launcher_of(exe);
+    let channel = launcher
+        .file_name()?
+        .to_str()?
+        .strip_prefix("fileflux-")?
+        .to_owned();
+    (!channel.is_empty() && channel.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some(channel)
+}
+
+/// The policy file `launcher`'s package installs: `POLICY_FILE` for the
+/// source package, `dev.fileflux.open-as-admin-<channel>.policy` for a
+/// channel's (the action id carries the same suffix).
+#[must_use]
+pub fn policy_file_of(launcher: &Path) -> String {
+    match channel_of(launcher) {
+        Some(channel) => format!("dev.fileflux.open-as-admin-{channel}.policy"),
+        None => POLICY_FILE.to_owned(),
+    }
+}
+
 /// Whether the policy text names `launcher` as the executable and allows
 /// the GUI environment through.
 #[must_use]
@@ -99,10 +127,10 @@ pub fn policy_allows(policy: &str, launcher: &Path) -> bool {
 /// actions from. A copy inside the package (`nix run`, a profile, a
 /// home-manager link) is never seen by polkit, so it must not count: the
 /// generic action would apply and strip `DISPLAY` and `XAUTHORITY`. The
-/// launcher is not consulted; it is the policy's `exec.path` that has to
-/// match it.
+/// launcher only picks the file name (see [`policy_file_of`]); it is the
+/// policy's `exec.path` that has to match it.
 #[must_use]
-pub fn policy_candidates(_launcher: &Path) -> Vec<PathBuf> {
+pub fn policy_candidates(launcher: &Path) -> Vec<PathBuf> {
     [
         "/etc/polkit-1/actions",
         "/usr/local/share/polkit-1/actions",
@@ -110,7 +138,7 @@ pub fn policy_candidates(_launcher: &Path) -> Vec<PathBuf> {
         "/run/current-system/sw/share/polkit-1/actions",
     ]
     .iter()
-    .map(|dir| Path::new(dir).join(POLICY_FILE))
+    .map(|dir| Path::new(dir).join(policy_file_of(launcher)))
     .collect()
 }
 

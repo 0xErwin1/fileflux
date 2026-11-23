@@ -8,7 +8,9 @@
 
   The exec.path annotation must be the absolute path of the installed
   fileflux launcher; the default is for a distribution package and the Nix
-  package replaces it with its store path at build time. exec.allow_gui
+  package replaces it with its store path at build time. A release channel's
+  package (the Nix nightly) suffixes the file name and the action id with
+  -<channel> (fileflux-nightly looks for ...open-as-admin-nightly.policy). exec.allow_gui
   lets pkexec keep DISPLAY and XAUTHORITY so the window can open. Without
   this file Fileflux still works through `pkexec env DISPLAY=... `, with
   polkit's generic prompt.

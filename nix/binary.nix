@@ -55,6 +55,17 @@ let
   isNightly = lib.hasInfix "nightly" releaseInfo.version;
   appId = if isNightly then "fileflux-nightly" else "fileflux";
   appName = if isNightly then "Fileflux Nightly" else "Fileflux";
+
+  # The channel suffix of everything that would otherwise be the source
+  # package's: the helper's directory, the policy files and the action ids.
+  # Fileflux derives the same channel from the launcher's file name
+  # (`fileflux-nightly` -> `nightly`, see `channel_of` in src/core/admin.rs)
+  # to find its helper (`../libexec/<channel>/`) and its policy file. A
+  # non-nightly info file keeps the unsuffixed names, as it already owns
+  # `bin/fileflux`.
+  channel = if isNightly then "nightly" else null;
+  helperDir = if channel == null then "bin" else "libexec/${channel}";
+  idSuffix = if channel == null then "" else "-${channel}";
 in
 stdenv.mkDerivation {
   pname = appId;
@@ -105,7 +116,11 @@ stdenv.mkDerivation {
 
   # Tarball layout, from .github/workflows/nightly.yml:
   #   bin/fileflux
-  #   bin/fileflux-owner-helper (optional)
+  #   bin/fileflux-owner-helper (optional; installed as
+  #     libexec/<channel>/fileflux-owner-helper for a channel)
+  #   packaging/dev.fileflux.{owner-helper,open-as-admin}.policy (for distro
+  #     packagers; this derivation substitutes the copies in the repository
+  #     checkout it was evaluated from, so older tarballs still install)
   #   share/applications/fileflux.desktop
   #   share/icons/hicolor/{scalable,16x16,...,256x256}/apps/fileflux.{svg,png}
   #   LICENSE
@@ -136,20 +151,29 @@ stdenv.mkDerivation {
 
     # The root owner helper and its polkit action, when the tarball has the
     # helper (older nightlies do not; Fileflux then falls back to
-    # `pkexec chown`). It sits next to the real executable, which is where
-    # Fileflux looks for it, and the action names its store path.
+    # `pkexec chown`). A channel package keeps it under
+    # libexec/<channel>/, which is where Fileflux looks for it, so it never
+    # shares `bin/fileflux-owner-helper` or a policy file with the source
+    # package; the action id carries the channel and its exec.path names
+    # the store path.
     if [ -e bin/fileflux-owner-helper ]; then
-      install -Dm755 bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
+      install -Dm755 bin/fileflux-owner-helper \
+        $out/${helperDir}/fileflux-owner-helper
       mkdir -p $out/share/polkit-1/actions
       substitute ${../packaging/dev.fileflux.owner-helper.policy} \
-        $out/share/polkit-1/actions/dev.fileflux.owner-helper.policy \
-        --replace-fail /usr/bin/fileflux-owner-helper $out/bin/fileflux-owner-helper
+        $out/share/polkit-1/actions/dev.fileflux.owner-helper${idSuffix}.policy \
+        --replace-fail 'id="dev.fileflux.change-owner"' \
+                       'id="dev.fileflux.change-owner${idSuffix}"' \
+        --replace-fail /usr/bin/fileflux-owner-helper \
+                       $out/${helperDir}/fileflux-owner-helper
     fi
 
     # The "Open as Administrator" polkit action names the installed launcher.
     mkdir -p $out/share/polkit-1/actions
     substitute ${../packaging/dev.fileflux.open-as-admin.policy} \
-      $out/share/polkit-1/actions/dev.fileflux.open-as-admin.policy \
+      $out/share/polkit-1/actions/dev.fileflux.open-as-admin${idSuffix}.policy \
+      --replace-fail 'id="dev.fileflux.open-as-admin"' \
+                     'id="dev.fileflux.open-as-admin${idSuffix}"' \
       --replace-fail /usr/bin/fileflux $out/bin/${appId}
 
     install -Dm644 LICENSE $out/share/licenses/${appId}/LICENSE

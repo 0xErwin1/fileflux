@@ -174,6 +174,36 @@ fn the_policy_counts_only_when_it_names_this_launcher_and_allows_the_gui() {
 }
 
 #[test]
+fn a_channel_launcher_looks_for_its_own_policy_file() {
+    let found = policy_candidates(Path::new("/nix/store/x/bin/fileflux-nightly"));
+    assert!(!found.is_empty());
+    for candidate in &found {
+        assert_eq!(
+            candidate.file_name().and_then(|name| name.to_str()),
+            Some("dev.fileflux.open-as-admin-nightly.policy"),
+            "{candidate:?}"
+        );
+    }
+    // The wrapped Nix name and a name that is no channel.
+    assert_eq!(
+        policy_candidates(Path::new("/x/bin/.fileflux-nightly-wrapped")),
+        found
+    );
+    for plain in ["/x/bin/fileflux", "/x/bin/other", "/x/bin/fileflux-.."] {
+        let files: Vec<_> = policy_candidates(Path::new(plain))
+            .iter()
+            .filter_map(|c| c.file_name().map(ToOwned::to_owned))
+            .collect();
+        assert!(
+            files
+                .iter()
+                .all(|f| f == "dev.fileflux.open-as-admin.policy"),
+            "{plain}: {files:?}"
+        );
+    }
+}
+
+#[test]
 fn the_policy_is_looked_for_only_where_polkitd_reads_actions() {
     let found = policy_candidates(Path::new("/nix/store/x/bin/fileflux"));
     assert!(

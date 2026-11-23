@@ -15,7 +15,6 @@ Undo, the dual pane, the Run / Run in Terminal / Open prompt for programs, type/
 
 | Item | What is missing | Today |
 |---|---|---|
-| Owner helper in the prebuilt release | The nightly tarball (`.github/workflows/nightly.yml`) packages only `bin/fileflux`: it must also ship `bin/fileflux-owner-helper`, `packaging/dev.fileflux.owner-helper.policy` and `packaging/dev.fileflux.open-as-admin.policy` (without the latter, Open as Administrator falls back to `pkexec env DISPLAY=… XAUTHORITY=…`). Distribution packages must install the helper next to `fileflux` and the policy into `share/polkit-1/actions` with the helper's installed path. Before the nightly ships it, `nix/binary.nix` must keep the source and nightly packages installable together: install the helper under `libexec/` per channel and give the policy file and action id a channel suffix, or both packages provide the same `bin/fileflux-owner-helper` and policy. An install outside the Nix store or a root-owned prefix (for example `cargo install`) uses a helper the user can replace: Fileflux could refuse a helper not owned by root or writable by others, at the cost of single-user Nix, whose store the user owns | The Nix source build installs the helper and the policy; without the helper Fileflux falls back to `pkexec chown --no-dereference --from=+<uid of the shown owner>`, which re-checks the file before and after but cannot stop a parent folder swapped for a link during the authentication dialog |
 
 ## Priority 2: expected file manager features
 
@@ -26,6 +25,7 @@ Undo, the dual pane, the Run / Run in Terminal / Open prompt for programs, type/
 
 | Item | What is missing | Today |
 |---|---|---|
+| Owner helper outside Nix | An install outside the Nix store or a root-owned prefix (for example `cargo install`) uses a helper the user can replace: Fileflux could refuse a helper not owned by root or writable by others, at the cost of single-user Nix, whose store the user owns | The helper is used wherever it is found beside the launcher (or under `libexec/<channel>/`) |
 | Tabs | Drag a tab to another window (the file explorer has one window; this needs more than one) | Tabs reorder within the window and move between the two panes |
 | Translations | A translated interface | English only |
 

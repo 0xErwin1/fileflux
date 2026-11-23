@@ -1,6 +1,7 @@
 //! Changing an owner needs root, so Fileflux asks polkit for it and polkit
 //! shows its own authentication dialog. When `fileflux-owner-helper` is
-//! installed next to the executable it runs
+//! installed for this package (next to the executable, or under
+//! `libexec/<channel>/` for a channel package) it runs
 //! `pkexec <helper> <path> <dev> <ino> <birth> <owner> <uid>`: the helper
 //! opens the path without following any symbolic link, compares the
 //! snapshot with that open file and changes the owner on it (see
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
+use super::admin::channel_of;
 use super::owner_helper::{Born, Exit, HELPER_NAME, Request, Snapshot};
 
 /// Where `pkexec` may be: NixOS's setuid wrapper first (the store copy is
@@ -87,16 +89,25 @@ impl fmt::Display for RelativePath {
 
 impl std::error::Error for RelativePath {}
 
-/// The helper installed in the same directory as the running executable
-/// (`exe`), if any: the directory is canonicalized and nothing else is
-/// searched, never `PATH`.
+/// The helper of the running executable (`exe`), if any: the directory is
+/// canonicalized and nothing else is searched, never `PATH`. The source
+/// package's helper is in the same directory; a channel's package (see
+/// [`channel_of`]) keeps its own in `../libexec/<channel>/`, so two packages
+/// in one profile never share a helper.
 pub fn helper_beside(
     exe: &Path,
     canonicalize: impl Fn(&Path) -> io::Result<PathBuf>,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     let dir = canonicalize(exe.parent()?).ok()?;
-    let helper = dir.join(HELPER_NAME);
+    let helper = match channel_of(exe) {
+        Some(channel) => dir
+            .parent()?
+            .join("libexec")
+            .join(channel)
+            .join(HELPER_NAME),
+        None => dir.join(HELPER_NAME),
+    };
     exists(&helper).then_some(helper)
 }
 
@@ -106,7 +117,7 @@ pub struct Elevation {
     pub pkexec: PathBuf,
     /// The fallback when there is no helper.
     pub chown: PathBuf,
-    /// `fileflux-owner-helper`, when it is installed next to the executable.
+    /// `fileflux-owner-helper`, when this package installed it (see [`helper_beside`]).
     pub helper: Option<PathBuf>,
 }
 

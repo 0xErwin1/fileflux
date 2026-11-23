@@ -8,7 +8,10 @@
 
   The exec.path annotation must be the absolute path of the installed helper.
   /usr/bin is the default for a distribution package; the Nix package
-  replaces it with its store path at build time.
+  replaces it with its store path at build time. A release channel's
+  package (the Nix nightly) installs the helper under libexec/<channel>/ and
+  gives this file and the action id a -<channel> suffix, so it can sit next
+  to the source package.
 -->
 <policyconfig>
   <vendor>Fileflux</vendor>
