@@ -138,6 +138,8 @@ pub struct UsageTree {
     root: PathBuf,
     nodes: Vec<Node>,
     estimate: bool,
+    /// The measured bytes of everything [`Self::remove`] took out.
+    removed_bytes: u64,
     /// What an id outside `nodes` reads as.
     missing: Node,
 }
@@ -187,6 +189,13 @@ impl UsageTree {
     #[must_use]
     pub fn is_estimate(&self) -> bool {
         self.estimate
+    }
+
+    /// The measured bytes of what was removed since the analysis: the
+    /// estimate of the space a cleanup freed (see [`Self::remove`]).
+    #[must_use]
+    pub fn removed_bytes(&self) -> u64 {
+        self.removed_bytes
     }
 
     #[must_use]
@@ -354,6 +363,7 @@ impl UsageTree {
             at = node.parent;
         }
         self.estimate = true;
+        self.removed_bytes = self.removed_bytes.saturating_add(removed.bytes);
         Some(removed)
     }
 }
@@ -522,6 +532,7 @@ impl<'a> Walk<'a> {
             root: self.root.to_path_buf(),
             nodes: self.nodes,
             estimate: false,
+            removed_bytes: 0,
             missing: Node::new(OsString::new(), None, 0),
         }))
     }
@@ -1093,6 +1104,33 @@ pub(crate) mod tests {
         assert_eq!(tree.remove(Path::new("/elsewhere/x")), None);
         assert_eq!(tree.total(UsageTree::ROOT), before);
         assert!(!tree.is_estimate());
+        Ok(())
+    }
+
+    #[test]
+    fn the_tree_adds_up_what_was_removed_from_it() -> io::Result<()> {
+        let scratch = Scratch::new("removed-bytes")?;
+        sample(scratch.path())?;
+        let mut tree = run(scratch.path())?;
+        assert_eq!(tree.removed_bytes(), 0);
+        let deep = scratch.path().join("a/deep");
+        let one = scratch.path().join("a/one.bin");
+        let deep_bytes = tree
+            .remove(&deep)
+            .ok_or_else(|| io::Error::other("deep"))?
+            .bytes;
+        assert_eq!(tree.removed_bytes(), deep_bytes);
+        let one_bytes = tree
+            .remove(&one)
+            .ok_or_else(|| io::Error::other("one"))?
+            .bytes;
+        assert_eq!(tree.removed_bytes(), deep_bytes + one_bytes);
+        assert_eq!(tree.remove(&scratch.path().join("nope")), None);
+        assert_eq!(
+            tree.removed_bytes(),
+            deep_bytes + one_bytes,
+            "what the analysis does not hold adds nothing"
+        );
         Ok(())
     }
 }

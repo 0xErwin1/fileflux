@@ -635,3 +635,344 @@ fn the_filled_folder_glyph_is_the_designs_shape_scaled_into_its_box() {
         / 2.0;
     assert!(area > 0.3 * 24.0 * 24.0, "area {area}");
 }
+
+// --- free space after a cleanup ----------------------------------------------------
+
+#[test]
+fn the_free_space_note_compares_the_estimate_with_what_the_volume_reports() {
+    use fileflux::core::places::format_bytes as fmt;
+    let free = |baseline, now| VolumeFree { baseline, now };
+    assert_eq!(
+        free_space_note(2_000_000, &free(Some(10_000_000), None)),
+        ""
+    );
+    assert_eq!(
+        free_space_note(2_000_000, &free(Some(10_000_000), Some(12_000_000))),
+        format!(
+            " \u{b7} {} estimated, {} free on the volume ({} more since the analysis)",
+            fmt(2_000_000),
+            fmt(12_000_000),
+            fmt(2_000_000)
+        )
+    );
+    assert_eq!(
+        free_space_note(2_000_000, &free(Some(10_000_000), Some(10_000_000))),
+        format!(
+            " \u{b7} {} estimated, {} free on the volume (no change since the analysis)",
+            fmt(2_000_000),
+            fmt(10_000_000)
+        )
+    );
+    assert_eq!(
+        free_space_note(2_000_000, &free(Some(10_000_000), Some(9_000_000))),
+        format!(
+            " \u{b7} {} estimated, {} free on the volume ({} less since the analysis)",
+            fmt(2_000_000),
+            fmt(9_000_000),
+            fmt(1_000_000)
+        )
+    );
+    assert_eq!(
+        free_space_note(2_000_000, &free(None, Some(9_000_000))),
+        format!(
+            " \u{b7} {} estimated, {} free on the volume",
+            fmt(2_000_000),
+            fmt(9_000_000)
+        )
+    );
+}
+
+#[test]
+fn the_status_line_after_a_cleanup_carries_the_free_space_comparison() -> io::Result<()> {
+    let scratch = Scratch::new("free-note")?;
+    sample(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    session.set_free_before(Some(5_000_000));
+    assert_eq!(
+        session.status_text(),
+        format!(
+            "{} in {} items",
+            fileflux::core::places::format_bytes(session.summary().map_or(0, |s| s.bytes)),
+            session.summary().map_or(0, |s| s.items)
+        ),
+        "no cleanup, no comparison"
+    );
+    let a_bytes = session.rows()[0].bytes;
+    session.removed(&[scratch.path().join("a")]);
+    assert!(
+        !session.status_text().contains("free on the volume"),
+        "no reading after the cleanup yet"
+    );
+    session.set_free_now(Some(6_000_000));
+    let text = session.status_text();
+    assert!(text.contains("(estimate after cleanup)"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "{} estimated, {} free on the volume ({} more since the analysis)",
+            fileflux::core::places::format_bytes(a_bytes),
+            fileflux::core::places::format_bytes(6_000_000),
+            fileflux::core::places::format_bytes(1_000_000),
+        )),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_reading_for_a_replaced_analysis_is_ignored() -> io::Result<()> {
+    let scratch = Scratch::new("free-stale")?;
+    sample(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    let ticket = session.next_free_ticket();
+    let newer = session.next_free_ticket();
+    assert!(!session.accept_free(ticket, FreeReading::Now(Some(1))));
+    assert_eq!(session.free.now, None);
+    assert!(session.accept_free(newer, FreeReading::Now(Some(7))));
+    assert_eq!(session.free.now, Some(7));
+    assert!(session.accept_free(newer, FreeReading::Before(Some(3))));
+    assert_eq!(session.free.baseline, Some(3));
+    Ok(())
+}
+
+// --- network and gvfs mounts -------------------------------------------------------
+
+#[test]
+fn a_gvfs_folder_is_asked_about_before_it_is_measured() {
+    let root = Path::new("/run/user/1000/gvfs");
+    let phone = root.join("mtp:host=P/DCIM");
+    assert!(needs_confirmation(&phone, Some(root), None));
+    assert!(
+        !needs_confirmation(&phone, Some(root), Some(&phone)),
+        "the confirmation is for that folder"
+    );
+    assert!(needs_confirmation(
+        &phone,
+        Some(root),
+        Some(Path::new("/home/u"))
+    ));
+    assert!(!needs_confirmation(Path::new("/home/u"), Some(root), None));
+    assert!(!needs_confirmation(&phone, None, None), "no gvfs, no gate");
+}
+
+#[test]
+fn a_session_that_asks_says_why_and_shows_no_numbers() {
+    let root = PathBuf::from("/run/user/1000/gvfs/mtp:host=P");
+    let session = UsageSession::asking(root.clone());
+    assert!(session.is_asking());
+    assert!(!session.is_walking());
+    assert!(session.tree().is_none());
+    assert!(session.rows().is_empty());
+    assert_eq!(session.summary(), None);
+    assert_eq!(session.analysis_root, root);
+    assert_eq!(
+        session.status_text(),
+        "Not measured: a network or phone mount can be slow and wake the device"
+    );
+}
+
+#[test]
+fn reaching_the_unconfirmed_folder_again_keeps_asking_and_a_finished_walk_is_reused()
+-> io::Result<()> {
+    let root = PathBuf::from("/run/user/1000/gvfs/mtp:host=P");
+    let asking = UsageSession::asking(root.clone());
+    assert_eq!(plan(Some(&asking), &root), Plan::Walk);
+    let scratch = Scratch::new("ask-plan")?;
+    sample(scratch.path())?;
+    let session = ready(scratch.path())?;
+    assert_eq!(plan(Some(&session), &scratch.path().join("a")), Plan::Reuse);
+    Ok(())
+}
+
+// --- the chart: ring zoom, keyboard, the Other slice --------------------------------
+
+fn thin_folder(root: &Path) -> io::Result<()> {
+    for index in 0..150 {
+        fs::write(root.join(format!("t{index:03}")), b"x")?;
+    }
+    fs::write(root.join("big"), vec![1u8; 4_000_000])?;
+    Ok(())
+}
+
+#[test]
+fn zooming_changes_the_number_of_rings_and_keeps_the_selection() -> io::Result<()> {
+    let scratch = Scratch::new("rings")?;
+    fs::create_dir_all(scratch.path().join("a/b/c/d"))?;
+    fs::write(scratch.path().join("a/b/c/d/f"), vec![1u8; 100_000])?;
+    let mut session = ready(scratch.path())?;
+    let depth = |session: &UsageSession| session.segments.iter().map(|s| s.depth).max();
+    assert_eq!(session.rings, usage_chart::RING_DEPTH);
+    assert_eq!(depth(&session), Some(3));
+    session.select(&scratch.path().join("a"));
+    assert!(session.zoom_rings(1));
+    assert_eq!(session.rings, usage_chart::RING_DEPTH + 1);
+    assert_eq!(depth(&session), Some(4));
+    assert_eq!(session.selected, Some(scratch.path().join("a")));
+    while session.zoom_rings(-1) {}
+    assert_eq!(session.rings, usage_chart::MIN_RINGS);
+    assert_eq!(depth(&session), Some(1));
+    assert!(!session.zoom_rings(-1), "already at the fewest");
+    while session.zoom_rings(1) {}
+    assert_eq!(session.rings, usage_chart::MAX_RINGS);
+    session.show(&scratch.path().join("a"));
+    assert_eq!(
+        session.rings,
+        usage_chart::MAX_RINGS,
+        "drilling keeps the zoom"
+    );
+    Ok(())
+}
+
+#[test]
+fn arrow_keys_move_the_cursor_and_the_selection_between_slices_and_rings() -> io::Result<()> {
+    let scratch = Scratch::new("keys")?;
+    sample(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    assert_eq!(session.cursor, None);
+    assert!(session.move_cursor(usage_chart::Move::Next));
+    assert_eq!(
+        session.selected,
+        Some(scratch.path().join("a")),
+        "the largest first"
+    );
+    assert!(session.cursor.is_some());
+    assert!(session.move_cursor(usage_chart::Move::Outward));
+    assert_eq!(session.selected, Some(scratch.path().join("a/one.bin")));
+    assert!(session.move_cursor(usage_chart::Move::Inward));
+    assert_eq!(session.selected, Some(scratch.path().join("a")));
+    assert!(session.move_cursor(usage_chart::Move::Next));
+    assert_eq!(session.selected, Some(scratch.path().join("b")));
+    assert!(!session.move_cursor(usage_chart::Move::Inward) || session.selected.is_some());
+    Ok(())
+}
+
+#[test]
+fn keys_do_nothing_without_a_finished_chart() {
+    let mut session = UsageSession::walking(PathBuf::from("/x"));
+    assert!(!session.move_cursor(usage_chart::Move::Next));
+    assert_eq!(session.cursor, None);
+    assert_eq!(session.selected, None);
+}
+
+#[test]
+fn the_cursor_follows_a_selection_made_elsewhere_and_a_relayout_keeps_it_on_the_item()
+-> io::Result<()> {
+    let scratch = Scratch::new("cursor-follow")?;
+    sample(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    session.select(&scratch.path().join("b"));
+    assert!(session.move_cursor(usage_chart::Move::Next));
+    assert_eq!(
+        session.selected,
+        Some(scratch.path().join("top.bin")),
+        "the step starts from the selected slice, not from the first"
+    );
+    session.zoom_rings(1);
+    let cursor = session
+        .cursor
+        .ok_or_else(|| io::Error::other("no cursor"))?;
+    assert_eq!(session.selected_segment(), Some(cursor));
+    Ok(())
+}
+
+#[test]
+fn selecting_the_other_slice_selects_the_folded_items_in_the_list() -> io::Result<()> {
+    let scratch = Scratch::new("other-select")?;
+    thin_folder(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    let other = session
+        .segments
+        .iter()
+        .position(|segment| matches!(segment.target, usage_chart::Target::Other { .. }))
+        .ok_or_else(|| io::Error::other("no fold"))?;
+    assert!(session.select_segment(other));
+    assert_eq!(session.selected, None, "no single item is selected");
+    assert_eq!(session.selected_segment(), Some(other));
+    let rows = session.rows();
+    let marked: Vec<&ShownRow> = rows.iter().filter(|row| session.is_marked(row)).collect();
+    assert_eq!(marked.len(), 150);
+    assert!(marked.iter().all(|row| row.name.starts_with('t')));
+    assert!(
+        rows.iter()
+            .any(|row| row.name == "big" && !session.is_marked(row))
+    );
+    // Selecting an ordinary item lets go of the fold.
+    session.select(&scratch.path().join("big"));
+    assert!(rows.iter().all(|row| !session.is_marked(row)));
+    assert_eq!(
+        session.selected_segment(),
+        session
+            .segments
+            .iter()
+            .position(|s| { matches!(s.target, usage_chart::Target::Item(_)) })
+    );
+    Ok(())
+}
+
+#[test]
+fn the_other_slice_of_a_nested_folder_opens_that_folder_in_the_list() -> io::Result<()> {
+    let scratch = Scratch::new("other-nested")?;
+    fs::create_dir_all(scratch.path().join("inner"))?;
+    thin_folder(&scratch.path().join("inner"))?;
+    fs::write(scratch.path().join("top"), vec![1u8; 4_000_000])?;
+    let mut session = ready(scratch.path())?;
+    let other = session
+        .segments
+        .iter()
+        .position(|segment| matches!(segment.target, usage_chart::Target::Other { .. }))
+        .ok_or_else(|| io::Error::other("no fold"))?;
+    assert!(session.select_segment(other));
+    assert!(session.expanded.contains(&scratch.path().join("inner")));
+    let rows = session.rows();
+    assert!(
+        rows.iter()
+            .filter(|row| session.is_marked(row))
+            .all(|row| row.depth == 1 && row.name.starts_with('t'))
+    );
+    assert_eq!(
+        rows.iter().filter(|row| session.is_marked(row)).count(),
+        150
+    );
+    Ok(())
+}
+
+#[test]
+fn enter_on_the_other_slice_drills_into_its_folder_only_when_it_is_nested() -> io::Result<()> {
+    let scratch = Scratch::new("other-enter")?;
+    thin_folder(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    let other = session
+        .segments
+        .iter()
+        .position(|segment| matches!(segment.target, usage_chart::Target::Other { .. }))
+        .ok_or_else(|| io::Error::other("no fold"))?;
+    session.select_segment(other);
+    assert_eq!(
+        session.other_activation(),
+        None,
+        "its folder is the one shown"
+    );
+    fs::create_dir_all(scratch.path().join("sub"))?;
+    thin_folder(&scratch.path().join("sub"))?;
+    let mut nested = ready(scratch.path())?;
+    let other = nested
+        .segments
+        .iter()
+        .position(|segment| {
+            matches!(segment.target, usage_chart::Target::Other { dir, .. } if dir != UsageTree::ROOT)
+        })
+        .ok_or_else(|| io::Error::other("no nested fold"))?;
+    nested.select_segment(other);
+    assert_eq!(nested.other_activation(), Some(scratch.path().join("sub")));
+    Ok(())
+}
+
+#[test]
+fn up_by_key_goes_to_the_parent_inside_the_analysis_only() -> io::Result<()> {
+    let scratch = Scratch::new("key-up")?;
+    sample(scratch.path())?;
+    let mut session = ready(scratch.path())?;
+    assert_eq!(session.up_target(), None);
+    session.show(&scratch.path().join("a"));
+    assert_eq!(session.up_target(), Some(scratch.path().to_path_buf()));
+    Ok(())
+}

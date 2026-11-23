@@ -17,14 +17,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fileflux::core::Location;
-use fileflux::core::places::format_bytes;
+use fileflux::core::places::{format_bytes, gvfs_root_from_env, volume_usage};
 use fileflux::core::usage::{
     Item, Partial, PartialRow, Row, UsageEnd, UsageProgress, UsageTree, analyze,
 };
-use fileflux::core::usage_chart::{self, Segment};
-use gpui::{Context, Pixels, Point, Task, UniformListScrollHandle, Window};
+use fileflux::core::usage_chart::{self, Move, Segment, Target};
+use gpui::{Context, Pixels, Point, ScrollStrategy, Task, UniformListScrollHandle, Window};
 
 use super::actions::MenuOn;
+use super::inspector::du_auto_allowed;
 use super::menu_tree::Shown;
 use super::ops::{MenuCommand, MenuItemSpec, MenuRow};
 use super::state::Transition;
@@ -42,6 +43,11 @@ pub(crate) const ANALYZE_LABEL: &str = "Analyze Disk Usage";
 
 /// What the session holds of the walk.
 pub(crate) enum Phase {
+    /// Not started: the folder is on a network or phone mount, where a walk
+    /// is slow and may wake the device, so the user is asked first (the
+    /// same decision as the details panel's size, see
+    /// [`needs_confirmation`]).
+    Ask,
     /// Running: the per-child totals counted so far.
     Walking(Partial),
     /// Stopped by the user: what was counted before it stopped.
@@ -58,6 +64,24 @@ pub(crate) struct ChartHover {
     pub(crate) segment: usize,
     /// The pointer, relative to the chart's top left corner.
     pub(crate) at: Point<Pixels>,
+}
+
+/// What the volume holding the analysis root reported as free (`statvfs`,
+/// the sidebar meter's source), at the end of the analysis and after the
+/// last cleanup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VolumeFree {
+    pub(crate) baseline: Option<u64>,
+    pub(crate) now: Option<u64>,
+}
+
+/// A reading of the volume's free space, from the background executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FreeReading {
+    /// At the end of the analysis.
+    Before(Option<u64>),
+    /// After a cleanup.
+    Now(Option<u64>),
 }
 
 /// One analysis and the view's state on it.
@@ -78,6 +102,20 @@ pub(crate) struct UsageSession {
     pub(crate) hover: Option<ChartHover>,
     /// The chart's segments for the shown folder (empty until finished).
     pub(crate) segments: Arc<Vec<Segment>>,
+    /// How many rings the chart draws (see [`usage_chart::zoom_rings`]).
+    pub(crate) rings: u32,
+    /// The slice the keyboard is on, an index into `segments`: drawn with a
+    /// focus outline.
+    pub(crate) cursor: Option<usize>,
+    /// The folder whose folded "Other" slice is selected, instead of an item.
+    pub(crate) other: Option<fileflux::core::usage::NodeId>,
+    /// The list rows the selected "Other" slice stands for, as a path and
+    /// whether the row is a folder's bucket of other files.
+    pub(crate) marked: BTreeSet<(PathBuf, bool)>,
+    pub(crate) free: VolumeFree,
+    /// Which free-space reading is the awaited one; an older reading is
+    /// dropped when it arrives.
+    free_ticket: u64,
     pub(crate) list_scroll: UniformListScrollHandle,
 }
 
@@ -164,8 +202,54 @@ impl UsageSession {
             stale: false,
             hover: None,
             segments: Arc::new(Vec::new()),
+            rings: usage_chart::RING_DEPTH,
+            cursor: None,
+            other: None,
+            marked: BTreeSet::new(),
+            free: VolumeFree::default(),
+            free_ticket: 0,
             list_scroll: UniformListScrollHandle::new(),
         }
+    }
+
+    /// A session that waits for the user's go-ahead before walking `root`.
+    pub(crate) fn asking(root: PathBuf) -> Self {
+        Self {
+            phase: Phase::Ask,
+            ..Self::walking(root)
+        }
+    }
+
+    pub(crate) fn is_asking(&self) -> bool {
+        matches!(self.phase, Phase::Ask)
+    }
+
+    /// Takes the next free-space reading's ticket: any reading asked for
+    /// before it is out of date.
+    pub(crate) fn next_free_ticket(&mut self) -> u64 {
+        self.free_ticket += 1;
+        self.free_ticket
+    }
+
+    /// Stores a reading made for `ticket`; `false` (and nothing stored) when
+    /// a newer one was asked for since.
+    pub(crate) fn accept_free(&mut self, ticket: u64, reading: FreeReading) -> bool {
+        if ticket != self.free_ticket {
+            return false;
+        }
+        match reading {
+            FreeReading::Before(free) => self.set_free_before(free),
+            FreeReading::Now(free) => self.set_free_now(free),
+        }
+        true
+    }
+
+    pub(crate) fn set_free_before(&mut self, free: Option<u64>) {
+        self.free.baseline = free;
+    }
+
+    pub(crate) fn set_free_now(&mut self, free: Option<u64>) {
+        self.free.now = free;
     }
 
     /// The streamed totals of the running walk.
@@ -213,6 +297,7 @@ impl UsageSession {
     pub(crate) fn show(&mut self, folder: &Path) {
         self.shown = folder.to_path_buf();
         self.selected = None;
+        self.drop_other();
         self.expanded.clear();
         self.hover = None;
         self.refresh_chart();
@@ -220,6 +305,114 @@ impl UsageSession {
 
     pub(crate) fn select(&mut self, path: &Path) {
         self.selected = Some(path.to_path_buf());
+        self.cursor = None;
+        self.drop_other();
+    }
+
+    fn drop_other(&mut self) {
+        self.other = None;
+        self.marked.clear();
+    }
+
+    /// Selects what the slice `index` stands for, shared with the list: an
+    /// item is the selection; the "Other" slice marks the folded items in
+    /// the list (opening their folder there). The keyboard cursor moves to
+    /// it. `false` for a slice that stands for neither (a streamed row).
+    pub(crate) fn select_segment(&mut self, index: usize) -> bool {
+        let Some(target) = self.segments.get(index).map(|segment| segment.target) else {
+            return false;
+        };
+        match target {
+            Target::Item(item) => {
+                let Some(tree) = self.tree() else {
+                    return false;
+                };
+                let path = item_path(tree, item);
+                self.select(&path);
+            }
+            Target::Other { dir, count, .. } => self.select_other(dir, count),
+            Target::Row(_) => return false,
+        }
+        self.cursor = Some(index);
+        true
+    }
+
+    fn select_other(&mut self, dir: fileflux::core::usage::NodeId, count: u64) {
+        let Some(tree) = self.tree() else {
+            return;
+        };
+        let folder = tree.path_of(dir);
+        let marked: BTreeSet<(PathBuf, bool)> = usage_chart::folded_items(tree, dir, count)
+            .into_iter()
+            .map(|item| (item_path(tree, item), matches!(item, Item::OtherFiles(_))))
+            .collect();
+        // The folded items are rows of their folder: it and every folder
+        // between it and the shown one open, so the rows are in the list.
+        let opened: Vec<PathBuf> = folder
+            .ancestors()
+            .take_while(|path| *path != self.shown && path.starts_with(&self.shown))
+            .map(Path::to_path_buf)
+            .collect();
+        self.selected = None;
+        self.other = Some(dir);
+        self.marked = marked;
+        self.expanded.extend(opened);
+    }
+
+    /// Whether the row is one of the items the selected "Other" slice folds.
+    pub(crate) fn is_marked(&self, row: &ShownRow) -> bool {
+        !self.marked.is_empty()
+            && self
+                .marked
+                .contains(&(row.path.clone(), row.kind == ShownKind::Other))
+    }
+
+    /// Where Enter goes on the selected "Other" slice: into its folder,
+    /// unless that is the one shown.
+    pub(crate) fn other_activation(&self) -> Option<PathBuf> {
+        let tree = self.tree()?;
+        let folder = tree.path_of(self.other?);
+        (folder != self.shown).then_some(folder)
+    }
+
+    /// A key moved the chart cursor: selects the slice it reaches. `false`
+    /// when there is nothing to move on or nowhere to go.
+    pub(crate) fn move_cursor(&mut self, movement: Move) -> bool {
+        if self.tree().is_none() {
+            return false;
+        }
+        let from = self
+            .cursor
+            .filter(|index| *index < self.segments.len())
+            .or_else(|| self.selected_segment());
+        match usage_chart::step(&self.segments, from, movement) {
+            Some(index) => self.select_segment(index),
+            None => false,
+        }
+    }
+
+    /// Scrolls the list to the first row of the selection (the selected item
+    /// or the items the "Other" slice folds).
+    pub(crate) fn reveal_selection(&self) {
+        let rows = self.rows();
+        let first = rows
+            .iter()
+            .position(|row| self.selected.as_ref() == Some(&row.path) || self.is_marked(row));
+        if let Some(index) = first {
+            self.list_scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+    }
+
+    /// Zooms the chart by `delta` rings; `false` when it stays as it is.
+    pub(crate) fn zoom_rings(&mut self, delta: i32) -> bool {
+        let rings = usage_chart::zoom_rings(self.rings, delta);
+        if rings == self.rings {
+            return false;
+        }
+        self.rings = rings;
+        self.refresh_chart();
+        true
     }
 
     /// Opens or closes a folder row of the list.
@@ -242,10 +435,12 @@ impl UsageSession {
     pub(crate) fn refresh_chart(&mut self) {
         self.hover = None;
         let segments = match (self.tree(), self.shown_id()) {
-            (Some(tree), Some(id)) => usage_chart::layout(tree, id, usage_chart::RING_DEPTH),
+            (Some(tree), Some(id)) => usage_chart::layout(tree, id, self.rings),
             _ => Vec::new(),
         };
         self.segments = Arc::new(segments);
+        // The cursor stays on what is selected, wherever it now is drawn.
+        self.cursor = self.selected_segment();
     }
 
     /// The totals of the shown folder.
@@ -264,7 +459,7 @@ impl UsageSession {
                 items: partial.items,
                 incomplete: partial.incomplete,
             }),
-            Phase::Failed(_) => None,
+            Phase::Ask | Phase::Failed(_) => None,
         }
     }
 
@@ -279,6 +474,7 @@ impl UsageSession {
         };
         match (&self.phase, self.summary()) {
             (Phase::Failed(message), _) => format!("Could not analyze: {message}"),
+            (Phase::Ask, _) => ASK_NOTICE.to_owned(),
             (Phase::Walking(_), Some(summary)) => {
                 format!("Measuring\u{2026} {} so far", counted(&summary))
             }
@@ -289,6 +485,9 @@ impl UsageSession {
                 let mut text = counted(&summary);
                 if self.is_estimate() {
                     text.push_str(" (estimate after cleanup)");
+                    if let Some(tree) = self.tree() {
+                        text.push_str(&free_space_note(tree.removed_bytes(), &self.free));
+                    }
                 }
                 if summary.incomplete {
                     text.push_str(" \u{b7} some folders could not be read");
@@ -355,7 +554,7 @@ impl UsageSession {
                 }
                 rows
             }
-            Phase::Failed(_) => Vec::new(),
+            Phase::Ask | Phase::Failed(_) => Vec::new(),
         }
     }
 
@@ -420,6 +619,7 @@ impl UsageSession {
             }
             self.expanded
                 .retain(|open| !paths.iter().any(|path| open.starts_with(path)));
+            self.drop_other();
             self.refresh_chart();
         }
         subtracted
@@ -428,12 +628,12 @@ impl UsageSession {
     /// The segment of the chart that stands for the selected item.
     pub(crate) fn selected_segment(&self) -> Option<usize> {
         let tree = self.tree()?;
-        let selected = self.selected.as_ref()?;
         self.segments
             .iter()
-            .position(|segment| match segment.target {
-                usage_chart::Target::Item(item) => item_path(tree, item) == *selected,
-                usage_chart::Target::Other { .. } | usage_chart::Target::Row(_) => false,
+            .position(|segment| match (segment.target, &self.selected) {
+                (Target::Item(item), Some(selected)) => item_path(tree, item) == *selected,
+                (Target::Other { dir, .. }, None) => self.other == Some(dir),
+                _ => false,
             })
     }
 }
@@ -449,6 +649,43 @@ pub(crate) fn item_path(tree: &UsageTree, item: Item) -> PathBuf {
             .map(|(candidate, bytes)| tree.row(candidate, bytes, 0).path)
             .unwrap_or_default(),
     }
+}
+
+/// What the list says in place of numbers while the user is asked.
+const ASK_NOTICE: &str = "Not measured: a network or phone mount can be slow and wake the device";
+
+/// Whether measuring `path` waits for the user's go-ahead: the details
+/// panel's decision for its size (see [`du_auto_allowed`]), so both ask on
+/// the same folders. `confirmed` is the folder the user said to go on with.
+pub(crate) fn needs_confirmation(
+    path: &Path,
+    gvfs_root: Option<&Path>,
+    confirmed: Option<&Path>,
+) -> bool {
+    !du_auto_allowed(path, gvfs_root, confirmed)
+}
+
+/// The tail of the status line after a cleanup: the estimated freed bytes
+/// against what the volume reports free now (and the change since the
+/// analysis). Empty until the volume has answered.
+pub(crate) fn free_space_note(freed: u64, free: &VolumeFree) -> String {
+    let Some(now) = free.now else {
+        return String::new();
+    };
+    let mut note = format!(
+        " \u{b7} {} estimated, {} free on the volume",
+        format_bytes(freed),
+        format_bytes(now)
+    );
+    if let Some(before) = free.baseline {
+        let change = match now.cmp(&before) {
+            std::cmp::Ordering::Greater => format!("{} more", format_bytes(now - before)),
+            std::cmp::Ordering::Equal => "no change".to_owned(),
+            std::cmp::Ordering::Less => format!("{} less", format_bytes(before - now)),
+        };
+        note.push_str(&format!(" ({change} since the analysis)"));
+    }
+    note
 }
 
 fn items_label(count: u64) -> String {
@@ -675,9 +912,73 @@ impl Explorer {
                     session.show(&root);
                 }
             }
-            Plan::Walk => self.start_usage(id, root, cx),
+            Plan::Walk => {
+                let gvfs = gvfs_root_from_env();
+                if needs_confirmation(&root, gvfs.as_deref(), tab.usage_confirmed.as_deref()) {
+                    tab.usage = Some(UsageSession::asking(root));
+                    tab.usage_run = None;
+                } else {
+                    self.start_usage(id, root, cx);
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// "Measure anyway" on a network or phone mount: remembers the go-ahead
+    /// for that folder and starts the walk.
+    pub(crate) fn confirm_usage(&mut self, cx: &mut Context<Self>) {
+        let id = self.active_id();
+        let Some(root) = self
+            .usage()
+            .filter(|session| session.is_asking())
+            .map(|session| session.analysis_root.clone())
+        else {
+            return;
+        };
+        self.tab_mut().usage_confirmed = Some(root.clone());
+        self.start_usage(id, root, cx);
+        cx.notify();
+    }
+
+    /// Reads the free space of the volume holding tab `id`'s analysis root
+    /// off the UI thread, the way the sidebar meter does (`statvfs`), and
+    /// stores it (`after_cleanup` tells which reading it is). A gvfs mount
+    /// is not read: its `statvfs` can hang on a sleeping device.
+    fn read_volume_free(&mut self, id: TabId, after_cleanup: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.tabs.by_id_mut(id).and_then(|tab| tab.usage.as_mut()) else {
+            return;
+        };
+        let root = session.analysis_root.clone();
+        let gvfs = gvfs_root_from_env();
+        if needs_confirmation(&root, gvfs.as_deref(), None) {
+            return;
+        }
+        let ticket = session.next_free_ticket();
+        let read = cx
+            .background_executor()
+            .spawn(async move { volume_usage(&root).map(|usage| usage.free) });
+        cx.spawn(async move |this, cx| {
+            let free = read.await;
+            let reading = if after_cleanup {
+                FreeReading::Now(free)
+            } else {
+                FreeReading::Before(free)
+            };
+            if let Err(error) = this.update(cx, |this, cx| {
+                let stored = this
+                    .tabs
+                    .by_id_mut(id)
+                    .and_then(|tab| tab.usage.as_mut())
+                    .is_some_and(|session| session.accept_free(ticket, reading));
+                if stored {
+                    cx.notify();
+                }
+            }) {
+                log::debug!("the explorer closed before the free space was read: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Measures `root` for tab `id` off the UI thread, streaming the totals.
@@ -729,7 +1030,10 @@ impl Explorer {
                     return;
                 };
                 match result {
-                    Ok(UsageEnd::Done(tree)) => session.finish(tree),
+                    Ok(UsageEnd::Done(tree)) => {
+                        session.finish(tree);
+                        this.read_volume_free(id, false, cx);
+                    }
                     Ok(UsageEnd::Cancelled) => {
                         session.progress(last);
                         session.stop();
@@ -767,7 +1071,11 @@ impl Explorer {
     /// "Analyze again": measures the analysis root afresh.
     pub(crate) fn reanalyze_usage(&mut self, cx: &mut Context<Self>) {
         let id = self.active_id();
-        let Some(root) = self.usage().map(|session| session.analysis_root.clone()) else {
+        let Some(root) = self
+            .usage()
+            .filter(|session| !session.is_asking())
+            .map(|session| session.analysis_root.clone())
+        else {
             return;
         };
         self.start_usage(id, root, cx);
@@ -832,6 +1140,69 @@ impl Explorer {
         }
     }
 
+    /// An arrow key in the entries area while a usage view shows: moves the
+    /// chart cursor (see [`UsageSession::move_cursor`]) and shows the
+    /// selection in the list. `true` when a usage view has the key, whether
+    /// or not the cursor could move.
+    pub(crate) fn usage_key(&mut self, movement: Move, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.tab_mut().usage.as_mut() else {
+            return false;
+        };
+        if session.move_cursor(movement) {
+            session.reveal_selection();
+            cx.notify();
+        }
+        true
+    }
+
+    /// A press on slice `index` of the chart: selects what it stands for.
+    pub(crate) fn usage_select_segment(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.entries_focus().focus(window, cx);
+        if let Some(session) = self.tab_mut().usage.as_mut()
+            && session.select_segment(index)
+        {
+            session.reveal_selection();
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+= / Ctrl+- or the wheel over the chart: more or fewer rings.
+    /// `true` when a usage view has the gesture.
+    pub(crate) fn usage_zoom(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.tab_mut().usage.as_mut() else {
+            return false;
+        };
+        if session.zoom_rings(delta) {
+            cx.notify();
+        }
+        true
+    }
+
+    /// Backspace in a usage view: Up, like the Up button. `true` when a
+    /// usage view has the key.
+    pub(crate) fn usage_backspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.usage().is_none() {
+            return false;
+        }
+        self.navigate(Transition::Up, window, cx);
+        true
+    }
+
+    /// Escape in a usage view that is drilled into a folder: up to its
+    /// parent. At the analysis root Escape keeps its usual meaning.
+    pub(crate) fn usage_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.usage().and_then(UsageSession::up_target).is_none() {
+            return false;
+        }
+        self.navigate(Transition::Up, window, cx);
+        true
+    }
+
     /// Enter in the entries area while a usage view shows; `true` when it
     /// was handled.
     pub(crate) fn usage_open_selected(
@@ -844,6 +1215,8 @@ impl Explorer {
         }
         if let Some(path) = self.usage_selected_path() {
             self.usage_activate(&path, window, cx);
+        } else if let Some(folder) = self.usage().and_then(UsageSession::other_activation) {
+            self.usage_drill(folder, window, cx);
         }
         true
     }
@@ -894,12 +1267,21 @@ impl Explorer {
     /// A job finished: the removed items leave the totals of every usage
     /// view (marked an estimate), and any other change under an analysis
     /// root marks it as possibly out of date.
-    pub(crate) fn usage_after_job(&mut self, removed: &[PathBuf], affected: Option<&Affected>) {
+    pub(crate) fn usage_after_job(
+        &mut self,
+        removed: &[PathBuf],
+        affected: Option<&Affected>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut cleaned = Vec::new();
         for tab in self.tabs.iter_mut() {
             let Some(session) = tab.usage.as_mut() else {
                 continue;
             };
             let subtracted = session.removed(removed);
+            if subtracted > 0 {
+                cleaned.push(tab.id);
+            }
             if removed.is_empty()
                 && affected.is_none_or(|affected| touches_root(affected, &session.analysis_root))
             {
@@ -914,6 +1296,10 @@ impl Explorer {
                     session.mark_stale();
                 }
             }
+        }
+        // What the volume now reports free, to set beside the estimate.
+        for id in cleaned {
+            self.read_volume_free(id, true, cx);
         }
     }
 }

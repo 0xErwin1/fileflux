@@ -49,6 +49,8 @@ Every key the explorer and the image viewer bind. Shortcuts also appear in toolb
 
 **Escape** does the nearest useful thing: it restores the path field or clears the search and returns the keyboard to the entries (in a subfolder search it first stops the search that is still running and keeps what it found; pressed again it leaves the search); it cancels an inline rename, an open menu, a dialog or a drag; elsewhere it clears the selection.
 
+In a **disk usage** view the arrows move the chart's cursor instead (see [Disk usage](user-guide.md#disk-usage)): ← → the previous and next slice of the ring, ↑ the slice inside (the parent ring), ↓ the first slice outside it; Enter drills into the selected folder, Backspace or Escape goes up one folder (Escape does so only inside a drilled folder), and Ctrl+`=` / Ctrl+`-` or the wheel over the chart show more or fewer rings.
+
 Inside a context menu, ↑ ↓ move (wrapping at the ends), Enter confirms, → opens a submenu (Enter does too), ← closes the open submenu, and Escape closes the open submenu first and the menu next. Enter on a sort or filter choice applies it and keeps the menu open. Inside a dialog, ↑ ↓ move the focus and Escape cancels.
 
 While a text field has the keyboard, the file operations (Ctrl+A, F2, Del, Ctrl+C/X/V/Z and the rest) are left to the field; the tab shortcuts, F3 and F6 still work (F5 and Shift+F5 are left to the field). Behind a dialog or an open menu, none of these shortcuts act.

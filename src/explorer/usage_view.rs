@@ -20,7 +20,8 @@ use fileflux::core::usage_chart::{self, Segment, Target};
 use gpui::{
     App, Bounds, ClickEvent, Context, DispatchPhase, Div, ElementId, Hsla, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Path, PathBuilder,
-    Pixels, Point, Stateful, Styled, WeakEntity, Window, canvas, div, point, prelude::*, px,
+    Pixels, Point, ScrollWheelEvent, Stateful, Styled, WeakEntity, Window, canvas, div, point,
+    prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 
@@ -167,6 +168,7 @@ fn header(session: &UsageSession, cx: &mut Context<Explorer>) -> Stateful<Div> {
             .tooltip("Measure the folder again")
             .on_click(cx.listener(|this, _event, _window, cx| this.reanalyze_usage(cx)))
     };
+    let asking = session.is_asking();
     let mut header = div()
         .id("explorer-usage-header")
         .flex_none()
@@ -204,7 +206,7 @@ fn header(session: &UsageSession, cx: &mut Context<Explorer>) -> Stateful<Div> {
                 .child("freed space is an estimate"),
         );
     }
-    header.child(action)
+    if asking { header } else { header.child(action) }
 }
 
 /// The footer: the totals of the shown folder and how much of the walk they
@@ -339,6 +341,8 @@ fn chart_panel(
                     .text_color(colors.muted)
                     .child(if session.is_walking() {
                         "Measuring\u{2026}"
+                    } else if session.is_asking() {
+                        "Not measured"
                     } else {
                         "No chart"
                     }),
@@ -350,7 +354,7 @@ fn chart_panel(
         let canvas = canvas(
             move |bounds, _window, _cx| bounds,
             move |bounds, _prepaint, window, _cx| {
-                paint(bounds, &segments, None, None, window);
+                paint(bounds, &segments, Marks::default(), window);
             },
         )
         .size_full();
@@ -405,12 +409,30 @@ fn chart_panel(
     }
     let segments = Arc::clone(&session.segments);
     let hovered = session.hover.map(|hover| hover.segment);
-    let selected = session.selected_segment();
+    let marks = Marks {
+        hovered,
+        selected: session.selected_segment(),
+        cursor: session.cursor,
+    };
     let weak_for_events = weak.clone();
     let canvas = canvas(
         move |bounds, _window, _cx| bounds,
         move |bounds, _prepaint, window, _cx| {
-            paint(bounds, &segments, hovered, selected, window);
+            paint(bounds, &segments, marks, window);
+            let wheel = weak_for_events.clone();
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                // Wheel up shows more rings, wheel down fewer.
+                let lines = f32::from(event.delta.pixel_delta(px(16.0)).y);
+                if phase == DispatchPhase::Bubble
+                    && bounds.contains(&event.position)
+                    && lines != 0.0
+                    && let Err(error) = wheel.update(cx, |this, cx| {
+                        this.usage_zoom(if lines > 0.0 { 1 } else { -1 }, cx);
+                    })
+                {
+                    log::debug!("the chart outlived its explorer: {error}");
+                }
+            });
             let hover = weak_for_events.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
                 if phase == DispatchPhase::Bubble
@@ -499,18 +521,31 @@ fn chart_geometry(bounds: Bounds<Pixels>) -> (Point<Pixels>, f32) {
     (bounds.center(), radius)
 }
 
-fn paint(
-    bounds: Bounds<Pixels>,
-    segments: &[Segment],
+/// Which slices are drawn apart from the rest.
+#[derive(Clone, Copy, Default)]
+struct Marks {
     hovered: Option<usize>,
     selected: Option<usize>,
-    window: &mut Window,
-) {
+    /// The slice the keyboard is on: outlined, so focus is visible.
+    cursor: Option<usize>,
+}
+
+/// The width of the keyboard cursor's outline.
+const CURSOR_OUTLINE: f32 = 2.5;
+
+fn paint(bounds: Bounds<Pixels>, segments: &[Segment], marks: Marks, window: &mut Window) {
     let (center, max_radius) = chart_geometry(bounds);
     for (index, segment) in segments.iter().enumerate() {
-        let color = segment_color(segment, Some(index) == hovered || Some(index) == selected);
-        if let Some(path) = segment_path(center, max_radius, segment) {
+        let lit = Some(index) == marks.hovered || Some(index) == marks.selected;
+        let color = segment_color(segment, lit);
+        if let Some(path) = segment_path(center, max_radius, segment, PathBuilder::fill()) {
             window.paint_path(path, color);
+        }
+    }
+    if let Some(segment) = marks.cursor.and_then(|index| segments.get(index)) {
+        let outline = PathBuilder::stroke(px(CURSOR_OUTLINE));
+        if let Some(path) = segment_path(center, max_radius, segment, outline) {
+            window.paint_path(path, hsla((0.0, 0.0, 0.96)));
         }
     }
 }
@@ -522,14 +557,18 @@ fn on_circle(center: Point<Pixels>, radius: f32, angle: f32) -> Point<Pixels> {
     )
 }
 
-fn segment_path(center: Point<Pixels>, max_radius: f32, segment: &Segment) -> Option<Path<Pixels>> {
+fn segment_path(
+    center: Point<Pixels>,
+    max_radius: f32,
+    segment: &Segment,
+    mut builder: PathBuilder,
+) -> Option<Path<Pixels>> {
     let inner = segment.inner * max_radius;
     let outer = segment.outer * max_radius;
     // A full circle is one arc that cannot say where it ends: stop a hair
     // short of the start.
     let end = segment.end.min(segment.start + 2.0 * PI - 1e-3);
     let large = end - segment.start > PI;
-    let mut builder = PathBuilder::fill();
     builder.move_to(on_circle(center, inner, segment.start));
     builder.line_to(on_circle(center, outer, segment.start));
     builder.arc_to(
@@ -652,7 +691,6 @@ impl Explorer {
             return;
         };
         let up = session.up_target();
-        let shown = session.shown.clone();
         let target = hit
             .segment_index
             .and_then(|index| session.segments.get(index))
@@ -661,10 +699,7 @@ impl Explorer {
             Some(Target::Item(item)) => Some((item_path(tree, item), item)),
             _ => None,
         };
-        let other_dir = match target {
-            Some(Target::Other { dir, .. }) => Some(tree.path_of(dir)),
-            _ => None,
-        };
+        let is_other = matches!(target, Some(Target::Other { .. }));
         self.entries_focus().focus(window, cx);
         match event.button {
             MouseButton::Left if hit.center => {
@@ -678,8 +713,15 @@ impl Explorer {
                     self.usage_activate(&path, window, cx);
                 } else if let Some((path, _)) = item {
                     self.usage_click(path, event.click_count, window, cx);
-                } else if let Some(dir) = other_dir.filter(|dir| *dir != shown) {
-                    self.usage_drill(dir, window, cx);
+                } else if is_other && let Some(index) = hit.segment_index {
+                    // The "Other" slice is selected: its items are marked in
+                    // the list. A double click goes into its folder.
+                    self.usage_select_segment(index, window, cx);
+                    if event.click_count >= 2
+                        && let Some(dir) = self.usage().and_then(UsageSession::other_activation)
+                    {
+                        self.usage_drill(dir, window, cx);
+                    }
                 }
             }
             MouseButton::Right => {
@@ -745,6 +787,29 @@ fn list_panel(
         .flex()
         .flex_col();
     if rows.is_empty() {
+        if session.is_asking() {
+            return panel
+                .justify_center()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(24.0))
+                .child(
+                    div()
+                        .id("explorer-usage-ask")
+                        .max_w(px(420.0))
+                        .text_center()
+                        .text_color(colors.muted)
+                        .child(
+                            "This folder is on a network or phone mount. Measuring it reads every folder below it, which can be slow and wake a sleeping device.",
+                        ),
+                )
+                .child(
+                    Button::new("explorer-usage-confirm", "Measure anyway")
+                        .secondary()
+                        .tooltip("Walk this folder")
+                        .on_click(cx.listener(|this, _event, _window, cx| this.confirm_usage(cx))),
+                );
+        }
         let note = match (&session.phase, session.is_walking()) {
             (super::usage::Phase::Failed(message), _) => format!("Could not analyze: {message}"),
             (_, true) => "Measuring\u{2026}".to_owned(),
@@ -790,7 +855,10 @@ fn list_panel(
             .child(head_cell(SIZE_WIDTH, "Size on disk"))
             .child(head_cell(ITEMS_WIDTH, "Items")),
     );
-    let selected = session.selected.clone();
+    let lit: Vec<bool> = rows
+        .iter()
+        .map(|row| session.selected.as_ref() == Some(&row.path) || session.is_marked(row))
+        .collect();
     let actionable = session.tree().is_some();
     let weak_for_rows = weak.clone();
     let count = rows.len();
@@ -801,11 +869,11 @@ fn list_panel(
             count,
             move |range, _window, cx: &mut App| {
                 range
-                    .filter_map(|index| rows.get(index))
-                    .map(|row| {
+                    .filter_map(|index| rows.get(index).map(|row| (index, row)))
+                    .map(|(index, row)| {
                         render_row(
                             row,
-                            selected.as_ref() == Some(&row.path),
+                            lit.get(index).copied().unwrap_or(false),
                             actionable,
                             &weak_for_rows,
                             cx,

@@ -344,6 +344,7 @@ impl Explorer {
         self.usage_after_job(
             &report.removed,
             context.as_ref().map(|context| &context.affected),
+            cx,
         );
         let origin = context.as_ref().map(|context| context.origin);
         if !report.select.is_empty()

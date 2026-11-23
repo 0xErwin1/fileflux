@@ -11,8 +11,13 @@ use std::f32::consts::PI;
 
 use super::usage::{Item, NodeId, UsageTree};
 
-/// How many rings the chart draws below the root.
+/// How many rings the chart draws below the root until the user zooms.
 pub const RING_DEPTH: u32 = 3;
+/// The fewest and the most rings a zoom reaches. More rings than this leave
+/// each one a few pixels thick, and the segment count (up to a few hundred a
+/// ring before the thin ones fold) grows with them.
+pub const MIN_RINGS: u32 = 1;
+pub const MAX_RINGS: u32 = 6;
 /// The radius of the empty centre, as a fraction of the chart radius. It was
 /// 0.22; the centre label (the folder name over a size such as "70.3 MB")
 /// does not fit in a hole that small, so the rings start further out and
@@ -21,6 +26,9 @@ pub const CENTER_HOLE: f32 = 0.38;
 /// Segments thinner than this (radians) are folded into one "other" segment
 /// of their parent, which bounds the segment count however wide a folder is.
 pub const MIN_SEGMENT_ANGLE: f32 = 0.025;
+
+/// The default is inside the zoom range, with something to zoom to.
+const _: () = assert!(MIN_RINGS <= RING_DEPTH && RING_DEPTH < MAX_RINGS);
 
 const TAU: f32 = 2.0 * PI;
 
@@ -198,6 +206,97 @@ fn layout_children(
             parent_bytes: total,
         });
     }
+}
+
+/// The ring count after zooming by `delta` rings, kept between [`MIN_RINGS`]
+/// and [`MAX_RINGS`].
+#[must_use]
+pub fn zoom_rings(current: u32, delta: i32) -> u32 {
+    let wanted = i64::from(current) + i64::from(delta);
+    let clamped = wanted.clamp(i64::from(MIN_RINGS), i64::from(MAX_RINGS));
+    u32::try_from(clamped).unwrap_or(RING_DEPTH)
+}
+
+/// A keyboard move on the chart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Move {
+    /// The previous slice of the same ring, counter-clockwise.
+    Previous,
+    /// The next slice of the same ring, clockwise.
+    Next,
+    /// The slice of the ring inside that holds this one.
+    Inward,
+    /// The first slice of the ring outside that lies within this one.
+    Outward,
+}
+
+/// The slice a keyboard move reaches from slice `from` (an index into
+/// `segments`), `None` when there is nowhere to go (the first ring inward, a
+/// leaf outward) or no segments. Without a valid `from` every move lands on
+/// the first slice. A ring wraps around.
+#[must_use]
+pub fn step(segments: &[Segment], from: Option<usize>, movement: Move) -> Option<usize> {
+    if segments.is_empty() {
+        return None;
+    }
+    let Some(current) = from.and_then(|index| segments.get(index)) else {
+        return Some(0);
+    };
+    let middle = (current.start + current.end) / 2.0;
+    let on_ring = |depth: u32| {
+        let mut ring: Vec<usize> = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| segment.depth == depth)
+            .map(|(index, _)| index)
+            .collect();
+        ring.sort_by(|a, b| {
+            let start = |index: &usize| segments.get(*index).map_or(0.0, |s| s.start);
+            start(a).total_cmp(&start(b))
+        });
+        ring
+    };
+    match movement {
+        Move::Previous | Move::Next => {
+            let ring = on_ring(current.depth);
+            let at = ring.iter().position(|index| Some(*index) == from)?;
+            let to = if movement == Move::Next {
+                (at + 1) % ring.len()
+            } else {
+                (at + ring.len() - 1) % ring.len()
+            };
+            ring.get(to).copied()
+        }
+        Move::Inward => {
+            let depth = current.depth.checked_sub(1).filter(|depth| *depth >= 1)?;
+            on_ring(depth).into_iter().find(|index| {
+                segments
+                    .get(*index)
+                    .is_some_and(|s| s.start <= middle && middle < s.end)
+            })
+        }
+        Move::Outward => on_ring(current.depth + 1).into_iter().find(|index| {
+            segments.get(*index).is_some_and(|s| {
+                current.start <= (s.start + s.end) / 2.0 && (s.start + s.end) / 2.0 <= current.end
+            })
+        }),
+    }
+}
+
+/// The children of `dir` that an [`Target::Other`] segment of `count` items
+/// stands for: the smallest `count` of the folder's non-empty children (the
+/// ranking is largest first, and the fold takes the thin tail).
+#[must_use]
+pub fn folded_items(tree: &UsageTree, dir: NodeId, count: u64) -> Vec<Item> {
+    let items: Vec<Item> = tree
+        .items(dir)
+        .into_iter()
+        .filter(|(_, bytes)| *bytes > 0)
+        .map(|(item, _)| item)
+        .collect();
+    let folded = usize::try_from(count).unwrap_or(usize::MAX);
+    let first = items.len().saturating_sub(folded);
+    items.into_iter().skip(first).collect()
 }
 
 /// A pointer offset from the centre as an angle (clockwise from twelve
@@ -691,5 +790,142 @@ mod tests {
         assert_eq!(ring[0].inner, CENTER_HOLE);
         assert_eq!(hit_test(&ring, 0.1, CENTER_HOLE - 1e-4), None);
         assert_eq!(hit_test(&ring, 0.1, CENTER_HOLE), ring.first());
+    }
+    // --- keyboard movement, folded items, ring zoom ------------------------
+
+    fn nested(tag: &str) -> std::io::Result<(Scratch, UsageTree)> {
+        let scratch = Scratch::new(tag)?;
+        fs::create_dir_all(scratch.path().join("mid/leafdir"))?;
+        fs::write(scratch.path().join("mid/leafdir/f"), vec![1u8; 200_000])?;
+        fs::write(scratch.path().join("side"), vec![1u8; 100_000])?;
+        let tree = run(scratch.path())?;
+        Ok((scratch, tree))
+    }
+
+    fn index_of(segments: &[Segment], tree: &UsageTree, name: &str) -> std::io::Result<usize> {
+        segments
+            .iter()
+            .position(|segment| segment_of(std::slice::from_ref(segment), tree, name).is_some())
+            .ok_or_else(|| std::io::Error::other(name.to_owned()))
+    }
+
+    #[test]
+    fn arrows_walk_a_ring_clockwise_and_wrap_around() -> std::io::Result<()> {
+        let (_scratch, tree) = nested("chart-step-ring")?;
+        let segments = layout(&tree, UsageTree::ROOT, RING_DEPTH);
+        let mid = index_of(&segments, &tree, "mid")?;
+        let side = index_of(&segments, &tree, "side")?;
+        assert_eq!(step(&segments, Some(mid), Move::Next), Some(side));
+        assert_eq!(step(&segments, Some(side), Move::Next), Some(mid), "wraps");
+        assert_eq!(step(&segments, Some(mid), Move::Previous), Some(side));
+        assert_eq!(step(&segments, Some(side), Move::Previous), Some(mid));
+        Ok(())
+    }
+
+    #[test]
+    fn arrows_move_between_rings_through_the_slice_they_sit_in() -> std::io::Result<()> {
+        let (_scratch, tree) = nested("chart-step-depth")?;
+        let segments = layout(&tree, UsageTree::ROOT, RING_DEPTH);
+        let mid = index_of(&segments, &tree, "mid")?;
+        let leafdir = index_of(&segments, &tree, "leafdir")?;
+        let file = index_of(&segments, &tree, "f")?;
+        let side = index_of(&segments, &tree, "side")?;
+        assert_eq!(step(&segments, Some(mid), Move::Outward), Some(leafdir));
+        assert_eq!(step(&segments, Some(leafdir), Move::Outward), Some(file));
+        assert_eq!(step(&segments, Some(file), Move::Inward), Some(leafdir));
+        assert_eq!(step(&segments, Some(leafdir), Move::Inward), Some(mid));
+        assert_eq!(step(&segments, Some(mid), Move::Inward), None, "first ring");
+        assert_eq!(
+            step(&segments, Some(file), Move::Outward),
+            None,
+            "last ring"
+        );
+        assert_eq!(step(&segments, Some(side), Move::Outward), None, "a leaf");
+        Ok(())
+    }
+
+    #[test]
+    fn the_first_arrow_lands_on_the_first_slice_and_an_empty_chart_stays_empty()
+    -> std::io::Result<()> {
+        let (_scratch, tree) = nested("chart-step-first")?;
+        let segments = layout(&tree, UsageTree::ROOT, RING_DEPTH);
+        for movement in [Move::Previous, Move::Next, Move::Inward, Move::Outward] {
+            assert_eq!(step(&segments, None, movement), Some(0));
+            assert_eq!(step(&[], None, movement), None);
+            assert_eq!(step(&[], Some(3), movement), None);
+        }
+        assert_eq!(step(&segments, Some(segments.len()), Move::Next), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn the_folded_items_are_the_children_too_thin_to_draw() -> std::io::Result<()> {
+        let scratch = Scratch::new("chart-folded")?;
+        for index in 0..150 {
+            fs::write(scratch.path().join(format!("t{index:03}")), b"x")?;
+        }
+        fs::write(scratch.path().join("big"), vec![1u8; 4_000_000])?;
+        let tree = run(scratch.path())?;
+        let segments = layout(&tree, UsageTree::ROOT, 1);
+        let Some(Target::Other { dir, count, .. }) = segments.last().map(|s| s.target) else {
+            return Err(std::io::Error::other("no fold"));
+        };
+        let folded = folded_items(&tree, dir, count);
+        assert_eq!(folded.len(), 150);
+        let drawn: Vec<Item> = segments
+            .iter()
+            .filter_map(|segment| match segment.target {
+                Target::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert!(folded.iter().all(|item| !drawn.contains(item)));
+        let folded_bytes: u64 = tree
+            .items(dir)
+            .into_iter()
+            .filter(|(item, _)| folded.contains(item))
+            .map(|(_, bytes)| bytes)
+            .sum();
+        assert_eq!(
+            Some(Target::Other {
+                dir,
+                bytes: folded_bytes,
+                count
+            }),
+            segments.last().map(|s| s.target)
+        );
+        assert!(folded_items(&tree, dir, 0).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn zooming_the_rings_stays_between_one_and_the_maximum() {
+        assert_eq!(zoom_rings(RING_DEPTH, 1), RING_DEPTH + 1);
+        assert_eq!(zoom_rings(RING_DEPTH, -1), RING_DEPTH - 1);
+        assert_eq!(zoom_rings(MAX_RINGS, 1), MAX_RINGS);
+        assert_eq!(zoom_rings(MIN_RINGS, -1), MIN_RINGS);
+        assert_eq!(zoom_rings(RING_DEPTH, 0), RING_DEPTH);
+        assert_eq!(zoom_rings(RING_DEPTH, 100), MAX_RINGS);
+        assert_eq!(zoom_rings(RING_DEPTH, -100), MIN_RINGS);
+    }
+
+    #[test]
+    fn every_ring_count_splits_the_space_outside_the_centre_evenly() -> std::io::Result<()> {
+        let scratch = Scratch::new("chart-zoom")?;
+        fs::create_dir_all(scratch.path().join("a/b/c/d/e/g"))?;
+        fs::write(scratch.path().join("a/b/c/d/e/g/f"), vec![1u8; 100_000])?;
+        let tree = run(scratch.path())?;
+        for rings in MIN_RINGS..=MAX_RINGS {
+            let segments = layout(&tree, UsageTree::ROOT, rings);
+            assert_eq!(segments.iter().map(|s| s.depth).max(), Some(rings));
+            let thickness = (1.0 - CENTER_HOLE) / rings as f32;
+            for segment in &segments {
+                assert!((segment.outer - segment.inner - thickness).abs() < 1e-5);
+                assert!(segment.inner >= CENTER_HOLE - 1e-6 && segment.outer <= 1.0 + 1e-5);
+            }
+            let last = segments.last().map(|s| s.outer).unwrap_or_default();
+            assert!((last - 1.0).abs() < 1e-5, "the outer ring reaches the edge");
+        }
+        Ok(())
     }
 }

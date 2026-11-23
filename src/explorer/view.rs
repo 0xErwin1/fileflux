@@ -36,6 +36,7 @@ use fileflux::core::settings::{
 };
 use fileflux::core::terminal::{self, Terminal, TerminalEnv};
 use fileflux::core::thumbnails::{Outcome, Skip};
+use fileflux::core::usage_chart;
 use fileflux::core::watch::{
     Debounce, FolderEvent, WatchHandle, WatchHub, nearest_existing_ancestor, stop_notice,
 };
@@ -127,6 +128,8 @@ actions!(
         NavigateForward,
         /// The parent of the current directory.
         NavigateUp,
+        /// Backspace in a disk usage view: Up.
+        UsageUp,
         /// Re-reads the current location from the filesystem.
         Reload,
         /// Shows or hides the details panel.
@@ -293,6 +296,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-home", ExtendToFirst, entries),
         KeyBinding::new("shift-end", ExtendToLast, entries),
         KeyBinding::new("enter", OpenSelected, entries),
+        KeyBinding::new("backspace", UsageUp, entries),
     ]);
 
     // The file operations answer anywhere in the window except while a text
@@ -536,6 +540,9 @@ pub(crate) struct Tab {
     pub(crate) du_task: Option<Task<()>>,
     /// The folder the user pressed Calculate for (gvfs mounts only).
     pub(crate) du_calculated: Option<PathBuf>,
+    /// The network or phone folder the user said to analyze (see
+    /// [`super::usage::needs_confirmation`]).
+    pub(crate) usage_confirmed: Option<PathBuf>,
     /// The retained folder-counting task, replaced by the next commit.
     counts_task: Option<Task<()>>,
     /// The thumbnail lookups of the listing, filled by `thumbs_task`.
@@ -739,6 +746,7 @@ impl Tab {
             du_run: None,
             du_task: None,
             du_calculated: None,
+            usage_confirmed: None,
             counts_task: None,
             thumbs: Arc::new(entries::Thumbs::new()),
             thumbs_task: None,
@@ -3021,6 +3029,10 @@ impl Explorer {
         if self.stop_search(id, cx) {
             return;
         }
+        // Escape inside a drilled disk usage view goes up one folder.
+        if self.usage_escape(window, cx) {
+            return;
+        }
         if !self.tab().state.selection().is_empty() {
             self.tab_mut().state.clear_selection();
         }
@@ -4226,6 +4238,11 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, _: &NavigateUp, window, cx| {
                 this.navigate(Transition::Up, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &UsageUp, window, cx| {
+                if !this.usage_backspace(window, cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| {
                 let current = this.tab().state.current().clone();
                 this.navigate(Transition::Visit(current), window, cx);
@@ -4241,29 +4258,47 @@ impl Render for Explorer {
                 this.arrange(ArrangeCommand::ToggleHidden, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomEntriesIn, _window, cx| {
+                if this.usage_zoom(1, cx) {
+                    return;
+                }
                 this.zoom(ZoomCommand::In, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomEntriesOut, _window, cx| {
+                if this.usage_zoom(-1, cx) {
+                    return;
+                }
                 this.zoom(ZoomCommand::Out, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomEntriesReset, _window, cx| {
                 this.zoom(ZoomCommand::Reset, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
+                if this.usage_key(usage_chart::Move::Inward, cx) {
+                    return;
+                }
                 let columns = this.grid_step();
                 this.move_selection(-columns, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectDown, _window, cx| {
+                if this.usage_key(usage_chart::Move::Outward, cx) {
+                    return;
+                }
                 let columns = this.grid_step();
                 this.move_selection(columns, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, _window, cx| {
+                if this.usage_key(usage_chart::Move::Previous, cx) {
+                    return;
+                }
                 if this.tab().state.view() == View::List {
                     return;
                 }
                 this.move_selection(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectRight, _window, cx| {
+                if this.usage_key(usage_chart::Move::Next, cx) {
+                    return;
+                }
                 if this.tab().state.view() == View::List {
                     return;
                 }

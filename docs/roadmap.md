@@ -35,10 +35,7 @@ The analyzer shipped: **Analyze Disk Usage** in the empty-space menu of a folder
 
 | Item | What is missing |
 |---|---|
-| Free-space estimate | The status line labels the totals an estimate after a cleanup; it does not compare them with the volume's free space, which the sidebar meter shows |
 | Very large trees | The whole tree is held in memory (folders in full, 200 files per folder). A multi-million-folder volume needs a bounded or on-disk form |
-| Chart extras | No keyboard navigation of the chart, no selectable "Other" slice, no zoom of the rings beyond three levels |
-| Network and gvfs mounts | They are walked like any folder; the details panel's size asks first on them, the analyzer does not |
 
 ## Out of scope unless decided otherwise
 
