@@ -380,3 +380,35 @@ fn launch_errors_say_what_is_missing() {
     assert!(LaunchError::Pkexec.to_string().contains("pkexec"));
     let _ = admin::NEW_INSTANCE_FLAG;
 }
+
+/// `nix/binary.nix` rewrites each policy's action id and `exec.path` with
+/// `substitute --replace-fail`; a literal that drifts on either side breaks
+/// the nightly build or ships an action whose path matches nothing.
+#[test]
+fn the_nix_substitution_targets_appear_exactly_once_in_the_shipped_policies()
+-> Result<(), Box<dyn Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let nix = std::fs::read_to_string(root.join("nix/binary.nix"))?;
+    let cases = [
+        (
+            "packaging/dev.fileflux.owner-helper.policy",
+            [
+                "id=\"dev.fileflux.change-owner\"",
+                "/usr/bin/fileflux-owner-helper",
+            ],
+        ),
+        (
+            "packaging/dev.fileflux.open-as-admin.policy",
+            ["id=\"dev.fileflux.open-as-admin\"", "/usr/bin/fileflux<"],
+        ),
+    ];
+    for (file, literals) in cases {
+        let policy = std::fs::read_to_string(root.join(file))?;
+        for literal in literals {
+            assert_eq!(policy.matches(literal).count(), 1, "{literal} in {file}");
+            let target = literal.trim_end_matches('<');
+            assert!(nix.contains(target), "nix/binary.nix substitutes {target}");
+        }
+    }
+    Ok(())
+}
