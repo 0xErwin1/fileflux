@@ -23,10 +23,10 @@ gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9", default-fea
 
 # Bolt, the design system shared with DBFlux and ReqFlux, from the same DBFlux
 # rev as the GPUI stack.
-bolt = { git = "https://github.com/0xErwin1/dbflux", rev = "85ce001c4828114bc5b0e7bee96459678f5c0f79" }
+bolt = { git = "https://github.com/0xErwin1/dbflux", rev = "e183aa1e1c3be1802b7223ea9ed578753b3443c1" }
 
 # The GPUI automation bridge (dev-only, behind the `ui-automation` feature).
-gpui-mcp = { git = "https://github.com/0xErwin1/dbflux", rev = "85ce001c4828114bc5b0e7bee96459678f5c0f79", default-features = false, features = ["gpui-pre"], optional = true }
+gpui-mcp = { git = "https://github.com/0xErwin1/dbflux", rev = "e183aa1e1c3be1802b7223ea9ed578753b3443c1", default-features = false, features = ["gpui-pre"], optional = true }
 
 # Only what startup and logging need.
 anyhow = "1.0.104"
@@ -75,6 +75,14 @@ usvg = { version = "=0.46.0" }
 # on purpose, the module drives the async API with `zbus::block_on`.
 zbus = { version = "=5.19.0", default-features = false, features = ["async-io"] }
 
+# Linux only: `gpui_linux::select_vulkan_driver` narrows the Vulkan loader to the
+# boot GPU's driver before it initialises, and `gpui_linux::restore_child_environment`
+# lifts that selection from every child process. The crate already reaches this
+# process through `gpui`; declaring it makes both calls reachable from `main` and
+# from `core::child`.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_linux = { package = "gpui-pre-linux", version = "=0.3.9" }
+
 [features]
 default = []
 ui-automation = ["dep:gpui-mcp"]
@@ -103,10 +111,10 @@ let_underscore_must_use = "warn"
 # gpui-component on one GPUI build without copying them here. The rev is
 # DBFlux's main where Bolt was merged (#1233); move it with DBFlux.
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/0xErwin1/dbflux", rev = "85ce001c4828114bc5b0e7bee96459678f5c0f79" }
-gpui-base = { git = "https://github.com/0xErwin1/dbflux", rev = "85ce001c4828114bc5b0e7bee96459678f5c0f79" }
-gpui-component = { git = "https://github.com/0xErwin1/dbflux", rev = "85ce001c4828114bc5b0e7bee96459678f5c0f79" }
-gpui-pre-linux = { git = "https://github.com/0xErwin1/dbflux", rev = "85ce001c4828114bc5b0e7bee96459678f5c0f79" }
+gpui-pre = { git = "https://github.com/0xErwin1/dbflux", rev = "e183aa1e1c3be1802b7223ea9ed578753b3443c1" }
+gpui-base = { git = "https://github.com/0xErwin1/dbflux", rev = "e183aa1e1c3be1802b7223ea9ed578753b3443c1" }
+gpui-component = { git = "https://github.com/0xErwin1/dbflux", rev = "e183aa1e1c3be1802b7223ea9ed578753b3443c1" }
+gpui-pre-linux = { git = "https://github.com/0xErwin1/dbflux", rev = "e183aa1e1c3be1802b7223ea9ed578753b3443c1" }
 
 # Line tables keep backtraces usable at a fraction of the link time and
 # memory that full debug info costs with GPUI in the graph.
