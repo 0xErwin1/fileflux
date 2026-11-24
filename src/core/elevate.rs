@@ -21,10 +21,11 @@ use std::fmt;
 use std::io;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::SystemTime;
 
 use super::admin::channel_of;
+use super::child;
 use super::owner_helper::{Born, Exit, HELPER_NAME, Request, Snapshot};
 
 /// Where `pkexec` may be: NixOS's setuid wrapper first (the store copy is
@@ -405,7 +406,7 @@ pub fn spawn_and_wait(argv: &[OsString]) -> io::Result<Finished> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::other("empty command line"))?;
-    let output = Command::new(program)
+    let output = child::command(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

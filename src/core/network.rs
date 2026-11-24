@@ -27,10 +27,11 @@
 use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
+use super::child;
 use super::devices::{UnlockTarget, unlock_args};
 
 // --- the address --------------------------------------------------------------
@@ -794,7 +795,7 @@ pub fn spawn_unlock(gio: &Path, target: &UnlockTarget) -> io::Result<MountSessio
 /// The shared runner of every `gio mount` attempt: `args` come from a typed
 /// builder, never from the person, and hold no secret.
 fn spawn_gio_mount(gio: &Path, args: &[OsString]) -> io::Result<MountSession> {
-    let mut child = Command::new(gio)
+    let mut child = child::command(gio)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())

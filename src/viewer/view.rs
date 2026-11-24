@@ -436,7 +436,7 @@ impl Viewer {
             return;
         };
         let spawned = std::env::current_exe()
-            .and_then(|exe| std::process::Command::new(exe).arg(dir).spawn());
+            .and_then(|exe| fileflux::core::child::command(exe).arg(dir).spawn());
         match spawned {
             // Reap the child when it exits so it does not linger as a zombie.
             Ok(mut child) => {

@@ -929,7 +929,7 @@ fn decode_fstab_field(field: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::core::child;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1433,7 +1433,7 @@ tmpfs /run tmpfs rw 0 0\n";
         let report_path = report_dir.path().join("report.txt");
 
         let exe = std::env::current_exe()?;
-        let output = Command::new(exe)
+        let output = child::command(exe)
             .arg("core::places::tests::discover_child_environment_isolation")
             .arg("--exact")
             .env(REPORT_VAR, &report_path)

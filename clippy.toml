@@ -1,0 +1,10 @@
+# `main` starts on the boot GPU's Vulkan driver: `gpui_linux::select_vulkan_driver`
+# replaces the process with itself, carrying `VK_LOADER_DRIVERS_SELECT` and the
+# `GPUI_VULKAN_DRIVER_SELECT` marker. A child inherits both, so an application started
+# from the explorer (a game with PRIME offload, a terminal) would silently run on the
+# boot GPU's driver instead of choosing its own. Every child command is therefore built
+# by `fileflux::core::child::command`, which restores the child's environment before it
+# is spawned; this entry makes any other `Command::new` a lint error.
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "a child inherits the Vulkan driver `main` selected, so the spawned program would be pinned to the boot GPU's driver instead of choosing its own; build it with `fileflux::core::child::command`, which lifts the selection from the child's environment" },
+]

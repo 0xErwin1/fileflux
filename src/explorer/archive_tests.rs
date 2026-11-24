@@ -294,7 +294,7 @@ fn an_unsafe_archive_is_a_clear_error_and_writes_nothing() -> Result<(), Box<dyn
     // A real archive whose member is renamed to a `..` path by bsdtar's -s.
     fs::write(scratch.0.join("f.txt"), b"x")?;
     let evil = scratch.0.join("evil.tar");
-    let made = std::process::Command::new(&tool)
+    let made = fileflux::core::child::command(&tool)
         .arg("-cf")
         .arg(&evil)
         .arg("-C")

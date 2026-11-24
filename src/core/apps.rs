@@ -5,8 +5,9 @@
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
+use super::child;
 use super::trash::encode_percent;
 
 /// The keys of a `[Desktop Entry]` group Fileflux uses.
@@ -708,7 +709,7 @@ pub fn filter_apps(apps: &[App], query: &str) -> Vec<App> {
 /// The MIME type of `path` by `xdg-mime query filetype` (no shell), else
 /// by extension, else `application/octet-stream`.
 pub fn query_mime(path: &Path) -> String {
-    let asked = Command::new("xdg-mime")
+    let asked = child::command("xdg-mime")
         .args(["query", "filetype"])
         .arg(path)
         .stdin(Stdio::null())
@@ -726,7 +727,7 @@ pub fn query_mime(path: &Path) -> String {
 /// The desktop file id of the default application for `mime`
 /// (`xdg-mime query default`), when there is one.
 pub fn query_default(mime: &str) -> Option<String> {
-    let output = Command::new("xdg-mime")
+    let output = child::command("xdg-mime")
         .args(["query", "default", mime])
         .stdin(Stdio::null())
         .stderr(Stdio::null())

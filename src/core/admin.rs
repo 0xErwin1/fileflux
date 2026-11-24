@@ -24,9 +24,10 @@ use std::fmt;
 use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
 use super::Location;
+use super::child;
 use super::elevate::{PKEXEC_CANDIDATES, is_executable_file, resolve};
 
 /// The command-line flag that starts an instance that never talks to the
@@ -351,7 +352,7 @@ pub fn spawn(argv: &[OsString]) -> io::Result<Child> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::other("empty command line"))?;
-    Command::new(program)
+    child::command(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

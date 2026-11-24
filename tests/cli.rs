@@ -5,10 +5,12 @@
 #![allow(clippy::expect_used)]
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
+
+use fileflux::core::child;
 
 fn fileflux(args: &[&str], cwd: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_fileflux"))
+    child::command(env!("CARGO_BIN_EXE_fileflux"))
         .args(args)
         .current_dir(cwd)
         .env_remove("DISPLAY")

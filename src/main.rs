@@ -18,6 +18,13 @@ use fileflux::dbus;
 const USAGE_ERROR: u8 = 2;
 
 fn main() -> ExitCode {
+    // Before any thread exists (Linux only): the Vulkan loader reads its driver
+    // variables while it initialises, so the boot GPU's driver is chosen by
+    // replacing this process with itself and one extra variable, never by
+    // changing this process's environment. It must stay the first statement.
+    #[cfg(target_os = "linux")]
+    gpui_linux::select_vulkan_driver();
+
     match launch() {
         Ok(Launch::Window {
             target,

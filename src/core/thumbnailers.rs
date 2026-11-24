@@ -12,12 +12,13 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::apps::split_exec;
+use super::child;
 use super::thumbnails::thumbnail_uri;
 
 /// How long one thumbnailer may run before it is killed. libfm allows 30 s,
@@ -245,7 +246,7 @@ fn run_into(
 ) -> Option<image::RgbaImage> {
     let arguments = arguments(&thumbnailer.exec, source, output, size)?;
     let (program, rest) = arguments.split_first()?;
-    let mut child = Command::new(program)
+    let mut child = child::command(program)
         .args(rest)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
