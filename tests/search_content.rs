@@ -8,6 +8,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use fileflux::core::child;
 use fileflux::core::search::{SearchOptions, SearchSummary, search};
 use fileflux::core::search_match::{Matcher, QueryOptions};
 
@@ -232,9 +233,7 @@ fn symlinked_files_are_not_read() -> TestResult {
 fn a_fifo_is_not_opened() -> TestResult {
     let scratch = Scratch::new("fifo")?;
     let root = scratch.root();
-    let status = std::process::Command::new("mkfifo")
-        .arg(root.join("pipe"))
-        .status()?;
+    let status = child::command("mkfifo").arg(root.join("pipe")).status()?;
     assert!(status.success());
     scratch.write("real.txt", b"needle\n")?;
     let (names, _) = find(&root, "needle", opts(false, false, true));

@@ -20,12 +20,13 @@ use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use super::child;
 use super::ops::{NameError, rename_noreplace, unique_name_cancellable, validate_name};
 
 /// The program every operation here runs.
@@ -355,7 +356,7 @@ fn run(
     if cancel.load(Ordering::Relaxed) {
         return Err(ArchiveError::Cancelled);
     }
-    let mut child = Command::new(tool)
+    let mut child = child::command(tool)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -633,10 +634,10 @@ fn remove_escaping_links(root: &Path) -> io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::{fs, process::Command};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -661,7 +662,7 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             // Extracted trees may hold unreadable folders.
-            Command::new("chmod")
+            child::command("chmod")
                 .arg("-R")
                 .arg("u+rwx")
                 .arg(&self.0)
@@ -1183,7 +1184,7 @@ mod tests {
         let dest = scratch.dir("dest/inner")?;
         let evil = scratch.0.join("evil.tar");
         write_tar(&evil, &[tar_entry(b"../escaped.txt", b'0', b"", b"bad")])?;
-        Command::new(&tool)
+        child::command(&tool)
             .args(extract_args(&evil, &dest))
             .output()?;
         assert!(!scratch.0.join("dest/escaped.txt").exists());
@@ -1193,7 +1194,7 @@ mod tests {
             &absolute,
             &[tar_entry(target.as_os_str().as_bytes(), b'0', b"", b"bad")],
         )?;
-        Command::new(&tool)
+        child::command(&tool)
             .args(extract_args(&absolute, &dest))
             .output()?;
         assert!(!target.exists());

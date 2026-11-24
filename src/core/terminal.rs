@@ -407,9 +407,10 @@ pub fn resolve(env: &TerminalEnv) -> Option<Terminal> {
 #[allow(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::core::child;
     use std::fs;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -502,7 +503,7 @@ mod tests {
             // is ETXTBSY for a moment, never a real failure.
             let mut attempts = 0;
             let status = loop {
-                let spawned = Command::new(&command.program)
+                let spawned = child::command(&command.program)
                     .args(&command.args)
                     .current_dir(&command.cwd)
                     .stdin(Stdio::null())
@@ -917,7 +918,7 @@ mod tests {
 
     #[test]
     fn the_wrapper_runs_the_program_with_its_arguments_intact() {
-        let output = Command::new(WRAPPER[0])
+        let output = child::command(WRAPPER[0])
             .args(&WRAPPER[1..])
             .args(["printf", "[%s]", "a b", "$HOME;x"])
             .output()

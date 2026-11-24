@@ -13,11 +13,13 @@ use std::fmt;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+use super::child;
 
 /// Why a device lookup or action failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -988,7 +990,7 @@ pub fn run_tool(
     timeout: Duration,
 ) -> Result<ToolOutput, DeviceError> {
     let tool = tool_name(program);
-    let mut child = Command::new(program)
+    let mut child = child::command(program)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())

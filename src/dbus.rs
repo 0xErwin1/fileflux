@@ -351,9 +351,10 @@ pub fn open_targets(paths: &[PathBuf], is_dir: impl Fn(&Path) -> bool) -> Vec<Sh
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
 
     use super::*;
+    use crate::core::child;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -444,7 +445,7 @@ mod tests {
                     scratch.display()
                 ),
             )?;
-            let mut child = Command::new("dbus-daemon")
+            let mut child = child::command("dbus-daemon")
                 .arg("--config-file")
                 .arg(&config)
                 .args(["--nofork", "--print-address"])

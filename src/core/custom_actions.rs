@@ -31,11 +31,12 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::SystemTime;
 
 use serde::Deserialize;
 
+use super::child;
 use super::mimes;
 use super::settings::settings_path;
 use super::{Entry, glob};
@@ -491,7 +492,7 @@ impl ActionsStore {
 /// `/dev/null`, output discarded, working directory `cwd`. The child is
 /// reaped on a thread of its own, so it may outlive the call. No shell.
 pub fn spawn_detached(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> io::Result<()> {
-    let mut command = Command::new(program);
+    let mut command = child::command(program);
     command
         .args(args)
         .stdin(Stdio::null())

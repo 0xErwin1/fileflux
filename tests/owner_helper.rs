@@ -13,6 +13,7 @@ use std::os::unix::fs::{MetadataExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use fileflux::core::child;
 use fileflux::core::owner_helper::{
     Born, Exit, Failure, Found, HELPER_NAME, Kernel, Kind, Request, Snapshot, Step, Tree,
     open_without_links, split_path, stat, walk,
@@ -442,7 +443,7 @@ fn a_missing_path_and_a_file_used_as_a_folder_are_not_found() -> TestResult {
 // --- the binary, as a non-root user ----------------------------------------------------
 
 fn helper() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fileflux-owner-helper"));
+    let mut command = child::command(env!("CARGO_BIN_EXE_fileflux-owner-helper"));
     command.stdin(Stdio::null());
     command
 }
@@ -609,7 +610,7 @@ fn run_chowns_through_the_o_path_descriptor() -> TestResult {
 fn a_fifo_is_refused() -> TestResult {
     let scratch = Scratch::new("fifo")?;
     let p = scratch.0.join("q");
-    assert!(Command::new("mkfifo").arg(&p).status()?.success());
+    assert!(child::command("mkfifo").arg(&p).status()?.success());
     let want = fileflux::core::elevate::Identity::of(&p)?.snapshot();
     for r in open_each_way(&p)? {
         let found = r.map_err(|f| f.reason)?;

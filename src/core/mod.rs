@@ -9,6 +9,7 @@ pub mod admin;
 pub mod apps;
 pub mod archive;
 pub mod bookmarks;
+pub mod child;
 pub mod clipboard;
 pub mod custom_actions;
 pub mod devices;
