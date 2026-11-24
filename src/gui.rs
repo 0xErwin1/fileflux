@@ -4,14 +4,16 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::Result;
 use fileflux::cli::Target;
+use fileflux::dbus::{Primary, Request};
 use gpui::{
-    App, AppContext as _, AssetSource, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px,
-    size,
+    App, AppContext as _, AssetSource, Bounds, Global, QuitMode, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, px, size,
 };
 use gpui_component::Root;
 
@@ -19,6 +21,19 @@ use crate::explorer::persist::Startup;
 use crate::explorer::{Explorer, bind_keys};
 use crate::theme;
 use crate::viewer;
+
+/// How often the app-level pump looks for a forwarded request when no
+/// explorer window is open to take it.
+const REQUEST_STEP: Duration = Duration::from_millis(50);
+
+/// How long quitting gets before the process exits anyway: tearing the last
+/// window down joins its watcher, device and bus threads on this thread, and
+/// one that never returns must not leave the process behind.
+const EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// The exit status of a window that closed and a process that had to be let
+/// go after [`EXIT_GRACE`]: closing the last window is not a failure.
+const EXIT_OK: i32 = 0;
 
 /// Initializes logging; call once, before anything logs.
 pub(crate) fn init_logging() {
@@ -42,14 +57,19 @@ pub(crate) fn open(
     };
     let target = Rc::new(target);
     let error_slot = Rc::clone(&startup_error);
+    let requests = desktop.clone();
     gpui_platform::application()
         .with_assets(assets())
         .run(move |cx: &mut App| {
-            // Quit when the last window closes, instead of running without
-            // any window.
-            cx.on_window_closed(|cx, _| {
+            // Closing the last window ends the process, whatever closed it.
+            // Said here rather than left to the platform's default, and
+            // backed by [`quit`], so no close path can leave it running.
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+            cx.set_global(ExplorerWindows::default());
+            cx.on_window_closed(|cx, window_id| {
+                cx.default_global::<ExplorerWindows>().forget(window_id);
                 if cx.windows().is_empty() {
-                    cx.quit();
+                    quit(cx);
                 }
             })
             .detach();
@@ -58,12 +78,19 @@ pub(crate) fn open(
                 cx.set_global(crate::explorer::desktop::DesktopLink(Rc::clone(desktop)));
             }
             let opened = match &*target {
-                Target::Explorer(start) => open_explorer_window(start.clone(), cx),
+                Target::Explorer(start) => open_explorer_window(start.clone(), None, cx).map(drop),
                 Target::Viewer(launch) => viewer::open_window(launch, cx),
             };
             if let Err(error) = opened {
                 error_slot.replace(Some(error));
                 cx.quit();
+                return;
+            }
+            // A forwarded launch must end with a window even when this
+            // process has none: the app-level pump opens one, since only a
+            // window's own pump could take the request otherwise.
+            if let Some(requests) = requests {
+                pump_requests(requests, cx);
             }
         });
 
@@ -74,6 +101,109 @@ pub(crate) fn open(
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// The explorer windows of this process: a forwarded request with none of them
+/// open has nowhere to land, so the app-level pump opens one.
+#[derive(Debug, Default)]
+struct ExplorerWindows(Vec<WindowId>);
+
+impl Global for ExplorerWindows {}
+
+impl ExplorerWindows {
+    fn opened(&mut self, window: WindowId) {
+        self.0.push(window);
+    }
+
+    fn forget(&mut self, window: WindowId) {
+        self.0.retain(|id| *id != window);
+    }
+
+    fn none(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Marks that the theme is installed and the explorer's keys are bound: a
+/// second explorer window — one the app-level pump opens — installs neither
+/// again.
+#[derive(Debug)]
+struct ExplorerDefaults;
+
+impl Global for ExplorerDefaults {}
+
+/// Drains forwarded requests while no explorer window is open. A window's own
+/// [`pump_desktop`](Explorer::pump_desktop) takes them otherwise, so a request
+/// that finds no window opens one here for its first target.
+fn pump_requests(primary: Rc<Primary>, cx: &App) {
+    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+        loop {
+            cx.background_executor().timer(REQUEST_STEP).await;
+            let opened = cx.update(|cx| show_without_window(&primary, cx));
+            if opened {
+                log::info!("a forwarded launch opened a window");
+            }
+        }
+    })
+    .detach();
+}
+
+/// Takes the next request when no explorer window can, and opens a window on
+/// it. `true` when one was opened. A request that cannot be shown stays
+/// unanswered on purpose: its launcher then opens an instance of its own.
+fn show_without_window(primary: &Primary, cx: &mut App) -> bool {
+    if !cx.default_global::<ExplorerWindows>().none() {
+        return false;
+    }
+    let Some(pending) = primary.try_recv() else {
+        return false;
+    };
+    let request = pending.request().clone();
+    let start = request.start().map(Path::to_path_buf);
+    let handle = match open_explorer_window(start, Some(request), cx) {
+        Ok(handle) => handle,
+        Err(error) => {
+            log::error!("cannot open a window for the forwarded launch: {error:#}");
+            return false;
+        }
+    };
+    // The launch is answered once the window drew: a window that never became
+    // visible is no answer, and dropping `pending` unanswered lets the
+    // launching process open its own instance instead.
+    let drawn = handle.update(cx, |_root, window, _cx| {
+        window.on_next_frame(move |_, _| pending.shown());
+    });
+    match &drawn {
+        Ok(()) => true,
+        Err(error) => {
+            log::warn!("the window opened for a forwarded launch closed at once: {error:#}");
+            false
+        }
+    }
+}
+
+/// Quits after the last window closed, and makes sure the process follows:
+/// everything the window owned — its watcher, device and bus threads, its
+/// clipboard handover — is torn down on this thread after the quit signal, so
+/// a teardown that does not return would leave a process with no window that
+/// still answers to the single-instance name and swallows every later launch.
+fn quit(cx: &mut App) {
+    cx.quit();
+    if let Err(error) = exit_after(EXIT_GRACE, || std::process::exit(EXIT_OK)) {
+        log::warn!("no exit watchdog thread: {error}");
+    }
+}
+
+/// Runs `exit` on its own thread after `grace`: [`quit`] uses it so the process
+/// never outlives its last window by more than that.
+fn exit_after(grace: Duration, exit: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("fileflux-exit".into())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            exit();
+        })
+        .map(drop)
 }
 
 /// The Lucide icons gpui-component bundles plus the installed icon theme's
@@ -111,10 +241,18 @@ impl AssetSource for ThemeAssets {
 }
 
 /// Installs the theme, binds the explorer's keys and opens the explorer
-/// window wrapped in gpui-component's [`Root`].
-fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
-    theme::install(theme::STARTUP_PALETTE, cx);
-    bind_keys(cx);
+/// window wrapped in gpui-component's [`Root`]. `request` is a forwarded
+/// launch the window was opened for: it is shown on top of `start`.
+fn open_explorer_window(
+    start: Option<PathBuf>,
+    request: Option<Request>,
+    cx: &mut App,
+) -> Result<WindowHandle<Root>> {
+    if !cx.has_global::<ExplorerDefaults>() {
+        theme::install(theme::STARTUP_PALETTE, cx);
+        bind_keys(cx);
+        cx.set_global(ExplorerDefaults);
+    }
 
     // The settings and session files are small: read them here, before the
     // window opens, so its size and the first tabs are the saved ones. A
@@ -141,11 +279,18 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
         ..Default::default()
     };
 
-    cx.open_window(options, |window, cx| {
+    let handle = cx.open_window(options, |window, cx| {
         // A development build can be driven by `gpui-mcp`; a release build
         // compiles this to nothing.
         crate::ui_automation::install(window, cx);
         let explorer = cx.new(|cx| Explorer::new(start, startup, window, cx));
+        // A window opened for a forwarded launch shows its folder and its
+        // selection before it takes the focus.
+        if let Some(request) = request {
+            explorer.update(cx, |explorer, cx| {
+                explorer.show_request_on_start(request, window, cx);
+            });
+        }
         explorer.update(cx, |explorer, cx| {
             explorer.initial_focus().focus(window, cx);
         });
@@ -157,8 +302,10 @@ fn open_explorer_window(start: Option<PathBuf>, cx: &mut App) -> Result<()> {
         });
         cx.new(|cx| Root::new(explorer, window, cx))
     })?;
+    cx.default_global::<ExplorerWindows>()
+        .opened(handle.window_id());
 
-    Ok(())
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -166,6 +313,24 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The watchdog [`quit`] arms runs its exit on its own thread once the
+    /// grace is over: a teardown that hangs still ends the process.
+    #[test]
+    fn the_exit_watchdog_runs_its_exit_after_the_grace() -> TestResult {
+        let (fired, watched) = std::sync::mpsc::channel();
+        exit_after(Duration::from_millis(20), move || {
+            if let Err(error) = fired.send(()) {
+                eprintln!("the watchdog fired but the test left: {error}");
+            }
+        })?;
+        assert_eq!(
+            watched.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "the watchdog exits after the grace"
+        );
+        Ok(())
+    }
 
     /// Absolute paths are read from disk — an icon the theme resolved — a
     /// missing one is no asset rather than an error, and relative paths keep

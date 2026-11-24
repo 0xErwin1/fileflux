@@ -27,6 +27,10 @@ const FILE_MANAGER_PATH: &str = "/org/freedesktop/FileManager1";
 /// How long the whole claim may take before the app opens normally.
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the running instance may take to show a forwarded request before
+/// the launching process opens one of its own.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Which bus to talk to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Endpoint {
@@ -53,22 +57,78 @@ pub struct Request {
     pub properties: bool,
 }
 
+impl Request {
+    /// The folder a window opened for this request starts on: its first
+    /// target's. `None` when the request only raises a window.
+    #[must_use]
+    pub fn start(&self) -> Option<&Path> {
+        self.targets.first().map(|show| show.folder.as_path())
+    }
+
+    /// The entries the window's own tab has to select: the first target's.
+    #[must_use]
+    pub fn first_selection(&self) -> &[PathBuf] {
+        self.targets
+            .first()
+            .map_or(&[], |show| show.select.as_slice())
+    }
+
+    /// The request without the target a new window opens on: what still needs
+    /// a tab of its own.
+    #[must_use]
+    pub fn rest(&self) -> Self {
+        Self {
+            targets: self.targets.iter().skip(1).cloned().collect(),
+            properties: self.properties,
+        }
+    }
+}
+
+/// A request the bus delivered and the answer its launcher waits for.
+#[derive(Debug)]
+pub struct Pending {
+    request: Request,
+    /// Told when a window shows the request. Dropped without it, the launcher
+    /// stops waiting and opens its own instance: a request no window can show
+    /// is never an answer.
+    shown: Option<Sender<()>>,
+}
+
+impl Pending {
+    /// The request to show.
+    #[must_use]
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+
+    /// Confirms a window shows the request: its launcher exits instead of
+    /// starting a second instance.
+    pub fn shown(mut self) {
+        if let Some(shown) = self.shown.take()
+            && let Err(error) = shown.send(())
+        {
+            // The launcher gave up on the answer already.
+            log::debug!("the launching process stopped waiting: {error}");
+        }
+    }
+}
+
 /// This process owns [`APP_NAME`]: the requests of the bus arrive here.
 #[derive(Debug)]
 pub struct Primary {
     _connection: Connection,
-    requests: Receiver<Request>,
+    requests: Receiver<Pending>,
     owns_file_manager: bool,
 }
 
 impl Primary {
     /// The next request, without waiting.
-    pub fn try_recv(&self) -> Option<Request> {
+    pub fn try_recv(&self) -> Option<Pending> {
         self.requests.try_recv().ok()
     }
 
     /// The next request, waiting up to `timeout`.
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<Request> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<Pending> {
         self.requests.recv_timeout(timeout).ok()
     }
 
@@ -85,9 +145,10 @@ impl Primary {
 pub enum Role {
     /// First instance: open the window and serve the bus.
     Primary(Primary),
-    /// Another instance owns the name and was handed the paths: exit.
+    /// Another instance owns the name and showed the paths: exit.
     Forwarded,
-    /// No usable bus, or any bus error: open normally.
+    /// No usable bus, any bus error, or a forward no window showed: open
+    /// normally.
     Standalone,
 }
 
@@ -162,7 +223,7 @@ async fn claim_async(endpoint: &Endpoint, forward: &[PathBuf]) -> zbus::Result<R
         // Someone else owns the name (DoNotQueue answers `Exists`).
         Ok(_) | Err(zbus::Error::NameTaken) => {
             let uris: Vec<String> = forward.iter().filter_map(|p| path_to_uri(p)).collect();
-            connection
+            let reply = connection
                 .call_method(
                     Some(APP_NAME),
                     APP_PATH,
@@ -171,6 +232,20 @@ async fn claim_async(endpoint: &Endpoint, forward: &[PathBuf]) -> zbus::Result<R
                     &(uris, String::new()),
                 )
                 .await?;
+            // The running instance answers only once one of its windows shows
+            // the request; a request it merely took is no answer, and this
+            // launch then opens an instance of its own instead of vanishing.
+            let shown = match reply.body().deserialize::<bool>() {
+                Ok(shown) => shown,
+                Err(error) => {
+                    log::debug!("the running {APP_NAME} gave no answer: {error}");
+                    false
+                }
+            };
+            if !shown {
+                log::debug!("{APP_NAME} took the paths without showing them");
+                return Ok(Role::Standalone);
+            }
             return Ok(Role::Forwarded);
         }
         Err(error) => return Err(error),
@@ -197,25 +272,38 @@ async fn claim_async(endpoint: &Endpoint, forward: &[PathBuf]) -> zbus::Result<R
 
 /// `io.github.fileflux.Fileflux1`: what a second launch calls.
 struct Instance {
-    requests: Sender<Request>,
+    requests: Sender<Pending>,
 }
 
 #[zbus::interface(name = "io.github.fileflux.Fileflux1")]
 impl Instance {
     /// Opens each folder in a new tab, or the folder of each file with the
-    /// file selected. Entries are absolute paths or `file://` URIs.
-    fn open(&self, paths: Vec<String>, _startup_id: String) {
+    /// file selected. Entries are absolute paths or `file://` URIs. Answers
+    /// once a window shows them: `true` when one did, `false` when the app has
+    /// none to show them in, so the caller opens an instance of its own.
+    fn open(&self, paths: Vec<String>, _startup_id: String) -> bool {
         let paths = paths_of(&paths);
-        self.send(Request {
-            targets: open_targets(&paths, Path::is_dir),
-            properties: false,
-        });
+        let (shown, answer) = channel();
+        let pending = Pending {
+            request: Request {
+                targets: open_targets(&paths, Path::is_dir),
+                properties: false,
+            },
+            shown: Some(shown),
+        };
+        // The app is gone when the channel is closed: nothing took it.
+        if self.requests.send(pending).is_err() {
+            return false;
+        }
+        // Waited for on the bus thread, never on the UI thread: the app-level
+        // pump or the window's takes the request before this answers.
+        answer.recv_timeout(ANSWER_TIMEOUT).is_ok()
     }
 }
 
 /// `org.freedesktop.FileManager1`.
 struct FileManager {
-    requests: Sender<Request>,
+    requests: Sender<Pending>,
 }
 
 #[zbus::interface(name = "org.freedesktop.FileManager1")]
@@ -243,16 +331,15 @@ impl FileManager {
     }
 }
 
-impl Instance {
-    fn send(&self, request: Request) {
-        // The app is gone when the channel is closed: nothing to do.
-        drop(self.requests.send(request));
-    }
-}
-
 impl FileManager {
     fn send(&self, request: Request) {
-        drop(self.requests.send(request));
+        // A third-party caller gets no answer, so nothing waits for a window.
+        let pending = Pending {
+            request,
+            shown: None,
+        };
+        // The app is gone when the channel is closed: nothing to do.
+        drop(self.requests.send(pending));
     }
 }
 
@@ -493,6 +580,39 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(5);
 
+    /// Waits for the next request the primary received and returns it.
+    fn next_request(primary: &Primary) -> Result<Pending, Box<dyn std::error::Error>> {
+        primary
+            .recv_timeout(WAIT)
+            .ok_or_else(|| "no request arrived".into())
+    }
+
+    #[test]
+    fn a_request_splits_into_the_window_it_opens_and_the_tabs_left() {
+        let request = Request {
+            targets: vec![show("/a", &["/a/one"]), show("/b", &[])],
+            properties: true,
+        };
+        assert_eq!(request.start(), Some(Path::new("/a")));
+        assert_eq!(request.first_selection(), [PathBuf::from("/a/one")]);
+        assert_eq!(
+            request.rest(),
+            Request {
+                targets: vec![show("/b", &[])],
+                properties: true
+            },
+            "only the targets past the window's own tab still need one"
+        );
+
+        let raise_only = Request {
+            targets: vec![],
+            properties: false,
+        };
+        assert_eq!(raise_only.start(), None);
+        assert!(raise_only.first_selection().is_empty());
+        assert_eq!(raise_only.rest(), raise_only);
+    }
+
     #[test]
     fn the_first_process_owns_the_name_and_a_second_one_forwards_its_paths() -> TestResult {
         let daemon = Daemon::start("single")?;
@@ -503,14 +623,15 @@ mod tests {
         let first = primary(claim(&daemon.endpoint(), &[]))?;
         assert!(first.owns_file_manager(), "the free FileManager1 is taken");
 
-        let second = claim(
-            &daemon.endpoint(),
-            &[work.join("folder"), work.join("file.txt")],
-        );
-        assert!(matches!(second, Role::Forwarded), "got {second:?}");
+        // The launcher waits for a window: the request arrives before it
+        // answers, and only the confirmation ends the launch.
+        let endpoint = daemon.endpoint();
+        let paths = vec![work.join("folder"), work.join("file.txt")];
+        let second = std::thread::spawn(move || claim(&endpoint, &paths));
+        let pending = next_request(&first)?;
         assert_eq!(
-            first.recv_timeout(WAIT),
-            Some(Request {
+            pending.request(),
+            &Request {
                 targets: vec![
                     Show {
                         folder: work.join("folder"),
@@ -522,19 +643,82 @@ mod tests {
                     },
                 ],
                 properties: false,
-            })
+            }
         );
+        pending.shown();
+        let second = second.join().map_err(|_| "the launcher panicked")?;
+        assert!(matches!(second, Role::Forwarded), "got {second:?}");
 
         // A launch without paths only raises the running window.
-        assert!(matches!(claim(&daemon.endpoint(), &[]), Role::Forwarded));
+        let endpoint = daemon.endpoint();
+        let second = std::thread::spawn(move || claim(&endpoint, &[]));
+        let pending = next_request(&first)?;
         assert_eq!(
-            first.recv_timeout(WAIT),
-            Some(Request {
+            pending.request(),
+            &Request {
                 targets: vec![],
                 properties: false
-            })
+            }
         );
-        assert_eq!(first.try_recv(), None);
+        pending.shown();
+        let second = second.join().map_err(|_| "the launcher panicked")?;
+        assert!(matches!(second, Role::Forwarded), "got {second:?}");
+        assert!(first.try_recv().is_none());
+        Ok(())
+    }
+
+    /// A request the running instance takes but no window shows is no answer:
+    /// the launch opens an instance of its own instead of exiting silently.
+    #[test]
+    fn a_forward_no_window_shows_opens_its_own_instance() -> TestResult {
+        let daemon = Daemon::start("unshown")?;
+        let first = primary(claim(&daemon.endpoint(), &[]))?;
+        let folder = daemon.scratch.join("somewhere");
+        std::fs::create_dir_all(&folder)?;
+
+        let endpoint = daemon.endpoint();
+        let paths = vec![folder.clone()];
+        let launch = std::thread::spawn(move || claim(&endpoint, &paths));
+        // The app takes the request and has no window to show it in.
+        let pending = next_request(&first)?;
+        assert_eq!(
+            pending.request().start(),
+            Some(folder.as_path()),
+            "the paths did arrive"
+        );
+        drop(pending);
+        let role = launch.join().map_err(|_| "the launcher panicked")?;
+        assert!(matches!(role, Role::Standalone), "got {role:?}");
+        Ok(())
+    }
+
+    /// A primary that takes the request and answers nothing: the launch stops
+    /// waiting on the answer it asked for, not on the claim's whole timeout.
+    #[test]
+    fn a_forward_the_primary_never_answers_times_out_to_its_own_instance() -> TestResult {
+        let daemon = Daemon::start("no-answer")?;
+        let first = primary(claim(&daemon.endpoint(), &[]))?;
+        let folder = daemon.scratch.join("wedged");
+        std::fs::create_dir_all(&folder)?;
+
+        let endpoint = daemon.endpoint();
+        let paths = vec![folder];
+        let started = std::time::Instant::now();
+        let launch = std::thread::spawn(move || claim(&endpoint, &paths));
+        let pending = next_request(&first)?;
+        // The request stays taken and unanswered, as a wedged window would.
+        std::mem::forget(pending);
+        let role = launch.join().map_err(|_| "the launcher panicked")?;
+        let waited = started.elapsed();
+        assert!(matches!(role, Role::Standalone), "got {role:?}");
+        assert!(
+            waited >= ANSWER_TIMEOUT,
+            "the primary had its own timeout to answer: {waited:?}"
+        );
+        assert!(
+            waited < CLAIM_TIMEOUT,
+            "the claim's whole timeout is not what decided: {waited:?}"
+        );
         Ok(())
     }
 
@@ -560,33 +744,33 @@ mod tests {
             strings(&["file:///tmp/a%20b", "http://x/y", "file:///tmp/c"]),
         )?;
         assert_eq!(
-            first.recv_timeout(WAIT),
-            Some(Request {
+            next_request(&first)?.request(),
+            &Request {
                 targets: vec![show("/tmp/a b", &[]), show("/tmp/c", &[])],
                 properties: false
-            })
+            }
         );
         call(
             "ShowItems",
             strings(&["file:///tmp/a/x", "file:///tmp/a/y", "file:///tmp/b/z"]),
         )?;
         assert_eq!(
-            first.recv_timeout(WAIT),
-            Some(Request {
+            next_request(&first)?.request(),
+            &Request {
                 targets: vec![
                     show("/tmp/a", &["/tmp/a/x", "/tmp/a/y"]),
                     show("/tmp/b", &["/tmp/b/z"])
                 ],
                 properties: false
-            })
+            }
         );
         call("ShowItemProperties", strings(&["file:///tmp/a/x"]))?;
         assert_eq!(
-            first.recv_timeout(WAIT),
-            Some(Request {
+            next_request(&first)?.request(),
+            &Request {
                 targets: vec![show("/tmp/a", &["/tmp/a/x"])],
                 properties: true
-            })
+            }
         );
         Ok(())
     }

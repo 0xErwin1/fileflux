@@ -24,9 +24,31 @@ impl Explorer {
         let Some(desktop) = self.desktop.clone() else {
             return;
         };
-        while let Some(request) = desktop.try_recv() {
-            self.show_requested(request, window, cx);
+        while let Some(pending) = desktop.try_recv() {
+            self.show_requested(pending.request().clone(), window, cx);
+            // The launch that forwarded the request exits now that a window
+            // shows it, instead of opening a second instance.
+            pending.shown();
         }
+    }
+
+    /// Shows `request` in the window opened for it: the window already shows
+    /// the request's first target's folder, so only that target's selection
+    /// and every other target are left.
+    pub(crate) fn show_request_on_start(
+        &mut self,
+        request: Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let select = request.first_selection();
+        if !select.is_empty() {
+            self.tab_mut().pending = Some(PendingSelect {
+                paths: select.to_vec(),
+                rename: false,
+            });
+        }
+        self.show_requested(request.rest(), window, cx);
     }
 
     /// One tab per requested folder, with the requested entries selected,
