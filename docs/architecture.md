@@ -15,7 +15,7 @@ One package, one library and one binary.
 | Part | Path | Role |
 |---|---|---|
 | Library `fileflux` | `src/lib.rs` | Exposes `fileflux::cli`, `fileflux::core` and `fileflux::dbus`. No GPUI dependency in these modules |
-| D-Bus | `src/dbus.rs` | Single instance (`io.github.fileflux.Fileflux`) and `org.freedesktop.FileManager1`, served on zbus's own thread; requests reach the UI thread through a channel that the app-level pump in `src/gui.rs` drains when no explorer window is open and `src/explorer/desktop.rs` otherwise. `Open` answers once a window shows the request |
+| D-Bus | `src/dbus.rs` | Single instance (`io.github.fileflux.Fileflux`) and `org.freedesktop.FileManager1`, served on zbus's own thread; requests reach the UI thread through a channel that the app-level pump in `src/gui.rs` drains when no explorer window is open and `src/explorer/desktop.rs` otherwise. `Open` answers `true` once a window shows the request; a launcher treats an empty reply (a Fileflux from before that answer) as forwarded |
 | Binary `fileflux` | `src/main.rs`, `src/gui.rs`, `src/theme.rs` | Parses the command line through `fileflux::cli`, starts GPUI, installs Bolt's dark theme, opens the explorer or the viewer inside `gpui_component`'s `Root` |
 | Explorer | `src/explorer/` | The window: state, views, sidebar, toolbar, tabs, dialogs, progress, key bindings |
 | Viewer | `src/viewer/` | The image viewer window: navigation, zoom, rotation, info panel |
@@ -77,7 +77,7 @@ The UI thread only draws and handles input. Everything that can block runs elsew
 
 **Navigation beats refresh.** A navigation always wins over the refresh of a finished operation, so a late completion never pulls you back.
 
-**Lifetime.** Closing the last window ends the process: GPUI is put in `QuitMode::LastWindowClosed`, and the quit is backed by a watchdog thread so a teardown that hangs — dropping the window joins its watcher, device and bus threads on the UI thread — still ends the process after 3 s instead of leaving one behind. That matters because the process owns the single-instance name: a windowless one would take every later launch's paths and show nothing. Two more guards cover it: the app-level pump above opens a window for a forwarded request when no explorer window is open, and a launch whose forward no window shows opens its own instance instead of exiting with status 0.
+**Lifetime.** Closing the last window ends the process: GPUI is put in `QuitMode::LastWindowClosed`, and the quit is backed by a watchdog thread that ends the process 3 s after the last window closed, so whatever keeps a windowless process alive (the exact hang was never reproduced; dropping the window joins its watcher, device and bus threads on the UI thread, a likely candidate) cannot leave one behind. That matters because the process owns the single-instance name: a windowless one would take every later launch's paths and show nothing. Two more guards cover it: the app-level pump above opens a window for a forwarded request when no explorer window is open, and a launch whose forward no window shows opens its own instance instead of exiting with status 0.
 
 ## Safety invariants
 

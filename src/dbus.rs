@@ -235,11 +235,19 @@ async fn claim_async(endpoint: &Endpoint, forward: &[PathBuf]) -> zbus::Result<R
             // The running instance answers only once one of its windows shows
             // the request; a request it merely took is no answer, and this
             // launch then opens an instance of its own instead of vanishing.
-            let shown = match reply.body().deserialize::<bool>() {
-                Ok(shown) => shown,
-                Err(error) => {
-                    log::debug!("the running {APP_NAME} gave no answer: {error}");
-                    false
+            // An instance from before that answer replies with no body: it
+            // opened the paths itself, so the launch counts as forwarded.
+            let body = reply.body();
+            let shown = if body.signature().to_string().is_empty() {
+                log::debug!("the running {APP_NAME} predates the shown answer");
+                true
+            } else {
+                match body.deserialize::<bool>() {
+                    Ok(shown) => shown,
+                    Err(error) => {
+                        log::debug!("the running {APP_NAME} gave no answer: {error}");
+                        false
+                    }
                 }
             };
             if !shown {
@@ -815,5 +823,49 @@ mod tests {
             claim(&Endpoint::Address("not an address".into()), &[]),
             Role::Standalone
         ));
+    }
+
+    /// The `Open` of a Fileflux from before the shown answer, which takes the
+    /// paths and replies with no body.
+    struct OldInstance {
+        paths: std::sync::Mutex<Sender<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "io.github.fileflux.Fileflux1")]
+    impl OldInstance {
+        fn open(&self, paths: Vec<String>, _startup_id: String) {
+            if let Ok(paths_out) = self.paths.lock() {
+                drop(paths_out.send(paths));
+            }
+        }
+    }
+
+    /// A running Fileflux of an older version answers `Open` with no body: it
+    /// took the paths and opened them, so this launch must not start a
+    /// second instance.
+    #[test]
+    fn a_primary_of_an_older_version_still_takes_the_launch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let daemon = Daemon::start("old-primary")?;
+        let (paths, received) = channel();
+        let old = daemon.client()?;
+        zbus::block_on(old.object_server().at(
+            APP_PATH,
+            OldInstance {
+                paths: std::sync::Mutex::new(paths),
+            },
+        ))?;
+        zbus::block_on(old.request_name_with_flags(APP_NAME, RequestNameFlags::DoNotQueue.into()))?;
+        let folder = daemon.scratch.join("from-an-old-version");
+        std::fs::create_dir_all(&folder)?;
+
+        let role = claim(&daemon.endpoint(), &[folder]);
+
+        assert!(
+            received.recv_timeout(WAIT).is_ok(),
+            "the older instance got the paths"
+        );
+        assert!(matches!(role, Role::Forwarded), "got {role:?}");
+        Ok(())
     }
 }
